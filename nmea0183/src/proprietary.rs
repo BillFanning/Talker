@@ -87,7 +87,7 @@ impl ProprietarySentence {
         let line = line.trim_end_matches(['\r', '\n']);
         let rest = line
             .strip_prefix('$')
-            .ok_or(NmeaError::MissingLeadingDollar)?;
+            .ok_or(NmeaError::MissingStartDelimiter)?;
 
         if !rest.starts_with('P') {
             return Err(NmeaError::Parse("not a proprietary sentence".to_string()));
@@ -454,6 +454,6 @@ mod tests {
     #[test]
     fn missing_dollar() {
         let err = ProprietarySentence::parse("PRDID,1.0,2.0,3.0").unwrap_err();
-        assert!(matches!(err, NmeaError::MissingLeadingDollar));
+        assert!(matches!(err, NmeaError::MissingStartDelimiter));
     }
 }

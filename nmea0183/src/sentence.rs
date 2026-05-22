@@ -45,7 +45,7 @@ impl NmeaSentence {
         let line = line.trim_end_matches(['\r', '\n']);
         let rest = line
             .strip_prefix('$')
-            .ok_or(NmeaError::MissingLeadingDollar)?;
+            .ok_or(NmeaError::MissingStartDelimiter)?;
 
         if rest.starts_with('P') {
             return Err(NmeaError::Parse(
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn parse_missing_dollar() {
         let err = NmeaSentence::parse("GPGGA,123519*47").unwrap_err();
-        assert!(matches!(err, NmeaError::MissingLeadingDollar));
+        assert!(matches!(err, NmeaError::MissingStartDelimiter));
     }
 
     #[test]

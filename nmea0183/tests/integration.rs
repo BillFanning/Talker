@@ -1,6 +1,6 @@
 use nmea0183::{
-    parse, AnyNmeaSentence, NmeaError, NmeaSentence, PashrData, PrdidData, ProprietarySentence,
-    SentenceType, TalkerId,
+    ais, parse, AisSentence, AnyNmeaSentence, NmeaError, NmeaSentence, PashrData, PrdidData,
+    ProprietarySentence, SentenceType, TalkerId,
 };
 
 // ── Checksum ──────────────────────────────────────────────────────────────────
@@ -166,7 +166,7 @@ fn parse_rejects_missing_checksum() {
 #[test]
 fn parse_rejects_missing_dollar() {
     let err = NmeaSentence::parse("GPGGA,123519*47").unwrap_err();
-    assert!(matches!(err, NmeaError::MissingLeadingDollar));
+    assert!(matches!(err, NmeaError::MissingStartDelimiter));
 }
 
 #[test]
@@ -286,6 +286,45 @@ fn top_level_parse_routes_raw_proprietary() {
 fn top_level_parse_missing_dollar() {
     assert!(matches!(
         parse("GPGGA*47").unwrap_err(),
-        NmeaError::MissingLeadingDollar
+        NmeaError::MissingStartDelimiter
     ));
+}
+
+// ── AIS ───────────────────────────────────────────────────────────────────────
+
+#[test]
+fn ais_sentence_round_trip() {
+    let s = AisSentence::new(false, "A", &[0xDE, 0xAD, 0xBE, 0xEF]);
+    let parsed = AisSentence::parse(&s.to_wire()).unwrap();
+    assert_eq!(parsed, s);
+}
+
+#[test]
+fn ais_own_vessel_uses_aivdo() {
+    let wire = AisSentence::new(true, "B", &[0x01]).to_wire();
+    assert!(wire.starts_with("!AIVDO,"));
+}
+
+#[test]
+fn top_level_parse_routes_ais() {
+    let wire = AisSentence::new(false, "A", &[0x10, 0x20]).to_wire();
+    assert!(matches!(parse(&wire).unwrap(), AnyNmeaSentence::Ais(_)));
+}
+
+#[test]
+fn ais_armor_round_trips_payload() {
+    let data = [0x12, 0x34, 0x56, 0x78, 0x9A];
+    let (payload, fill) = ais::armor(&data);
+    assert_eq!(ais::unarmor(&payload, fill).unwrap(), data);
+}
+
+#[test]
+fn ais_parsed_payload_recovers_binary() {
+    let data = b"binary AIS data";
+    let s = AisSentence::new(false, "A", data);
+    let parsed = AisSentence::parse(&s.to_wire()).unwrap();
+    assert_eq!(
+        ais::unarmor(&parsed.payload, parsed.fill_bits).unwrap(),
+        data
+    );
 }

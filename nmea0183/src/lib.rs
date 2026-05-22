@@ -1,3 +1,4 @@
+pub mod ais;
 pub mod checksum;
 
 mod error;
@@ -6,6 +7,7 @@ mod sentence;
 mod sentence_type;
 mod talker_id;
 
+pub use ais::AisSentence;
 pub use error::NmeaError;
 pub use proprietary::{PashrData, PrdidData, ProprietarySentence};
 pub use sentence::NmeaSentence;
@@ -18,20 +20,23 @@ pub use talker_id::TalkerId;
 pub enum AnyNmeaSentence {
     Standard(NmeaSentence),
     Proprietary(ProprietarySentence),
+    Ais(AisSentence),
 }
 
-/// Parse any NMEA sentence, dispatching to [`NmeaSentence`] or [`ProprietarySentence`]
-/// based on whether the sentence begins with `$P`.
+/// Parse any NMEA sentence, dispatching by its start delimiter:
+/// `!` → AIS, `$P` → proprietary, `$` → standard.
 pub fn parse(line: &str) -> Result<AnyNmeaSentence, NmeaError> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
-    let rest = trimmed
-        .strip_prefix('$')
-        .ok_or(NmeaError::MissingLeadingDollar)?;
-
-    if rest.starts_with('P') {
-        ProprietarySentence::parse(line).map(AnyNmeaSentence::Proprietary)
-    } else {
-        NmeaSentence::parse(line).map(AnyNmeaSentence::Standard)
+    match trimmed.as_bytes().first() {
+        Some(b'!') => AisSentence::parse(line).map(AnyNmeaSentence::Ais),
+        Some(b'$') => {
+            if trimmed[1..].starts_with('P') {
+                ProprietarySentence::parse(line).map(AnyNmeaSentence::Proprietary)
+            } else {
+                NmeaSentence::parse(line).map(AnyNmeaSentence::Standard)
+            }
+        }
+        _ => Err(NmeaError::MissingStartDelimiter),
     }
 }
 
@@ -76,8 +81,20 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_missing_dollar() {
+    fn dispatch_ais() {
+        let wire = AisSentence::new(false, "A", &[0x01, 0x02, 0x03]).to_wire();
+        assert!(matches!(parse(&wire).unwrap(), AnyNmeaSentence::Ais(_)));
+    }
+
+    #[test]
+    fn dispatch_unknown_delimiter() {
         let err = parse("GPGGA*47").unwrap_err();
-        assert!(matches!(err, NmeaError::MissingLeadingDollar));
+        assert!(matches!(err, NmeaError::MissingStartDelimiter));
+    }
+
+    #[test]
+    fn dispatch_empty_line() {
+        let err = parse("").unwrap_err();
+        assert!(matches!(err, NmeaError::MissingStartDelimiter));
     }
 }
