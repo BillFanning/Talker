@@ -1,7 +1,7 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.4  
-**Date:** 2025-05-13  
+**Version:** 1.5  
+**Date:** 2026-05-22  
 **Status:** Accepted
 
 ---
@@ -216,6 +216,8 @@ An ADR captures *why* a significant decision was made, not just *what* was decid
 
 ## ADR-012 — Binary field types
 
+**Status:** Superseded by the spec v2.0 message-format model (see ADR-015 context and CLAUDE.md "Message Formats"). Spec v2.0 removed the typed-binary-field concept: arbitrary byte sequences are now entered in **Hex** format, and structured data is built through the UTF-8/UTF-16/ASCII/NMEA formats. `core::data` and the `BinaryField` enum were never carried into the v2.0 codebase. This ADR is retained for historical context.
+
 **Context:** The spec originally deferred the exact set of binary field types. A concrete decision is needed before `core::data` can be implemented.
 
 **Decision:** Binary data is constructed as an ordered sequence of typed fields. Supported types are: `u8`, `u16`, `u24`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `f32`, `f64`, and raw bytes (arbitrary hex). Byte order is selectable per field — big-endian (default) or little-endian.
@@ -253,6 +255,45 @@ The version number increments only on breaking schema changes that `serde(defaul
 - Migration functions live in `core::profile::migration` as a match on `(from_version, current_version)`.
 - The `#[non_exhaustive]` attribute is used on profile enums to prevent external code from exhaustively matching on them, enabling future variant addition without breaking changes.
 
+**Update (v2.0, 2026-05-22):** The spec v2.0 upgrade restructured the profile schema (nested channels, each owning an interface and a list of messages). Rather than write a v1→v2 migration, the project chose a **clean break**: `CURRENT_VERSION` is `2`, and `Profile::load` refuses any profile whose version differs from it — newer versions are rejected as unsupported (Layer 2 as designed), and **older versions (v1) are also rejected**, with an error instructing the user to recreate the profile. The reasoning: v1 had no released users, so migration code would have been dead weight maintained forever. Layer 1 (`#[serde(default)]` on every field) still stands and handles all *additive* schema changes within v2. The `core::profile::migration` module was therefore never created; when a breaking v3 change arrives, a migration step and version-downgrade handling are reinstated at that point.
+
+---
+
+## ADR-014 — `talker` as a library plus a thin binary
+
+**Context:** The `talker` crate began as a pure binary (`main.rs` and a module tree). All application logic lives in `core`; `cli` and `gui` are thin interface layers. During the spec v2.0 upgrade, removing the workspace-wide `#![allow(dead_code)]` exposed nine false-positive dead-code errors: constructors and helpers in `core` that are exercised by unit tests but not yet called from `main`. In a binary crate, anything not reachable from `fn main` is "dead" — even when it is part of a module's intended public API and is under test.
+
+**Decision:** `talker` is both a library and a binary. `src/lib.rs` declares `pub mod cli; pub mod core; pub mod gui;`. `src/main.rs` is a thin shim that calls into the library. The library's public items are part of an exported API, so the compiler no longer flags tested-but-not-yet-wired `core` code as dead.
+
+**Alternatives considered:**
+- **Keep `#![allow(dead_code)]`:** Silences the false positives but also silences *genuine* dead code for the life of the project. Rejected — the lint is worth keeping honest.
+- **Per-item `#[allow(dead_code)]`:** Scatters annotations across `core` and requires adding/removing them as `main` wiring catches up. Noisy and easy to leave stale.
+- **`#[cfg(test)]`-only constructors:** Would mean test-only code paths diverge from production ones. Rejected — tests should exercise the real API.
+
+**Consequences:**
+- `cargo test` can address `core` modules directly through the library crate (`use talker::core::...`), and integration tests in `talker/tests/` link against the library.
+- The crate compiles with the default dead-code lint active; genuinely unused code is caught.
+- `main.rs` contains no logic beyond argument dispatch — consistent with the existing rule that `cli`/`gui` are thin layers.
+
+---
+
+## ADR-015 — Code pages: hand-written tables, no `encoding_rs`
+
+**Context:** Spec §5.2 requires four single-byte code pages for ASCII-format messages — CP437, Windows-1252, Mac OS Roman, and ISO-8859-1 — available on every host OS regardless of the platform's own locale. Each is a fixed mapping between byte values 128–255 and Unicode scalar values.
+
+**Decision:** Each code page is implemented as a hand-written static table in `core::message::codepage`, generated from the authoritative Unicode Consortium mapping files. No transcoding crate is taken as a dependency.
+
+**Alternatives considered:**
+- **`encoding_rs`:** The standard Rust transcoding crate (the encoding engine from Firefox). It is correct and well-maintained, but it is a heavy dependency — it carries the full WHATWG Encoding Standard: every legacy multi-byte CJK encoding, big lookup tables, and a streaming decoder API. `talker` needs four *single-byte* maps and a one-shot encode. Pulling in the whole crate for that is disproportionate: it inflates compile time and binary size and widens the dependency surface for no functional gain.
+- **`codepage`/`oem_cp` and similar smaller crates:** Lighter than `encoding_rs`, but still an external dependency and an API to track, for tables that are trivially expressed inline and never change.
+- **OS-provided conversion APIs:** Platform-specific, and would violate the spec requirement that all four code pages work identically on every host OS.
+
+**Consequences:**
+- `core::message::codepage` owns four `[char; 128]`-style tables; encoding is a direct lookup, decoding (for the display pane) is a reverse search.
+- The tables were transcribed from the Unicode Consortium `.TXT` mapping files, not from memory; unit tests pin representative code points so a transcription error cannot pass silently.
+- ISO-8859-1's 128–255 range is the identity map onto U+0080–U+00FF, so it needs no table — it is handled as a special case.
+- Adding a fifth code page later is a self-contained table addition with no dependency change.
+
 ---
 
 ## Open questions
@@ -261,9 +302,9 @@ The following decisions are deferred until the relevant module is written. They 
 
 **OQ-1 — `nmea0183` path-vs-version dependency.** The `talker` crate currently depends on `nmea0183` via `{ path = "../nmea0183" }`. When `nmea0183` is published to crates.io (per ADR-001), this should become `{ path = "../nmea0183", version = "0.1" }` so that downstream consumers building against published versions resolve cleanly while in-workspace builds continue to use the local source. Defer until publication is imminent.
 
-**OQ-2 — `toml` 1.x vs 0.8 API.** The workspace currently pins `toml = "1"`. The 1.x API changed from 0.8 (the parser/writer split, `Value` semantics). When `core::profile` is written, verify the API surface used matches 1.x; if friction is high, fall back to `toml = "0.8"`. Either choice is consistent with ADR-005.
+**OQ-2 — `toml` 1.x vs 0.8 API. — Resolved (v2.0).** `core::profile` was implemented against `toml = "1"` with no friction: `Profile::load` parses to a `toml::Value` to inspect the schema version before full deserialization, then `toml::from_str` / `toml::to_string_pretty` handle the round trip. The 1.x API surface was sufficient; the fallback to `"0.8"` was not needed. The workspace stays on `toml = "1"`.
 
-**OQ-3 — `nmea0183` serde feature activation in `talker`.** Profiles may need to serialize NMEA sentence definitions. If `core::profile` serializes `nmea0183` types directly, the dependency line in `talker/Cargo.toml` must enable the `serde` feature: `nmea0183 = { path = "../nmea0183", features = ["serde"] }`. If `core::profile` instead defines its own `talker`-side representation and converts to/from `nmea0183` types at the boundary, the feature stays off. The latter is more decoupled but adds boilerplate; the former is more direct but ties profile schema to the library's struct shapes. Decision deferred to when `core::profile` is designed.
+**OQ-3 — `nmea0183` serde feature activation in `talker`. — Resolved (v2.0).** `core::profile` uses a **`talker`-side representation**: an NMEA message is stored as `PayloadConfig::Nmea { talker: String, sentence_type: String, fields: Vec<String> }` — plain strings, not `nmea0183` types — and converted to a `nmea0183::NmeaSentence` only at compile time. The profile schema is therefore decoupled from the library's struct shapes, and the `talker` dependency on `nmea0183` does **not** enable the `serde` feature (`nmea0183 = { path = "../nmea0183" }`). The `serde` feature on `nmea0183` itself still exists and is still verified to compile, for the benefit of other potential consumers.
 
 **OQ-4 — `nmea0183` library MSRV policy.** ADR-008 sets the workspace MSRV to current stable Rust. The `nmea0183` library, intended for crates.io publication, may benefit from a looser MSRV to accommodate cautious downstream users. The policy (e.g., N-6 months of stable releases) and the mechanism (per-crate `rust-version` override) are deferred to a future ADR when publication approaches. See ADR-008 for context.
 

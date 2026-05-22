@@ -1,16 +1,18 @@
+pub mod ais;
 pub mod checksum;
 
 mod error;
-mod talker_id;
-mod sentence_type;
-mod sentence;
 mod proprietary;
+mod sentence;
+mod sentence_type;
+mod talker_id;
 
+pub use ais::AisSentence;
 pub use error::NmeaError;
-pub use talker_id::TalkerId;
-pub use sentence_type::SentenceType;
-pub use sentence::NmeaSentence;
 pub use proprietary::{PashrData, PrdidData, ProprietarySentence};
+pub use sentence::NmeaSentence;
+pub use sentence_type::SentenceType;
+pub use talker_id::TalkerId;
 
 /// The result of parsing any NMEA sentence.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -18,18 +20,23 @@ pub use proprietary::{PashrData, PrdidData, ProprietarySentence};
 pub enum AnyNmeaSentence {
     Standard(NmeaSentence),
     Proprietary(ProprietarySentence),
+    Ais(AisSentence),
 }
 
-/// Parse any NMEA sentence, dispatching to [`NmeaSentence`] or [`ProprietarySentence`]
-/// based on whether the sentence begins with `$P`.
+/// Parse any NMEA sentence, dispatching by its start delimiter:
+/// `!` → AIS, `$P` → proprietary, `$` → standard.
 pub fn parse(line: &str) -> Result<AnyNmeaSentence, NmeaError> {
     let trimmed = line.trim_end_matches(['\r', '\n']);
-    let rest = trimmed.strip_prefix('$').ok_or(NmeaError::MissingLeadingDollar)?;
-
-    if rest.starts_with('P') {
-        ProprietarySentence::parse(line).map(AnyNmeaSentence::Proprietary)
-    } else {
-        NmeaSentence::parse(line).map(AnyNmeaSentence::Standard)
+    match trimmed.as_bytes().first() {
+        Some(b'!') => AisSentence::parse(line).map(AnyNmeaSentence::Ais),
+        Some(b'$') => {
+            if trimmed[1..].starts_with('P') {
+                ProprietarySentence::parse(line).map(AnyNmeaSentence::Proprietary)
+            } else {
+                NmeaSentence::parse(line).map(AnyNmeaSentence::Standard)
+            }
+        }
+        _ => Err(NmeaError::MissingStartDelimiter),
     }
 }
 
@@ -40,13 +47,24 @@ mod tests {
     #[test]
     fn dispatch_standard() {
         let wire = NmeaSentence::new(TalkerId::GP, SentenceType::GGA, vec![]).to_wire();
-        assert!(matches!(parse(&wire).unwrap(), AnyNmeaSentence::Standard(_)));
+        assert!(matches!(
+            parse(&wire).unwrap(),
+            AnyNmeaSentence::Standard(_)
+        ));
     }
 
     #[test]
     fn dispatch_proprietary_prdid() {
-        let wire = ProprietarySentence::Prdid(PrdidData { pitch: 1.0, roll: 2.0, heave: 3.0 }).to_wire();
-        assert!(matches!(parse(&wire).unwrap(), AnyNmeaSentence::Proprietary(_)));
+        let wire = ProprietarySentence::Prdid(PrdidData {
+            pitch: 1.0,
+            roll: 2.0,
+            heading: 3.0,
+        })
+        .to_wire();
+        assert!(matches!(
+            parse(&wire).unwrap(),
+            AnyNmeaSentence::Proprietary(_)
+        ));
     }
 
     #[test]
@@ -54,13 +72,29 @@ mod tests {
         let wire = ProprietarySentence::Raw {
             identifier: "FOO".to_string(),
             fields: vec![],
-        }.to_wire();
-        assert!(matches!(parse(&wire).unwrap(), AnyNmeaSentence::Proprietary(_)));
+        }
+        .to_wire();
+        assert!(matches!(
+            parse(&wire).unwrap(),
+            AnyNmeaSentence::Proprietary(_)
+        ));
     }
 
     #[test]
-    fn dispatch_missing_dollar() {
+    fn dispatch_ais() {
+        let wire = AisSentence::new(false, "A", &[0x01, 0x02, 0x03]).to_wire();
+        assert!(matches!(parse(&wire).unwrap(), AnyNmeaSentence::Ais(_)));
+    }
+
+    #[test]
+    fn dispatch_unknown_delimiter() {
         let err = parse("GPGGA*47").unwrap_err();
-        assert!(matches!(err, NmeaError::MissingLeadingDollar));
+        assert!(matches!(err, NmeaError::MissingStartDelimiter));
+    }
+
+    #[test]
+    fn dispatch_empty_line() {
+        let err = parse("").unwrap_err();
+        assert!(matches!(err, NmeaError::MissingStartDelimiter));
     }
 }

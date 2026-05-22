@@ -1,13 +1,13 @@
 use anyhow::Context;
 
-use super::Connection;
 use super::config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
+use super::Interface;
 
-pub(super) struct SerialConnection {
+pub(super) struct SerialInterface {
     port: Box<dyn serialport::SerialPort>,
 }
 
-impl SerialConnection {
+impl SerialInterface {
     pub(super) fn open(config: &SerialConfig) -> anyhow::Result<Self> {
         let port = serialport::new(&config.port, config.baud_rate)
             .data_bits(to_sp_data_bits(config.data_bits))
@@ -21,7 +21,7 @@ impl SerialConnection {
     }
 }
 
-impl Connection for SerialConnection {
+impl Interface for SerialInterface {
     fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
         use std::io::Write;
         self.port.write_all(data).context("writing to serial port")
@@ -67,35 +67,65 @@ mod tests {
     #[test]
     fn open_nonexistent_port_returns_error() {
         let config = SerialConfig::new("/dev/does_not_exist_xyz");
-        let result = SerialConnection::open(&config);
-        let msg = result.err().expect("expected error opening nonexistent port").to_string();
+        let result = SerialInterface::open(&config);
+        let msg = result
+            .err()
+            .expect("expected error opening nonexistent port")
+            .to_string();
         assert!(msg.contains("does_not_exist_xyz"));
     }
 
     #[test]
     fn data_bits_conversion_covers_all_variants() {
-        assert!(matches!(to_sp_data_bits(DataBits::Five), serialport::DataBits::Five));
-        assert!(matches!(to_sp_data_bits(DataBits::Six), serialport::DataBits::Six));
-        assert!(matches!(to_sp_data_bits(DataBits::Seven), serialport::DataBits::Seven));
-        assert!(matches!(to_sp_data_bits(DataBits::Eight), serialport::DataBits::Eight));
+        assert!(matches!(
+            to_sp_data_bits(DataBits::Five),
+            serialport::DataBits::Five
+        ));
+        assert!(matches!(
+            to_sp_data_bits(DataBits::Six),
+            serialport::DataBits::Six
+        ));
+        assert!(matches!(
+            to_sp_data_bits(DataBits::Seven),
+            serialport::DataBits::Seven
+        ));
+        assert!(matches!(
+            to_sp_data_bits(DataBits::Eight),
+            serialport::DataBits::Eight
+        ));
     }
 
     #[test]
     fn parity_conversion_covers_all_variants() {
-        assert!(matches!(to_sp_parity(Parity::None), serialport::Parity::None));
+        assert!(matches!(
+            to_sp_parity(Parity::None),
+            serialport::Parity::None
+        ));
         assert!(matches!(to_sp_parity(Parity::Odd), serialport::Parity::Odd));
-        assert!(matches!(to_sp_parity(Parity::Even), serialport::Parity::Even));
+        assert!(matches!(
+            to_sp_parity(Parity::Even),
+            serialport::Parity::Even
+        ));
     }
 
     #[test]
     fn stop_bits_conversion_covers_all_variants() {
-        assert!(matches!(to_sp_stop_bits(StopBits::One), serialport::StopBits::One));
-        assert!(matches!(to_sp_stop_bits(StopBits::Two), serialport::StopBits::Two));
+        assert!(matches!(
+            to_sp_stop_bits(StopBits::One),
+            serialport::StopBits::One
+        ));
+        assert!(matches!(
+            to_sp_stop_bits(StopBits::Two),
+            serialport::StopBits::Two
+        ));
     }
 
     #[test]
     fn flow_control_conversion_covers_all_variants() {
-        assert!(matches!(to_sp_flow_control(FlowControl::None), serialport::FlowControl::None));
+        assert!(matches!(
+            to_sp_flow_control(FlowControl::None),
+            serialport::FlowControl::None
+        ));
         assert!(matches!(
             to_sp_flow_control(FlowControl::Software),
             serialport::FlowControl::Software

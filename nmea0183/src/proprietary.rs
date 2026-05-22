@@ -5,15 +5,18 @@ use crate::error::NmeaError;
 
 /// Data carried by `$PRDID` sentences.
 ///
-/// `$PRDID` does not include a checksum by convention.
-/// Wire format: `$PRDID,{pitch},{roll},{heave}\r\n`
+/// `$PRDID` (Teledyne RDI ADCP) does not include a checksum by convention.
+/// Wire format: `$PRDID,{pitch},{roll},{heading}\r\n`
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct PrdidData {
+    /// Pitch in degrees (positive = bow up).
     pub pitch: f64,
+    /// Roll in degrees (positive = starboard up).
     pub roll: f64,
-    pub heave: f64,
+    /// True heading in degrees (0–359.99).
+    pub heading: f64,
 }
 
 /// Data carried by `$PASHR` sentences.
@@ -55,7 +58,10 @@ pub enum ProprietarySentence {
     Pashr(PashrData),
     /// Any other `$P` sentence.
     /// `identifier` is the part after `$P` and before the first `,` (e.g. `"GRMZ"`).
-    Raw { identifier: String, fields: Vec<String> },
+    Raw {
+        identifier: String,
+        fields: Vec<String>,
+    },
 }
 
 impl ProprietarySentence {
@@ -79,7 +85,9 @@ impl ProprietarySentence {
     /// Parse a proprietary sentence string. Accepts lines with or without `\r\n`.
     pub fn parse(line: &str) -> Result<Self, NmeaError> {
         let line = line.trim_end_matches(['\r', '\n']);
-        let rest = line.strip_prefix('$').ok_or(NmeaError::MissingLeadingDollar)?;
+        let rest = line
+            .strip_prefix('$')
+            .ok_or(NmeaError::MissingStartDelimiter)?;
 
         if !rest.starts_with('P') {
             return Err(NmeaError::Parse("not a proprietary sentence".to_string()));
@@ -92,9 +100,7 @@ impl ProprietarySentence {
         }
 
         // All other proprietary sentences require a checksum.
-        let (body, chk) = rest
-            .rsplit_once('*')
-            .ok_or(NmeaError::MissingChecksum)?;
+        let (body, chk) = rest.rsplit_once('*').ok_or(NmeaError::MissingChecksum)?;
 
         let expected = u8::from_str_radix(chk, 16)
             .map_err(|_| NmeaError::Parse(format!("invalid checksum hex: {chk:?}")))?;
@@ -118,7 +124,10 @@ impl ProprietarySentence {
                 } else {
                     fields_str.split(',').map(str::to_string).collect()
                 };
-                Ok(Self::Raw { identifier: ident.to_string(), fields })
+                Ok(Self::Raw {
+                    identifier: ident.to_string(),
+                    fields,
+                })
             }
         }
     }
@@ -133,12 +142,19 @@ impl fmt::Display for ProprietarySentence {
 // ── PrdidData ────────────────────────────────────────────────────────────────
 
 impl PrdidData {
-    pub fn new(pitch: f64, roll: f64, heave: f64) -> Self {
-        Self { pitch, roll, heave }
+    pub fn new(pitch: f64, roll: f64, heading: f64) -> Self {
+        Self {
+            pitch,
+            roll,
+            heading,
+        }
     }
 
     pub fn to_wire(&self) -> String {
-        format!("$PRDID,{:.2},{:.2},{:.2}\r\n", self.pitch, self.roll, self.heave)
+        format!(
+            "$PRDID,{:.2},{:.2},{:.2}\r\n",
+            self.pitch, self.roll, self.heading
+        )
     }
 }
 
@@ -147,9 +163,13 @@ fn parse_prdid(fields_str: &str) -> Result<ProprietarySentence, NmeaError> {
 
     let pitch = parse_f64(it.next(), 0, "pitch")?;
     let roll = parse_f64(it.next(), 1, "roll")?;
-    let heave = parse_f64(it.next(), 2, "heave")?;
+    let heading = parse_f64(it.next(), 2, "heading")?;
 
-    Ok(ProprietarySentence::Prdid(PrdidData { pitch, roll, heave }))
+    Ok(ProprietarySentence::Prdid(PrdidData {
+        pitch,
+        roll,
+        heading,
+    }))
 }
 
 // ── PashrData ────────────────────────────────────────────────────────────────
@@ -286,22 +306,37 @@ mod tests {
 
     #[test]
     fn prdid_to_wire_no_checksum() {
-        let d = PrdidData { pitch: 1.50, roll: 0.30, heave: -0.10 };
+        let d = PrdidData {
+            pitch: 1.50,
+            roll: 0.30,
+            heading: 127.45,
+        };
         let wire = ProprietarySentence::Prdid(d).to_wire();
-        assert_eq!(wire, "$PRDID,1.50,0.30,-0.10\r\n");
+        assert_eq!(wire, "$PRDID,1.50,0.30,127.45\r\n");
         assert!(!wire.contains('*'), "PRDID must not contain a checksum");
     }
 
     #[test]
     fn prdid_parse_basic() {
-        let wire = "$PRDID,1.50,0.30,-0.10\r\n";
+        let wire = "$PRDID,1.50,0.30,127.45\r\n";
         let s = ProprietarySentence::parse(wire).unwrap();
-        assert_eq!(s, ProprietarySentence::Prdid(PrdidData { pitch: 1.50, roll: 0.30, heave: -0.10 }));
+        assert_eq!(
+            s,
+            ProprietarySentence::Prdid(PrdidData {
+                pitch: 1.50,
+                roll: 0.30,
+                heading: 127.45
+            })
+        );
     }
 
     #[test]
     fn prdid_round_trip() {
-        let d = PrdidData { pitch: -3.75, roll: 0.01, heave: 0.50 };
+        let d = PrdidData {
+            pitch: -3.75,
+            roll: 0.01,
+            heading: 0.50,
+        };
         let wire = ProprietarySentence::Prdid(d.clone()).to_wire();
         let parsed = ProprietarySentence::parse(&wire).unwrap();
         assert_eq!(parsed, ProprietarySentence::Prdid(d));
@@ -369,10 +404,13 @@ mod tests {
     fn pashr_bad_checksum() {
         let wire = ProprietarySentence::Pashr(sample_pashr_no_utc()).to_wire();
         // Corrupt the checksum digit
-        let bad = wire.replace(|c: char| c == '\r' || c == '\n', "");
+        let bad = wire.replace(['\r', '\n'], "");
         let bad = format!("{}X\r\n", &bad[..bad.len() - 1]);
         let err = ProprietarySentence::parse(&bad).unwrap_err();
-        assert!(matches!(err, NmeaError::InvalidChecksum { .. } | NmeaError::Parse(_)));
+        assert!(matches!(
+            err,
+            NmeaError::InvalidChecksum { .. } | NmeaError::Parse(_)
+        ));
     }
 
     // --- Raw ---
@@ -416,6 +454,6 @@ mod tests {
     #[test]
     fn missing_dollar() {
         let err = ProprietarySentence::parse("PRDID,1.0,2.0,3.0").unwrap_err();
-        assert!(matches!(err, NmeaError::MissingLeadingDollar));
+        assert!(matches!(err, NmeaError::MissingStartDelimiter));
     }
 }

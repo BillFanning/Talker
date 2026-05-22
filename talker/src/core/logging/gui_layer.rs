@@ -112,7 +112,7 @@ mod tests {
         let (tx, rx) = unbounded::<LogEvent>();
         let layer = GuiLogLayer::new(tx);
         drop(rx); // disconnect receiver
-        // Sending to a disconnected channel must not panic — try_send discards.
+                  // Sending to a disconnected channel must not panic — try_send discards.
         drop(layer);
     }
 

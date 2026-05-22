@@ -9,8 +9,8 @@ pub enum NmeaError {
     #[error("sentence has no checksum")]
     MissingChecksum,
 
-    #[error("sentence does not start with '$'")]
-    MissingLeadingDollar,
+    #[error("sentence does not start with '$' or '!'")]
+    MissingStartDelimiter,
 
     #[error("talker ID is too short or malformed: {0:?}")]
     InvalidTalkerId(String),

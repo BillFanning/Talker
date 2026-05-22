@@ -1,28 +1,32 @@
+mod display;
 mod draft;
 mod thread;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::Context as _;
 use egui::{Align, Layout, ScrollArea};
 
 use crate::core::{
-    connection::ConnectionCollection,
+    channel::ChannelConfig,
     logging::{LogEvent, LoggingConfig},
+    message::{segments, ChecksumAlgorithm, CodePage, Segment},
     profile::Profile,
+    scheduler::Schedule,
 };
 
+use display::{ChannelDisplay, ControlStyle, DisplayMode};
 use draft::{ConnDraft, ConnKind, PayloadKind, ScheduleDraft, UdpModeDraft};
-use thread::{TalkerCommand, TalkerHandle, TalkerStatus, run_talker};
+use thread::{run_talker, TalkerCommand, TalkerHandle, TalkerStatus};
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
     let (log_tx, log_rx) = crossbeam_channel::bounded::<LogEvent>(512);
-    let _logging =
-        crate::core::logging::init(&LoggingConfig::default(), Some(log_tx))
-            .context("initializing logging")?;
+    let _logging = crate::core::logging::init(&LoggingConfig::default(), Some(log_tx))
+        .context("initializing logging")?;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 740.0]),
@@ -31,7 +35,14 @@ pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
     eframe::run_native(
         "Talker",
         options,
-        Box::new(move |cc| Ok(Box::new(TalkerApp::new(log_rx, initial_profile, &cc.egui_ctx, cc.storage)))),
+        Box::new(move |cc| {
+            Ok(Box::new(TalkerApp::new(
+                log_rx,
+                initial_profile,
+                &cc.egui_ctx,
+                cc.storage,
+            )))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -49,6 +60,7 @@ struct TalkerApp {
     log_rx: crossbeam_channel::Receiver<LogEvent>,
     log_lines: Vec<(String, egui::Color32)>,
     sent_counts: Vec<u64>,
+    displays: Vec<ChannelDisplay>,
     error_count: u64,
     last_title: String,
     serial_ports: Vec<String>,
@@ -80,6 +92,7 @@ impl TalkerApp {
             log_rx,
             log_lines: Vec::new(),
             sent_counts: Vec::new(),
+            displays: Vec::new(),
             error_count: 0,
             last_title: String::new(),
             serial_ports: Vec::new(),
@@ -113,10 +126,14 @@ impl TalkerApp {
 
     fn can_start_connection(&self, i: usize) -> bool {
         !self.is_connection_running(i)
-            && self.conn_drafts.get(i).is_some_and(|d| d.to_config().is_some())
-            && self.sched_drafts
+            && self
+                .conn_drafts
                 .get(i)
-                .is_some_and(|s| s.iter().any(|d| d.to_entry_config().is_some()))
+                .is_some_and(|d| d.to_config().is_some())
+            && self
+                .sched_drafts
+                .get(i)
+                .is_some_and(|s| s.iter().any(|d| d.to_message_config().is_some()))
     }
 
     fn can_start_any(&self) -> bool {
@@ -133,7 +150,11 @@ impl TalkerApp {
     }
 
     fn window_title(&self) -> String {
-        let name = if self.profile.name.is_empty() { "unnamed" } else { &self.profile.name };
+        let name = if self.profile.name.is_empty() {
+            "unnamed"
+        } else {
+            &self.profile.name
+        };
         let star = if self.dirty { " *" } else { "" };
         if self.profile_path.is_none() && !self.dirty {
             "Talker".to_string()
@@ -148,19 +169,21 @@ impl TalkerApp {
         self.stop_all();
         match Profile::load(path) {
             Ok(p) => {
-                let n = p.connections.len();
-                self.conn_drafts = p.connections.iter().map(ConnDraft::from).collect();
-                self.sched_drafts = (0..n)
-                    .map(|i| {
-                        p.schedules
-                            .get(i)
-                            .map(|s| s.entries.iter().map(ScheduleDraft::from).collect())
-                            .unwrap_or_default()
-                    })
+                let n = p.channels.len();
+                self.conn_drafts = p
+                    .channels
+                    .iter()
+                    .map(|ch| ConnDraft::from(&ch.interface))
+                    .collect();
+                self.sched_drafts = p
+                    .channels
+                    .iter()
+                    .map(|ch| ch.messages.iter().map(ScheduleDraft::from).collect())
                     .collect();
                 self.conn_errors = vec![None; n];
                 self.talkers = (0..n).map(|_| None).collect();
                 self.sent_counts = vec![0; n];
+                self.displays = (0..n).map(|_| ChannelDisplay::default()).collect();
                 self.profile = p;
                 self.profile_path = Some(path.to_path_buf());
                 self.dirty = false;
@@ -193,6 +216,7 @@ impl TalkerApp {
         self.conn_errors.clear();
         self.talkers.clear();
         self.sent_counts.clear();
+        self.displays.clear();
         self.error_count = 0;
         tracing::info!("new profile");
     }
@@ -216,8 +240,11 @@ impl TalkerApp {
         let path = match &self.profile_path {
             Some(p) => p.clone(),
             None => {
-                let stem =
-                    if self.profile.name.is_empty() { "profile" } else { &self.profile.name };
+                let stem = if self.profile.name.is_empty() {
+                    "profile"
+                } else {
+                    &self.profile.name
+                };
                 let name = format!("{stem}.toml");
                 let Some(p) = rfd::FileDialog::new()
                     .add_filter("TOML Profile", &["toml"])
@@ -246,14 +273,14 @@ impl TalkerApp {
         self.flush_drafts_to_profile();
 
         let Some(cfg) = self.conn_drafts.get(i).and_then(|d| d.to_config()) else {
-            tracing::warn!("connection {i} config invalid");
+            tracing::warn!("channel {i} config invalid");
             return;
         };
 
-        let conn = match cfg.open() {
+        let interface = match cfg.open() {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("failed to open connection {i}: {e:#}");
+                tracing::error!("failed to open channel {i}: {e:#}");
                 self.error_count += 1;
                 if i < self.conn_errors.len() {
                     self.conn_errors[i] = Some(format!("{e:#}"));
@@ -262,30 +289,40 @@ impl TalkerApp {
             }
         };
 
-        let sched_cfg = self.profile.schedules.get(i).cloned().unwrap_or_default();
-        let schedule = match sched_cfg.compile() {
+        let messages = self
+            .profile
+            .channels
+            .get(i)
+            .map(|c| c.messages.clone())
+            .unwrap_or_default();
+        let schedule = match Schedule::compile(&messages, Instant::now()) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("connection {i} schedule error: {e:#}");
+                tracing::error!("channel {i} schedule error: {e:#}");
                 return;
             }
         };
 
-        let mut connections = ConnectionCollection::new();
-        connections.push(conn);
-
-        if i < self.conn_errors.len() { self.conn_errors[i] = None; }
-        if i < self.sent_counts.len() { self.sent_counts[i] = 0; }
+        if i < self.conn_errors.len() {
+            self.conn_errors[i] = None;
+        }
+        if i < self.sent_counts.len() {
+            self.sent_counts[i] = 0;
+        }
 
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(32);
         let (status_tx, status_rx) = crossbeam_channel::bounded(256);
-        let thread = std::thread::spawn(move || run_talker(connections, schedule, cmd_rx, status_tx));
+        let thread = std::thread::spawn(move || run_talker(interface, schedule, cmd_rx, status_tx));
 
         if i < self.talkers.len() {
-            self.talkers[i] = Some(TalkerHandle { cmd_tx, status_rx, thread });
+            self.talkers[i] = Some(TalkerHandle {
+                cmd_tx,
+                status_rx,
+                thread,
+            });
         }
-        let entry_count = self.profile.schedules.get(i).map_or(0, |s| s.entries.len());
-        tracing::info!("connection {i} started ({entry_count}-entry schedule)");
+        let message_count = messages.len();
+        tracing::info!("channel {i} started ({message_count}-message schedule)");
     }
 
     fn stop_connection(&mut self, i: usize) {
@@ -316,27 +353,37 @@ impl TalkerApp {
     }
 
     fn flush_drafts_to_profile(&mut self) {
-        self.profile.connections =
-            self.conn_drafts.iter().filter_map(|d| d.to_config()).collect();
-        self.profile.schedules = self
-            .sched_drafts
-            .iter()
-            .map(|entries| crate::core::scheduler::ScheduleConfig::new(
-                entries.iter().filter_map(|d| d.to_entry_config()).collect(),
-            ))
+        self.profile.channels = (0..self.conn_drafts.len())
+            .filter_map(|i| {
+                let interface = self.conn_drafts[i].to_config()?;
+                let messages = self
+                    .sched_drafts
+                    .get(i)
+                    .map(|drafts| {
+                        drafts
+                            .iter()
+                            .filter_map(|d| d.to_message_config())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(ChannelConfig::new(interface, messages))
+            })
             .collect();
     }
 
     fn apply_connection(&mut self, i: usize) {
-        let Some(cfg) = self.conn_drafts[i].to_config() else { return };
-        if i < self.profile.connections.len() {
-            self.profile.connections[i] = cfg.clone();
+        let Some(cfg) = self.conn_drafts[i].to_config() else {
+            return;
+        };
+        if i < self.profile.channels.len() {
+            self.profile.channels[i].interface = cfg.clone();
         } else {
-            self.profile.connections.push(cfg.clone());
+            self.profile
+                .channels
+                .push(ChannelConfig::new(cfg.clone(), Vec::new()));
         }
-        // Each talker owns one connection at index 0.
         if let Some(Some(h)) = self.talkers.get(i) {
-            let _ = h.cmd_tx.try_send(TalkerCommand::UpdateConnection(0, cfg));
+            let _ = h.cmd_tx.try_send(TalkerCommand::UpdateInterface(cfg));
         }
         self.dirty = true;
     }
@@ -353,9 +400,15 @@ impl TalkerApp {
                 ctrl && inp.key_pressed(egui::Key::S),
             )
         });
-        if new  { self.new_profile(); }
-        if load { self.load_profile_dialog(); }
-        if save { self.save_profile(); }
+        if new {
+            self.new_profile();
+        }
+        if load {
+            self.load_profile_dialog();
+        }
+        if save {
+            self.save_profile();
+        }
 
         for event in self.log_rx.try_iter() {
             let ts = event.timestamp.format("%H:%M:%S%.3f");
@@ -381,13 +434,22 @@ impl TalkerApp {
             any_running = true;
             for status in statuses {
                 match status {
-                    TalkerStatus::SendCount(n) => {
-                        if i < self.sent_counts.len() { self.sent_counts[i] = n; }
-                        if i < self.conn_errors.len() { self.conn_errors[i] = None; }
+                    TalkerStatus::Sent { count, payload } => {
+                        if i < self.sent_counts.len() {
+                            self.sent_counts[i] = count;
+                        }
+                        if i < self.conn_errors.len() {
+                            self.conn_errors[i] = None;
+                        }
+                        if let Some(d) = self.displays.get_mut(i) {
+                            d.push(payload);
+                        }
                     }
                     TalkerStatus::ConnectionError { message, .. } => {
                         self.error_count += 1;
-                        if i < self.conn_errors.len() { self.conn_errors[i] = Some(message); }
+                        if i < self.conn_errors.len() {
+                            self.conn_errors[i] = Some(message);
+                        }
                     }
                 }
             }
@@ -426,7 +488,8 @@ impl eframe::App for TalkerApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        let path_str = self.profile_path
+        let path_str = self
+            .profile_path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
@@ -443,9 +506,8 @@ impl TalkerApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("Profile:");
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.profile.name).desired_width(160.0),
-                );
+                let r =
+                    ui.add(egui::TextEdit::singleline(&mut self.profile.name).desired_width(160.0));
                 if r.changed() {
                     self.dirty = true;
                 }
@@ -468,8 +530,14 @@ impl TalkerApp {
                 let r_plus = ui.small_button("+");
 
                 let minus_down = r_minus.is_pointer_button_down_on();
-                let plus_down  = r_plus.is_pointer_button_down_on();
-                let direction: f32 = if minus_down { -1.0 } else if plus_down { 1.0 } else { 0.0 };
+                let plus_down = r_plus.is_pointer_button_down_on();
+                let direction: f32 = if minus_down {
+                    -1.0
+                } else if plus_down {
+                    1.0
+                } else {
+                    0.0
+                };
 
                 if direction != 0.0 {
                     let dt = ui.ctx().input(|i| i.stable_dt);
@@ -514,7 +582,7 @@ impl TalkerApp {
                     }
                     if !self.can_start_any() {
                         btn.on_disabled_hover_text(
-                            "Add at least one valid connection and one schedule entry",
+                            "Add at least one valid channel and one message",
                         );
                     }
                 });
@@ -530,12 +598,14 @@ impl TalkerApp {
                 let running = self.talkers.iter().filter(|t| t.is_some()).count();
                 let total = self.talkers.len();
                 let (color, label) = if running > 0 {
-                    (egui::Color32::from_rgb(80, 200, 80),
-                     if running == total && total > 0 {
-                         "\u{25cf} All running".to_string()
-                     } else {
-                         format!("\u{25cf} {running}/{total} running")
-                     })
+                    (
+                        egui::Color32::from_rgb(80, 200, 80),
+                        if running == total && total > 0 {
+                            "\u{25cf} All running".to_string()
+                        } else {
+                            format!("\u{25cf} {running}/{total} running")
+                        },
+                    )
                 } else {
                     (egui::Color32::GRAY, "\u{25cf} Stopped".to_string())
                 };
@@ -596,22 +666,23 @@ impl TalkerApp {
             for i in 0..n {
                 ui.push_id(i, |ui| {
                     let mut conn_frame = egui::Frame::group(ui.style());
-                    conn_frame.stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(70, 85, 120));
+                    conn_frame.stroke =
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(70, 85, 120));
                     conn_frame.show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let error = self.conn_errors.get(i).and_then(|e| e.as_deref());
                             let running = self.is_connection_running(i);
-                            let (dot_color, dot_tip): (egui::Color32, &str) =
-                                if !running {
-                                    (egui::Color32::GRAY, "not running")
-                                } else if let Some(msg) = error {
-                                    (egui::Color32::RED, msg)
-                                } else {
-                                    (egui::Color32::from_rgb(80, 200, 80), "ok")
-                                };
-                            ui.colored_label(dot_color, "\u{25cf}").on_hover_text(dot_tip);
+                            let (dot_color, dot_tip): (egui::Color32, &str) = if !running {
+                                (egui::Color32::GRAY, "not running")
+                            } else if let Some(msg) = error {
+                                (egui::Color32::RED, msg)
+                            } else {
+                                (egui::Color32::from_rgb(80, 200, 80), "ok")
+                            };
+                            ui.colored_label(dot_color, "\u{25cf}")
+                                .on_hover_text(dot_tip);
 
-                            ui.strong(format!("Connection {}", i + 1));
+                            ui.strong(format!("Channel {}", i + 1));
                             ui.separator();
                             let before_kind = self.conn_drafts[i].kind;
                             ui.radio_value(
@@ -619,16 +690,8 @@ impl TalkerApp {
                                 ConnKind::Serial,
                                 "Serial",
                             );
-                            ui.radio_value(
-                                &mut self.conn_drafts[i].kind,
-                                ConnKind::Udp,
-                                "UDP",
-                            );
-                            ui.radio_value(
-                                &mut self.conn_drafts[i].kind,
-                                ConnKind::Tcp,
-                                "TCP",
-                            );
+                            ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Udp, "UDP");
+                            ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Tcp, "TCP");
                             if self.conn_drafts[i].kind != before_kind {
                                 to_apply.push(i);
                             }
@@ -642,13 +705,13 @@ impl TalkerApp {
                                     }
                                 } else {
                                     let can = self.can_start_connection(i);
-                                    let btn = ui.add_enabled(
-                                        can,
-                                        egui::Button::new("\u{25b6}").small(),
-                                    );
-                                    if btn.clicked() { to_start = Some(i); }
+                                    let btn =
+                                        ui.add_enabled(can, egui::Button::new("\u{25b6}").small());
+                                    if btn.clicked() {
+                                        to_start = Some(i);
+                                    }
                                     if !can {
-                                        btn.on_disabled_hover_text("Add a valid schedule entry first");
+                                        btn.on_disabled_hover_text("Add a valid message first");
                                     }
                                 }
                             });
@@ -670,12 +733,24 @@ impl TalkerApp {
                         }
 
                         ui.separator();
-                        show_schedule_section(ui, &mut self.sched_drafts[i], &mut self.dirty);
+                        let interval_changes =
+                            show_schedule_section(ui, &mut self.sched_drafts[i], &mut self.dirty);
+                        for (msg_index, interval_ms) in interval_changes {
+                            if let Some(Some(handle)) = self.talkers.get(i) {
+                                let _ = handle.cmd_tx.try_send(TalkerCommand::SetInterval {
+                                    index: msg_index,
+                                    interval_ms,
+                                });
+                            }
+                        }
+
+                        ui.separator();
+                        show_display_pane(ui, &mut self.displays[i]);
                     });
                 });
                 ui.add_space(6.0);
             }
-            if ui.button("+ Add Connection").clicked() {
+            if ui.button("+ Add Channel").clicked() {
                 add_one = true;
             }
         });
@@ -683,8 +758,12 @@ impl TalkerApp {
         for i in to_apply {
             self.apply_connection(i);
         }
-        if let Some(i) = to_start { self.start_connection(i); }
-        if let Some(i) = to_stop  { self.stop_connection(i); }
+        if let Some(i) = to_start {
+            self.start_connection(i);
+        }
+        if let Some(i) = to_stop {
+            self.stop_connection(i);
+        }
         if let Some(i) = to_remove {
             self.stop_connection(i);
             self.conn_drafts.remove(i);
@@ -692,8 +771,9 @@ impl TalkerApp {
             self.conn_errors.remove(i);
             self.talkers.remove(i);
             self.sent_counts.remove(i);
-            if i < self.profile.connections.len() {
-                self.profile.connections.remove(i);
+            self.displays.remove(i);
+            if i < self.profile.channels.len() {
+                self.profile.channels.remove(i);
             }
             self.dirty = true;
         }
@@ -703,29 +783,38 @@ impl TalkerApp {
             self.conn_errors.push(None);
             self.talkers.push(None);
             self.sent_counts.push(0);
+            self.displays.push(ChannelDisplay::default());
             self.dirty = true;
         }
         if do_refresh_ports {
             self.refresh_serial_ports();
         }
     }
-
 }
 
-// ── Inline schedule editor (one per connection card) ──────────────────────────
+// ── Inline message editor (one section per channel card) ──────────────────────
 
-fn show_schedule_section(ui: &mut egui::Ui, entries: &mut Vec<ScheduleDraft>, dirty: &mut bool) {
+fn show_schedule_section(
+    ui: &mut egui::Ui,
+    entries: &mut Vec<ScheduleDraft>,
+    dirty: &mut bool,
+) -> Vec<(usize, u64)> {
     let mut to_remove: Option<usize> = None;
     let mut add_one = false;
+    // Message indices whose interval was committed this frame, with the new value.
+    let mut interval_changes: Vec<(usize, u64)> = Vec::new();
 
-    ui.collapsing("Schedule", |ui| {
+    ui.collapsing("Messages", |ui| {
         for (i, entry) in entries.iter_mut().enumerate() {
             ui.push_id(i, |ui| {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.strong(format!("Entry {}", i + 1));
+                        ui.strong(format!("Message {}", i + 1));
                         ui.separator();
-                        ui.radio_value(&mut entry.payload_kind, PayloadKind::RawHex, "Hex");
+                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Hex, "Hex");
+                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Utf8, "UTF-8");
+                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Utf16, "UTF-16");
+                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Ascii, "ASCII");
                         ui.radio_value(&mut entry.payload_kind, PayloadKind::Nmea, "NMEA");
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.small_button("\u{2715}").clicked() {
@@ -734,112 +823,38 @@ fn show_schedule_section(ui: &mut egui::Ui, entries: &mut Vec<ScheduleDraft>, di
                         });
                     });
 
-                    egui::Grid::new("sched_grid")
+                    egui::Grid::new("message_grid")
                         .num_columns(2)
                         .spacing([8.0, 4.0])
                         .show(ui, |ui| {
-                            match entry.payload_kind {
-                                PayloadKind::RawHex => {
-                                    ui.label("Data (hex)");
-                                    let r = ui.add(
-                                        egui::TextEdit::singleline(&mut entry.hex_data)
-                                            .desired_width(360.0)
-                                            .hint_text("DE AD BE EF"),
-                                    );
-                                    if r.changed() {
-                                        entry.hex_data = entry.hex_data.to_ascii_uppercase();
-                                    }
-                                    ui.end_row();
-                                    if !entry.hex_data.is_empty() && !hex_valid(&entry.hex_data) {
-                                        ui.label("");
-                                        ui.label(err_text(
-                                            "invalid hex — use byte pairs like DE AD BE EF",
-                                        ));
-                                        ui.end_row();
-                                    }
-                                }
-                                PayloadKind::Nmea => {
-                                    ui.label("Talker");
-                                    ui.horizontal(|ui| {
-                                        let r = ui.add(
-                                            egui::TextEdit::singleline(&mut entry.nmea_talker)
-                                                .desired_width(40.0)
-                                                .hint_text("GP"),
-                                        );
-                                        if r.changed() {
-                                            entry.nmea_talker =
-                                                entry.nmea_talker.to_ascii_uppercase();
-                                        }
-                                        ui.menu_button("v", |ui| {
-                                            for id in &["GP", "GN", "GL", "GA", "GB", "GQ", "P"] {
-                                                if ui.button(*id).clicked() {
-                                                    entry.nmea_talker = id.to_string();
-                                                    ui.close();
-                                                }
-                                            }
-                                        });
-                                    });
-                                    ui.end_row();
-
-                                    ui.label("Sentence");
-                                    ui.horizontal(|ui| {
-                                        let r = ui.add(
-                                            egui::TextEdit::singleline(
-                                                &mut entry.nmea_sentence_type,
-                                            )
-                                            .desired_width(50.0)
-                                            .hint_text("GGA"),
-                                        );
-                                        if r.changed() {
-                                            entry.nmea_sentence_type =
-                                                entry.nmea_sentence_type.to_ascii_uppercase();
-                                        }
-                                        ui.menu_button("v", |ui| {
-                                            for st in &[
-                                                "GGA", "RMC", "VTG", "GLL", "GSA", "GSV",
-                                                "HDT", "HDM", "ZDA", "GNS", "VHW", "DBT",
-                                                "DPT", "MTW", "MWV", "RSA", "ROT",
-                                            ] {
-                                                if ui.button(*st).clicked() {
-                                                    entry.nmea_sentence_type = st.to_string();
-                                                    ui.close();
-                                                }
-                                            }
-                                        });
-                                    });
-                                    ui.end_row();
-
-                                    ui.label("Fields");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut entry.nmea_fields)
-                                            .desired_width(360.0)
-                                            .hint_text(
-                                                "comma-separated, e.g. 123519,4807.038,N,01131.000,E",
-                                            ),
-                                    );
-                                    ui.end_row();
-                                }
-                            }
+                            show_payload_fields(ui, entry);
 
                             ui.label("Interval (ms)");
-                            ui.add(
+                            let interval_resp = ui.add(
                                 egui::TextEdit::singleline(&mut entry.interval_ms)
                                     .desired_width(80.0),
                             );
                             ui.end_row();
-                            if !entry.interval_ms.is_empty()
-                                && entry.interval_ms.parse::<u64>().is_err()
-                            {
-                                ui.label("");
-                                ui.label(err_text("must be a whole number greater than 0"));
-                                ui.end_row();
+                            match entry.interval_ms.parse::<u64>() {
+                                Ok(ms) if interval_resp.lost_focus() => {
+                                    interval_changes.push((i, ms));
+                                }
+                                Err(_) if !entry.interval_ms.is_empty() => {
+                                    ui.label("");
+                                    ui.label(err_text("must be a whole number"));
+                                    ui.end_row();
+                                }
+                                _ => {}
                             }
                         });
+
+                    show_timestamp_editor(ui, entry);
+                    show_checksum_editor(ui, entry);
                 });
             });
             ui.add_space(4.0);
         }
-        if ui.small_button("+ Add Entry").clicked() {
+        if ui.small_button("+ Add Message").clicked() {
             add_one = true;
         }
     });
@@ -852,9 +867,298 @@ fn show_schedule_section(ui: &mut egui::Ui, entries: &mut Vec<ScheduleDraft>, di
         entries.push(ScheduleDraft::default());
         *dirty = true;
     }
+
+    interval_changes
+}
+
+/// Render the payload-format fields for one message into the surrounding grid.
+fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+    match entry.payload_kind {
+        PayloadKind::Hex => {
+            ui.label("Data (hex)");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut entry.hex_data)
+                    .desired_width(360.0)
+                    .hint_text("DE AD BE EF"),
+            );
+            if r.changed() {
+                entry.hex_data = entry.hex_data.to_ascii_uppercase();
+            }
+            ui.end_row();
+            if !entry.hex_data.is_empty() && !hex_valid(&entry.hex_data) {
+                ui.label("");
+                ui.label(err_text("invalid hex — use byte pairs like DE AD BE EF"));
+                ui.end_row();
+            }
+        }
+        PayloadKind::Utf8 => {
+            ui.label("Text");
+            ui.horizontal(|ui| {
+                let mut layouter = marker_layouter;
+                ui.add(
+                    egui::TextEdit::singleline(&mut entry.utf8_text)
+                        .desired_width(300.0)
+                        .hint_text("Unicode text")
+                        .layouter(&mut layouter),
+                );
+                show_insert_byte_button(ui, &mut entry.utf8_text, &mut entry.insert_byte_hex);
+            });
+            ui.end_row();
+        }
+        PayloadKind::Utf16 => {
+            ui.label("Text");
+            ui.add(
+                egui::TextEdit::singleline(&mut entry.utf16_text)
+                    .desired_width(360.0)
+                    .hint_text("Unicode text"),
+            );
+            ui.end_row();
+            ui.label("Byte order");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut entry.utf16_big_endian, true, "Big-endian");
+                ui.radio_value(&mut entry.utf16_big_endian, false, "Little-endian");
+                ui.separator();
+                ui.checkbox(&mut entry.utf16_bom, "BOM");
+            });
+            ui.end_row();
+        }
+        PayloadKind::Ascii => {
+            ui.label("Text");
+            ui.horizontal(|ui| {
+                let mut layouter = marker_layouter;
+                ui.add(
+                    egui::TextEdit::singleline(&mut entry.ascii_text)
+                        .desired_width(300.0)
+                        .hint_text("text")
+                        .layouter(&mut layouter),
+                );
+                show_insert_byte_button(ui, &mut entry.ascii_text, &mut entry.insert_byte_hex);
+            });
+            ui.end_row();
+            ui.label("Code page");
+            egui::ComboBox::from_id_salt("code_page")
+                .selected_text(code_page_label(entry.ascii_code_page))
+                .show_ui(ui, |ui| {
+                    for cp in [
+                        CodePage::Iso8859_1,
+                        CodePage::Windows1252,
+                        CodePage::Cp437,
+                        CodePage::MacRoman,
+                    ] {
+                        ui.selectable_value(&mut entry.ascii_code_page, cp, code_page_label(cp));
+                    }
+                });
+            ui.end_row();
+        }
+        PayloadKind::Nmea => {
+            ui.label("Talker");
+            ui.horizontal(|ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut entry.nmea_talker)
+                        .desired_width(40.0)
+                        .hint_text("GP"),
+                );
+                if r.changed() {
+                    entry.nmea_talker = entry.nmea_talker.to_ascii_uppercase();
+                }
+                ui.menu_button("v", |ui| {
+                    for id in &["GP", "GN", "GL", "GA", "GB", "GQ", "P"] {
+                        if ui.button(*id).clicked() {
+                            entry.nmea_talker = id.to_string();
+                            ui.close();
+                        }
+                    }
+                });
+            });
+            ui.end_row();
+
+            ui.label("Sentence");
+            ui.horizontal(|ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut entry.nmea_sentence_type)
+                        .desired_width(50.0)
+                        .hint_text("GGA"),
+                );
+                if r.changed() {
+                    entry.nmea_sentence_type = entry.nmea_sentence_type.to_ascii_uppercase();
+                }
+                ui.menu_button("v", |ui| {
+                    for st in &[
+                        "GGA", "RMC", "VTG", "GLL", "GSA", "GSV", "HDT", "HDM", "ZDA", "GNS",
+                        "VHW", "DBT", "DPT", "MTW", "MWV", "RSA", "ROT",
+                    ] {
+                        if ui.button(*st).clicked() {
+                            entry.nmea_sentence_type = st.to_string();
+                            ui.close();
+                        }
+                    }
+                });
+            });
+            ui.end_row();
+
+            ui.label("Fields");
+            ui.add(
+                egui::TextEdit::singleline(&mut entry.nmea_fields)
+                    .desired_width(360.0)
+                    .hint_text("comma-separated, e.g. 123519,4807.038,N,01131.000,E"),
+            );
+            ui.end_row();
+        }
+    }
+}
+
+/// Render the per-message timestamp toggles.
+fn show_timestamp_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut entry.timestamp_enabled, "Timestamp");
+        if entry.timestamp_enabled {
+            ui.separator();
+            ui.checkbox(&mut entry.ts_date, "Date");
+            ui.checkbox(&mut entry.ts_millis, "Milliseconds");
+            ui.checkbox(&mut entry.ts_timezone, "Timezone");
+        }
+    });
+}
+
+/// Render the per-message checksum controls.
+fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut entry.checksum_enabled, "Checksum");
+        if entry.checksum_enabled {
+            ui.separator();
+            egui::ComboBox::from_id_salt("checksum_algorithm")
+                .selected_text(checksum_label(entry.checksum_algorithm))
+                .show_ui(ui, |ui| {
+                    for algo in [
+                        ChecksumAlgorithm::Xor,
+                        ChecksumAlgorithm::Crc8,
+                        ChecksumAlgorithm::Crc16Ccitt,
+                        ChecksumAlgorithm::Crc16Modbus,
+                        ChecksumAlgorithm::Crc32,
+                    ] {
+                        ui.selectable_value(
+                            &mut entry.checksum_algorithm,
+                            algo,
+                            checksum_label(algo),
+                        );
+                    }
+                });
+            ui.checkbox(&mut entry.checksum_wrong, "Intentionally wrong");
+        }
+    });
+}
+
+fn code_page_label(code_page: CodePage) -> &'static str {
+    match code_page {
+        CodePage::Iso8859_1 => "ISO-8859-1",
+        CodePage::Windows1252 => "Windows-1252",
+        CodePage::Cp437 => "CP437",
+        CodePage::MacRoman => "Mac OS Roman",
+    }
+}
+
+fn checksum_label(algorithm: ChecksumAlgorithm) -> &'static str {
+    match algorithm {
+        ChecksumAlgorithm::Xor => "XOR",
+        ChecksumAlgorithm::Crc8 => "CRC-8",
+        ChecksumAlgorithm::Crc16Ccitt => "CRC-16/CCITT",
+        ChecksumAlgorithm::Crc16Modbus => "CRC-16/MODBUS",
+        ChecksumAlgorithm::Crc32 => "CRC-32",
+    }
 }
 
 // ── Field renderers ───────────────────────────────────────────────────────────
+
+/// Lay out a UTF-8/ASCII text field, drawing `‹XX›` byte markers in a
+/// distinct colour from surrounding text (spec §5.3).
+fn marker_layouter(
+    ui: &egui::Ui,
+    buf: &dyn egui::TextBuffer,
+    wrap_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let text = buf.as_str();
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let normal = ui.visuals().text_color();
+    let marker = egui::Color32::from_rgb(110, 170, 255);
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    for (range, segment) in segments(text) {
+        let color = match segment {
+            Segment::Byte(_) => marker,
+            Segment::Text => normal,
+        };
+        job.append(
+            &text[range],
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color,
+                ..Default::default()
+            },
+        );
+    }
+    ui.fonts_mut(|f| f.layout_job(job))
+}
+
+/// An "Insert Byte" button whose popup appends a `‹XX›` marker to `text`.
+fn show_insert_byte_button(ui: &mut egui::Ui, text: &mut String, hex: &mut String) {
+    ui.menu_button("Insert Byte", |ui| {
+        ui.label("Byte value (hex):");
+        let resp = ui.add(
+            egui::TextEdit::singleline(hex)
+                .desired_width(48.0)
+                .hint_text("1B"),
+        );
+        let value = u8::from_str_radix(hex.trim(), 16).ok();
+        let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let insert = ui.add_enabled(value.is_some(), egui::Button::new("Insert"));
+        if let Some(b) = value {
+            if insert.clicked() || entered {
+                text.push_str(&format!("\u{2039}{b:02X}\u{203A}"));
+                hex.clear();
+                ui.close();
+            }
+        }
+    });
+}
+
+/// Render a channel's real-time outbound display pane (spec §5.7).
+fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay) {
+    ui.collapsing("Output", |ui| {
+        ui.horizontal(|ui| {
+            ui.label("View:");
+            ui.radio_value(&mut display.mode, DisplayMode::Hex, "Hex");
+            ui.radio_value(&mut display.mode, DisplayMode::Ascii, "ASCII");
+            ui.radio_value(&mut display.mode, DisplayMode::Decoded, "Decoded");
+            if display.mode == DisplayMode::Ascii {
+                ui.separator();
+                ui.label("Controls:");
+                ui.radio_value(
+                    &mut display.control_style,
+                    ControlStyle::Pictures,
+                    "\u{240A}",
+                );
+                ui.radio_value(&mut display.control_style, ControlStyle::Brackets, "[LF]");
+                ui.radio_value(&mut display.control_style, ControlStyle::HexEscapes, "<0x>");
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("Clear").clicked() {
+                    display.clear();
+                }
+            });
+        });
+        ui.separator();
+        ScrollArea::vertical()
+            .max_height(150.0)
+            .stick_to_bottom(true)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for line in display.lines() {
+                    ui.label(egui::RichText::new(line).monospace());
+                }
+            });
+    });
+}
 
 fn show_serial_fields(ui: &mut egui::Ui, conn: &mut ConnDraft, ports: &[String]) -> (bool, bool) {
     let before = (
@@ -868,95 +1172,103 @@ fn show_serial_fields(ui: &mut egui::Ui, conn: &mut ConnDraft, ports: &[String])
     );
     let mut refresh = false;
 
-    egui::Grid::new("serial_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-        ui.label("Port");
-        ui.horizontal(|ui| {
-            let label = if conn.serial_port.is_empty() {
-                "select port\u{2026}".to_string()
-            } else {
-                conn.serial_port.clone()
-            };
-            egui::ComboBox::from_label("")
-                .selected_text(label)
-                .width(180.0)
-                .show_ui(ui, |ui| {
-                    if ports.is_empty() {
-                        ui.weak("No ports found");
-                    } else {
-                        for port in ports {
-                            ui.selectable_value(&mut conn.serial_port, port.clone(), port);
+    egui::Grid::new("serial_grid")
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Port");
+            ui.horizontal(|ui| {
+                let label = if conn.serial_port.is_empty() {
+                    "select port\u{2026}".to_string()
+                } else {
+                    conn.serial_port.clone()
+                };
+                egui::ComboBox::from_label("")
+                    .selected_text(label)
+                    .width(180.0)
+                    .show_ui(ui, |ui| {
+                        if ports.is_empty() {
+                            ui.weak("No ports found");
+                        } else {
+                            for port in ports {
+                                ui.selectable_value(&mut conn.serial_port, port.clone(), port);
+                            }
+                        }
+                    });
+                if ui
+                    .small_button("\u{21ba}")
+                    .on_hover_text("Refresh port list")
+                    .clicked()
+                {
+                    refresh = true;
+                }
+            });
+            ui.end_row();
+
+            ui.label("Baud");
+            ui.horizontal(|ui| {
+                for &baud in &[4800u32, 9600, 19200, 38400, 57600, 115200] {
+                    if ui
+                        .radio_value(&mut conn.baud_rate, baud, baud.to_string())
+                        .clicked()
+                    {
+                        conn.baud_custom.clear();
+                    }
+                }
+                ui.separator();
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut conn.baud_custom)
+                        .desired_width(68.0)
+                        .hint_text("custom"),
+                );
+                if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                    if let Ok(b) = conn.baud_custom.parse::<u32>() {
+                        if b > 0 {
+                            conn.baud_rate = b;
                         }
                     }
-                });
-            if ui
-                .small_button("\u{21ba}")
-                .on_hover_text("Refresh port list")
-                .clicked()
-            {
-                refresh = true;
-            }
-        });
-        ui.end_row();
-
-        ui.label("Baud");
-        ui.horizontal(|ui| {
-            for &baud in &[4800u32, 9600, 19200, 38400, 57600, 115200] {
-                if ui.radio_value(&mut conn.baud_rate, baud, baud.to_string()).clicked() {
-                    conn.baud_custom.clear();
                 }
-            }
-            ui.separator();
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut conn.baud_custom)
-                    .desired_width(68.0)
-                    .hint_text("custom"),
-            );
-            if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                if let Ok(b) = conn.baud_custom.parse::<u32>() {
-                    if b > 0 {
-                        conn.baud_rate = b;
-                    }
-                }
-            }
-        });
-        ui.end_row();
-        if !conn.baud_custom.is_empty() && conn.baud_custom.parse::<u32>().map_or(true, |b| b == 0) {
-            ui.label("");
-            ui.label(err_text("enter a positive baud rate — e.g. 230400"));
+            });
             ui.end_row();
-        }
-
-        ui.label("Data bits");
-        ui.horizontal(|ui| {
-            for &bits in &[5u8, 6, 7, 8] {
-                ui.radio_value(&mut conn.data_bits, bits, bits.to_string());
+            if !conn.baud_custom.is_empty()
+                && conn.baud_custom.parse::<u32>().map_or(true, |b| b == 0)
+            {
+                ui.label("");
+                ui.label(err_text("enter a positive baud rate — e.g. 230400"));
+                ui.end_row();
             }
-        });
-        ui.end_row();
 
-        ui.label("Parity");
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut conn.parity, 0u8, "None");
-            ui.radio_value(&mut conn.parity, 1u8, "Odd");
-            ui.radio_value(&mut conn.parity, 2u8, "Even");
-        });
-        ui.end_row();
+            ui.label("Data bits");
+            ui.horizontal(|ui| {
+                for &bits in &[5u8, 6, 7, 8] {
+                    ui.radio_value(&mut conn.data_bits, bits, bits.to_string());
+                }
+            });
+            ui.end_row();
 
-        ui.label("Stop bits");
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut conn.stop_bits, 1u8, "1");
-            ui.radio_value(&mut conn.stop_bits, 2u8, "2");
-        });
-        ui.end_row();
+            ui.label("Parity");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut conn.parity, 0u8, "None");
+                ui.radio_value(&mut conn.parity, 1u8, "Odd");
+                ui.radio_value(&mut conn.parity, 2u8, "Even");
+            });
+            ui.end_row();
 
-        ui.label("Flow control");
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut conn.flow_control, 0u8, "None");
-            ui.radio_value(&mut conn.flow_control, 1u8, "Software");
-            ui.radio_value(&mut conn.flow_control, 2u8, "Hardware");
+            ui.label("Stop bits");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut conn.stop_bits, 1u8, "1");
+                ui.radio_value(&mut conn.stop_bits, 2u8, "2");
+            });
+            ui.end_row();
+
+            ui.label("Flow control");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut conn.flow_control, 0u8, "None");
+                ui.radio_value(&mut conn.flow_control, 1u8, "Software");
+                ui.radio_value(&mut conn.flow_control, 2u8, "Hardware");
+            });
+            ui.end_row();
         });
-        ui.end_row();
-    });
 
     let after = (
         conn.serial_port.clone(),
@@ -974,95 +1286,98 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     let before_mode = conn.udp_mode;
     let mut apply = false;
 
-    egui::Grid::new("udp_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-        ui.label("Mode");
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Unicast, "Unicast");
-            ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Broadcast, "Broadcast");
-            ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Multicast, "Multicast");
-        });
-        ui.end_row();
-
-        match conn.udp_mode {
-            UdpModeDraft::Unicast | UdpModeDraft::Broadcast => {
-                ui.label("Destination");
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut conn.udp_dest)
-                        .desired_width(220.0)
-                        .hint_text("host:port  (Enter to apply)"),
-                );
-                if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                    apply = true;
-                }
-                ui.end_row();
-                if !conn.udp_dest.is_empty() && conn.udp_dest.parse::<SocketAddr>().is_err() {
-                    ui.label("");
-                    ui.label(err_text("enter host:port — e.g. 192.168.1.100:4000"));
-                    ui.end_row();
-                }
-            }
-            UdpModeDraft::Multicast => {
-                ui.label("Group");
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut conn.udp_group)
-                        .desired_width(140.0)
-                        .hint_text("239.x.x.x  (Enter to apply)"),
-                );
-                if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                    apply = true;
-                }
-                ui.end_row();
-                if !conn.udp_group.is_empty() && conn.udp_group.parse::<Ipv4Addr>().is_err() {
-                    ui.label("");
-                    ui.label(err_text("enter IPv4 multicast address — e.g. 239.0.0.1"));
-                    ui.end_row();
-                }
-
-                ui.label("Port");
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut conn.udp_mc_port)
-                        .desired_width(80.0)
-                        .hint_text("port"),
-                );
-                if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                    apply = true;
-                }
-                ui.end_row();
-                if !conn.udp_mc_port.is_empty() && conn.udp_mc_port.parse::<u16>().is_err() {
-                    ui.label("");
-                    ui.label(err_text("enter a port number 1–65535"));
-                    ui.end_row();
-                }
-            }
-        }
-
-        ui.label("Local port");
-        let r = ui.add(
-            egui::TextEdit::singleline(&mut conn.local_port)
-                .desired_width(80.0)
-                .hint_text("auto"),
-        );
-        if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-            apply = true;
-        }
-        ui.end_row();
-        if !conn.local_port.is_empty() && conn.local_port.parse::<u16>().is_err() {
-            ui.label("");
-            ui.label(err_text("enter a port number 1–65535"));
+    egui::Grid::new("udp_grid")
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Mode");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Unicast, "Unicast");
+                ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Broadcast, "Broadcast");
+                ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Multicast, "Multicast");
+            });
             ui.end_row();
-        }
-    });
+
+            match conn.udp_mode {
+                UdpModeDraft::Unicast | UdpModeDraft::Broadcast => {
+                    ui.label("Destination");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut conn.udp_dest)
+                            .desired_width(220.0)
+                            .hint_text("host:port  (Enter to apply)"),
+                    );
+                    if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                    ui.end_row();
+                    if !conn.udp_dest.is_empty() && conn.udp_dest.parse::<SocketAddr>().is_err() {
+                        ui.label("");
+                        ui.label(err_text("enter host:port — e.g. 192.168.1.100:4000"));
+                        ui.end_row();
+                    }
+                }
+                UdpModeDraft::Multicast => {
+                    ui.label("Group");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut conn.udp_group)
+                            .desired_width(140.0)
+                            .hint_text("239.x.x.x  (Enter to apply)"),
+                    );
+                    if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                    ui.end_row();
+                    if !conn.udp_group.is_empty() && conn.udp_group.parse::<Ipv4Addr>().is_err() {
+                        ui.label("");
+                        ui.label(err_text("enter IPv4 multicast address — e.g. 239.0.0.1"));
+                        ui.end_row();
+                    }
+
+                    ui.label("Port");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut conn.udp_mc_port)
+                            .desired_width(80.0)
+                            .hint_text("port"),
+                    );
+                    if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                    ui.end_row();
+                    if !conn.udp_mc_port.is_empty() && conn.udp_mc_port.parse::<u16>().is_err() {
+                        ui.label("");
+                        ui.label(err_text("enter a port number 1–65535"));
+                        ui.end_row();
+                    }
+                }
+            }
+
+            ui.label("Local port");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut conn.local_port)
+                    .desired_width(80.0)
+                    .hint_text("auto"),
+            );
+            if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                apply = true;
+            }
+            ui.end_row();
+            if !conn.local_port.is_empty() && conn.local_port.parse::<u16>().is_err() {
+                ui.label("");
+                ui.label(err_text("enter a port number 1–65535"));
+                ui.end_row();
+            }
+        });
 
     apply || (conn.udp_mode != before_mode)
 }
 
 fn level_color(level: tracing::Level) -> egui::Color32 {
     match level {
-        tracing::Level::ERROR => egui::Color32::from_rgb(220, 80,  80),
-        tracing::Level::WARN  => egui::Color32::from_rgb(220, 180, 60),
+        tracing::Level::ERROR => egui::Color32::from_rgb(220, 80, 80),
+        tracing::Level::WARN => egui::Color32::from_rgb(220, 180, 60),
         tracing::Level::DEBUG => egui::Color32::from_rgb(130, 130, 130),
         tracing::Level::TRACE => egui::Color32::from_rgb(100, 100, 100),
-        _                     => egui::Color32::from_rgb(200, 200, 200),
+        _ => egui::Color32::from_rgb(200, 200, 200),
     }
 }
 
@@ -1071,8 +1386,10 @@ fn err_text(msg: &str) -> egui::RichText {
 }
 
 fn hex_valid(s: &str) -> bool {
-    let stripped: String =
-        s.chars().filter(|c| !c.is_whitespace() && *c != '-').collect();
+    let stripped: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
     !stripped.is_empty()
         && stripped.len().is_multiple_of(2)
         && stripped.chars().all(|c| c.is_ascii_hexdigit())
@@ -1081,23 +1398,26 @@ fn hex_valid(s: &str) -> bool {
 fn show_tcp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     let mut apply = false;
 
-    egui::Grid::new("tcp_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-        ui.label("Address");
-        let r = ui.add(
-            egui::TextEdit::singleline(&mut conn.tcp_addr)
-                .desired_width(220.0)
-                .hint_text("host:port  (Enter to apply)"),
-        );
-        if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-            apply = true;
-        }
-        ui.end_row();
-        if !conn.tcp_addr.is_empty() && conn.tcp_addr.parse::<SocketAddr>().is_err() {
-            ui.label("");
-            ui.label(err_text("enter host:port — e.g. 192.168.1.100:4000"));
+    egui::Grid::new("tcp_grid")
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Address");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut conn.tcp_addr)
+                    .desired_width(220.0)
+                    .hint_text("host:port  (Enter to apply)"),
+            );
+            if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                apply = true;
+            }
             ui.end_row();
-        }
-    });
+            if !conn.tcp_addr.is_empty() && conn.tcp_addr.parse::<SocketAddr>().is_err() {
+                ui.label("");
+                ui.label(err_text("enter host:port — e.g. 192.168.1.100:4000"));
+                ui.end_row();
+            }
+        });
 
     apply
 }

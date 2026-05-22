@@ -1,8 +1,6 @@
-mod cli;
-mod core;
-mod gui;
-
 use clap::Parser;
+
+use talker::{cli, core, gui};
 
 #[derive(Parser)]
 #[command(
@@ -10,7 +8,7 @@ use clap::Parser;
     about = "Send NMEA 0183 and binary data over serial and network connections"
 )]
 struct TopArgs {
-    /// Launch the GUI (not yet implemented).
+    /// Launch the GUI.
     #[arg(long)]
     gui: bool,
 
@@ -25,7 +23,7 @@ fn main() {
         let initial_profile = if let Some(p) = args.cli.profile_path {
             Some(p)
         } else if let Some(name) = args.cli.profile {
-            crate::core::profile::default_dir().map(|d| d.join(format!("{name}.toml")))
+            core::profile::default_dir().map(|d| d.join(format!("{name}.toml")))
         } else {
             None
         };
