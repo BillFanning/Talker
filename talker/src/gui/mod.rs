@@ -11,6 +11,7 @@ use egui::{Align, Layout, ScrollArea};
 use crate::core::{
     channel::ChannelConfig,
     logging::{LogEvent, LoggingConfig},
+    message::{ChecksumAlgorithm, CodePage},
     profile::Profile,
     scheduler::Schedule,
 };
@@ -572,7 +573,7 @@ impl TalkerApp {
                     }
                     if !self.can_start_any() {
                         btn.on_disabled_hover_text(
-                            "Add at least one valid connection and one schedule entry",
+                            "Add at least one valid channel and one message",
                         );
                     }
                 });
@@ -672,7 +673,7 @@ impl TalkerApp {
                             ui.colored_label(dot_color, "\u{25cf}")
                                 .on_hover_text(dot_tip);
 
-                            ui.strong(format!("Connection {}", i + 1));
+                            ui.strong(format!("Channel {}", i + 1));
                             ui.separator();
                             let before_kind = self.conn_drafts[i].kind;
                             ui.radio_value(
@@ -701,9 +702,7 @@ impl TalkerApp {
                                         to_start = Some(i);
                                     }
                                     if !can {
-                                        btn.on_disabled_hover_text(
-                                            "Add a valid schedule entry first",
-                                        );
+                                        btn.on_disabled_hover_text("Add a valid message first");
                                     }
                                 }
                             });
@@ -730,7 +729,7 @@ impl TalkerApp {
                 });
                 ui.add_space(6.0);
             }
-            if ui.button("+ Add Connection").clicked() {
+            if ui.button("+ Add Channel").clicked() {
                 add_one = true;
             }
         });
@@ -770,20 +769,23 @@ impl TalkerApp {
     }
 }
 
-// ── Inline schedule editor (one per connection card) ──────────────────────────
+// ── Inline message editor (one section per channel card) ──────────────────────
 
 fn show_schedule_section(ui: &mut egui::Ui, entries: &mut Vec<ScheduleDraft>, dirty: &mut bool) {
     let mut to_remove: Option<usize> = None;
     let mut add_one = false;
 
-    ui.collapsing("Schedule", |ui| {
+    ui.collapsing("Messages", |ui| {
         for (i, entry) in entries.iter_mut().enumerate() {
             ui.push_id(i, |ui| {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.strong(format!("Entry {}", i + 1));
+                        ui.strong(format!("Message {}", i + 1));
                         ui.separator();
-                        ui.radio_value(&mut entry.payload_kind, PayloadKind::RawHex, "Hex");
+                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Hex, "Hex");
+                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Utf8, "UTF-8");
+                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Utf16, "UTF-16");
+                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Ascii, "ASCII");
                         ui.radio_value(&mut entry.payload_kind, PayloadKind::Nmea, "NMEA");
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.small_button("\u{2715}").clicked() {
@@ -792,99 +794,11 @@ fn show_schedule_section(ui: &mut egui::Ui, entries: &mut Vec<ScheduleDraft>, di
                         });
                     });
 
-                    egui::Grid::new("sched_grid")
+                    egui::Grid::new("message_grid")
                         .num_columns(2)
                         .spacing([8.0, 4.0])
                         .show(ui, |ui| {
-                            match entry.payload_kind {
-                                PayloadKind::RawHex => {
-                                    ui.label("Data (hex)");
-                                    let r = ui.add(
-                                        egui::TextEdit::singleline(&mut entry.hex_data)
-                                            .desired_width(360.0)
-                                            .hint_text("DE AD BE EF"),
-                                    );
-                                    if r.changed() {
-                                        entry.hex_data = entry.hex_data.to_ascii_uppercase();
-                                    }
-                                    ui.end_row();
-                                    if !entry.hex_data.is_empty() && !hex_valid(&entry.hex_data) {
-                                        ui.label("");
-                                        ui.label(err_text(
-                                            "invalid hex — use byte pairs like DE AD BE EF",
-                                        ));
-                                        ui.end_row();
-                                    }
-                                }
-                                PayloadKind::Nmea => {
-                                    ui.label("Talker");
-                                    ui.horizontal(|ui| {
-                                        let r = ui.add(
-                                            egui::TextEdit::singleline(&mut entry.nmea_talker)
-                                                .desired_width(40.0)
-                                                .hint_text("GP"),
-                                        );
-                                        if r.changed() {
-                                            entry.nmea_talker =
-                                                entry.nmea_talker.to_ascii_uppercase();
-                                        }
-                                        ui.menu_button("v", |ui| {
-                                            for id in &["GP", "GN", "GL", "GA", "GB", "GQ", "P"] {
-                                                if ui.button(*id).clicked() {
-                                                    entry.nmea_talker = id.to_string();
-                                                    ui.close();
-                                                }
-                                            }
-                                        });
-                                    });
-                                    ui.end_row();
-
-                                    ui.label("Sentence");
-                                    ui.horizontal(|ui| {
-                                        let r = ui.add(
-                                            egui::TextEdit::singleline(
-                                                &mut entry.nmea_sentence_type,
-                                            )
-                                            .desired_width(50.0)
-                                            .hint_text("GGA"),
-                                        );
-                                        if r.changed() {
-                                            entry.nmea_sentence_type =
-                                                entry.nmea_sentence_type.to_ascii_uppercase();
-                                        }
-                                        ui.menu_button("v", |ui| {
-                                            for st in &[
-                                                "GGA", "RMC", "VTG", "GLL", "GSA", "GSV",
-                                                "HDT", "HDM", "ZDA", "GNS", "VHW", "DBT",
-                                                "DPT", "MTW", "MWV", "RSA", "ROT",
-                                            ] {
-                                                if ui.button(*st).clicked() {
-                                                    entry.nmea_sentence_type = st.to_string();
-                                                    ui.close();
-                                                }
-                                            }
-                                        });
-                                    });
-                                    ui.end_row();
-
-                                    ui.label("Fields");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut entry.nmea_fields)
-                                            .desired_width(360.0)
-                                            .hint_text(
-                                                "comma-separated, e.g. 123519,4807.038,N,01131.000,E",
-                                            ),
-                                    );
-                                    ui.end_row();
-                                }
-                                PayloadKind::Other => {
-                                    ui.label("Format");
-                                    ui.weak(
-                                        "set via TOML \u{2014} GUI editor in a later phase",
-                                    );
-                                    ui.end_row();
-                                }
-                            }
+                            show_payload_fields(ui, entry);
 
                             ui.label("Interval (ms)");
                             ui.add(
@@ -901,16 +815,13 @@ fn show_schedule_section(ui: &mut egui::Ui, entries: &mut Vec<ScheduleDraft>, di
                             }
                         });
 
-                    if entry.timestamp.is_some() || entry.checksum.is_some() {
-                        ui.weak(
-                            "timestamp/checksum configured \u{2014} editor in a later phase",
-                        );
-                    }
+                    show_timestamp_editor(ui, entry);
+                    show_checksum_editor(ui, entry);
                 });
             });
             ui.add_space(4.0);
         }
-        if ui.small_button("+ Add Entry").clicked() {
+        if ui.small_button("+ Add Message").clicked() {
             add_one = true;
         }
     });
@@ -922,6 +833,192 @@ fn show_schedule_section(ui: &mut egui::Ui, entries: &mut Vec<ScheduleDraft>, di
     if add_one {
         entries.push(ScheduleDraft::default());
         *dirty = true;
+    }
+}
+
+/// Render the payload-format fields for one message into the surrounding grid.
+fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+    match entry.payload_kind {
+        PayloadKind::Hex => {
+            ui.label("Data (hex)");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut entry.hex_data)
+                    .desired_width(360.0)
+                    .hint_text("DE AD BE EF"),
+            );
+            if r.changed() {
+                entry.hex_data = entry.hex_data.to_ascii_uppercase();
+            }
+            ui.end_row();
+            if !entry.hex_data.is_empty() && !hex_valid(&entry.hex_data) {
+                ui.label("");
+                ui.label(err_text("invalid hex — use byte pairs like DE AD BE EF"));
+                ui.end_row();
+            }
+        }
+        PayloadKind::Utf8 => {
+            ui.label("Text");
+            ui.add(
+                egui::TextEdit::singleline(&mut entry.utf8_text)
+                    .desired_width(360.0)
+                    .hint_text("Unicode text"),
+            );
+            ui.end_row();
+        }
+        PayloadKind::Utf16 => {
+            ui.label("Text");
+            ui.add(
+                egui::TextEdit::singleline(&mut entry.utf16_text)
+                    .desired_width(360.0)
+                    .hint_text("Unicode text"),
+            );
+            ui.end_row();
+            ui.label("Byte order");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut entry.utf16_big_endian, true, "Big-endian");
+                ui.radio_value(&mut entry.utf16_big_endian, false, "Little-endian");
+                ui.separator();
+                ui.checkbox(&mut entry.utf16_bom, "BOM");
+            });
+            ui.end_row();
+        }
+        PayloadKind::Ascii => {
+            ui.label("Text");
+            ui.add(
+                egui::TextEdit::singleline(&mut entry.ascii_text)
+                    .desired_width(360.0)
+                    .hint_text("text"),
+            );
+            ui.end_row();
+            ui.label("Code page");
+            egui::ComboBox::from_id_salt("code_page")
+                .selected_text(code_page_label(entry.ascii_code_page))
+                .show_ui(ui, |ui| {
+                    for cp in [
+                        CodePage::Iso8859_1,
+                        CodePage::Windows1252,
+                        CodePage::Cp437,
+                        CodePage::MacRoman,
+                    ] {
+                        ui.selectable_value(&mut entry.ascii_code_page, cp, code_page_label(cp));
+                    }
+                });
+            ui.end_row();
+        }
+        PayloadKind::Nmea => {
+            ui.label("Talker");
+            ui.horizontal(|ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut entry.nmea_talker)
+                        .desired_width(40.0)
+                        .hint_text("GP"),
+                );
+                if r.changed() {
+                    entry.nmea_talker = entry.nmea_talker.to_ascii_uppercase();
+                }
+                ui.menu_button("v", |ui| {
+                    for id in &["GP", "GN", "GL", "GA", "GB", "GQ", "P"] {
+                        if ui.button(*id).clicked() {
+                            entry.nmea_talker = id.to_string();
+                            ui.close();
+                        }
+                    }
+                });
+            });
+            ui.end_row();
+
+            ui.label("Sentence");
+            ui.horizontal(|ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut entry.nmea_sentence_type)
+                        .desired_width(50.0)
+                        .hint_text("GGA"),
+                );
+                if r.changed() {
+                    entry.nmea_sentence_type = entry.nmea_sentence_type.to_ascii_uppercase();
+                }
+                ui.menu_button("v", |ui| {
+                    for st in &[
+                        "GGA", "RMC", "VTG", "GLL", "GSA", "GSV", "HDT", "HDM", "ZDA", "GNS",
+                        "VHW", "DBT", "DPT", "MTW", "MWV", "RSA", "ROT",
+                    ] {
+                        if ui.button(*st).clicked() {
+                            entry.nmea_sentence_type = st.to_string();
+                            ui.close();
+                        }
+                    }
+                });
+            });
+            ui.end_row();
+
+            ui.label("Fields");
+            ui.add(
+                egui::TextEdit::singleline(&mut entry.nmea_fields)
+                    .desired_width(360.0)
+                    .hint_text("comma-separated, e.g. 123519,4807.038,N,01131.000,E"),
+            );
+            ui.end_row();
+        }
+    }
+}
+
+/// Render the per-message timestamp toggles.
+fn show_timestamp_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut entry.timestamp_enabled, "Timestamp");
+        if entry.timestamp_enabled {
+            ui.separator();
+            ui.checkbox(&mut entry.ts_date, "Date");
+            ui.checkbox(&mut entry.ts_millis, "Milliseconds");
+            ui.checkbox(&mut entry.ts_timezone, "Timezone");
+        }
+    });
+}
+
+/// Render the per-message checksum controls.
+fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut entry.checksum_enabled, "Checksum");
+        if entry.checksum_enabled {
+            ui.separator();
+            egui::ComboBox::from_id_salt("checksum_algorithm")
+                .selected_text(checksum_label(entry.checksum_algorithm))
+                .show_ui(ui, |ui| {
+                    for algo in [
+                        ChecksumAlgorithm::Xor,
+                        ChecksumAlgorithm::Crc8,
+                        ChecksumAlgorithm::Crc16Ccitt,
+                        ChecksumAlgorithm::Crc16Modbus,
+                        ChecksumAlgorithm::Crc32,
+                    ] {
+                        ui.selectable_value(
+                            &mut entry.checksum_algorithm,
+                            algo,
+                            checksum_label(algo),
+                        );
+                    }
+                });
+            ui.checkbox(&mut entry.checksum_wrong, "Intentionally wrong");
+        }
+    });
+}
+
+fn code_page_label(code_page: CodePage) -> &'static str {
+    match code_page {
+        CodePage::Iso8859_1 => "ISO-8859-1",
+        CodePage::Windows1252 => "Windows-1252",
+        CodePage::Cp437 => "CP437",
+        CodePage::MacRoman => "Mac OS Roman",
+    }
+}
+
+fn checksum_label(algorithm: ChecksumAlgorithm) -> &'static str {
+    match algorithm {
+        ChecksumAlgorithm::Xor => "XOR",
+        ChecksumAlgorithm::Crc8 => "CRC-8",
+        ChecksumAlgorithm::Crc16Ccitt => "CRC-16/CCITT",
+        ChecksumAlgorithm::Crc16Modbus => "CRC-16/MODBUS",
+        ChecksumAlgorithm::Crc32 => "CRC-32",
     }
 }
 

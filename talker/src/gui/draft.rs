@@ -5,7 +5,10 @@ use crate::core::{
         DataBits, FlowControl, InterfaceConfig, Parity, SerialConfig, StopBits, TcpClientConfig,
         UdpConfig, UdpMode,
     },
-    message::{ChecksumConfig, MessageConfig, PayloadConfig, TimestampConfig},
+    message::{
+        ByteOrder, ChecksumAlgorithm, ChecksumConfig, CodePage, MessageConfig, PayloadConfig,
+        TimestampConfig,
+    },
 };
 
 // ── Channel interface ─────────────────────────────────────────────────────────
@@ -199,77 +202,125 @@ impl ConnDraft {
 
 // ── Message ───────────────────────────────────────────────────────────────────
 
+/// Which payload format a message draft is editing.
 #[derive(PartialEq, Clone, Copy)]
 pub enum PayloadKind {
-    RawHex,
+    Hex,
+    Utf8,
+    Utf16,
+    Ascii,
     Nmea,
-    /// A payload format the GUI cannot yet edit (UTF-8/UTF-16/ASCII); it is
-    /// carried verbatim so a profile round-trips. Editors land in a later phase.
-    Other,
 }
 
+/// Editable state for one message. A text buffer is kept per format so
+/// switching the format selector does not discard what was typed.
 pub struct ScheduleDraft {
     pub payload_kind: PayloadKind,
-    // raw hex
+    // hex
     pub hex_data: String,
+    // utf-8
+    pub utf8_text: String,
+    // utf-16
+    pub utf16_text: String,
+    pub utf16_big_endian: bool,
+    pub utf16_bom: bool,
+    // ascii
+    pub ascii_text: String,
+    pub ascii_code_page: CodePage,
     // nmea
     pub nmea_talker: String,
     pub nmea_sentence_type: String,
     pub nmea_fields: String, // comma-separated field values
     // common
     pub interval_ms: String,
-    /// Payload carried verbatim when `payload_kind` is [`PayloadKind::Other`].
-    pub other_payload: Option<PayloadConfig>,
-    /// Timestamp and checksum are carried verbatim until their editors land.
-    pub timestamp: Option<TimestampConfig>,
-    pub checksum: Option<ChecksumConfig>,
+    // timestamp
+    pub timestamp_enabled: bool,
+    pub ts_date: bool,
+    pub ts_millis: bool,
+    pub ts_timezone: bool,
+    // checksum
+    pub checksum_enabled: bool,
+    pub checksum_algorithm: ChecksumAlgorithm,
+    pub checksum_wrong: bool,
 }
 
 impl Default for ScheduleDraft {
     fn default() -> Self {
         Self {
-            payload_kind: PayloadKind::RawHex,
+            payload_kind: PayloadKind::Hex,
             hex_data: String::new(),
+            utf8_text: String::new(),
+            utf16_text: String::new(),
+            utf16_big_endian: true,
+            utf16_bom: false,
+            ascii_text: String::new(),
+            ascii_code_page: CodePage::default(),
             nmea_talker: "GP".to_string(),
             nmea_sentence_type: String::new(),
             nmea_fields: String::new(),
             interval_ms: "1000".to_string(),
-            other_payload: None,
-            timestamp: None,
-            checksum: None,
+            timestamp_enabled: false,
+            ts_date: true,
+            ts_millis: false,
+            ts_timezone: true,
+            checksum_enabled: false,
+            checksum_algorithm: ChecksumAlgorithm::default(),
+            checksum_wrong: false,
         }
     }
 }
 
 impl From<&MessageConfig> for ScheduleDraft {
     fn from(m: &MessageConfig) -> Self {
-        let mut draft = match &m.payload {
-            PayloadConfig::RawHex { data } => Self {
-                payload_kind: PayloadKind::RawHex,
-                hex_data: data.clone(),
-                ..Default::default()
-            },
+        let mut d = ScheduleDraft::default();
+        match &m.payload {
+            PayloadConfig::RawHex { data } => {
+                d.payload_kind = PayloadKind::Hex;
+                d.hex_data = data.clone();
+            }
+            PayloadConfig::Utf8 { text } => {
+                d.payload_kind = PayloadKind::Utf8;
+                d.utf8_text = text.clone();
+            }
+            PayloadConfig::Utf16 {
+                text,
+                byte_order,
+                bom,
+            } => {
+                d.payload_kind = PayloadKind::Utf16;
+                d.utf16_text = text.clone();
+                d.utf16_big_endian = matches!(byte_order, ByteOrder::BigEndian);
+                d.utf16_bom = *bom;
+            }
+            PayloadConfig::Ascii { text, code_page } => {
+                d.payload_kind = PayloadKind::Ascii;
+                d.ascii_text = text.clone();
+                d.ascii_code_page = *code_page;
+            }
             PayloadConfig::Nmea {
                 talker,
                 sentence_type,
                 fields,
-            } => Self {
-                payload_kind: PayloadKind::Nmea,
-                nmea_talker: talker.clone(),
-                nmea_sentence_type: sentence_type.clone(),
-                nmea_fields: fields.join(","),
-                ..Default::default()
-            },
-            other => Self {
-                payload_kind: PayloadKind::Other,
-                other_payload: Some(other.clone()),
-                ..Default::default()
-            },
-        };
-        draft.interval_ms = m.interval_ms.to_string();
-        draft.timestamp = m.timestamp;
-        draft.checksum = m.checksum;
-        draft
+            } => {
+                d.payload_kind = PayloadKind::Nmea;
+                d.nmea_talker = talker.clone();
+                d.nmea_sentence_type = sentence_type.clone();
+                d.nmea_fields = fields.join(",");
+            }
+        }
+        d.interval_ms = m.interval_ms.to_string();
+        if let Some(ts) = &m.timestamp {
+            d.timestamp_enabled = true;
+            d.ts_date = ts.include_date;
+            d.ts_millis = ts.include_millis;
+            d.ts_timezone = ts.include_timezone;
+        }
+        if let Some(cs) = &m.checksum {
+            d.checksum_enabled = true;
+            d.checksum_algorithm = cs.algorithm;
+            d.checksum_wrong = cs.intentionally_wrong;
+        }
+        d
     }
 }
 
@@ -277,7 +328,23 @@ impl ScheduleDraft {
     pub fn to_message_config(&self) -> Option<MessageConfig> {
         let interval_ms: u64 = self.interval_ms.parse().ok()?;
         let payload = match self.payload_kind {
-            PayloadKind::RawHex => PayloadConfig::raw_hex(&self.hex_data),
+            PayloadKind::Hex => PayloadConfig::raw_hex(&self.hex_data),
+            PayloadKind::Utf8 => PayloadConfig::Utf8 {
+                text: self.utf8_text.clone(),
+            },
+            PayloadKind::Utf16 => PayloadConfig::Utf16 {
+                text: self.utf16_text.clone(),
+                byte_order: if self.utf16_big_endian {
+                    ByteOrder::BigEndian
+                } else {
+                    ByteOrder::LittleEndian
+                },
+                bom: self.utf16_bom,
+            },
+            PayloadKind::Ascii => PayloadConfig::Ascii {
+                text: self.ascii_text.clone(),
+                code_page: self.ascii_code_page,
+            },
             PayloadKind::Nmea => {
                 if self.nmea_talker.is_empty() || self.nmea_sentence_type.is_empty() {
                     return None;
@@ -289,13 +356,21 @@ impl ScheduleDraft {
                 };
                 PayloadConfig::nmea(&self.nmea_talker, &self.nmea_sentence_type, fields)
             }
-            PayloadKind::Other => self.other_payload.clone()?,
         };
+        let timestamp = self.timestamp_enabled.then_some(TimestampConfig {
+            include_date: self.ts_date,
+            include_millis: self.ts_millis,
+            include_timezone: self.ts_timezone,
+        });
+        let checksum = self.checksum_enabled.then_some(ChecksumConfig {
+            algorithm: self.checksum_algorithm,
+            intentionally_wrong: self.checksum_wrong,
+        });
         Some(MessageConfig {
             payload,
             interval_ms,
-            timestamp: self.timestamp,
-            checksum: self.checksum,
+            timestamp,
+            checksum,
         })
     }
 }
