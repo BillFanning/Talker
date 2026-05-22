@@ -203,7 +203,7 @@ impl ConnDraft {
 // ── Message ───────────────────────────────────────────────────────────────────
 
 /// Which payload format a message draft is editing.
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum PayloadKind {
     Hex,
     Utf8,
@@ -372,5 +372,167 @@ impl ScheduleDraft {
             timestamp,
             checksum,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ConnDraft round-trips ─────────────────────────────────────────────────
+    //
+    // A GUI-representable interface config must survive
+    // InterfaceConfig -> ConnDraft -> to_config() unchanged.
+
+    fn conn_round_trip(cfg: InterfaceConfig) {
+        let draft = ConnDraft::from(&cfg);
+        assert_eq!(draft.to_config(), Some(cfg));
+    }
+
+    #[test]
+    fn serial_draft_round_trip() {
+        conn_round_trip(InterfaceConfig::Serial(SerialConfig {
+            port: "COM7".to_string(),
+            baud_rate: 38400,
+            data_bits: DataBits::Seven,
+            parity: Parity::Even,
+            stop_bits: StopBits::Two,
+            flow_control: FlowControl::Hardware,
+        }));
+    }
+
+    #[test]
+    fn udp_unicast_draft_round_trip() {
+        conn_round_trip(InterfaceConfig::Udp(UdpConfig::unicast(
+            "192.168.1.50:4000".parse().unwrap(),
+        )));
+    }
+
+    #[test]
+    fn udp_broadcast_draft_round_trip() {
+        conn_round_trip(InterfaceConfig::Udp(UdpConfig::broadcast(
+            "255.255.255.255:9000".parse().unwrap(),
+        )));
+    }
+
+    #[test]
+    fn udp_multicast_draft_round_trip() {
+        conn_round_trip(InterfaceConfig::Udp(UdpConfig::multicast(
+            "239.0.0.7".parse().unwrap(),
+            5500,
+        )));
+    }
+
+    #[test]
+    fn udp_draft_preserves_local_port() {
+        let mut udp = UdpConfig::unicast("127.0.0.1:5000".parse().unwrap());
+        udp.local_port = Some(6000);
+        conn_round_trip(InterfaceConfig::Udp(udp));
+    }
+
+    #[test]
+    fn tcp_draft_round_trip() {
+        conn_round_trip(InterfaceConfig::TcpClient(TcpClientConfig::new(
+            "10.0.0.1:4001".parse().unwrap(),
+        )));
+    }
+
+    // ── ScheduleDraft round-trips ─────────────────────────────────────────────
+    //
+    // A message must survive MessageConfig -> ScheduleDraft -> to_message_config()
+    // unchanged, for every payload format and with/without timestamp + checksum.
+
+    fn message_round_trip(m: MessageConfig) {
+        let draft = ScheduleDraft::from(&m);
+        assert_eq!(draft.to_message_config(), Some(m));
+    }
+
+    #[test]
+    fn hex_message_round_trip() {
+        message_round_trip(MessageConfig::new(PayloadConfig::raw_hex("DEADBEEF"), 500));
+    }
+
+    #[test]
+    fn utf8_message_round_trip() {
+        message_round_trip(MessageConfig::new(
+            PayloadConfig::Utf8 {
+                text: "héllo".to_string(),
+            },
+            1000,
+        ));
+    }
+
+    #[test]
+    fn utf16_message_round_trip() {
+        message_round_trip(MessageConfig::new(
+            PayloadConfig::Utf16 {
+                text: "data".to_string(),
+                byte_order: ByteOrder::LittleEndian,
+                bom: true,
+            },
+            250,
+        ));
+    }
+
+    #[test]
+    fn ascii_message_round_trip() {
+        message_round_trip(MessageConfig::new(
+            PayloadConfig::Ascii {
+                text: "café".to_string(),
+                code_page: CodePage::Cp437,
+            },
+            750,
+        ));
+    }
+
+    #[test]
+    fn nmea_message_round_trip() {
+        message_round_trip(MessageConfig::new(
+            PayloadConfig::nmea("GP", "GGA", vec!["123519".to_string(), "N".to_string()]),
+            1000,
+        ));
+    }
+
+    #[test]
+    fn nmea_message_with_no_fields_round_trip() {
+        message_round_trip(MessageConfig::new(
+            PayloadConfig::nmea("GN", "RMC", vec![]),
+            2000,
+        ));
+    }
+
+    #[test]
+    fn message_round_trip_with_timestamp_and_checksum() {
+        message_round_trip(MessageConfig {
+            payload: PayloadConfig::raw_hex("AABB"),
+            interval_ms: 1000,
+            timestamp: Some(TimestampConfig {
+                include_date: true,
+                include_millis: false,
+                include_timezone: true,
+            }),
+            checksum: Some(ChecksumConfig {
+                algorithm: ChecksumAlgorithm::Crc16Modbus,
+                intentionally_wrong: true,
+            }),
+        });
+    }
+
+    #[test]
+    fn message_without_timestamp_or_checksum_stays_disabled() {
+        let m = MessageConfig::new(PayloadConfig::raw_hex("00"), 100);
+        let draft = ScheduleDraft::from(&m);
+        assert!(!draft.timestamp_enabled);
+        assert!(!draft.checksum_enabled);
+        assert_eq!(draft.to_message_config(), Some(m));
+    }
+
+    #[test]
+    fn switching_format_does_not_lose_other_buffers() {
+        // A hex message loaded as a draft keeps usable defaults in the other
+        // format buffers, so toggling the selector never panics or blanks out.
+        let draft = ScheduleDraft::from(&MessageConfig::new(PayloadConfig::raw_hex("FF"), 100));
+        assert_eq!(draft.payload_kind, PayloadKind::Hex);
+        assert_eq!(draft.nmea_talker, "GP");
     }
 }
