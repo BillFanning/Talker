@@ -1,3 +1,4 @@
+mod display;
 mod draft;
 mod thread;
 
@@ -16,6 +17,7 @@ use crate::core::{
     scheduler::Schedule,
 };
 
+use display::{ChannelDisplay, ControlStyle, DisplayMode};
 use draft::{ConnDraft, ConnKind, PayloadKind, ScheduleDraft, UdpModeDraft};
 use thread::{run_talker, TalkerCommand, TalkerHandle, TalkerStatus};
 
@@ -58,6 +60,7 @@ struct TalkerApp {
     log_rx: crossbeam_channel::Receiver<LogEvent>,
     log_lines: Vec<(String, egui::Color32)>,
     sent_counts: Vec<u64>,
+    displays: Vec<ChannelDisplay>,
     error_count: u64,
     last_title: String,
     serial_ports: Vec<String>,
@@ -89,6 +92,7 @@ impl TalkerApp {
             log_rx,
             log_lines: Vec::new(),
             sent_counts: Vec::new(),
+            displays: Vec::new(),
             error_count: 0,
             last_title: String::new(),
             serial_ports: Vec::new(),
@@ -179,6 +183,7 @@ impl TalkerApp {
                 self.conn_errors = vec![None; n];
                 self.talkers = (0..n).map(|_| None).collect();
                 self.sent_counts = vec![0; n];
+                self.displays = (0..n).map(|_| ChannelDisplay::default()).collect();
                 self.profile = p;
                 self.profile_path = Some(path.to_path_buf());
                 self.dirty = false;
@@ -211,6 +216,7 @@ impl TalkerApp {
         self.conn_errors.clear();
         self.talkers.clear();
         self.sent_counts.clear();
+        self.displays.clear();
         self.error_count = 0;
         tracing::info!("new profile");
     }
@@ -428,12 +434,15 @@ impl TalkerApp {
             any_running = true;
             for status in statuses {
                 match status {
-                    TalkerStatus::SendCount(n) => {
+                    TalkerStatus::Sent { count, payload } => {
                         if i < self.sent_counts.len() {
-                            self.sent_counts[i] = n;
+                            self.sent_counts[i] = count;
                         }
                         if i < self.conn_errors.len() {
                             self.conn_errors[i] = None;
+                        }
+                        if let Some(d) = self.displays.get_mut(i) {
+                            d.push(payload);
                         }
                     }
                     TalkerStatus::ConnectionError { message, .. } => {
@@ -734,6 +743,9 @@ impl TalkerApp {
                                 });
                             }
                         }
+
+                        ui.separator();
+                        show_display_pane(ui, &mut self.displays[i]);
                     });
                 });
                 ui.add_space(6.0);
@@ -759,6 +771,7 @@ impl TalkerApp {
             self.conn_errors.remove(i);
             self.talkers.remove(i);
             self.sent_counts.remove(i);
+            self.displays.remove(i);
             if i < self.profile.channels.len() {
                 self.profile.channels.remove(i);
             }
@@ -770,6 +783,7 @@ impl TalkerApp {
             self.conn_errors.push(None);
             self.talkers.push(None);
             self.sent_counts.push(0);
+            self.displays.push(ChannelDisplay::default());
             self.dirty = true;
         }
         if do_refresh_ports {
@@ -1044,6 +1058,44 @@ fn checksum_label(algorithm: ChecksumAlgorithm) -> &'static str {
 }
 
 // ── Field renderers ───────────────────────────────────────────────────────────
+
+/// Render a channel's real-time outbound display pane (spec §5.7).
+fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay) {
+    ui.collapsing("Output", |ui| {
+        ui.horizontal(|ui| {
+            ui.label("View:");
+            ui.radio_value(&mut display.mode, DisplayMode::Hex, "Hex");
+            ui.radio_value(&mut display.mode, DisplayMode::Ascii, "ASCII");
+            ui.radio_value(&mut display.mode, DisplayMode::Decoded, "Decoded");
+            if display.mode == DisplayMode::Ascii {
+                ui.separator();
+                ui.label("Controls:");
+                ui.radio_value(
+                    &mut display.control_style,
+                    ControlStyle::Pictures,
+                    "\u{240A}",
+                );
+                ui.radio_value(&mut display.control_style, ControlStyle::Brackets, "[LF]");
+                ui.radio_value(&mut display.control_style, ControlStyle::HexEscapes, "<0x>");
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("Clear").clicked() {
+                    display.clear();
+                }
+            });
+        });
+        ui.separator();
+        ScrollArea::vertical()
+            .max_height(150.0)
+            .stick_to_bottom(true)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for line in display.lines() {
+                    ui.label(egui::RichText::new(line).monospace());
+                }
+            });
+    });
+}
 
 fn show_serial_fields(ui: &mut egui::Ui, conn: &mut ConnDraft, ports: &[String]) -> (bool, bool) {
     let before = (

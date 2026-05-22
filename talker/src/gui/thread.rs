@@ -19,8 +19,14 @@ pub enum TalkerCommand {
 
 /// A status update sent from a talker thread to the UI thread.
 pub enum TalkerStatus {
-    SendCount(u64),
-    ConnectionError { message: String },
+    /// A message was sent — the running count and the bytes put on the wire.
+    Sent {
+        count: u64,
+        payload: Vec<u8>,
+    },
+    ConnectionError {
+        message: String,
+    },
 }
 
 /// The UI-side handle for a running talker thread.
@@ -69,7 +75,10 @@ pub fn run_talker(
             Tick::Send { payload, .. } => match interface.send(&payload) {
                 Ok(()) => {
                     sent_count += 1;
-                    let _ = status_tx.try_send(TalkerStatus::SendCount(sent_count));
+                    let _ = status_tx.try_send(TalkerStatus::Sent {
+                        count: sent_count,
+                        payload,
+                    });
                 }
                 Err(e) => {
                     tracing::warn!("send failed: {e:#}");
