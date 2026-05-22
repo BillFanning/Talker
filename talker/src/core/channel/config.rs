@@ -2,11 +2,35 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
-/// Top-level discriminator stored in a profile's connection list.
+use crate::core::message::MessageConfig;
+
+/// One channel in a profile: a single interface and the messages sent on it.
+///
+/// A channel has exactly one interface port. Each message is configured
+/// independently (payload, interval, and — from a later phase — timestamp and
+/// checksum).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChannelConfig {
+    pub interface: InterfaceConfig,
+    #[serde(default)]
+    pub messages: Vec<MessageConfig>,
+}
+
+impl ChannelConfig {
+    pub fn new(interface: InterfaceConfig, messages: Vec<MessageConfig>) -> Self {
+        Self {
+            interface,
+            messages,
+        }
+    }
+}
+
+/// The interface type and parameters for one channel.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ConnectionConfig {
+pub enum InterfaceConfig {
     Serial(SerialConfig),
     Udp(UdpConfig),
     TcpClient(TcpClientConfig),
@@ -163,6 +187,7 @@ impl TcpClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::message::PayloadConfig;
 
     fn round_trip<T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug>(
         value: &T,
@@ -189,8 +214,8 @@ mod tests {
     }
 
     #[test]
-    fn connection_config_serial_tag() {
-        let c = ConnectionConfig::Serial(SerialConfig::new("COM3"));
+    fn interface_config_serial_tag() {
+        let c = InterfaceConfig::Serial(SerialConfig::new("COM3"));
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("\"type\":\"serial\""));
         round_trip(&c);
@@ -198,7 +223,7 @@ mod tests {
 
     #[test]
     fn udp_unicast_round_trip() {
-        let c = ConnectionConfig::Udp(UdpConfig::unicast("127.0.0.1:5000".parse().unwrap()));
+        let c = InterfaceConfig::Udp(UdpConfig::unicast("127.0.0.1:5000".parse().unwrap()));
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("\"type\":\"udp\""));
         assert!(json.contains("\"type\":\"unicast\""));
@@ -207,7 +232,7 @@ mod tests {
 
     #[test]
     fn udp_broadcast_round_trip() {
-        let c = ConnectionConfig::Udp(UdpConfig::broadcast(
+        let c = InterfaceConfig::Udp(UdpConfig::broadcast(
             "255.255.255.255:9999".parse().unwrap(),
         ));
         round_trip(&c);
@@ -215,16 +240,32 @@ mod tests {
 
     #[test]
     fn udp_multicast_round_trip() {
-        let c = ConnectionConfig::Udp(UdpConfig::multicast("239.1.2.3".parse().unwrap(), 5000));
+        let c = InterfaceConfig::Udp(UdpConfig::multicast("239.1.2.3".parse().unwrap(), 5000));
         round_trip(&c);
     }
 
     #[test]
     fn tcp_client_round_trip() {
-        let c = ConnectionConfig::TcpClient(TcpClientConfig::new("10.0.0.1:4001".parse().unwrap()));
+        let c = InterfaceConfig::TcpClient(TcpClientConfig::new("10.0.0.1:4001".parse().unwrap()));
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("\"type\":\"tcp_client\""));
         round_trip(&c);
+    }
+
+    #[test]
+    fn channel_config_round_trip() {
+        let c = ChannelConfig::new(
+            InterfaceConfig::Udp(UdpConfig::unicast("127.0.0.1:6000".parse().unwrap())),
+            vec![MessageConfig::new(PayloadConfig::raw_hex("AABB"), 500)],
+        );
+        round_trip(&c);
+    }
+
+    #[test]
+    fn channel_config_defaults_messages_to_empty() {
+        let json = r#"{"interface":{"type":"tcp_client","address":"10.0.0.1:1"}}"#;
+        let c: ChannelConfig = serde_json::from_str(json).unwrap();
+        assert!(c.messages.is_empty());
     }
 
     #[test]

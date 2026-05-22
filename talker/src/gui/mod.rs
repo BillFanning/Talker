@@ -8,9 +8,10 @@ use anyhow::Context as _;
 use egui::{Align, Layout, ScrollArea};
 
 use crate::core::{
-    connection::ConnectionCollection,
+    channel::ChannelConfig,
     logging::{LogEvent, LoggingConfig},
     profile::Profile,
+    scheduler::Schedule,
 };
 
 use draft::{ConnDraft, ConnKind, PayloadKind, ScheduleDraft, UdpModeDraft};
@@ -126,7 +127,7 @@ impl TalkerApp {
             && self
                 .sched_drafts
                 .get(i)
-                .is_some_and(|s| s.iter().any(|d| d.to_entry_config().is_some()))
+                .is_some_and(|s| s.iter().any(|d| d.to_message_config().is_some()))
     }
 
     fn can_start_any(&self) -> bool {
@@ -162,15 +163,16 @@ impl TalkerApp {
         self.stop_all();
         match Profile::load(path) {
             Ok(p) => {
-                let n = p.connections.len();
-                self.conn_drafts = p.connections.iter().map(ConnDraft::from).collect();
-                self.sched_drafts = (0..n)
-                    .map(|i| {
-                        p.schedules
-                            .get(i)
-                            .map(|s| s.entries.iter().map(ScheduleDraft::from).collect())
-                            .unwrap_or_default()
-                    })
+                let n = p.channels.len();
+                self.conn_drafts = p
+                    .channels
+                    .iter()
+                    .map(|ch| ConnDraft::from(&ch.interface))
+                    .collect();
+                self.sched_drafts = p
+                    .channels
+                    .iter()
+                    .map(|ch| ch.messages.iter().map(ScheduleDraft::from).collect())
                     .collect();
                 self.conn_errors = vec![None; n];
                 self.talkers = (0..n).map(|_| None).collect();
@@ -263,14 +265,14 @@ impl TalkerApp {
         self.flush_drafts_to_profile();
 
         let Some(cfg) = self.conn_drafts.get(i).and_then(|d| d.to_config()) else {
-            tracing::warn!("connection {i} config invalid");
+            tracing::warn!("channel {i} config invalid");
             return;
         };
 
-        let conn = match cfg.open() {
+        let interface = match cfg.open() {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("failed to open connection {i}: {e:#}");
+                tracing::error!("failed to open channel {i}: {e:#}");
                 self.error_count += 1;
                 if i < self.conn_errors.len() {
                     self.conn_errors[i] = Some(format!("{e:#}"));
@@ -279,17 +281,19 @@ impl TalkerApp {
             }
         };
 
-        let sched_cfg = self.profile.schedules.get(i).cloned().unwrap_or_default();
-        let schedule = match sched_cfg.compile() {
+        let messages = self
+            .profile
+            .channels
+            .get(i)
+            .map(|c| c.messages.clone())
+            .unwrap_or_default();
+        let schedule = match Schedule::compile(&messages) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("connection {i} schedule error: {e:#}");
+                tracing::error!("channel {i} schedule error: {e:#}");
                 return;
             }
         };
-
-        let mut connections = ConnectionCollection::new();
-        connections.push(conn);
 
         if i < self.conn_errors.len() {
             self.conn_errors[i] = None;
@@ -300,8 +304,7 @@ impl TalkerApp {
 
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(32);
         let (status_tx, status_rx) = crossbeam_channel::bounded(256);
-        let thread =
-            std::thread::spawn(move || run_talker(connections, schedule, cmd_rx, status_tx));
+        let thread = std::thread::spawn(move || run_talker(interface, schedule, cmd_rx, status_tx));
 
         if i < self.talkers.len() {
             self.talkers[i] = Some(TalkerHandle {
@@ -310,8 +313,8 @@ impl TalkerApp {
                 thread,
             });
         }
-        let entry_count = self.profile.schedules.get(i).map_or(0, |s| s.entries.len());
-        tracing::info!("connection {i} started ({entry_count}-entry schedule)");
+        let message_count = messages.len();
+        tracing::info!("channel {i} started ({message_count}-message schedule)");
     }
 
     fn stop_connection(&mut self, i: usize) {
@@ -342,18 +345,20 @@ impl TalkerApp {
     }
 
     fn flush_drafts_to_profile(&mut self) {
-        self.profile.connections = self
-            .conn_drafts
-            .iter()
-            .filter_map(|d| d.to_config())
-            .collect();
-        self.profile.schedules = self
-            .sched_drafts
-            .iter()
-            .map(|entries| {
-                crate::core::scheduler::ScheduleConfig::new(
-                    entries.iter().filter_map(|d| d.to_entry_config()).collect(),
-                )
+        self.profile.channels = (0..self.conn_drafts.len())
+            .filter_map(|i| {
+                let interface = self.conn_drafts[i].to_config()?;
+                let messages = self
+                    .sched_drafts
+                    .get(i)
+                    .map(|drafts| {
+                        drafts
+                            .iter()
+                            .filter_map(|d| d.to_message_config())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(ChannelConfig::new(interface, messages))
             })
             .collect();
     }
@@ -362,14 +367,15 @@ impl TalkerApp {
         let Some(cfg) = self.conn_drafts[i].to_config() else {
             return;
         };
-        if i < self.profile.connections.len() {
-            self.profile.connections[i] = cfg.clone();
+        if i < self.profile.channels.len() {
+            self.profile.channels[i].interface = cfg.clone();
         } else {
-            self.profile.connections.push(cfg.clone());
+            self.profile
+                .channels
+                .push(ChannelConfig::new(cfg.clone(), Vec::new()));
         }
-        // Each talker owns one connection at index 0.
         if let Some(Some(h)) = self.talkers.get(i) {
-            let _ = h.cmd_tx.try_send(TalkerCommand::UpdateConnection(0, cfg));
+            let _ = h.cmd_tx.try_send(TalkerCommand::UpdateInterface(cfg));
         }
         self.dirty = true;
     }
@@ -744,8 +750,8 @@ impl TalkerApp {
             self.conn_errors.remove(i);
             self.talkers.remove(i);
             self.sent_counts.remove(i);
-            if i < self.profile.connections.len() {
-                self.profile.connections.remove(i);
+            if i < self.profile.channels.len() {
+                self.profile.channels.remove(i);
             }
             self.dirty = true;
         }

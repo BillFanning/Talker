@@ -4,13 +4,13 @@ use std::net::TcpStream;
 use anyhow::Context;
 
 use super::config::TcpClientConfig;
-use super::Connection;
+use super::Interface;
 
-pub(super) struct TcpClientConnection {
+pub(super) struct TcpClientInterface {
     stream: TcpStream,
 }
 
-impl TcpClientConnection {
+impl TcpClientInterface {
     pub(super) fn open(config: &TcpClientConfig) -> anyhow::Result<Self> {
         let stream = TcpStream::connect(config.address)
             .with_context(|| format!("connecting to {}", config.address))?;
@@ -18,7 +18,7 @@ impl TcpClientConnection {
     }
 }
 
-impl Connection for TcpClientConnection {
+impl Interface for TcpClientInterface {
     fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
         self.stream.write_all(data).context("writing to TCP stream")
     }
@@ -33,7 +33,7 @@ mod tests {
     #[test]
     fn connect_to_nonexistent_port_returns_error() {
         let config = TcpClientConfig::new("127.0.0.1:1".parse().unwrap());
-        let result = TcpClientConnection::open(&config);
+        let result = TcpClientInterface::open(&config);
         let msg = result
             .err()
             .expect("expected error connecting to port 1")
@@ -47,7 +47,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let config = TcpClientConfig::new(addr);
-        let mut conn = TcpClientConnection::open(&config).unwrap();
+        let mut conn = TcpClientInterface::open(&config).unwrap();
 
         let (mut server_stream, _) = listener.accept().unwrap();
 
@@ -68,7 +68,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let config = TcpClientConfig::new(addr);
-        let mut conn = TcpClientConnection::open(&config).unwrap();
+        let mut conn = TcpClientInterface::open(&config).unwrap();
 
         let (mut server_stream, _) = listener.accept().unwrap();
         let payload = vec![0xABu8; 4096];

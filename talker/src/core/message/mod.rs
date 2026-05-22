@@ -1,25 +1,18 @@
+//! Message definitions: payload format, encoding, and (in later phases)
+//! timestamp and checksum. A [`MessageConfig`] compiles to the raw bytes a
+//! channel puts on the wire.
+
 use serde::{Deserialize, Serialize};
 
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct ScheduleConfig {
-    pub entries: Vec<ScheduleEntryConfig>,
-}
-
-impl ScheduleConfig {
-    pub fn new(entries: Vec<ScheduleEntryConfig>) -> Self {
-        Self { entries }
-    }
-}
-
+/// One message in a channel: a payload and how often to send it.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ScheduleEntryConfig {
+pub struct MessageConfig {
     pub payload: PayloadConfig,
     pub interval_ms: u64,
 }
 
-impl ScheduleEntryConfig {
+impl MessageConfig {
     pub fn new(payload: PayloadConfig, interval_ms: u64) -> Self {
         Self {
             payload,
@@ -28,7 +21,7 @@ impl ScheduleEntryConfig {
     }
 }
 
-/// The payload source for one schedule entry.
+/// The payload source for one message.
 ///
 /// `compile()` converts this to a wire-ready `Vec<u8>`.
 #[non_exhaustive]
@@ -198,13 +191,10 @@ mod tests {
     }
 
     #[test]
-    fn schedule_config_round_trip() {
-        let c = ScheduleConfig::new(vec![
-            ScheduleEntryConfig::new(PayloadConfig::raw_hex("FF"), 500),
-            ScheduleEntryConfig::new(PayloadConfig::nmea("GP", "RMC", vec![]), 1000),
-        ]);
-        let json = serde_json::to_string(&c).unwrap();
-        let back: ScheduleConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(c, back);
+    fn message_config_round_trip() {
+        let m = MessageConfig::new(PayloadConfig::nmea("GP", "RMC", vec![]), 1000);
+        let json = serde_json::to_string(&m).unwrap();
+        let back: MessageConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, back);
     }
 }

@@ -1,20 +1,25 @@
-version = 1
-name = ""
+# Sample talker profile (schema v2).
+# One channel: a UDP broadcast interface sending a GPS GGA sentence at 1 Hz.
 
-[[connections]]
+version = 2
+name = "udp-broadcast-gga"
+
+[[channels]]
+
+[channels.interface]
 type = "udp"
 
-[connections.mode]
+[channels.interface.mode]
 type = "broadcast"
 destination = "192.168.1.116:18180"
 
-[[schedule.entries]]
+[[channels.messages]]
 interval_ms = 1000
 
-[schedule.entries.payload]
+[channels.messages.payload]
 type = "nmea"
 talker = "GP"
-sentence_type = "gga"
+sentence_type = "GGA"
 fields = []
 
 [logging]

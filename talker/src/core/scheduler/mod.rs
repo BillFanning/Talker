@@ -1,10 +1,15 @@
-mod config;
-
-pub use config::{PayloadConfig, ScheduleConfig, ScheduleEntryConfig};
+//! The per-channel send loop. A [`Schedule`] is the runnable form of a
+//! channel's messages.
+//!
+//! The current implementation cycles through entries in list order. The
+//! priority-queue scheduler (independent per-message fire times) lands in a
+//! later phase.
 
 use std::time::Duration;
 
 use anyhow::Context;
+
+use crate::core::message::MessageConfig;
 
 /// A compiled, wire-ready payload paired with how long to wait after sending it.
 #[derive(Debug, Clone)]
@@ -29,6 +34,26 @@ impl Schedule {
         Ok(Self { entries, cursor: 0 })
     }
 
+    /// Compile a channel's messages into a runnable schedule.
+    pub fn compile(messages: &[MessageConfig]) -> anyhow::Result<Self> {
+        anyhow::ensure!(!messages.is_empty(), "channel has no messages");
+        let entries = messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let payload = m
+                    .payload
+                    .compile()
+                    .with_context(|| format!("compiling message {i}"))?;
+                Ok(ScheduleEntry {
+                    payload,
+                    interval: Duration::from_millis(m.interval_ms),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Schedule::new(entries)
+    }
+
     /// Return a reference to the current entry and advance the cursor.
     pub fn next_entry(&mut self) -> &ScheduleEntry {
         let entry = &self.entries[self.cursor];
@@ -45,35 +70,13 @@ impl Schedule {
     }
 }
 
-impl ScheduleConfig {
-    /// Compile all entries into a runnable [`Schedule`].
-    pub fn compile(&self) -> anyhow::Result<Schedule> {
-        anyhow::ensure!(!self.entries.is_empty(), "schedule config has no entries");
-        let entries = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let payload = e
-                    .payload
-                    .compile()
-                    .with_context(|| format!("compiling schedule entry {i}"))?;
-                Ok(ScheduleEntry {
-                    payload,
-                    interval: Duration::from_millis(e.interval_ms),
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Schedule::new(entries)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::message::PayloadConfig;
 
-    fn entry(hex: &str, ms: u64) -> ScheduleEntryConfig {
-        ScheduleEntryConfig::new(PayloadConfig::raw_hex(hex), ms)
+    fn message(hex: &str, ms: u64) -> MessageConfig {
+        MessageConfig::new(PayloadConfig::raw_hex(hex), ms)
     }
 
     // ── Schedule::new ─────────────────────────────────────────────────────────
@@ -155,27 +158,26 @@ mod tests {
         assert_eq!(s.next_entry().interval, Duration::from_millis(750));
     }
 
-    // ── ScheduleConfig::compile ───────────────────────────────────────────────
+    // ── Schedule::compile ─────────────────────────────────────────────────────
 
     #[test]
-    fn compile_empty_config_returns_error() {
-        let cfg = ScheduleConfig::new(vec![]);
-        assert!(cfg.compile().is_err());
+    fn compile_no_messages_returns_error() {
+        assert!(Schedule::compile(&[]).is_err());
     }
 
     #[test]
-    fn compile_single_raw_hex_entry() {
-        let cfg = ScheduleConfig::new(vec![entry("AABB", 100)]);
-        let mut sched = cfg.compile().unwrap();
+    fn compile_single_raw_hex_message() {
+        let mut sched = Schedule::compile(&[message("AABB", 100)]).unwrap();
         assert_eq!(sched.len(), 1);
         assert_eq!(sched.next_entry().payload, vec![0xAA, 0xBB]);
         assert_eq!(sched.next_entry().interval, Duration::from_millis(100));
     }
 
     #[test]
-    fn compile_multiple_entries_preserves_order() {
-        let cfg = ScheduleConfig::new(vec![entry("01", 100), entry("02", 200), entry("03", 300)]);
-        let mut sched = cfg.compile().unwrap();
+    fn compile_multiple_messages_preserves_order() {
+        let mut sched =
+            Schedule::compile(&[message("01", 100), message("02", 200), message("03", 300)])
+                .unwrap();
         assert_eq!(sched.next_entry().payload, vec![0x01]);
         assert_eq!(sched.next_entry().payload, vec![0x02]);
         assert_eq!(sched.next_entry().payload, vec![0x03]);
@@ -184,12 +186,12 @@ mod tests {
     }
 
     #[test]
-    fn compile_nmea_entry() {
-        let cfg = ScheduleConfig::new(vec![ScheduleEntryConfig::new(
+    fn compile_nmea_message() {
+        let mut sched = Schedule::compile(&[MessageConfig::new(
             PayloadConfig::nmea("GP", "GGA", vec!["123519".to_string()]),
             1000,
-        )]);
-        let mut sched = cfg.compile().unwrap();
+        )])
+        .unwrap();
         let wire = std::str::from_utf8(&sched.next_entry().payload).unwrap();
         assert!(wire.starts_with("$GPGGA,123519*"));
         assert!(wire.ends_with("\r\n"));
@@ -197,8 +199,7 @@ mod tests {
 
     #[test]
     fn compile_bad_payload_returns_error_with_context() {
-        let cfg = ScheduleConfig::new(vec![entry("XYZ", 100)]);
-        let err = cfg.compile().unwrap_err();
-        assert!(err.to_string().contains("entry 0"));
+        let err = Schedule::compile(&[message("XYZ", 100)]).unwrap_err();
+        assert!(err.to_string().contains("message 0"));
     }
 }

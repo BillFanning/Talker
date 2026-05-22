@@ -3,14 +3,14 @@ use std::net::{SocketAddr, UdpSocket};
 use anyhow::Context;
 
 use super::config::{UdpConfig, UdpMode};
-use super::Connection;
+use super::Interface;
 
-pub(super) struct UdpConnection {
+pub(super) struct UdpInterface {
     socket: UdpSocket,
     destination: SocketAddr,
 }
 
-impl UdpConnection {
+impl UdpInterface {
     pub(super) fn open(config: &UdpConfig) -> anyhow::Result<Self> {
         let local_port = config.local_port.unwrap_or(0);
 
@@ -54,7 +54,7 @@ impl UdpConnection {
     }
 }
 
-impl Connection for UdpConnection {
+impl Interface for UdpInterface {
     fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
         self.socket
             .send_to(data, self.destination)
@@ -73,7 +73,7 @@ mod tests {
         let dest: SocketAddr = receiver.local_addr().unwrap();
 
         let config = UdpConfig::unicast(dest);
-        let mut conn = UdpConnection::open(&config).unwrap();
+        let mut conn = UdpInterface::open(&config).unwrap();
 
         conn.send(b"hello").unwrap();
 
@@ -89,13 +89,13 @@ mod tests {
     fn broadcast_socket_opens() {
         let dest: SocketAddr = "255.255.255.255:19999".parse().unwrap();
         let config = UdpConfig::broadcast(dest);
-        assert!(UdpConnection::open(&config).is_ok());
+        assert!(UdpInterface::open(&config).is_ok());
     }
 
     #[test]
     fn multicast_socket_opens() {
         let config = UdpConfig::multicast("239.0.0.1".parse().unwrap(), 20000);
-        assert!(UdpConnection::open(&config).is_ok());
+        assert!(UdpInterface::open(&config).is_ok());
     }
 
     #[test]
@@ -103,7 +103,7 @@ mod tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
         let dest = receiver.local_addr().unwrap();
 
-        let mut conn = UdpConnection::open(&UdpConfig::unicast(dest)).unwrap();
+        let mut conn = UdpInterface::open(&UdpConfig::unicast(dest)).unwrap();
         receiver
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
             .unwrap();

@@ -7,9 +7,10 @@ use anyhow::Context;
 use clap::Args as ClapArgs;
 
 use crate::core::{
-    connection::ConnectionCollection,
+    channel::Interface,
     logging,
     profile::{self, Profile},
+    scheduler::Schedule,
 };
 
 // ── Clap argument struct ──────────────────────────────────────────────────────
@@ -43,39 +44,58 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let _log = logging::init(&profile.logging, None).context("initializing logging")?;
 
     tracing::info!("profile {:?} loaded", profile.name);
+    anyhow::ensure!(!profile.channels.is_empty(), "profile has no channels");
 
-    // Open every connection in the profile.
-    let mut connections = ConnectionCollection::new();
-    for (i, cfg) in profile.connections.iter().enumerate() {
-        let conn = cfg
+    // Open every channel's interface and compile its schedule up front, so a
+    // failure aborts cleanly before any talker thread is spawned.
+    let mut prepared: Vec<(usize, Box<dyn Interface>, Schedule)> = Vec::new();
+    for (i, channel) in profile.channels.into_iter().enumerate() {
+        let interface = channel
+            .interface
             .open()
-            .with_context(|| format!("opening connection {i}"))?;
-        connections.push(conn);
+            .with_context(|| format!("opening channel {i}"))?;
+        let schedule = Schedule::compile(&channel.messages)
+            .with_context(|| format!("compiling channel {i} schedule"))?;
+        prepared.push((i, interface, schedule));
     }
-    anyhow::ensure!(!connections.is_empty(), "profile has no connections");
-    tracing::info!("opened {} connection(s)", connections.len());
-
-    // Compile the schedule into send-ready entries.
-    let sched_cfg = profile.schedules.into_iter().next().unwrap_or_default();
-    let mut schedule = sched_cfg.compile().context("compiling schedule")?;
-    tracing::info!(
-        "{}-entry schedule compiled — starting send loop (Ctrl+C to stop)",
-        schedule.len()
-    );
 
     // Shared stop flag written by the Ctrl+C handler.
     let running = Arc::new(AtomicBool::new(true));
-    let stop = Arc::clone(&running);
-    ctrlc::set_handler(move || {
-        stop.store(false, Ordering::SeqCst);
-    })
-    .context("installing Ctrl+C handler")?;
+    {
+        let stop = Arc::clone(&running);
+        ctrlc::set_handler(move || stop.store(false, Ordering::SeqCst))
+            .context("installing Ctrl+C handler")?;
+    }
 
-    // Send loop: fire each entry, sleep the configured interval, repeat.
+    // One talker thread per channel — all run in parallel.
+    let mut handles = Vec::new();
+    for (i, interface, schedule) in prepared {
+        let running = Arc::clone(&running);
+        handles.push(std::thread::spawn(move || {
+            run_channel(i, interface, schedule, &running);
+        }));
+    }
+    tracing::info!("{} channel(s) started — Ctrl+C to stop", handles.len());
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+    tracing::info!("stopped");
+    Ok(())
+}
+
+/// Send loop for one channel: fire each entry, wait its interval, repeat,
+/// until `running` is cleared by the Ctrl+C handler.
+fn run_channel(
+    index: usize,
+    mut interface: Box<dyn Interface>,
+    mut schedule: Schedule,
+    running: &AtomicBool,
+) {
     while running.load(Ordering::SeqCst) {
         let entry = schedule.next_entry();
-        if let Err(e) = connections.send_all(&entry.payload) {
-            tracing::warn!("send failed: {e:#}");
+        if let Err(e) = interface.send(&entry.payload) {
+            tracing::warn!("channel {index} send failed: {e:#}");
         }
         // Sleep in 50 ms slices so Ctrl+C is responsive even on long intervals.
         let deadline = Instant::now() + entry.interval;
@@ -87,9 +107,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             std::thread::sleep(remaining.min(Duration::from_millis(50)));
         }
     }
-
-    tracing::info!("stopped");
-    Ok(())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

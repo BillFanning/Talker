@@ -1,13 +1,13 @@
 use anyhow::Context;
 
 use super::config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
-use super::Connection;
+use super::Interface;
 
-pub(super) struct SerialConnection {
+pub(super) struct SerialInterface {
     port: Box<dyn serialport::SerialPort>,
 }
 
-impl SerialConnection {
+impl SerialInterface {
     pub(super) fn open(config: &SerialConfig) -> anyhow::Result<Self> {
         let port = serialport::new(&config.port, config.baud_rate)
             .data_bits(to_sp_data_bits(config.data_bits))
@@ -21,7 +21,7 @@ impl SerialConnection {
     }
 }
 
-impl Connection for SerialConnection {
+impl Interface for SerialInterface {
     fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
         use std::io::Write;
         self.port.write_all(data).context("writing to serial port")
@@ -67,7 +67,7 @@ mod tests {
     #[test]
     fn open_nonexistent_port_returns_error() {
         let config = SerialConfig::new("/dev/does_not_exist_xyz");
-        let result = SerialConnection::open(&config);
+        let result = SerialInterface::open(&config);
         let msg = result
             .err()
             .expect("expected error opening nonexistent port")
