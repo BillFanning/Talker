@@ -1,0 +1,28 @@
+[package]
+name        = "nmea0183"
+description = "NMEA 0183 sentence construction, parsing, and checksum support — reusable library"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+rust-version.workspace = true
+
+# This crate is designed to be extractable from the talker workspace and
+# published to crates.io independently. Keep it free of dependencies on
+# other workspace members and avoid pulling in application-level crates.
+
+[dependencies]
+# Typed error definitions for the public API
+thiserror = { workspace = true }
+
+# Serde support is optional — enable it to serialize/deserialize sentence
+# structs, e.g. for saving sentence definitions in TOML profiles.
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde   = ["dep:serde"]
+
+[dev-dependencies]
+# Unit tests live at the bottom of each source file per project convention.
+# No additional test-only dependencies required at this time.

@@ -1,0 +1,21 @@
+version = 1
+name = ""
+
+[[connections]]
+type = "udp"
+
+[connections.mode]
+type = "broadcast"
+destination = "192.168.1.116:18180"
+
+[[schedule.entries]]
+interval_ms = 1000
+
+[schedule.entries.payload]
+type = "nmea"
+talker = "GP"
+sentence_type = "gga"
+fields = []
+
+[logging]
+level = "info"

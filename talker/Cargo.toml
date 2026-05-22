@@ -1,0 +1,58 @@
+[package]
+name        = "talker"
+description = "Send byte-oriented data over serial and network connections for device testing"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+rust-version.workspace = true
+
+[[bin]]
+name = "talker"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace crate
+nmea0183 = { path = "../nmea0183" }
+
+# Serial
+serialport = { workspace = true }
+
+# GUI
+eframe  = { workspace = true }
+egui    = { workspace = true }
+
+# CLI
+clap  = { workspace = true }
+ctrlc = { workspace = true }
+
+# Threading
+crossbeam-channel = { workspace = true }
+
+# Logging
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender   = { workspace = true }
+
+# Error handling (application-level)
+anyhow = { workspace = true }
+
+# Profiles
+serde = { workspace = true }
+toml  = { workspace = true }
+
+# Paths
+dirs = { workspace = true }
+
+# CRC
+crc = { workspace = true }
+
+# File dialogs
+rfd = { workspace = true }
+
+# Timestamps
+chrono = { workspace = true }
+
+[dev-dependencies]
+# Integration tests live in /tests per Rust convention
+serde_json = "1"
