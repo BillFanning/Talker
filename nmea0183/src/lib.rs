@@ -45,7 +45,7 @@ mod tests {
 
     #[test]
     fn dispatch_proprietary_prdid() {
-        let wire = ProprietarySentence::Prdid(PrdidData { pitch: 1.0, roll: 2.0, heave: 3.0 }).to_wire();
+        let wire = ProprietarySentence::Prdid(PrdidData { pitch: 1.0, roll: 2.0, heading: 3.0 }).to_wire();
         assert!(matches!(parse(&wire).unwrap(), AnyNmeaSentence::Proprietary(_)));
     }
 

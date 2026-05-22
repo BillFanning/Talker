@@ -10,7 +10,7 @@ use clap::Parser;
     about = "Send NMEA 0183 and binary data over serial and network connections"
 )]
 struct TopArgs {
-    /// Launch the GUI (not yet implemented).
+    /// Launch the GUI.
     #[arg(long)]
     gui: bool,
 
