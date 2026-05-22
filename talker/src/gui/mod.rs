@@ -3,6 +3,7 @@ mod thread;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::Context as _;
 use egui::{Align, Layout, ScrollArea};
@@ -287,7 +288,7 @@ impl TalkerApp {
             .get(i)
             .map(|c| c.messages.clone())
             .unwrap_or_default();
-        let schedule = match Schedule::compile(&messages) {
+        let schedule = match Schedule::compile(&messages, Instant::now()) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("channel {i} schedule error: {e:#}");

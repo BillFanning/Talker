@@ -10,7 +10,7 @@ use crate::core::{
     channel::Interface,
     logging,
     profile::{self, Profile},
-    scheduler::Schedule,
+    scheduler::{Schedule, Tick},
 };
 
 // ── Clap argument struct ──────────────────────────────────────────────────────
@@ -54,7 +54,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .interface
             .open()
             .with_context(|| format!("opening channel {i}"))?;
-        let schedule = Schedule::compile(&channel.messages)
+        let schedule = Schedule::compile(&channel.messages, Instant::now())
             .with_context(|| format!("compiling channel {i} schedule"))?;
         prepared.push((i, interface, schedule));
     }
@@ -84,8 +84,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Send loop for one channel: fire each entry, wait its interval, repeat,
-/// until `running` is cleared by the Ctrl+C handler.
+/// Send loop for one channel: poll the schedule, send whatever is due, and
+/// wait, until `running` is cleared by the Ctrl+C handler.
 fn run_channel(
     index: usize,
     mut interface: Box<dyn Interface>,
@@ -93,18 +93,18 @@ fn run_channel(
     running: &AtomicBool,
 ) {
     while running.load(Ordering::SeqCst) {
-        let entry = schedule.next_entry();
-        if let Err(e) = interface.send(&entry.payload) {
-            tracing::warn!("channel {index} send failed: {e:#}");
-        }
-        // Sleep in 50 ms slices so Ctrl+C is responsive even on long intervals.
-        let deadline = Instant::now() + entry.interval;
-        while running.load(Ordering::SeqCst) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
+        match schedule.poll(Instant::now()) {
+            Tick::Send { payload, .. } => {
+                if let Err(e) = interface.send(&payload) {
+                    tracing::warn!("channel {index} send failed: {e:#}");
+                }
             }
-            std::thread::sleep(remaining.min(Duration::from_millis(50)));
+            // Sleep in <=50 ms slices so Ctrl+C stays responsive on long waits.
+            Tick::Wait(until) => {
+                let remaining = until.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(Duration::from_millis(50)));
+            }
+            Tick::Idle => std::thread::sleep(Duration::from_millis(50)),
         }
     }
 }
