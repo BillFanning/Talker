@@ -5,7 +5,7 @@ use crate::core::{
         DataBits, FlowControl, InterfaceConfig, Parity, SerialConfig, StopBits, TcpClientConfig,
         UdpConfig, UdpMode,
     },
-    message::{MessageConfig, PayloadConfig},
+    message::{ChecksumConfig, MessageConfig, PayloadConfig, TimestampConfig},
 };
 
 // ── Channel interface ─────────────────────────────────────────────────────────
@@ -177,32 +177,21 @@ impl ConnDraft {
                 }))
             }
             ConnKind::Udp => {
-                let mode = match self.udp_mode {
-                    UdpModeDraft::Unicast => {
-                        let dest: SocketAddr = self.udp_dest.parse().ok()?;
-                        UdpMode::Unicast { destination: dest }
-                    }
-                    UdpModeDraft::Broadcast => {
-                        let dest: SocketAddr = self.udp_dest.parse().ok()?;
-                        UdpMode::Broadcast { destination: dest }
-                    }
+                let mut udp = match self.udp_mode {
+                    UdpModeDraft::Unicast => UdpConfig::unicast(self.udp_dest.parse().ok()?),
+                    UdpModeDraft::Broadcast => UdpConfig::broadcast(self.udp_dest.parse().ok()?),
                     UdpModeDraft::Multicast => {
                         let group: Ipv4Addr = self.udp_group.parse().ok()?;
                         let port: u16 = self.udp_mc_port.parse().ok()?;
-                        UdpMode::Multicast {
-                            group,
-                            port,
-                            interface: None,
-                        }
+                        UdpConfig::multicast(group, port)
                     }
                 };
-                Some(InterfaceConfig::Udp(UdpConfig { mode, local_port }))
+                udp.local_port = local_port;
+                Some(InterfaceConfig::Udp(udp))
             }
             ConnKind::Tcp => {
                 let addr: SocketAddr = self.tcp_addr.parse().ok()?;
-                Some(InterfaceConfig::TcpClient(TcpClientConfig {
-                    address: addr,
-                }))
+                Some(InterfaceConfig::TcpClient(TcpClientConfig::new(addr)))
             }
         }
     }
@@ -214,6 +203,9 @@ impl ConnDraft {
 pub enum PayloadKind {
     RawHex,
     Nmea,
+    /// A payload format the GUI cannot yet edit (UTF-8/UTF-16/ASCII); it is
+    /// carried verbatim so a profile round-trips. Editors land in a later phase.
+    Other,
 }
 
 pub struct ScheduleDraft {
@@ -226,6 +218,11 @@ pub struct ScheduleDraft {
     pub nmea_fields: String, // comma-separated field values
     // common
     pub interval_ms: String,
+    /// Payload carried verbatim when `payload_kind` is [`PayloadKind::Other`].
+    pub other_payload: Option<PayloadConfig>,
+    /// Timestamp and checksum are carried verbatim until their editors land.
+    pub timestamp: Option<TimestampConfig>,
+    pub checksum: Option<ChecksumConfig>,
 }
 
 impl Default for ScheduleDraft {
@@ -237,17 +234,19 @@ impl Default for ScheduleDraft {
             nmea_sentence_type: String::new(),
             nmea_fields: String::new(),
             interval_ms: "1000".to_string(),
+            other_payload: None,
+            timestamp: None,
+            checksum: None,
         }
     }
 }
 
 impl From<&MessageConfig> for ScheduleDraft {
     fn from(m: &MessageConfig) -> Self {
-        match &m.payload {
+        let mut draft = match &m.payload {
             PayloadConfig::RawHex { data } => Self {
                 payload_kind: PayloadKind::RawHex,
                 hex_data: data.clone(),
-                interval_ms: m.interval_ms.to_string(),
                 ..Default::default()
             },
             PayloadConfig::Nmea {
@@ -259,10 +258,18 @@ impl From<&MessageConfig> for ScheduleDraft {
                 nmea_talker: talker.clone(),
                 nmea_sentence_type: sentence_type.clone(),
                 nmea_fields: fields.join(","),
-                interval_ms: m.interval_ms.to_string(),
                 ..Default::default()
             },
-        }
+            other => Self {
+                payload_kind: PayloadKind::Other,
+                other_payload: Some(other.clone()),
+                ..Default::default()
+            },
+        };
+        draft.interval_ms = m.interval_ms.to_string();
+        draft.timestamp = m.timestamp;
+        draft.checksum = m.checksum;
+        draft
     }
 }
 
@@ -282,7 +289,13 @@ impl ScheduleDraft {
                 };
                 PayloadConfig::nmea(&self.nmea_talker, &self.nmea_sentence_type, fields)
             }
+            PayloadKind::Other => self.other_payload.clone()?,
         };
-        Some(MessageConfig::new(payload, interval_ms))
+        Some(MessageConfig {
+            payload,
+            interval_ms,
+            timestamp: self.timestamp,
+            checksum: self.checksum,
+        })
     }
 }

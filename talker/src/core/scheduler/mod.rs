@@ -10,12 +10,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
-use crate::core::message::MessageConfig;
+use crate::core::message::{CompiledMessage, MessageConfig};
 
 /// One compiled message tracked by the scheduler.
 #[derive(Debug)]
 struct ScheduledMessage {
-    payload: Vec<u8>,
+    compiled: CompiledMessage,
     /// Send interval. Zero means the message is dormant.
     interval: Duration,
     /// When this message should next fire (only meaningful while active).
@@ -57,12 +57,11 @@ impl Schedule {
             .iter()
             .enumerate()
             .map(|(i, m)| {
-                let payload = m
-                    .payload
+                let compiled = m
                     .compile()
                     .with_context(|| format!("compiling message {i}"))?;
                 Ok(ScheduledMessage {
-                    payload,
+                    compiled,
                     interval: Duration::from_millis(m.interval_ms),
                     next_fire: start,
                 })
@@ -97,7 +96,7 @@ impl Schedule {
             msg.next_fire += msg.interval;
             Tick::Send {
                 index,
-                payload: msg.payload.clone(),
+                payload: msg.compiled.render(),
             }
         } else {
             Tick::Wait(msg.next_fire)

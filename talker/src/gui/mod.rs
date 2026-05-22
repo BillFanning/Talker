@@ -877,6 +877,13 @@ fn show_schedule_section(ui: &mut egui::Ui, entries: &mut Vec<ScheduleDraft>, di
                                     );
                                     ui.end_row();
                                 }
+                                PayloadKind::Other => {
+                                    ui.label("Format");
+                                    ui.weak(
+                                        "set via TOML \u{2014} GUI editor in a later phase",
+                                    );
+                                    ui.end_row();
+                                }
                             }
 
                             ui.label("Interval (ms)");
@@ -893,6 +900,12 @@ fn show_schedule_section(ui: &mut egui::Ui, entries: &mut Vec<ScheduleDraft>, di
                                 ui.end_row();
                             }
                         });
+
+                    if entry.timestamp.is_some() || entry.checksum.is_some() {
+                        ui.weak(
+                            "timestamp/checksum configured \u{2014} editor in a later phase",
+                        );
+                    }
                 });
             });
             ui.add_space(4.0);
