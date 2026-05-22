@@ -1,5 +1,5 @@
 # TODO
-**Version:** 1.0
+**Version:** 1.1
 
 Implementation reminders — small concrete tasks that need to happen during normal development. Not architectural decisions (those go in the ADR's Open questions section).
 
@@ -16,33 +16,26 @@ Cross off items as they are completed. Add new ones inline as they come up.
   - `keywords = ["nmea", "nmea0183", "marine", "gnss", "gps"]` (max 5)
   - `categories = ["parser-implementations", "encoding"]` (must match crates.io category slugs)
 - [ ] Write `nmea0183/README.md`.
-- [ ] Add `#[non_exhaustive]` to `NmeaError` (per ADR-004) and to public enums per ADR-013.
 - [ ] Resolve OQ-4 (library MSRV policy) in a new ADR.
+- [ ] Update `talker/Cargo.toml`: `nmea0183 = { path = "../nmea0183", version = "0.1" }` (per OQ-1), so downstream builds against the published crate resolve while in-workspace builds use the local source.
 
-## When writing `nmea0183` source
+`#[non_exhaustive]` on `NmeaError` and the public enums (per ADR-004 / ADR-009) is already done.
 
-- [ ] Gate serde derives on all public types behind `#[cfg(feature = "serde")]`. The feature exists in `Cargo.toml` but the code must opt in to it.
-  - Example: `#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]`
-- [ ] Verify the optional-serde feature actually compiles cleanly with `cargo build` (default) and `cargo build --features serde`.
-
-## When writing `core::logging`
-
-- [ ] Add `tracing-appender` (or equivalent) to workspace dependencies for rotating file output. Spec §9.2 requires log file rotation; `tracing-subscriber` alone does not provide it.
-- [ ] Implement the dual-mode subscriber: CLI writes to stdout/file; GUI captures events into a `tracing_subscriber::Layer` that forwards to the UI thread via `crossbeam-channel` (per ADR-006 consequences).
-
-## When writing `core::profile`
-
-- [ ] Resolve OQ-2: verify `toml = "1"` API matches needs, or pin to `"0.8"`.
-- [ ] Resolve OQ-3: decide whether profiles serialize `nmea0183` types directly (requires enabling the `serde` feature on the `nmea0183` dependency in `talker/Cargo.toml`) or via a `talker`-side representation.
-- [ ] Implement `PROFILE_SCHEMA_VERSION: u32` constant and version check on every load (per ADR-013).
-- [ ] Apply `#[serde(default)]` to all profile fields from the first commit (per ADR-013).
-- [ ] Apply `#[non_exhaustive]` to profile enums (per ADR-013).
-
-## When writing the README
+## When writing the project README
 
 - [ ] Document the system packages required on Linux for `eframe` (`libxcb`, `libxkbcommon`, etc.) per ADR-003 consequences.
 - [ ] Document MSRV and the `rustup update stable` requirement per ADR-008.
 
-## Pre-publication of `nmea0183` (workspace change)
+## Future work — out of scope for spec v2.0
 
-- [ ] Update `talker/Cargo.toml`: `nmea0183 = { path = "../nmea0183", version = "0.1" }` (per OQ-1).
+- **AIS as a sendable `talker` payload.** The `nmea0183` crate already builds and parses `!AIVDM`/`!AIVDO` and armors the 6-bit payload, but spec v2.0 §5.1 lists exactly five message formats and AIS is not one of them. Exposing AIS in the `talker` message editor — whether as pre-armored raw bytes or as a structured per-message-type editor (Type 1/5/18/24…) — is a feature beyond the current spec. Revisit only with a spec amendment. See the ADR-012 context note and the 2026-05-22 discussion.
+
+---
+
+## Completed during the spec v2.0 upgrade
+
+The sections below were open in TODO v1.0 and are now done; kept here so the history is not lost.
+
+- **`nmea0183` source** — serde derives on all public types are gated behind the `serde` feature, and verified to compile both with and without it (`cargo build -p nmea0183` / `--features serde`).
+- **`core::logging`** — `tracing-appender` added to workspace dependencies for rotating file output; dual-mode subscriber implemented (CLI writes to stdout/file; the GUI captures events into a `tracing_subscriber::Layer` that forwards to the UI thread via `crossbeam-channel`).
+- **`core::profile`** — schema v2 with `CURRENT_VERSION` checked on every load; `#[serde(default)]` on all fields; `#[non_exhaustive]` on profile enums. OQ-2 (`toml = "1"` is sufficient) and OQ-3 (profiles use a `talker`-side NMEA representation, so the `nmea0183` `serde` feature stays off) are resolved — see the Open questions section of the ADR.
