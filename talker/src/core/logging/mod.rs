@@ -13,17 +13,37 @@ pub use gui_layer::{GuiLogLayer, LogEvent};
 // ── Config types ──────────────────────────────────────────────────────────────
 
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoggingConfig {
     #[serde(default)]
     pub level: LogLevel,
+    /// Whether log events are written to stdout.
+    #[serde(default = "default_true")]
+    pub stdout: bool,
     #[serde(default)]
     pub file: Option<FileLogConfig>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: LogLevel::default(),
+            stdout: true,
+            file: None,
+        }
+    }
+}
+
 impl LoggingConfig {
     pub fn new(level: LogLevel) -> Self {
-        Self { level, file: None }
+        Self {
+            level,
+            ..Self::default()
+        }
     }
 }
 
@@ -114,10 +134,12 @@ pub fn init(
 
     // Build all layers into a single vec so the subscriber type stays
     // `Registry` throughout and dynamic dispatch compiles cleanly.
-    let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync + 'static>> = vec![
-        Box::new(to_level_filter(config.level)),
-        tracing_subscriber::fmt::layer().with_target(false).boxed(),
-    ];
+    let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync + 'static>> =
+        vec![Box::new(to_level_filter(config.level))];
+
+    if config.stdout {
+        layers.push(tracing_subscriber::fmt::layer().with_target(false).boxed());
+    }
 
     if let Some(fc) = &config.file {
         let appender = make_rolling_appender(fc);
@@ -141,6 +163,13 @@ pub fn init(
         .context("installing global tracing subscriber (already initialized?)")?;
 
     Ok(LoggingHandle { _guards: guards })
+}
+
+/// The OS-appropriate directory for log files when no path is configured.
+///
+/// Returns `None` if the platform's local-data directory cannot be determined.
+pub fn default_log_dir() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("talker").join("logs"))
 }
 
 fn to_level_filter(level: LogLevel) -> LevelFilter {
@@ -200,6 +229,19 @@ mod tests {
     }
 
     #[test]
+    fn logging_config_defaults_stdout_on() {
+        assert!(LoggingConfig::default().stdout);
+        assert!(LoggingConfig::new(LogLevel::Debug).stdout);
+    }
+
+    #[test]
+    fn logging_config_deserializes_stdout_default() {
+        // A config without a `stdout` key defaults to enabled.
+        let c: LoggingConfig = serde_json::from_str(r#"{"level":"info"}"#).unwrap();
+        assert!(c.stdout);
+    }
+
+    #[test]
     fn logging_config_new() {
         let c = LoggingConfig::new(LogLevel::Debug);
         assert_eq!(c.level, LogLevel::Debug);
@@ -229,6 +271,7 @@ mod tests {
     fn logging_config_round_trip_with_file() {
         let c = LoggingConfig {
             level: LogLevel::Debug,
+            stdout: false,
             file: Some(FileLogConfig {
                 directory: PathBuf::from("/var/log/talker"),
                 prefix: "app.log".to_string(),
