@@ -6,10 +6,12 @@
 
 mod checksum;
 mod codepage;
+mod marker;
 mod timestamp;
 
 pub use checksum::{ChecksumAlgorithm, ChecksumConfig};
 pub use codepage::CodePage;
+pub use marker::{segments, Segment};
 pub use timestamp::TimestampConfig;
 
 use serde::{Deserialize, Serialize};
@@ -151,13 +153,13 @@ impl PayloadConfig {
     pub fn compile(&self) -> anyhow::Result<Vec<u8>> {
         match self {
             Self::RawHex { data } => compile_hex(data),
-            Self::Utf8 { text } => Ok(text.clone().into_bytes()),
+            Self::Utf8 { text } => Ok(compile_utf8(text)),
             Self::Utf16 {
                 text,
                 byte_order,
                 bom,
             } => Ok(encode_utf16(text, *byte_order, *bom)),
-            Self::Ascii { text, code_page } => codepage::encode(text, *code_page),
+            Self::Ascii { text, code_page } => compile_ascii(text, *code_page),
             Self::Nmea {
                 talker,
                 sentence_type,
@@ -180,6 +182,30 @@ fn compile_hex(data: &str) -> anyhow::Result<Vec<u8>> {
                 .map_err(|_| anyhow::anyhow!("invalid hex byte {:?} in {data:?}", &clean[i..i + 2]))
         })
         .collect()
+}
+
+/// Encode UTF-8 text, expanding `‹XX›` markers to raw bytes (spec §5.3).
+fn compile_utf8(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    for (range, segment) in segments(text) {
+        match segment {
+            Segment::Text => out.extend_from_slice(text[range].as_bytes()),
+            Segment::Byte(b) => out.push(b),
+        }
+    }
+    out
+}
+
+/// Encode ASCII text with `code_page`, expanding `‹XX›` markers to raw bytes.
+fn compile_ascii(text: &str, code_page: CodePage) -> anyhow::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for (range, segment) in segments(text) {
+        match segment {
+            Segment::Text => out.extend(codepage::encode(&text[range], code_page)?),
+            Segment::Byte(b) => out.push(b),
+        }
+    }
+    Ok(out)
 }
 
 fn encode_utf16(text: &str, byte_order: ByteOrder, bom: bool) -> Vec<u8> {
@@ -300,6 +326,23 @@ mod tests {
             code_page: CodePage::Iso8859_1,
         };
         assert!(p.compile().is_err());
+    }
+
+    #[test]
+    fn compile_utf8_expands_byte_markers() {
+        let p = PayloadConfig::Utf8 {
+            text: "AB‹0D›‹0A›".to_string(),
+        };
+        assert_eq!(p.compile().unwrap(), vec![0x41, 0x42, 0x0D, 0x0A]);
+    }
+
+    #[test]
+    fn compile_ascii_expands_byte_markers() {
+        let p = PayloadConfig::Ascii {
+            text: "X‹FF›Y".to_string(),
+            code_page: CodePage::Iso8859_1,
+        };
+        assert_eq!(p.compile().unwrap(), vec![0x58, 0xFF, 0x59]);
     }
 
     // ── NMEA ──────────────────────────────────────────────────────────────────

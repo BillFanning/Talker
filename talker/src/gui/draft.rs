@@ -242,6 +242,8 @@ pub struct ScheduleDraft {
     pub checksum_enabled: bool,
     pub checksum_algorithm: ChecksumAlgorithm,
     pub checksum_wrong: bool,
+    /// Scratch buffer for the Insert Byte popup; not part of the message.
+    pub insert_byte_hex: String,
 }
 
 impl Default for ScheduleDraft {
@@ -266,6 +268,7 @@ impl Default for ScheduleDraft {
             checksum_enabled: false,
             checksum_algorithm: ChecksumAlgorithm::default(),
             checksum_wrong: false,
+            insert_byte_hex: String::new(),
         }
     }
 }

@@ -12,7 +12,7 @@ use egui::{Align, Layout, ScrollArea};
 use crate::core::{
     channel::ChannelConfig,
     logging::{LogEvent, LoggingConfig},
-    message::{ChecksumAlgorithm, CodePage},
+    message::{segments, ChecksumAlgorithm, CodePage, Segment},
     profile::Profile,
     scheduler::Schedule,
 };
@@ -893,11 +893,16 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
         }
         PayloadKind::Utf8 => {
             ui.label("Text");
-            ui.add(
-                egui::TextEdit::singleline(&mut entry.utf8_text)
-                    .desired_width(360.0)
-                    .hint_text("Unicode text"),
-            );
+            ui.horizontal(|ui| {
+                let mut layouter = marker_layouter;
+                ui.add(
+                    egui::TextEdit::singleline(&mut entry.utf8_text)
+                        .desired_width(300.0)
+                        .hint_text("Unicode text")
+                        .layouter(&mut layouter),
+                );
+                show_insert_byte_button(ui, &mut entry.utf8_text, &mut entry.insert_byte_hex);
+            });
             ui.end_row();
         }
         PayloadKind::Utf16 => {
@@ -919,11 +924,16 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
         }
         PayloadKind::Ascii => {
             ui.label("Text");
-            ui.add(
-                egui::TextEdit::singleline(&mut entry.ascii_text)
-                    .desired_width(360.0)
-                    .hint_text("text"),
-            );
+            ui.horizontal(|ui| {
+                let mut layouter = marker_layouter;
+                ui.add(
+                    egui::TextEdit::singleline(&mut entry.ascii_text)
+                        .desired_width(300.0)
+                        .hint_text("text")
+                        .layouter(&mut layouter),
+                );
+                show_insert_byte_button(ui, &mut entry.ascii_text, &mut entry.insert_byte_hex);
+            });
             ui.end_row();
             ui.label("Code page");
             egui::ComboBox::from_id_salt("code_page")
@@ -1058,6 +1068,59 @@ fn checksum_label(algorithm: ChecksumAlgorithm) -> &'static str {
 }
 
 // ── Field renderers ───────────────────────────────────────────────────────────
+
+/// Lay out a UTF-8/ASCII text field, drawing `‹XX›` byte markers in a
+/// distinct colour from surrounding text (spec §5.3).
+fn marker_layouter(
+    ui: &egui::Ui,
+    buf: &dyn egui::TextBuffer,
+    wrap_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let text = buf.as_str();
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let normal = ui.visuals().text_color();
+    let marker = egui::Color32::from_rgb(110, 170, 255);
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    for (range, segment) in segments(text) {
+        let color = match segment {
+            Segment::Byte(_) => marker,
+            Segment::Text => normal,
+        };
+        job.append(
+            &text[range],
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color,
+                ..Default::default()
+            },
+        );
+    }
+    ui.fonts_mut(|f| f.layout_job(job))
+}
+
+/// An "Insert Byte" button whose popup appends a `‹XX›` marker to `text`.
+fn show_insert_byte_button(ui: &mut egui::Ui, text: &mut String, hex: &mut String) {
+    ui.menu_button("Insert Byte", |ui| {
+        ui.label("Byte value (hex):");
+        let resp = ui.add(
+            egui::TextEdit::singleline(hex)
+                .desired_width(48.0)
+                .hint_text("1B"),
+        );
+        let value = u8::from_str_radix(hex.trim(), 16).ok();
+        let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let insert = ui.add_enabled(value.is_some(), egui::Button::new("Insert"));
+        if let Some(b) = value {
+            if insert.clicked() || entered {
+                text.push_str(&format!("\u{2039}{b:02X}\u{203A}"));
+                hex.clear();
+                ui.close();
+            }
+        }
+    });
+}
 
 /// Render a channel's real-time outbound display pane (spec §5.7).
 fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay) {
