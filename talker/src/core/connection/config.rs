@@ -100,15 +100,28 @@ pub struct UdpConfig {
 
 impl UdpConfig {
     pub fn unicast(destination: SocketAddr) -> Self {
-        Self { mode: UdpMode::Unicast { destination }, local_port: None }
+        Self {
+            mode: UdpMode::Unicast { destination },
+            local_port: None,
+        }
     }
 
     pub fn broadcast(destination: SocketAddr) -> Self {
-        Self { mode: UdpMode::Broadcast { destination }, local_port: None }
+        Self {
+            mode: UdpMode::Broadcast { destination },
+            local_port: None,
+        }
     }
 
     pub fn multicast(group: Ipv4Addr, port: u16) -> Self {
-        Self { mode: UdpMode::Multicast { group, port, interface: None }, local_port: None }
+        Self {
+            mode: UdpMode::Multicast {
+                group,
+                port,
+                interface: None,
+            },
+            local_port: None,
+        }
     }
 }
 
@@ -116,8 +129,12 @@ impl UdpConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UdpMode {
-    Unicast { destination: SocketAddr },
-    Broadcast { destination: SocketAddr },
+    Unicast {
+        destination: SocketAddr,
+    },
+    Broadcast {
+        destination: SocketAddr,
+    },
     Multicast {
         group: Ipv4Addr,
         port: u16,

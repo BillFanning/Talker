@@ -134,7 +134,10 @@ fn custom_talker_and_sentence_type_round_trip() {
     assert!(wire.starts_with("$HQXYZ,abc*"));
     let parsed = NmeaSentence::parse(&wire).unwrap();
     assert_eq!(parsed.talker_id, TalkerId::Custom("HQ".to_string()));
-    assert_eq!(parsed.sentence_type, SentenceType::Custom("XYZ".to_string()));
+    assert_eq!(
+        parsed.sentence_type,
+        SentenceType::Custom("XYZ".to_string())
+    );
 }
 
 // ── Parse error cases ─────────────────────────────────────────────────────────
@@ -145,7 +148,13 @@ fn parse_rejects_bad_checksum() {
         "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*48\r\n",
     )
     .unwrap_err();
-    assert!(matches!(err, NmeaError::InvalidChecksum { expected: 0x48, computed: 0x47 }));
+    assert!(matches!(
+        err,
+        NmeaError::InvalidChecksum {
+            expected: 0x48,
+            computed: 0x47
+        }
+    ));
 }
 
 #[test]
@@ -194,7 +203,14 @@ fn pashr_round_trip_no_utc() {
 fn pashr_round_trip_with_utc() {
     let d = PashrData::new(
         Some("235959.99".to_string()),
-        0.00, 0.00, 0.00, 0.00, 0.001, 0.001, 0.010, 0,
+        0.00,
+        0.00,
+        0.00,
+        0.00,
+        0.001,
+        0.001,
+        0.010,
+        0,
     );
     let wire = ProprietarySentence::Pashr(d.clone()).to_wire();
     let parsed = ProprietarySentence::parse(&wire).unwrap();
@@ -228,7 +244,10 @@ fn raw_proprietary_no_fields() {
 #[test]
 fn top_level_parse_routes_standard() {
     let wire = NmeaSentence::new(TalkerId::GP, SentenceType::RMC, vec![]).to_wire();
-    assert!(matches!(parse(&wire).unwrap(), AnyNmeaSentence::Standard(_)));
+    assert!(matches!(
+        parse(&wire).unwrap(),
+        AnyNmeaSentence::Standard(_)
+    ));
 }
 
 #[test]

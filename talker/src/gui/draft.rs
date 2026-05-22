@@ -2,8 +2,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use crate::core::{
     connection::{
-        ConnectionConfig, DataBits, FlowControl, Parity, SerialConfig, StopBits,
-        TcpClientConfig, UdpConfig, UdpMode,
+        ConnectionConfig, DataBits, FlowControl, Parity, SerialConfig, StopBits, TcpClientConfig,
+        UdpConfig, UdpMode,
     },
     scheduler::{PayloadConfig, ScheduleEntryConfig},
 };
@@ -31,9 +31,9 @@ pub struct ConnDraft {
     pub baud_rate: u32,
     pub baud_custom: String, // text buffer for non-preset baud rates
     pub data_bits: u8,
-    pub parity: u8,        // 0=None 1=Odd 2=Even
-    pub stop_bits: u8,     // 1 or 2
-    pub flow_control: u8,  // 0=None 1=Software 2=Hardware
+    pub parity: u8,       // 0=None 1=Odd 2=Even
+    pub stop_bits: u8,    // 1 or 2
+    pub flow_control: u8, // 0=None 1=Software 2=Hardware
     // udp
     pub udp_mode: UdpModeDraft,
     pub udp_dest: String,    // unicast / broadcast destination (host:port)
@@ -71,47 +71,57 @@ impl From<&ConnectionConfig> for ConnDraft {
             ConnectionConfig::Serial(s) => {
                 const PRESETS: &[u32] = &[4800, 9600, 19200, 38400, 57600, 115200];
                 Self {
-                kind: ConnKind::Serial,
-                serial_port: s.port.clone(),
-                baud_rate: s.baud_rate,
-                baud_custom: if PRESETS.contains(&s.baud_rate) {
-                    String::new()
-                } else {
-                    s.baud_rate.to_string()
-                },
-                data_bits: match s.data_bits {
-                    DataBits::Five => 5,
-                    DataBits::Six => 6,
-                    DataBits::Seven => 7,
-                    _ => 8,
-                },
-                parity: match s.parity {
-                    Parity::Odd => 1,
-                    Parity::Even => 2,
-                    _ => 0,
-                },
-                stop_bits: match s.stop_bits {
-                    StopBits::Two => 2,
-                    _ => 1,
-                },
-                flow_control: match s.flow_control {
-                    FlowControl::Software => 1,
-                    FlowControl::Hardware => 2,
-                    _ => 0,
-                },
-                ..Default::default()
-            }}
+                    kind: ConnKind::Serial,
+                    serial_port: s.port.clone(),
+                    baud_rate: s.baud_rate,
+                    baud_custom: if PRESETS.contains(&s.baud_rate) {
+                        String::new()
+                    } else {
+                        s.baud_rate.to_string()
+                    },
+                    data_bits: match s.data_bits {
+                        DataBits::Five => 5,
+                        DataBits::Six => 6,
+                        DataBits::Seven => 7,
+                        _ => 8,
+                    },
+                    parity: match s.parity {
+                        Parity::Odd => 1,
+                        Parity::Even => 2,
+                        _ => 0,
+                    },
+                    stop_bits: match s.stop_bits {
+                        StopBits::Two => 2,
+                        _ => 1,
+                    },
+                    flow_control: match s.flow_control {
+                        FlowControl::Software => 1,
+                        FlowControl::Hardware => 2,
+                        _ => 0,
+                    },
+                    ..Default::default()
+                }
+            }
             ConnectionConfig::Udp(u) => {
                 let (udp_mode, udp_dest, udp_group, udp_mc_port) = match &u.mode {
-                    UdpMode::Unicast { destination } => {
-                        (UdpModeDraft::Unicast, destination.to_string(), String::new(), String::new())
-                    }
-                    UdpMode::Broadcast { destination } => {
-                        (UdpModeDraft::Broadcast, destination.to_string(), String::new(), String::new())
-                    }
-                    UdpMode::Multicast { group, port, .. } => {
-                        (UdpModeDraft::Multicast, String::new(), group.to_string(), port.to_string())
-                    }
+                    UdpMode::Unicast { destination } => (
+                        UdpModeDraft::Unicast,
+                        destination.to_string(),
+                        String::new(),
+                        String::new(),
+                    ),
+                    UdpMode::Broadcast { destination } => (
+                        UdpModeDraft::Broadcast,
+                        destination.to_string(),
+                        String::new(),
+                        String::new(),
+                    ),
+                    UdpMode::Multicast { group, port, .. } => (
+                        UdpModeDraft::Multicast,
+                        String::new(),
+                        group.to_string(),
+                        port.to_string(),
+                    ),
                 };
                 Self {
                     kind: ConnKind::Udp,
@@ -154,7 +164,11 @@ impl ConnDraft {
                         2 => Parity::Even,
                         _ => Parity::None,
                     },
-                    stop_bits: if self.stop_bits == 2 { StopBits::Two } else { StopBits::One },
+                    stop_bits: if self.stop_bits == 2 {
+                        StopBits::Two
+                    } else {
+                        StopBits::One
+                    },
                     flow_control: match self.flow_control {
                         1 => FlowControl::Software,
                         2 => FlowControl::Hardware,
@@ -175,14 +189,20 @@ impl ConnDraft {
                     UdpModeDraft::Multicast => {
                         let group: Ipv4Addr = self.udp_group.parse().ok()?;
                         let port: u16 = self.udp_mc_port.parse().ok()?;
-                        UdpMode::Multicast { group, port, interface: None }
+                        UdpMode::Multicast {
+                            group,
+                            port,
+                            interface: None,
+                        }
                     }
                 };
                 Some(ConnectionConfig::Udp(UdpConfig { mode, local_port }))
             }
             ConnKind::Tcp => {
                 let addr: SocketAddr = self.tcp_addr.parse().ok()?;
-                Some(ConnectionConfig::TcpClient(TcpClientConfig { address: addr }))
+                Some(ConnectionConfig::TcpClient(TcpClientConfig {
+                    address: addr,
+                }))
             }
         }
     }
@@ -230,7 +250,11 @@ impl From<&ScheduleEntryConfig> for ScheduleDraft {
                 interval_ms: e.interval_ms.to_string(),
                 ..Default::default()
             },
-            PayloadConfig::Nmea { talker, sentence_type, fields } => Self {
+            PayloadConfig::Nmea {
+                talker,
+                sentence_type,
+                fields,
+            } => Self {
                 payload_kind: PayloadKind::Nmea,
                 nmea_talker: talker.clone(),
                 nmea_sentence_type: sentence_type.clone(),

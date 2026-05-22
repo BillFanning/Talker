@@ -114,12 +114,18 @@ mod tests {
 
     #[test]
     fn encode_u16_be() {
-        assert_eq!(BinaryField::U16(0x1234, ByteOrder::BigEndian).encode(), vec![0x12, 0x34]);
+        assert_eq!(
+            BinaryField::U16(0x1234, ByteOrder::BigEndian).encode(),
+            vec![0x12, 0x34]
+        );
     }
 
     #[test]
     fn encode_u16_le() {
-        assert_eq!(BinaryField::U16(0x1234, ByteOrder::LittleEndian).encode(), vec![0x34, 0x12]);
+        assert_eq!(
+            BinaryField::U16(0x1234, ByteOrder::LittleEndian).encode(),
+            vec![0x34, 0x12]
+        );
     }
 
     // ── u24 ──────────────────────────────────────────────────────────────────
@@ -127,24 +133,36 @@ mod tests {
     #[test]
     fn encode_u24_be() {
         // 0x123456 big-endian → [0x12, 0x34, 0x56]
-        assert_eq!(BinaryField::U24(0x123456, ByteOrder::BigEndian).encode(), vec![0x12, 0x34, 0x56]);
+        assert_eq!(
+            BinaryField::U24(0x123456, ByteOrder::BigEndian).encode(),
+            vec![0x12, 0x34, 0x56]
+        );
     }
 
     #[test]
     fn encode_u24_le() {
         // 0x123456 little-endian → [0x56, 0x34, 0x12]
-        assert_eq!(BinaryField::U24(0x123456, ByteOrder::LittleEndian).encode(), vec![0x56, 0x34, 0x12]);
+        assert_eq!(
+            BinaryField::U24(0x123456, ByteOrder::LittleEndian).encode(),
+            vec![0x56, 0x34, 0x12]
+        );
     }
 
     #[test]
     fn encode_u24_max() {
         // All 24 bits set
-        assert_eq!(BinaryField::U24(0xFFFFFF, ByteOrder::BigEndian).encode(), vec![0xFF, 0xFF, 0xFF]);
+        assert_eq!(
+            BinaryField::U24(0xFFFFFF, ByteOrder::BigEndian).encode(),
+            vec![0xFF, 0xFF, 0xFF]
+        );
     }
 
     #[test]
     fn encode_u24_zero() {
-        assert_eq!(BinaryField::U24(0, ByteOrder::BigEndian).encode(), vec![0x00, 0x00, 0x00]);
+        assert_eq!(
+            BinaryField::U24(0, ByteOrder::BigEndian).encode(),
+            vec![0x00, 0x00, 0x00]
+        );
     }
 
     // ── u32 ──────────────────────────────────────────────────────────────────

@@ -54,9 +54,14 @@ impl ScheduleConfig {
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let payload =
-                    e.payload.compile().with_context(|| format!("compiling schedule entry {i}"))?;
-                Ok(ScheduleEntry { payload, interval: Duration::from_millis(e.interval_ms) })
+                let payload = e
+                    .payload
+                    .compile()
+                    .with_context(|| format!("compiling schedule entry {i}"))?;
+                Ok(ScheduleEntry {
+                    payload,
+                    interval: Duration::from_millis(e.interval_ms),
+                })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         Schedule::new(entries)
@@ -94,8 +99,14 @@ mod tests {
     #[test]
     fn next_entry_advances_cursor() {
         let mut s = Schedule::new(vec![
-            ScheduleEntry { payload: vec![1], interval: Duration::from_millis(100) },
-            ScheduleEntry { payload: vec![2], interval: Duration::from_millis(200) },
+            ScheduleEntry {
+                payload: vec![1],
+                interval: Duration::from_millis(100),
+            },
+            ScheduleEntry {
+                payload: vec![2],
+                interval: Duration::from_millis(200),
+            },
         ])
         .unwrap();
 
@@ -106,8 +117,14 @@ mod tests {
     #[test]
     fn next_entry_wraps_to_start() {
         let mut s = Schedule::new(vec![
-            ScheduleEntry { payload: vec![1], interval: Duration::from_millis(100) },
-            ScheduleEntry { payload: vec![2], interval: Duration::from_millis(200) },
+            ScheduleEntry {
+                payload: vec![1],
+                interval: Duration::from_millis(100),
+            },
+            ScheduleEntry {
+                payload: vec![2],
+                interval: Duration::from_millis(200),
+            },
         ])
         .unwrap();
 

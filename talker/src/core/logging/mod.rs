@@ -250,8 +250,17 @@ mod tests {
 
     #[test]
     fn rotation_serde_uses_snake_case() {
-        assert_eq!(serde_json::to_string(&Rotation::Never).unwrap(), "\"never\"");
-        assert_eq!(serde_json::to_string(&Rotation::Hourly).unwrap(), "\"hourly\"");
-        assert_eq!(serde_json::to_string(&Rotation::Daily).unwrap(), "\"daily\"");
+        assert_eq!(
+            serde_json::to_string(&Rotation::Never).unwrap(),
+            "\"never\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Rotation::Hourly).unwrap(),
+            "\"hourly\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Rotation::Daily).unwrap(),
+            "\"daily\""
+        );
     }
 }

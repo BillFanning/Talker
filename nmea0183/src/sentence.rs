@@ -16,7 +16,11 @@ pub struct NmeaSentence {
 
 impl NmeaSentence {
     pub fn new(talker_id: TalkerId, sentence_type: SentenceType, fields: Vec<String>) -> Self {
-        Self { talker_id, sentence_type, fields }
+        Self {
+            talker_id,
+            sentence_type,
+            fields,
+        }
     }
 
     /// Return the field at `index`, or `None` if out of range.
@@ -39,7 +43,9 @@ impl NmeaSentence {
     /// Validates the checksum. Does not accept proprietary `$P...` sentences.
     pub fn parse(line: &str) -> Result<Self, NmeaError> {
         let line = line.trim_end_matches(['\r', '\n']);
-        let rest = line.strip_prefix('$').ok_or(NmeaError::MissingLeadingDollar)?;
+        let rest = line
+            .strip_prefix('$')
+            .ok_or(NmeaError::MissingLeadingDollar)?;
 
         if rest.starts_with('P') {
             return Err(NmeaError::Parse(
@@ -80,7 +86,11 @@ impl NmeaSentence {
             fields_str.split(',').map(str::to_string).collect()
         };
 
-        Ok(Self { talker_id, sentence_type, fields })
+        Ok(Self {
+            talker_id,
+            sentence_type,
+            fields,
+        })
     }
 
     fn payload(&self) -> String {
@@ -124,7 +134,10 @@ mod tests {
             "".to_string(),
         ];
         let s = NmeaSentence::new(TalkerId::GP, SentenceType::GGA, fields);
-        assert_eq!(s.to_wire(), "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n");
+        assert_eq!(
+            s.to_wire(),
+            "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n"
+        );
     }
 
     #[test]

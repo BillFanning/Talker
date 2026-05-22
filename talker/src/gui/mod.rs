@@ -14,15 +14,14 @@ use crate::core::{
 };
 
 use draft::{ConnDraft, ConnKind, PayloadKind, ScheduleDraft, UdpModeDraft};
-use thread::{TalkerCommand, TalkerHandle, TalkerStatus, run_talker};
+use thread::{run_talker, TalkerCommand, TalkerHandle, TalkerStatus};
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
     let (log_tx, log_rx) = crossbeam_channel::bounded::<LogEvent>(512);
-    let _logging =
-        crate::core::logging::init(&LoggingConfig::default(), Some(log_tx))
-            .context("initializing logging")?;
+    let _logging = crate::core::logging::init(&LoggingConfig::default(), Some(log_tx))
+        .context("initializing logging")?;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 740.0]),
@@ -31,7 +30,14 @@ pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
     eframe::run_native(
         "Talker",
         options,
-        Box::new(move |cc| Ok(Box::new(TalkerApp::new(log_rx, initial_profile, &cc.egui_ctx, cc.storage)))),
+        Box::new(move |cc| {
+            Ok(Box::new(TalkerApp::new(
+                log_rx,
+                initial_profile,
+                &cc.egui_ctx,
+                cc.storage,
+            )))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -113,8 +119,12 @@ impl TalkerApp {
 
     fn can_start_connection(&self, i: usize) -> bool {
         !self.is_connection_running(i)
-            && self.conn_drafts.get(i).is_some_and(|d| d.to_config().is_some())
-            && self.sched_drafts
+            && self
+                .conn_drafts
+                .get(i)
+                .is_some_and(|d| d.to_config().is_some())
+            && self
+                .sched_drafts
                 .get(i)
                 .is_some_and(|s| s.iter().any(|d| d.to_entry_config().is_some()))
     }
@@ -133,7 +143,11 @@ impl TalkerApp {
     }
 
     fn window_title(&self) -> String {
-        let name = if self.profile.name.is_empty() { "unnamed" } else { &self.profile.name };
+        let name = if self.profile.name.is_empty() {
+            "unnamed"
+        } else {
+            &self.profile.name
+        };
         let star = if self.dirty { " *" } else { "" };
         if self.profile_path.is_none() && !self.dirty {
             "Talker".to_string()
@@ -216,8 +230,11 @@ impl TalkerApp {
         let path = match &self.profile_path {
             Some(p) => p.clone(),
             None => {
-                let stem =
-                    if self.profile.name.is_empty() { "profile" } else { &self.profile.name };
+                let stem = if self.profile.name.is_empty() {
+                    "profile"
+                } else {
+                    &self.profile.name
+                };
                 let name = format!("{stem}.toml");
                 let Some(p) = rfd::FileDialog::new()
                     .add_filter("TOML Profile", &["toml"])
@@ -274,15 +291,24 @@ impl TalkerApp {
         let mut connections = ConnectionCollection::new();
         connections.push(conn);
 
-        if i < self.conn_errors.len() { self.conn_errors[i] = None; }
-        if i < self.sent_counts.len() { self.sent_counts[i] = 0; }
+        if i < self.conn_errors.len() {
+            self.conn_errors[i] = None;
+        }
+        if i < self.sent_counts.len() {
+            self.sent_counts[i] = 0;
+        }
 
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(32);
         let (status_tx, status_rx) = crossbeam_channel::bounded(256);
-        let thread = std::thread::spawn(move || run_talker(connections, schedule, cmd_rx, status_tx));
+        let thread =
+            std::thread::spawn(move || run_talker(connections, schedule, cmd_rx, status_tx));
 
         if i < self.talkers.len() {
-            self.talkers[i] = Some(TalkerHandle { cmd_tx, status_rx, thread });
+            self.talkers[i] = Some(TalkerHandle {
+                cmd_tx,
+                status_rx,
+                thread,
+            });
         }
         let entry_count = self.profile.schedules.get(i).map_or(0, |s| s.entries.len());
         tracing::info!("connection {i} started ({entry_count}-entry schedule)");
@@ -316,19 +342,26 @@ impl TalkerApp {
     }
 
     fn flush_drafts_to_profile(&mut self) {
-        self.profile.connections =
-            self.conn_drafts.iter().filter_map(|d| d.to_config()).collect();
+        self.profile.connections = self
+            .conn_drafts
+            .iter()
+            .filter_map(|d| d.to_config())
+            .collect();
         self.profile.schedules = self
             .sched_drafts
             .iter()
-            .map(|entries| crate::core::scheduler::ScheduleConfig::new(
-                entries.iter().filter_map(|d| d.to_entry_config()).collect(),
-            ))
+            .map(|entries| {
+                crate::core::scheduler::ScheduleConfig::new(
+                    entries.iter().filter_map(|d| d.to_entry_config()).collect(),
+                )
+            })
             .collect();
     }
 
     fn apply_connection(&mut self, i: usize) {
-        let Some(cfg) = self.conn_drafts[i].to_config() else { return };
+        let Some(cfg) = self.conn_drafts[i].to_config() else {
+            return;
+        };
         if i < self.profile.connections.len() {
             self.profile.connections[i] = cfg.clone();
         } else {
@@ -353,9 +386,15 @@ impl TalkerApp {
                 ctrl && inp.key_pressed(egui::Key::S),
             )
         });
-        if new  { self.new_profile(); }
-        if load { self.load_profile_dialog(); }
-        if save { self.save_profile(); }
+        if new {
+            self.new_profile();
+        }
+        if load {
+            self.load_profile_dialog();
+        }
+        if save {
+            self.save_profile();
+        }
 
         for event in self.log_rx.try_iter() {
             let ts = event.timestamp.format("%H:%M:%S%.3f");
@@ -382,12 +421,18 @@ impl TalkerApp {
             for status in statuses {
                 match status {
                     TalkerStatus::SendCount(n) => {
-                        if i < self.sent_counts.len() { self.sent_counts[i] = n; }
-                        if i < self.conn_errors.len() { self.conn_errors[i] = None; }
+                        if i < self.sent_counts.len() {
+                            self.sent_counts[i] = n;
+                        }
+                        if i < self.conn_errors.len() {
+                            self.conn_errors[i] = None;
+                        }
                     }
                     TalkerStatus::ConnectionError { message, .. } => {
                         self.error_count += 1;
-                        if i < self.conn_errors.len() { self.conn_errors[i] = Some(message); }
+                        if i < self.conn_errors.len() {
+                            self.conn_errors[i] = Some(message);
+                        }
                     }
                 }
             }
@@ -426,7 +471,8 @@ impl eframe::App for TalkerApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        let path_str = self.profile_path
+        let path_str = self
+            .profile_path
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
@@ -443,9 +489,8 @@ impl TalkerApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("Profile:");
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.profile.name).desired_width(160.0),
-                );
+                let r =
+                    ui.add(egui::TextEdit::singleline(&mut self.profile.name).desired_width(160.0));
                 if r.changed() {
                     self.dirty = true;
                 }
@@ -468,8 +513,14 @@ impl TalkerApp {
                 let r_plus = ui.small_button("+");
 
                 let minus_down = r_minus.is_pointer_button_down_on();
-                let plus_down  = r_plus.is_pointer_button_down_on();
-                let direction: f32 = if minus_down { -1.0 } else if plus_down { 1.0 } else { 0.0 };
+                let plus_down = r_plus.is_pointer_button_down_on();
+                let direction: f32 = if minus_down {
+                    -1.0
+                } else if plus_down {
+                    1.0
+                } else {
+                    0.0
+                };
 
                 if direction != 0.0 {
                     let dt = ui.ctx().input(|i| i.stable_dt);
@@ -530,12 +581,14 @@ impl TalkerApp {
                 let running = self.talkers.iter().filter(|t| t.is_some()).count();
                 let total = self.talkers.len();
                 let (color, label) = if running > 0 {
-                    (egui::Color32::from_rgb(80, 200, 80),
-                     if running == total && total > 0 {
-                         "\u{25cf} All running".to_string()
-                     } else {
-                         format!("\u{25cf} {running}/{total} running")
-                     })
+                    (
+                        egui::Color32::from_rgb(80, 200, 80),
+                        if running == total && total > 0 {
+                            "\u{25cf} All running".to_string()
+                        } else {
+                            format!("\u{25cf} {running}/{total} running")
+                        },
+                    )
                 } else {
                     (egui::Color32::GRAY, "\u{25cf} Stopped".to_string())
                 };
@@ -596,20 +649,21 @@ impl TalkerApp {
             for i in 0..n {
                 ui.push_id(i, |ui| {
                     let mut conn_frame = egui::Frame::group(ui.style());
-                    conn_frame.stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(70, 85, 120));
+                    conn_frame.stroke =
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(70, 85, 120));
                     conn_frame.show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let error = self.conn_errors.get(i).and_then(|e| e.as_deref());
                             let running = self.is_connection_running(i);
-                            let (dot_color, dot_tip): (egui::Color32, &str) =
-                                if !running {
-                                    (egui::Color32::GRAY, "not running")
-                                } else if let Some(msg) = error {
-                                    (egui::Color32::RED, msg)
-                                } else {
-                                    (egui::Color32::from_rgb(80, 200, 80), "ok")
-                                };
-                            ui.colored_label(dot_color, "\u{25cf}").on_hover_text(dot_tip);
+                            let (dot_color, dot_tip): (egui::Color32, &str) = if !running {
+                                (egui::Color32::GRAY, "not running")
+                            } else if let Some(msg) = error {
+                                (egui::Color32::RED, msg)
+                            } else {
+                                (egui::Color32::from_rgb(80, 200, 80), "ok")
+                            };
+                            ui.colored_label(dot_color, "\u{25cf}")
+                                .on_hover_text(dot_tip);
 
                             ui.strong(format!("Connection {}", i + 1));
                             ui.separator();
@@ -619,16 +673,8 @@ impl TalkerApp {
                                 ConnKind::Serial,
                                 "Serial",
                             );
-                            ui.radio_value(
-                                &mut self.conn_drafts[i].kind,
-                                ConnKind::Udp,
-                                "UDP",
-                            );
-                            ui.radio_value(
-                                &mut self.conn_drafts[i].kind,
-                                ConnKind::Tcp,
-                                "TCP",
-                            );
+                            ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Udp, "UDP");
+                            ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Tcp, "TCP");
                             if self.conn_drafts[i].kind != before_kind {
                                 to_apply.push(i);
                             }
@@ -642,13 +688,15 @@ impl TalkerApp {
                                     }
                                 } else {
                                     let can = self.can_start_connection(i);
-                                    let btn = ui.add_enabled(
-                                        can,
-                                        egui::Button::new("\u{25b6}").small(),
-                                    );
-                                    if btn.clicked() { to_start = Some(i); }
+                                    let btn =
+                                        ui.add_enabled(can, egui::Button::new("\u{25b6}").small());
+                                    if btn.clicked() {
+                                        to_start = Some(i);
+                                    }
                                     if !can {
-                                        btn.on_disabled_hover_text("Add a valid schedule entry first");
+                                        btn.on_disabled_hover_text(
+                                            "Add a valid schedule entry first",
+                                        );
                                     }
                                 }
                             });
@@ -683,8 +731,12 @@ impl TalkerApp {
         for i in to_apply {
             self.apply_connection(i);
         }
-        if let Some(i) = to_start { self.start_connection(i); }
-        if let Some(i) = to_stop  { self.stop_connection(i); }
+        if let Some(i) = to_start {
+            self.start_connection(i);
+        }
+        if let Some(i) = to_stop {
+            self.stop_connection(i);
+        }
         if let Some(i) = to_remove {
             self.stop_connection(i);
             self.conn_drafts.remove(i);
@@ -709,7 +761,6 @@ impl TalkerApp {
             self.refresh_serial_ports();
         }
     }
-
 }
 
 // ── Inline schedule editor (one per connection card) ──────────────────────────
@@ -868,95 +919,103 @@ fn show_serial_fields(ui: &mut egui::Ui, conn: &mut ConnDraft, ports: &[String])
     );
     let mut refresh = false;
 
-    egui::Grid::new("serial_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-        ui.label("Port");
-        ui.horizontal(|ui| {
-            let label = if conn.serial_port.is_empty() {
-                "select port\u{2026}".to_string()
-            } else {
-                conn.serial_port.clone()
-            };
-            egui::ComboBox::from_label("")
-                .selected_text(label)
-                .width(180.0)
-                .show_ui(ui, |ui| {
-                    if ports.is_empty() {
-                        ui.weak("No ports found");
-                    } else {
-                        for port in ports {
-                            ui.selectable_value(&mut conn.serial_port, port.clone(), port);
+    egui::Grid::new("serial_grid")
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Port");
+            ui.horizontal(|ui| {
+                let label = if conn.serial_port.is_empty() {
+                    "select port\u{2026}".to_string()
+                } else {
+                    conn.serial_port.clone()
+                };
+                egui::ComboBox::from_label("")
+                    .selected_text(label)
+                    .width(180.0)
+                    .show_ui(ui, |ui| {
+                        if ports.is_empty() {
+                            ui.weak("No ports found");
+                        } else {
+                            for port in ports {
+                                ui.selectable_value(&mut conn.serial_port, port.clone(), port);
+                            }
+                        }
+                    });
+                if ui
+                    .small_button("\u{21ba}")
+                    .on_hover_text("Refresh port list")
+                    .clicked()
+                {
+                    refresh = true;
+                }
+            });
+            ui.end_row();
+
+            ui.label("Baud");
+            ui.horizontal(|ui| {
+                for &baud in &[4800u32, 9600, 19200, 38400, 57600, 115200] {
+                    if ui
+                        .radio_value(&mut conn.baud_rate, baud, baud.to_string())
+                        .clicked()
+                    {
+                        conn.baud_custom.clear();
+                    }
+                }
+                ui.separator();
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut conn.baud_custom)
+                        .desired_width(68.0)
+                        .hint_text("custom"),
+                );
+                if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                    if let Ok(b) = conn.baud_custom.parse::<u32>() {
+                        if b > 0 {
+                            conn.baud_rate = b;
                         }
                     }
-                });
-            if ui
-                .small_button("\u{21ba}")
-                .on_hover_text("Refresh port list")
-                .clicked()
-            {
-                refresh = true;
-            }
-        });
-        ui.end_row();
-
-        ui.label("Baud");
-        ui.horizontal(|ui| {
-            for &baud in &[4800u32, 9600, 19200, 38400, 57600, 115200] {
-                if ui.radio_value(&mut conn.baud_rate, baud, baud.to_string()).clicked() {
-                    conn.baud_custom.clear();
                 }
-            }
-            ui.separator();
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut conn.baud_custom)
-                    .desired_width(68.0)
-                    .hint_text("custom"),
-            );
-            if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                if let Ok(b) = conn.baud_custom.parse::<u32>() {
-                    if b > 0 {
-                        conn.baud_rate = b;
-                    }
-                }
-            }
-        });
-        ui.end_row();
-        if !conn.baud_custom.is_empty() && conn.baud_custom.parse::<u32>().map_or(true, |b| b == 0) {
-            ui.label("");
-            ui.label(err_text("enter a positive baud rate — e.g. 230400"));
+            });
             ui.end_row();
-        }
-
-        ui.label("Data bits");
-        ui.horizontal(|ui| {
-            for &bits in &[5u8, 6, 7, 8] {
-                ui.radio_value(&mut conn.data_bits, bits, bits.to_string());
+            if !conn.baud_custom.is_empty()
+                && conn.baud_custom.parse::<u32>().map_or(true, |b| b == 0)
+            {
+                ui.label("");
+                ui.label(err_text("enter a positive baud rate — e.g. 230400"));
+                ui.end_row();
             }
-        });
-        ui.end_row();
 
-        ui.label("Parity");
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut conn.parity, 0u8, "None");
-            ui.radio_value(&mut conn.parity, 1u8, "Odd");
-            ui.radio_value(&mut conn.parity, 2u8, "Even");
-        });
-        ui.end_row();
+            ui.label("Data bits");
+            ui.horizontal(|ui| {
+                for &bits in &[5u8, 6, 7, 8] {
+                    ui.radio_value(&mut conn.data_bits, bits, bits.to_string());
+                }
+            });
+            ui.end_row();
 
-        ui.label("Stop bits");
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut conn.stop_bits, 1u8, "1");
-            ui.radio_value(&mut conn.stop_bits, 2u8, "2");
-        });
-        ui.end_row();
+            ui.label("Parity");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut conn.parity, 0u8, "None");
+                ui.radio_value(&mut conn.parity, 1u8, "Odd");
+                ui.radio_value(&mut conn.parity, 2u8, "Even");
+            });
+            ui.end_row();
 
-        ui.label("Flow control");
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut conn.flow_control, 0u8, "None");
-            ui.radio_value(&mut conn.flow_control, 1u8, "Software");
-            ui.radio_value(&mut conn.flow_control, 2u8, "Hardware");
+            ui.label("Stop bits");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut conn.stop_bits, 1u8, "1");
+                ui.radio_value(&mut conn.stop_bits, 2u8, "2");
+            });
+            ui.end_row();
+
+            ui.label("Flow control");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut conn.flow_control, 0u8, "None");
+                ui.radio_value(&mut conn.flow_control, 1u8, "Software");
+                ui.radio_value(&mut conn.flow_control, 2u8, "Hardware");
+            });
+            ui.end_row();
         });
-        ui.end_row();
-    });
 
     let after = (
         conn.serial_port.clone(),
@@ -974,95 +1033,98 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     let before_mode = conn.udp_mode;
     let mut apply = false;
 
-    egui::Grid::new("udp_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-        ui.label("Mode");
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Unicast, "Unicast");
-            ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Broadcast, "Broadcast");
-            ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Multicast, "Multicast");
-        });
-        ui.end_row();
-
-        match conn.udp_mode {
-            UdpModeDraft::Unicast | UdpModeDraft::Broadcast => {
-                ui.label("Destination");
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut conn.udp_dest)
-                        .desired_width(220.0)
-                        .hint_text("host:port  (Enter to apply)"),
-                );
-                if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                    apply = true;
-                }
-                ui.end_row();
-                if !conn.udp_dest.is_empty() && conn.udp_dest.parse::<SocketAddr>().is_err() {
-                    ui.label("");
-                    ui.label(err_text("enter host:port — e.g. 192.168.1.100:4000"));
-                    ui.end_row();
-                }
-            }
-            UdpModeDraft::Multicast => {
-                ui.label("Group");
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut conn.udp_group)
-                        .desired_width(140.0)
-                        .hint_text("239.x.x.x  (Enter to apply)"),
-                );
-                if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                    apply = true;
-                }
-                ui.end_row();
-                if !conn.udp_group.is_empty() && conn.udp_group.parse::<Ipv4Addr>().is_err() {
-                    ui.label("");
-                    ui.label(err_text("enter IPv4 multicast address — e.g. 239.0.0.1"));
-                    ui.end_row();
-                }
-
-                ui.label("Port");
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut conn.udp_mc_port)
-                        .desired_width(80.0)
-                        .hint_text("port"),
-                );
-                if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                    apply = true;
-                }
-                ui.end_row();
-                if !conn.udp_mc_port.is_empty() && conn.udp_mc_port.parse::<u16>().is_err() {
-                    ui.label("");
-                    ui.label(err_text("enter a port number 1–65535"));
-                    ui.end_row();
-                }
-            }
-        }
-
-        ui.label("Local port");
-        let r = ui.add(
-            egui::TextEdit::singleline(&mut conn.local_port)
-                .desired_width(80.0)
-                .hint_text("auto"),
-        );
-        if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-            apply = true;
-        }
-        ui.end_row();
-        if !conn.local_port.is_empty() && conn.local_port.parse::<u16>().is_err() {
-            ui.label("");
-            ui.label(err_text("enter a port number 1–65535"));
+    egui::Grid::new("udp_grid")
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Mode");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Unicast, "Unicast");
+                ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Broadcast, "Broadcast");
+                ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Multicast, "Multicast");
+            });
             ui.end_row();
-        }
-    });
+
+            match conn.udp_mode {
+                UdpModeDraft::Unicast | UdpModeDraft::Broadcast => {
+                    ui.label("Destination");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut conn.udp_dest)
+                            .desired_width(220.0)
+                            .hint_text("host:port  (Enter to apply)"),
+                    );
+                    if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                    ui.end_row();
+                    if !conn.udp_dest.is_empty() && conn.udp_dest.parse::<SocketAddr>().is_err() {
+                        ui.label("");
+                        ui.label(err_text("enter host:port — e.g. 192.168.1.100:4000"));
+                        ui.end_row();
+                    }
+                }
+                UdpModeDraft::Multicast => {
+                    ui.label("Group");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut conn.udp_group)
+                            .desired_width(140.0)
+                            .hint_text("239.x.x.x  (Enter to apply)"),
+                    );
+                    if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                    ui.end_row();
+                    if !conn.udp_group.is_empty() && conn.udp_group.parse::<Ipv4Addr>().is_err() {
+                        ui.label("");
+                        ui.label(err_text("enter IPv4 multicast address — e.g. 239.0.0.1"));
+                        ui.end_row();
+                    }
+
+                    ui.label("Port");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut conn.udp_mc_port)
+                            .desired_width(80.0)
+                            .hint_text("port"),
+                    );
+                    if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                    ui.end_row();
+                    if !conn.udp_mc_port.is_empty() && conn.udp_mc_port.parse::<u16>().is_err() {
+                        ui.label("");
+                        ui.label(err_text("enter a port number 1–65535"));
+                        ui.end_row();
+                    }
+                }
+            }
+
+            ui.label("Local port");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut conn.local_port)
+                    .desired_width(80.0)
+                    .hint_text("auto"),
+            );
+            if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                apply = true;
+            }
+            ui.end_row();
+            if !conn.local_port.is_empty() && conn.local_port.parse::<u16>().is_err() {
+                ui.label("");
+                ui.label(err_text("enter a port number 1–65535"));
+                ui.end_row();
+            }
+        });
 
     apply || (conn.udp_mode != before_mode)
 }
 
 fn level_color(level: tracing::Level) -> egui::Color32 {
     match level {
-        tracing::Level::ERROR => egui::Color32::from_rgb(220, 80,  80),
-        tracing::Level::WARN  => egui::Color32::from_rgb(220, 180, 60),
+        tracing::Level::ERROR => egui::Color32::from_rgb(220, 80, 80),
+        tracing::Level::WARN => egui::Color32::from_rgb(220, 180, 60),
         tracing::Level::DEBUG => egui::Color32::from_rgb(130, 130, 130),
         tracing::Level::TRACE => egui::Color32::from_rgb(100, 100, 100),
-        _                     => egui::Color32::from_rgb(200, 200, 200),
+        _ => egui::Color32::from_rgb(200, 200, 200),
     }
 }
 
@@ -1071,8 +1133,10 @@ fn err_text(msg: &str) -> egui::RichText {
 }
 
 fn hex_valid(s: &str) -> bool {
-    let stripped: String =
-        s.chars().filter(|c| !c.is_whitespace() && *c != '-').collect();
+    let stripped: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
     !stripped.is_empty()
         && stripped.len().is_multiple_of(2)
         && stripped.chars().all(|c| c.is_ascii_hexdigit())
@@ -1081,23 +1145,26 @@ fn hex_valid(s: &str) -> bool {
 fn show_tcp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     let mut apply = false;
 
-    egui::Grid::new("tcp_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-        ui.label("Address");
-        let r = ui.add(
-            egui::TextEdit::singleline(&mut conn.tcp_addr)
-                .desired_width(220.0)
-                .hint_text("host:port  (Enter to apply)"),
-        );
-        if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-            apply = true;
-        }
-        ui.end_row();
-        if !conn.tcp_addr.is_empty() && conn.tcp_addr.parse::<SocketAddr>().is_err() {
-            ui.label("");
-            ui.label(err_text("enter host:port — e.g. 192.168.1.100:4000"));
+    egui::Grid::new("tcp_grid")
+        .num_columns(2)
+        .spacing([8.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Address");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut conn.tcp_addr)
+                    .desired_width(220.0)
+                    .hint_text("host:port  (Enter to apply)"),
+            );
+            if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                apply = true;
+            }
             ui.end_row();
-        }
-    });
+            if !conn.tcp_addr.is_empty() && conn.tcp_addr.parse::<SocketAddr>().is_err() {
+                ui.label("");
+                ui.label(err_text("enter host:port — e.g. 192.168.1.100:4000"));
+                ui.end_row();
+            }
+        });
 
     apply
 }

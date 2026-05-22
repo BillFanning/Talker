@@ -12,7 +12,6 @@ impl ScheduleConfig {
     }
 }
 
-
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScheduleEntryConfig {
@@ -22,7 +21,10 @@ pub struct ScheduleEntryConfig {
 
 impl ScheduleEntryConfig {
     pub fn new(payload: PayloadConfig, interval_ms: u64) -> Self {
-        Self { payload, interval_ms }
+        Self {
+            payload,
+            interval_ms,
+        }
     }
 }
 
@@ -38,7 +40,12 @@ pub enum PayloadConfig {
     RawHex { data: String },
     /// A standard NMEA 0183 sentence. Fields are the payload values after the
     /// sentence type; the checksum is computed automatically.
-    Nmea { talker: String, sentence_type: String, #[serde(default)] fields: Vec<String> },
+    Nmea {
+        talker: String,
+        sentence_type: String,
+        #[serde(default)]
+        fields: Vec<String>,
+    },
 }
 
 impl PayloadConfig {
@@ -51,16 +58,22 @@ impl PayloadConfig {
         sentence_type: impl Into<String>,
         fields: Vec<String>,
     ) -> Self {
-        Self::Nmea { talker: talker.into(), sentence_type: sentence_type.into(), fields }
+        Self::Nmea {
+            talker: talker.into(),
+            sentence_type: sentence_type.into(),
+            fields,
+        }
     }
 
     /// Compile this config to the raw bytes that will be put on the wire.
     pub fn compile(&self) -> anyhow::Result<Vec<u8>> {
         match self {
             Self::RawHex { data } => compile_hex(data),
-            Self::Nmea { talker, sentence_type, fields } => {
-                compile_nmea(talker, sentence_type, fields)
-            }
+            Self::Nmea {
+                talker,
+                sentence_type,
+                fields,
+            } => compile_nmea(talker, sentence_type, fields),
         }
     }
 }
@@ -119,7 +132,10 @@ mod tests {
 
     #[test]
     fn compile_raw_hex_empty() {
-        assert_eq!(PayloadConfig::raw_hex("").compile().unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            PayloadConfig::raw_hex("").compile().unwrap(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]

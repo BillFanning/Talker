@@ -46,7 +46,10 @@ impl Default for Profile {
 
 impl Profile {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), ..Self::default() }
+        Self {
+            name: name.into(),
+            ..Self::default()
+        }
     }
 
     /// Load a profile from a TOML file.
@@ -55,13 +58,13 @@ impl Profile {
     /// Profiles with an older version are accepted as-is; add migration steps
     /// in `migration.rs` when the schema is bumped.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("reading profile {:?}", path))?;
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading profile {:?}", path))?;
 
         // Parse to a raw Value first so we can inspect the version and apply
         // migrations before deserializing the typed struct.
-        let mut doc: toml::Value = toml::from_str(&content)
-            .with_context(|| format!("parsing profile {:?}", path))?;
+        let mut doc: toml::Value =
+            toml::from_str(&content).with_context(|| format!("parsing profile {:?}", path))?;
 
         let version = extract_version(&doc)?;
 
@@ -71,8 +74,9 @@ impl Profile {
         );
 
         if version < CURRENT_VERSION {
-            migration::migrate(&mut doc, version)
-                .with_context(|| format!("migrating profile from v{version} to v{CURRENT_VERSION}"))?;
+            migration::migrate(&mut doc, version).with_context(|| {
+                format!("migrating profile from v{version} to v{CURRENT_VERSION}")
+            })?;
             if let toml::Value::Table(ref mut t) = doc {
                 t.insert(
                     "version".to_string(),
@@ -95,8 +99,7 @@ impl Profile {
                 .with_context(|| format!("creating directory {:?}", parent))?;
         }
         let content = toml::to_string(self).context("serializing profile to TOML")?;
-        std::fs::write(path, content)
-            .with_context(|| format!("writing profile {:?}", path))?;
+        std::fs::write(path, content).with_context(|| format!("writing profile {:?}", path))?;
         Ok(())
     }
 }
@@ -173,14 +176,24 @@ mod tests {
         let path = temp_path("full");
         let addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
         let mut profile = Profile::new("full");
-        profile.connections.push(ConnectionConfig::TcpClient(TcpClientConfig::new(addr)));
-        profile.connections.push(ConnectionConfig::Udp(UdpConfig::unicast(addr)));
-        profile.schedules.push(ScheduleConfig::new(vec![
-            ScheduleEntryConfig::new(PayloadConfig::raw_hex("AABB"), 500),
-        ]));
-        profile.schedules.push(ScheduleConfig::new(vec![
-            ScheduleEntryConfig::new(PayloadConfig::nmea("GP", "GGA", vec![]), 1000),
-        ]));
+        profile
+            .connections
+            .push(ConnectionConfig::TcpClient(TcpClientConfig::new(addr)));
+        profile
+            .connections
+            .push(ConnectionConfig::Udp(UdpConfig::unicast(addr)));
+        profile
+            .schedules
+            .push(ScheduleConfig::new(vec![ScheduleEntryConfig::new(
+                PayloadConfig::raw_hex("AABB"),
+                500,
+            )]));
+        profile
+            .schedules
+            .push(ScheduleConfig::new(vec![ScheduleEntryConfig::new(
+                PayloadConfig::nmea("GP", "GGA", vec![]),
+                1000,
+            )]));
 
         profile.save(&path).unwrap();
         let loaded = Profile::load(&path).unwrap();

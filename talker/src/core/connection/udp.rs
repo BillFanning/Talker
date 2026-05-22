@@ -2,8 +2,8 @@ use std::net::{SocketAddr, UdpSocket};
 
 use anyhow::Context;
 
-use super::Connection;
 use super::config::{UdpConfig, UdpMode};
+use super::Connection;
 
 pub(super) struct UdpConnection {
     socket: UdpSocket,
@@ -18,22 +18,37 @@ impl UdpConnection {
             UdpMode::Unicast { destination } => {
                 let socket =
                     UdpSocket::bind(("0.0.0.0", local_port)).context("binding UDP socket")?;
-                Ok(Self { socket, destination: *destination })
+                Ok(Self {
+                    socket,
+                    destination: *destination,
+                })
             }
             UdpMode::Broadcast { destination } => {
                 let socket =
                     UdpSocket::bind(("0.0.0.0", local_port)).context("binding UDP socket")?;
-                socket.set_broadcast(true).context("enabling UDP broadcast")?;
-                Ok(Self { socket, destination: *destination })
+                socket
+                    .set_broadcast(true)
+                    .context("enabling UDP broadcast")?;
+                Ok(Self {
+                    socket,
+                    destination: *destination,
+                })
             }
-            UdpMode::Multicast { group, port, interface: _ } => {
+            UdpMode::Multicast {
+                group,
+                port,
+                interface: _,
+            } => {
                 // Outgoing interface selection requires socket2; for now the OS
                 // default interface is used.  The config field is preserved for
                 // future wiring.
                 let socket =
                     UdpSocket::bind(("0.0.0.0", local_port)).context("binding UDP socket")?;
                 let destination = SocketAddr::from((*group, *port));
-                Ok(Self { socket, destination })
+                Ok(Self {
+                    socket,
+                    destination,
+                })
             }
         }
     }
@@ -63,7 +78,9 @@ mod tests {
         conn.send(b"hello").unwrap();
 
         let mut buf = [0u8; 16];
-        receiver.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
         let (n, _) = receiver.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello");
     }
@@ -87,7 +104,9 @@ mod tests {
         let dest = receiver.local_addr().unwrap();
 
         let mut conn = UdpConnection::open(&UdpConfig::unicast(dest)).unwrap();
-        receiver.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
 
         for msg in [b"one" as &[u8], b"two", b"three"] {
             conn.send(msg).unwrap();

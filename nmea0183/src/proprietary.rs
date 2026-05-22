@@ -58,7 +58,10 @@ pub enum ProprietarySentence {
     Pashr(PashrData),
     /// Any other `$P` sentence.
     /// `identifier` is the part after `$P` and before the first `,` (e.g. `"GRMZ"`).
-    Raw { identifier: String, fields: Vec<String> },
+    Raw {
+        identifier: String,
+        fields: Vec<String>,
+    },
 }
 
 impl ProprietarySentence {
@@ -82,7 +85,9 @@ impl ProprietarySentence {
     /// Parse a proprietary sentence string. Accepts lines with or without `\r\n`.
     pub fn parse(line: &str) -> Result<Self, NmeaError> {
         let line = line.trim_end_matches(['\r', '\n']);
-        let rest = line.strip_prefix('$').ok_or(NmeaError::MissingLeadingDollar)?;
+        let rest = line
+            .strip_prefix('$')
+            .ok_or(NmeaError::MissingLeadingDollar)?;
 
         if !rest.starts_with('P') {
             return Err(NmeaError::Parse("not a proprietary sentence".to_string()));
@@ -95,9 +100,7 @@ impl ProprietarySentence {
         }
 
         // All other proprietary sentences require a checksum.
-        let (body, chk) = rest
-            .rsplit_once('*')
-            .ok_or(NmeaError::MissingChecksum)?;
+        let (body, chk) = rest.rsplit_once('*').ok_or(NmeaError::MissingChecksum)?;
 
         let expected = u8::from_str_radix(chk, 16)
             .map_err(|_| NmeaError::Parse(format!("invalid checksum hex: {chk:?}")))?;
@@ -121,7 +124,10 @@ impl ProprietarySentence {
                 } else {
                     fields_str.split(',').map(str::to_string).collect()
                 };
-                Ok(Self::Raw { identifier: ident.to_string(), fields })
+                Ok(Self::Raw {
+                    identifier: ident.to_string(),
+                    fields,
+                })
             }
         }
     }
@@ -137,11 +143,18 @@ impl fmt::Display for ProprietarySentence {
 
 impl PrdidData {
     pub fn new(pitch: f64, roll: f64, heading: f64) -> Self {
-        Self { pitch, roll, heading }
+        Self {
+            pitch,
+            roll,
+            heading,
+        }
     }
 
     pub fn to_wire(&self) -> String {
-        format!("$PRDID,{:.2},{:.2},{:.2}\r\n", self.pitch, self.roll, self.heading)
+        format!(
+            "$PRDID,{:.2},{:.2},{:.2}\r\n",
+            self.pitch, self.roll, self.heading
+        )
     }
 }
 
@@ -152,7 +165,11 @@ fn parse_prdid(fields_str: &str) -> Result<ProprietarySentence, NmeaError> {
     let roll = parse_f64(it.next(), 1, "roll")?;
     let heading = parse_f64(it.next(), 2, "heading")?;
 
-    Ok(ProprietarySentence::Prdid(PrdidData { pitch, roll, heading }))
+    Ok(ProprietarySentence::Prdid(PrdidData {
+        pitch,
+        roll,
+        heading,
+    }))
 }
 
 // ── PashrData ────────────────────────────────────────────────────────────────
@@ -289,7 +306,11 @@ mod tests {
 
     #[test]
     fn prdid_to_wire_no_checksum() {
-        let d = PrdidData { pitch: 1.50, roll: 0.30, heading: 127.45 };
+        let d = PrdidData {
+            pitch: 1.50,
+            roll: 0.30,
+            heading: 127.45,
+        };
         let wire = ProprietarySentence::Prdid(d).to_wire();
         assert_eq!(wire, "$PRDID,1.50,0.30,127.45\r\n");
         assert!(!wire.contains('*'), "PRDID must not contain a checksum");
@@ -299,12 +320,23 @@ mod tests {
     fn prdid_parse_basic() {
         let wire = "$PRDID,1.50,0.30,127.45\r\n";
         let s = ProprietarySentence::parse(wire).unwrap();
-        assert_eq!(s, ProprietarySentence::Prdid(PrdidData { pitch: 1.50, roll: 0.30, heading: 127.45 }));
+        assert_eq!(
+            s,
+            ProprietarySentence::Prdid(PrdidData {
+                pitch: 1.50,
+                roll: 0.30,
+                heading: 127.45
+            })
+        );
     }
 
     #[test]
     fn prdid_round_trip() {
-        let d = PrdidData { pitch: -3.75, roll: 0.01, heading: 0.50 };
+        let d = PrdidData {
+            pitch: -3.75,
+            roll: 0.01,
+            heading: 0.50,
+        };
         let wire = ProprietarySentence::Prdid(d.clone()).to_wire();
         let parsed = ProprietarySentence::parse(&wire).unwrap();
         assert_eq!(parsed, ProprietarySentence::Prdid(d));
@@ -375,7 +407,10 @@ mod tests {
         let bad = wire.replace(['\r', '\n'], "");
         let bad = format!("{}X\r\n", &bad[..bad.len() - 1]);
         let err = ProprietarySentence::parse(&bad).unwrap_err();
-        assert!(matches!(err, NmeaError::InvalidChecksum { .. } | NmeaError::Parse(_)));
+        assert!(matches!(
+            err,
+            NmeaError::InvalidChecksum { .. } | NmeaError::Parse(_)
+        ));
     }
 
     // --- Raw ---

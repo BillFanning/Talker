@@ -3,8 +3,8 @@ use std::net::TcpStream;
 
 use anyhow::Context;
 
-use super::Connection;
 use super::config::TcpClientConfig;
+use super::Connection;
 
 pub(super) struct TcpClientConnection {
     stream: TcpStream,
@@ -34,7 +34,10 @@ mod tests {
     fn connect_to_nonexistent_port_returns_error() {
         let config = TcpClientConfig::new("127.0.0.1:1".parse().unwrap());
         let result = TcpClientConnection::open(&config);
-        let msg = result.err().expect("expected error connecting to port 1").to_string();
+        let msg = result
+            .err()
+            .expect("expected error connecting to port 1")
+            .to_string();
         assert!(msg.contains("127.0.0.1:1"));
     }
 
@@ -52,7 +55,9 @@ mod tests {
 
         let mut buf = [0u8; 16];
         use std::io::Read;
-        server_stream.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+        server_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
         let n = server_stream.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"ping");
     }
@@ -71,7 +76,9 @@ mod tests {
         conn.send(&payload).unwrap();
 
         let mut received = Vec::new();
-        server_stream.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+        server_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
         let mut buf = [0u8; 4096];
         loop {
             match std::io::Read::read(&mut server_stream, &mut buf) {

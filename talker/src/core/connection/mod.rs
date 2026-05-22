@@ -37,7 +37,9 @@ pub struct ConnectionCollection {
 
 impl ConnectionCollection {
     pub fn new() -> Self {
-        Self { connections: Vec::new() }
+        Self {
+            connections: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, conn: Box<dyn Connection>) {

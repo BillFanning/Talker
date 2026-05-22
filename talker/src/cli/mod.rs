@@ -47,7 +47,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Open every connection in the profile.
     let mut connections = ConnectionCollection::new();
     for (i, cfg) in profile.connections.iter().enumerate() {
-        let conn = cfg.open().with_context(|| format!("opening connection {i}"))?;
+        let conn = cfg
+            .open()
+            .with_context(|| format!("opening connection {i}"))?;
         connections.push(conn);
     }
     anyhow::ensure!(!connections.is_empty(), "profile has no connections");
@@ -56,7 +58,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Compile the schedule into send-ready entries.
     let sched_cfg = profile.schedules.into_iter().next().unwrap_or_default();
     let mut schedule = sched_cfg.compile().context("compiling schedule")?;
-    tracing::info!("{}-entry schedule compiled — starting send loop (Ctrl+C to stop)", schedule.len());
+    tracing::info!(
+        "{}-entry schedule compiled — starting send loop (Ctrl+C to stop)",
+        schedule.len()
+    );
 
     // Shared stop flag written by the Ctrl+C handler.
     let running = Arc::new(AtomicBool::new(true));
@@ -111,7 +116,10 @@ fn list_profiles() -> anyhow::Result<()> {
     };
 
     if !dir.exists() {
-        println!("No profiles found (directory {} does not exist).", dir.display());
+        println!(
+            "No profiles found (directory {} does not exist).",
+            dir.display()
+        );
         return Ok(());
     }
 
@@ -163,7 +171,10 @@ mod tests {
     #[test]
     fn parse_profile_path() {
         let a = parse(&["talker", "--profile-path", "/etc/talker/foo.toml"]).unwrap();
-        assert_eq!(a.profile_path.as_deref(), Some(std::path::Path::new("/etc/talker/foo.toml")));
+        assert_eq!(
+            a.profile_path.as_deref(),
+            Some(std::path::Path::new("/etc/talker/foo.toml"))
+        );
         assert!(a.profile.is_none());
     }
 
@@ -175,13 +186,23 @@ mod tests {
 
     #[test]
     fn profile_and_profile_path_conflict() {
-        let result = parse(&["talker", "--profile", "foo", "--profile-path", "/bar/baz.toml"]);
+        let result = parse(&[
+            "talker",
+            "--profile",
+            "foo",
+            "--profile-path",
+            "/bar/baz.toml",
+        ]);
         assert!(result.is_err());
     }
 
     #[test]
     fn load_profile_errors_when_neither_flag_given() {
-        let args = Args { profile: None, profile_path: None, list_profiles: false };
+        let args = Args {
+            profile: None,
+            profile_path: None,
+            list_profiles: false,
+        };
         let err = load_profile(&args).unwrap_err();
         assert!(err.to_string().contains("--profile"));
     }
