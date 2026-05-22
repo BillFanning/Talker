@@ -10,6 +10,11 @@ pub enum TalkerCommand {
     Stop,
     /// Reopen the channel's interface with a new configuration.
     UpdateInterface(InterfaceConfig),
+    /// Change message `index`'s send interval, effective immediately.
+    SetInterval {
+        index: usize,
+        interval_ms: u64,
+    },
 }
 
 /// A status update sent from a talker thread to the UI thread.
@@ -54,6 +59,9 @@ pub fn run_talker(
                         });
                     }
                 },
+                TalkerCommand::SetInterval { index, interval_ms } => {
+                    schedule.set_interval(index, interval_ms, Instant::now());
+                }
             }
         }
 

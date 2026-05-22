@@ -724,7 +724,16 @@ impl TalkerApp {
                         }
 
                         ui.separator();
-                        show_schedule_section(ui, &mut self.sched_drafts[i], &mut self.dirty);
+                        let interval_changes =
+                            show_schedule_section(ui, &mut self.sched_drafts[i], &mut self.dirty);
+                        for (msg_index, interval_ms) in interval_changes {
+                            if let Some(Some(handle)) = self.talkers.get(i) {
+                                let _ = handle.cmd_tx.try_send(TalkerCommand::SetInterval {
+                                    index: msg_index,
+                                    interval_ms,
+                                });
+                            }
+                        }
                     });
                 });
                 ui.add_space(6.0);
@@ -771,9 +780,15 @@ impl TalkerApp {
 
 // ── Inline message editor (one section per channel card) ──────────────────────
 
-fn show_schedule_section(ui: &mut egui::Ui, entries: &mut Vec<ScheduleDraft>, dirty: &mut bool) {
+fn show_schedule_section(
+    ui: &mut egui::Ui,
+    entries: &mut Vec<ScheduleDraft>,
+    dirty: &mut bool,
+) -> Vec<(usize, u64)> {
     let mut to_remove: Option<usize> = None;
     let mut add_one = false;
+    // Message indices whose interval was committed this frame, with the new value.
+    let mut interval_changes: Vec<(usize, u64)> = Vec::new();
 
     ui.collapsing("Messages", |ui| {
         for (i, entry) in entries.iter_mut().enumerate() {
@@ -801,17 +816,21 @@ fn show_schedule_section(ui: &mut egui::Ui, entries: &mut Vec<ScheduleDraft>, di
                             show_payload_fields(ui, entry);
 
                             ui.label("Interval (ms)");
-                            ui.add(
+                            let interval_resp = ui.add(
                                 egui::TextEdit::singleline(&mut entry.interval_ms)
                                     .desired_width(80.0),
                             );
                             ui.end_row();
-                            if !entry.interval_ms.is_empty()
-                                && entry.interval_ms.parse::<u64>().is_err()
-                            {
-                                ui.label("");
-                                ui.label(err_text("must be a whole number greater than 0"));
-                                ui.end_row();
+                            match entry.interval_ms.parse::<u64>() {
+                                Ok(ms) if interval_resp.lost_focus() => {
+                                    interval_changes.push((i, ms));
+                                }
+                                Err(_) if !entry.interval_ms.is_empty() => {
+                                    ui.label("");
+                                    ui.label(err_text("must be a whole number"));
+                                    ui.end_row();
+                                }
+                                _ => {}
                             }
                         });
 
@@ -834,6 +853,8 @@ fn show_schedule_section(ui: &mut egui::Ui, entries: &mut Vec<ScheduleDraft>, di
         entries.push(ScheduleDraft::default());
         *dirty = true;
     }
+
+    interval_changes
 }
 
 /// Render the payload-format fields for one message into the surrounding grid.
