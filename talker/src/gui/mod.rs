@@ -18,7 +18,7 @@ use crate::core::{
 };
 
 use display::{ChannelDisplay, ControlStyle, DisplayMode};
-use draft::{ConnDraft, ConnKind, PayloadKind, ScheduleDraft, UdpModeDraft};
+use draft::{ConnDraft, ConnKind, PayloadKind, PortHold, ScheduleDraft, UdpModeDraft};
 use thread::{run_talker, TalkerCommand, TalkerHandle, TalkerStatus};
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1057,6 +1057,130 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     }
 }
 
+/// Drive one frame of hold-to-repeat for the broadcast port's ± buttons.
+///
+/// - A simple click (button down + up before the initial delay elapses)
+///   changes the port by exactly 1.
+/// - Holding either button fires once immediately, then waits for a 400 ms
+///   initial delay, then auto-repeats at a rate that *accelerates* the
+///   longer the button is held (see [`port_repeat_interval`]).
+/// - Switching from one button to the other while held resets the state.
+///
+/// Returns `true` if the port value changed this frame.
+fn drive_port_hold(
+    ui: &egui::Ui,
+    conn: &mut ConnDraft,
+    r_minus: &egui::Response,
+    r_plus: &egui::Response,
+) -> bool {
+    let direction: i8 = if r_minus.is_pointer_button_down_on() {
+        -1
+    } else if r_plus.is_pointer_button_down_on() {
+        1
+    } else {
+        0
+    };
+
+    let mut changed = false;
+
+    if direction != 0 {
+        let dt = ui.ctx().input(|i| i.stable_dt);
+        let needs_reset = conn.udp_port_hold.is_none_or(|h| h.direction != direction);
+        if needs_reset {
+            // First frame held (or switched buttons): fire once, start delay.
+            changed |= port_step(conn, direction);
+            conn.udp_port_hold = Some(PortHold {
+                direction,
+                next_fire_in: -0.4, // 400 ms initial delay before auto-repeat
+                total_held: 0.0,
+            });
+        } else if let Some(h) = conn.udp_port_hold.as_mut() {
+            h.total_held += dt;
+            h.next_fire_in += dt;
+            if h.next_fire_in >= 0.0 {
+                let interval = port_repeat_interval(h.total_held);
+                h.next_fire_in -= interval;
+                changed |= port_step(conn, direction);
+            }
+        }
+        ui.ctx().request_repaint();
+    } else {
+        // Quick tap (down + up inside the same frame, before
+        // is_pointer_button_down_on saw it).
+        if r_minus.clicked() && conn.udp_port_hold.is_none() {
+            changed |= port_step(conn, -1);
+        }
+        if r_plus.clicked() && conn.udp_port_hold.is_none() {
+            changed |= port_step(conn, 1);
+        }
+        conn.udp_port_hold = None;
+    }
+
+    changed
+}
+
+/// Step the broadcast port by `direction` (±1), clamped to 1..=65535.
+/// Returns `true` if the value actually changed.
+fn port_step(conn: &mut ConnDraft, direction: i8) -> bool {
+    let Ok(p) = conn.udp_broadcast_port.parse::<u16>() else {
+        return false;
+    };
+    let new = match direction {
+        -1 if p > 1 => p - 1,
+        1 if p < u16::MAX => p + 1,
+        _ => return false,
+    };
+    conn.udp_broadcast_port = new.to_string();
+    true
+}
+
+/// Acceleration curve for the ± port hold-to-repeat. Total seconds held
+/// → seconds between successive repeats.
+///
+/// Tiered (not exponential) so the cadence is predictable when the user
+/// is targeting a specific port number.
+fn port_repeat_interval(total_held: f32) -> f32 {
+    match total_held {
+        t if t < 1.0 => 0.15,  // ~7 / s for the first second
+        t if t < 3.0 => 0.075, // ~13 / s next two seconds
+        t if t < 6.0 => 0.035, // ~28 / s next three seconds
+        _ => 0.015,            // ~65 / s after that
+    }
+}
+
+/// Render `bytes` as a single-line preview string.
+///
+/// - Trailing CR/LF is stripped (NMEA's `\r\n` terminator) so the preview
+///   stays on one visual line.
+/// - Valid UTF-8 sequences are emitted as characters, *except* control
+///   characters, which are emitted as `‹XX›` markers so they are visible
+///   and don't break the line.
+/// - Invalid UTF-8 bytes (e.g. the binary message-checksum byte appended
+///   after an NMEA sentence, or extended-codepage bytes in Ascii mode)
+///   are also emitted as `‹XX›` markers. This avoids the U+FFFD-tofu the
+///   bundled fonts would otherwise show.
+fn preview_text(bytes: &[u8]) -> String {
+    let trimmed = match bytes {
+        [rest @ .., b'\r', b'\n'] => rest,
+        [rest @ .., b'\n'] | [rest @ .., b'\r'] => rest,
+        _ => bytes,
+    };
+    let mut out = String::with_capacity(trimmed.len());
+    for chunk in trimmed.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if c.is_control() {
+                out.push_str(&format!("\u{2039}{:02X}\u{203A}", c as u32));
+            } else {
+                out.push(c);
+            }
+        }
+        for &b in chunk.invalid() {
+            out.push_str(&format!("\u{2039}{b:02X}\u{203A}"));
+        }
+    }
+    out
+}
+
 /// One-line, human-readable summary of a channel's selected interface and
 /// its parameters, shown in the channel-card header so the active config
 /// is visible at a glance without expanding the editor. Uses the draft's
@@ -1224,7 +1348,7 @@ fn show_message_preview(ui: &mut egui::Ui, entry: &ScheduleDraft) {
                 let bytes = compiled.render_at(reference);
                 match entry.payload_kind {
                     PayloadKind::Utf8 | PayloadKind::Ascii | PayloadKind::Nmea => {
-                        String::from_utf8_lossy(&bytes).into_owned()
+                        preview_text(&bytes)
                     }
                     PayloadKind::Hex | PayloadKind::Utf16 => bytes
                         .iter()
@@ -1661,16 +1785,9 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                             apply = true;
                         }
                         ui.label("Port:");
-                        if ui
+                        let r_minus = ui
                             .small_button("\u{2212}")
-                            .on_hover_text("Decrement port")
-                            .clicked()
-                        {
-                            if let Ok(p) = conn.udp_broadcast_port.parse::<u16>() {
-                                conn.udp_broadcast_port = p.saturating_sub(1).max(1).to_string();
-                                apply = true;
-                            }
-                        }
+                            .on_hover_text("Decrement port (hold to accelerate)");
                         let port_r =
                             red_bordered(ui, bad_port, "enter a port number 1–65535", |ui| {
                                 ui.add(
@@ -1682,17 +1799,11 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                         {
                             apply = true;
                         }
-                        if ui
+                        let r_plus = ui
                             .small_button("+")
-                            .on_hover_text("Increment port")
-                            .clicked()
-                        {
-                            if let Ok(p) = conn.udp_broadcast_port.parse::<u16>() {
-                                if p < u16::MAX {
-                                    conn.udp_broadcast_port = (p + 1).to_string();
-                                    apply = true;
-                                }
-                            }
+                            .on_hover_text("Increment port (hold to accelerate)");
+                        if drive_port_hold(ui, conn, &r_minus, &r_plus) {
+                            apply = true;
                         }
                     });
                     ui.end_row();

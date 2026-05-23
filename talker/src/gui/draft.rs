@@ -27,6 +27,20 @@ pub enum UdpModeDraft {
     Multicast,
 }
 
+/// Hold-to-repeat state for a single ± port control. Lives only at runtime;
+/// never serialised.
+#[derive(Debug, Clone, Copy)]
+pub struct PortHold {
+    /// −1 for the minus button, +1 for the plus button.
+    pub direction: i8,
+    /// Seconds until the next repeat fires. Negative while we wait out the
+    /// initial delay, then drives the per-frame repeat cadence.
+    pub next_fire_in: f32,
+    /// Total seconds the button has been held — used to accelerate the
+    /// repeat interval (see `port_repeat_interval` in `gui/mod.rs`).
+    pub total_held: f32,
+}
+
 pub struct ConnDraft {
     pub kind: ConnKind,
     // serial
@@ -42,9 +56,14 @@ pub struct ConnDraft {
     pub udp_dest: String,           // unicast destination (host:port)
     pub udp_broadcast_addr: String, // broadcast destination address (defaults to 255.255.255.255)
     pub udp_broadcast_port: String, // broadcast destination port
-    pub udp_group: String,          // multicast group address
-    pub udp_mc_port: String,        // multicast port
-    pub local_port: String,         // optional local bind port
+    /// Transient state for the broadcast port's ± hold-to-repeat. `None`
+    /// when nothing is being held; otherwise carries the pressed direction
+    /// (−1 or +1), seconds until the next repeat fires (negative = still
+    /// waiting), and total seconds held (used to accelerate the rate).
+    pub udp_port_hold: Option<PortHold>,
+    pub udp_group: String,   // multicast group address
+    pub udp_mc_port: String, // multicast port
+    pub local_port: String,  // optional local bind port
     // tcp
     pub tcp_addr: String,
 }
@@ -64,6 +83,7 @@ impl Default for ConnDraft {
             udp_dest: String::new(),
             udp_broadcast_addr: Ipv4Addr::BROADCAST.to_string(),
             udp_broadcast_port: String::new(),
+            udp_port_hold: None,
             udp_group: String::new(),
             udp_mc_port: String::new(),
             local_port: String::new(),
