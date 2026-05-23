@@ -82,6 +82,7 @@ impl TalkerApp {
             .unwrap_or(1.0);
         ctx.set_pixels_per_point(ppp);
         set_high_contrast_dark_visuals(ctx);
+        install_control_pictures_fallback_font(ctx);
         let mut app = Self {
             profile: Profile::default(),
             profile_path: None,
@@ -1104,6 +1105,32 @@ fn set_high_contrast_dark_visuals(ctx: &egui::Context) {
     ctx.set_visuals_of(egui::Theme::Light, v);
 }
 
+/// Register a Unicode Control Pictures fallback font.
+///
+/// The default `egui` fonts (Hack, Ubuntu-Light, NotoEmoji, emoji-icon) cover
+/// zero glyphs in U+2400–U+243F, so the display pane's `Pictures` style would
+/// otherwise render every control byte as a tofu box. We ship an ~19 KB
+/// subset of Cascadia Mono containing exactly U+2400–U+2421 and register it
+/// as a low-priority fallback for both the Monospace family (display pane)
+/// and the Proportional family (the `␊` radio label in the controls bar).
+fn install_control_pictures_fallback_font(ctx: &egui::Context) {
+    const FONT: &[u8] = include_bytes!("../../assets/fonts/CascadiaMono-ControlPictures.ttf");
+    ctx.add_font(egui::epaint::text::FontInsert::new(
+        "control_pictures",
+        egui::FontData::from_static(FONT),
+        vec![
+            egui::epaint::text::InsertFontFamily {
+                family: egui::FontFamily::Monospace,
+                priority: egui::epaint::text::FontPriority::Lowest,
+            },
+            egui::epaint::text::InsertFontFamily {
+                family: egui::FontFamily::Proportional,
+                priority: egui::epaint::text::FontPriority::Lowest,
+            },
+        ],
+    ));
+}
+
 // ── Field renderers ───────────────────────────────────────────────────────────
 
 /// Lay out a UTF-8/ASCII text field, drawing `‹XX›` byte markers in a
@@ -1191,7 +1218,9 @@ fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay) {
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for line in display.lines() {
-                    ui.label(egui::RichText::new(line).monospace());
+                    // Force wrap so long Hex rows break at the right edge and
+                    // continue at the left, instead of overflowing horizontally.
+                    ui.add(egui::Label::new(egui::RichText::new(line).monospace()).wrap());
                 }
             });
     });

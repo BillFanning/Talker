@@ -82,7 +82,14 @@ pub fn render(bytes: &[u8], mode: DisplayMode, control_style: ControlStyle) -> S
             }
             s
         }
-        DisplayMode::Decoded => String::from_utf8_lossy(bytes).into_owned(),
+        DisplayMode::Decoded => {
+            // Strip the trailing CR / LF that ends most NMEA sentences so
+            // each message renders as one display line; an embedded newline
+            // mid-message would otherwise be rendered as a real line break
+            // and produce a blank line between every entry.
+            let s = String::from_utf8_lossy(bytes);
+            s.trim_end_matches(['\r', '\n']).to_owned()
+        }
     }
 }
 
@@ -214,6 +221,27 @@ mod tests {
                 ControlStyle::Pictures
             ),
             "héllo"
+        );
+    }
+
+    #[test]
+    fn decoded_strips_trailing_cr_lf() {
+        // A typical NMEA sentence ends with "\r\n"; that trailing newline
+        // must not appear in the display, or every entry would be followed
+        // by a blank line.
+        let bytes = b"$GPGGA,,,,,,0,,,,,,,,*56\r\n";
+        let out = render(bytes, DisplayMode::Decoded, ControlStyle::Pictures);
+        assert!(!out.ends_with('\n'));
+        assert!(!out.ends_with('\r'));
+        assert!(out.ends_with("*56"));
+    }
+
+    #[test]
+    fn decoded_keeps_internal_text() {
+        // Trimming is only at the *end*; embedded characters are preserved.
+        assert_eq!(
+            render(b"AB\rCD\r\n", DisplayMode::Decoded, ControlStyle::Pictures),
+            "AB\rCD"
         );
     }
 
