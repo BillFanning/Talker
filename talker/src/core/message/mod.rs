@@ -28,6 +28,34 @@ pub enum ByteOrder {
     LittleEndian,
 }
 
+/// How an NMEA payload's trailing `*XX` checksum is rendered.
+///
+/// `talker`-side mirror of [`nmea0183::NmeaChecksumMode`], so the profile
+/// schema can serialize/deserialize without enabling the `serde` feature
+/// on `nmea0183` (per OQ-3 / ADR-014). Converted at compile time.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NmeaChecksumMode {
+    /// Protocol default: append `*XX\r\n` with the correct XOR.
+    #[default]
+    Correct,
+    /// Omit `*XX` entirely — wire ends with `\r\n` directly after fields.
+    Omit,
+    /// Append `*XX\r\n` with a deliberately wrong byte (correct ^ 0xFF).
+    Wrong,
+}
+
+impl From<NmeaChecksumMode> for nmea0183::NmeaChecksumMode {
+    fn from(m: NmeaChecksumMode) -> Self {
+        match m {
+            NmeaChecksumMode::Correct => Self::Correct,
+            NmeaChecksumMode::Omit => Self::Omit,
+            NmeaChecksumMode::Wrong => Self::Wrong,
+        }
+    }
+}
+
 /// One message in a channel: a payload, a send interval, and optional
 /// timestamp and checksum.
 #[non_exhaustive]
@@ -77,9 +105,16 @@ impl CompiledMessage {
     /// The timestamp is generated at the current instant; the checksum is
     /// computed over the timestamp and payload together.
     pub fn render(&self) -> Vec<u8> {
+        self.render_at(chrono::Utc::now())
+    }
+
+    /// Like [`Self::render`], but uses `now` as the timestamp instant
+    /// instead of reading the wall clock. Useful for previews where the
+    /// output should not advance every frame.
+    pub fn render_at(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.payload.len() + 16);
         if let Some(ts) = &self.timestamp {
-            out.extend_from_slice(ts.format(chrono::Utc::now()).as_bytes());
+            out.extend_from_slice(ts.format(now).as_bytes());
         }
         out.extend_from_slice(&self.payload);
         if let Some(cs) = &self.checksum {
@@ -123,12 +158,18 @@ pub enum PayloadConfig {
         code_page: CodePage,
     },
     /// A standard NMEA 0183 sentence. Fields are the payload values after the
-    /// sentence type; the checksum is computed automatically.
+    /// sentence type; the trailing `*XX` checksum is appended per
+    /// [`nmea_checksum`].
     Nmea {
         talker: String,
         sentence_type: String,
         #[serde(default)]
         fields: Vec<String>,
+        /// How the protocol-internal `*XX` checksum is rendered.
+        /// Defaults to [`NmeaChecksumMode::Correct`]; older profiles
+        /// without this field deserialize to that default.
+        #[serde(default)]
+        nmea_checksum: NmeaChecksumMode,
     },
 }
 
@@ -146,6 +187,7 @@ impl PayloadConfig {
             talker: talker.into(),
             sentence_type: sentence_type.into(),
             fields,
+            nmea_checksum: NmeaChecksumMode::Correct,
         }
     }
 
@@ -164,7 +206,8 @@ impl PayloadConfig {
                 talker,
                 sentence_type,
                 fields,
-            } => compile_nmea(talker, sentence_type, fields),
+                nmea_checksum,
+            } => compile_nmea(talker, sentence_type, fields, *nmea_checksum),
         }
     }
 }
@@ -224,12 +267,17 @@ fn encode_utf16(text: &str, byte_order: ByteOrder, bom: bool) -> Vec<u8> {
     out
 }
 
-fn compile_nmea(talker: &str, sentence_type: &str, fields: &[String]) -> anyhow::Result<Vec<u8>> {
+fn compile_nmea(
+    talker: &str,
+    sentence_type: &str,
+    fields: &[String],
+    nmea_checksum: NmeaChecksumMode,
+) -> anyhow::Result<Vec<u8>> {
     use nmea0183::{NmeaSentence, SentenceType, TalkerId};
     let talker_id: TalkerId = talker.parse().unwrap();
     let st: SentenceType = sentence_type.parse().unwrap();
     let sentence = NmeaSentence::new(talker_id, st, fields.to_vec());
-    Ok(sentence.to_wire().into_bytes())
+    Ok(sentence.to_wire_with(nmea_checksum.into()).into_bytes())
 }
 
 #[cfg(test)]

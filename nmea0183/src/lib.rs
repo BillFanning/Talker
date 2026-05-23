@@ -10,7 +10,7 @@ mod talker_id;
 pub use ais::AisSentence;
 pub use error::NmeaError;
 pub use proprietary::{PashrData, PrdidData, ProprietarySentence};
-pub use sentence::NmeaSentence;
+pub use sentence::{NmeaChecksumMode, NmeaSentence};
 pub use sentence_type::SentenceType;
 pub use talker_id::TalkerId;
 

@@ -6,8 +6,8 @@ use crate::core::{
         UdpConfig, UdpMode,
     },
     message::{
-        ByteOrder, ChecksumAlgorithm, ChecksumConfig, CodePage, MessageConfig, PayloadConfig,
-        TimestampConfig,
+        ByteOrder, ChecksumAlgorithm, ChecksumConfig, CodePage, MessageConfig, NmeaChecksumMode,
+        PayloadConfig, TimestampConfig,
     },
 };
 
@@ -232,6 +232,7 @@ pub struct ScheduleDraft {
     pub nmea_talker: String,
     pub nmea_sentence_type: String,
     pub nmea_fields: String, // comma-separated field values
+    pub nmea_checksum_mode: NmeaChecksumMode,
     // common
     pub interval_ms: String,
     // timestamp
@@ -261,6 +262,7 @@ impl Default for ScheduleDraft {
             nmea_talker: "GP".to_string(),
             nmea_sentence_type: String::new(),
             nmea_fields: String::new(),
+            nmea_checksum_mode: NmeaChecksumMode::Correct,
             interval_ms: "1000".to_string(),
             timestamp_enabled: false,
             ts_date: true,
@@ -305,11 +307,13 @@ impl From<&MessageConfig> for ScheduleDraft {
                 talker,
                 sentence_type,
                 fields,
+                nmea_checksum,
             } => {
                 d.payload_kind = PayloadKind::Nmea;
                 d.nmea_talker = talker.clone();
                 d.nmea_sentence_type = sentence_type.clone();
                 d.nmea_fields = fields.join(",");
+                d.nmea_checksum_mode = *nmea_checksum;
             }
         }
         d.interval_ms = m.interval_ms.to_string();
@@ -358,7 +362,12 @@ impl ScheduleDraft {
                 } else {
                     self.nmea_fields.split(',').map(str::to_string).collect()
                 };
-                PayloadConfig::nmea(&self.nmea_talker, &self.nmea_sentence_type, fields)
+                PayloadConfig::Nmea {
+                    talker: self.nmea_talker.clone(),
+                    sentence_type: self.nmea_sentence_type.clone(),
+                    fields,
+                    nmea_checksum: self.nmea_checksum_mode,
+                }
             }
         };
         let timestamp = self.timestamp_enabled.then_some(TimestampConfig {

@@ -12,7 +12,7 @@ use egui::{Align, Layout, ScrollArea};
 use crate::core::{
     channel::ChannelConfig,
     logging::{LogEvent, LoggingConfig},
-    message::{segments, ChecksumAlgorithm, CodePage, Segment},
+    message::{segments, ChecksumAlgorithm, CodePage, NmeaChecksumMode, Segment},
     profile::Profile,
     scheduler::Schedule,
 };
@@ -1019,6 +1019,27 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                         }
                     }
                 });
+                ui.separator();
+                ui.label("*XX:").on_hover_text(
+                    "The protocol-internal NMEA checksum (`*XX` at end of sentence). \
+                     Distinct from the per-message Checksum row below, which wraps \
+                     an outer checksum around the complete output.",
+                );
+                ui.radio_value(
+                    &mut entry.nmea_checksum_mode,
+                    NmeaChecksumMode::Correct,
+                    "include",
+                );
+                ui.radio_value(
+                    &mut entry.nmea_checksum_mode,
+                    NmeaChecksumMode::Omit,
+                    "omit",
+                );
+                ui.radio_value(
+                    &mut entry.nmea_checksum_mode,
+                    NmeaChecksumMode::Wrong,
+                    "wrong",
+                );
             });
             ui.end_row();
 
@@ -1139,15 +1160,40 @@ fn message_blockers(idx: usize, entry: &ScheduleDraft) -> Vec<String> {
 
 /// Render the read-only "this is what would be sent" preview row.
 ///
-/// Compiles the draft each frame and renders the wire bytes with the
-/// timestamp baked in for the current instant. Because egui only repaints
-/// on input, the timestamp does not tick on its own — it updates whenever
-/// the user interacts with the GUI.
+/// Compiles the draft each frame and renders the wire bytes with a fixed
+/// reference timestamp — never `chrono::Utc::now()` — so the value does
+/// not change between repaints (which can be triggered by mouse motion,
+/// not just edits). The actual send still uses the wall clock; this
+/// preview shows the format and structure, not a live tick.
+///
+/// Bytes are shown as text (lossy UTF-8) for payload types that are text
+/// at heart (Utf8 / Ascii / NMEA) and as space-separated hex for the
+/// binary types (Hex / Utf16), to avoid the U+FFFD-tofu we'd otherwise
+/// get for non-UTF-8 bytes — Hack and Ubuntu-Light don't include
+/// U+FFFD glyphs.
 fn show_message_preview(ui: &mut egui::Ui, entry: &ScheduleDraft) {
+    // 2024-01-01T12:00:00.000Z — a fixed, recognisable sample instant.
+    let reference = chrono::DateTime::<chrono::Utc>::from_timestamp(1_704_110_400, 0).unwrap();
     ui.horizontal(|ui| {
-        ui.label("Preview:");
+        ui.label("Preview:").on_hover_text(
+            "Sample of the wire bytes that would be sent. \
+                 Timestamps use a fixed reference instant so the value \
+                 doesn't tick — the actual send uses the wall clock.",
+        );
         let text = match entry.to_message_config().and_then(|m| m.compile().ok()) {
-            Some(compiled) => String::from_utf8_lossy(&compiled.render()).into_owned(),
+            Some(compiled) => {
+                let bytes = compiled.render_at(reference);
+                match entry.payload_kind {
+                    PayloadKind::Utf8 | PayloadKind::Ascii | PayloadKind::Nmea => {
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    }
+                    PayloadKind::Hex | PayloadKind::Utf16 => bytes
+                        .iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                }
+            }
             None => "(message is incomplete)".to_string(),
         };
         ui.label(egui::RichText::new(text).monospace());
@@ -1338,7 +1384,11 @@ fn show_insert_byte_button(ui: &mut egui::Ui, text: &mut String, hex: &mut Strin
 fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay) {
     ui.collapsing("Output", |ui| {
         ui.horizontal(|ui| {
-            ui.label("View:");
+            ui.label("View:").on_hover_text(
+                "These are display modes — the bytes on the wire are the \
+                 same regardless of which view is selected. The view only \
+                 changes how the buffered bytes are rendered here.",
+            );
             ui.radio_value(&mut display.mode, DisplayMode::Hex, "Hex");
             ui.radio_value(&mut display.mode, DisplayMode::Ascii, "ASCII");
             ui.radio_value(&mut display.mode, DisplayMode::Decoded, "Decoded");

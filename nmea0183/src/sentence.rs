@@ -5,6 +5,23 @@ use crate::error::NmeaError;
 use crate::sentence_type::SentenceType;
 use crate::talker_id::TalkerId;
 
+/// How the trailing `*XX` checksum is rendered when serializing a
+/// [`NmeaSentence`]. Used by [`NmeaSentence::to_wire_with`].
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum NmeaChecksumMode {
+    /// Append `*XX\r\n` with the correct XOR checksum (protocol default).
+    #[default]
+    Correct,
+    /// Append only `\r\n` — no `*XX` suffix at all.
+    Omit,
+    /// Append `*XX\r\n` with an intentionally-wrong byte (correct ^ 0xFF).
+    /// Useful for testing how a downstream parser reacts to a bad checksum.
+    Wrong,
+}
+
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -33,10 +50,29 @@ impl NmeaSentence {
         checksum::xor(self.payload().as_bytes())
     }
 
-    /// Serialize to wire format: `$<talker><type>,<f1>,...*XX\r\n`
+    /// Serialize to wire format with a correct checksum:
+    /// `$<talker><type>,<f1>,...*XX\r\n`.
+    ///
+    /// Equivalent to [`Self::to_wire_with`] called with
+    /// [`NmeaChecksumMode::Correct`].
     pub fn to_wire(&self) -> String {
+        self.to_wire_with(NmeaChecksumMode::Correct)
+    }
+
+    /// Serialize to wire format with caller-selected checksum handling.
+    ///
+    /// - [`NmeaChecksumMode::Correct`]: `$...*XX\r\n` with the correct XOR.
+    /// - [`NmeaChecksumMode::Omit`]:    `$...\r\n` with no `*XX` suffix.
+    /// - [`NmeaChecksumMode::Wrong`]:   `$...*XX\r\n` with a deliberately
+    ///   wrong byte (correct ^ 0xFF) — for negative testing of parsers.
+    pub fn to_wire_with(&self, mode: NmeaChecksumMode) -> String {
         let payload = self.payload();
-        format!("${}*{:02X}\r\n", payload, checksum::xor(payload.as_bytes()))
+        let cs = checksum::xor(payload.as_bytes());
+        match mode {
+            NmeaChecksumMode::Correct => format!("${payload}*{cs:02X}\r\n"),
+            NmeaChecksumMode::Omit => format!("${payload}\r\n"),
+            NmeaChecksumMode::Wrong => format!("${}*{:02X}\r\n", payload, cs ^ 0xFF),
+        }
     }
 
     /// Parse a NMEA sentence string. Accepts lines with or without `\r\n`.
@@ -138,6 +174,50 @@ mod tests {
             s.to_wire(),
             "$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n"
         );
+    }
+
+    #[test]
+    fn to_wire_with_omit_drops_checksum_suffix() {
+        let s = NmeaSentence::new(
+            TalkerId::GP,
+            SentenceType::HDT,
+            vec!["123.4".into(), "T".into()],
+        );
+        let correct = s.to_wire_with(NmeaChecksumMode::Correct);
+        let omitted = s.to_wire_with(NmeaChecksumMode::Omit);
+        assert!(correct.contains('*'));
+        assert!(!omitted.contains('*'));
+        assert!(omitted.ends_with("\r\n"));
+        assert_eq!(omitted, "$GPHDT,123.4,T\r\n");
+    }
+
+    #[test]
+    fn to_wire_with_wrong_flips_checksum() {
+        let s = NmeaSentence::new(
+            TalkerId::GP,
+            SentenceType::HDT,
+            vec!["123.4".into(), "T".into()],
+        );
+        let correct = s.to_wire_with(NmeaChecksumMode::Correct);
+        let wrong = s.to_wire_with(NmeaChecksumMode::Wrong);
+        // Same length and shape, only the checksum byte differs.
+        assert_eq!(correct.len(), wrong.len());
+        assert_ne!(correct, wrong);
+        // The wrong wire must fail parsing as InvalidChecksum, never anything else.
+        match NmeaSentence::parse(&wrong) {
+            Err(NmeaError::InvalidChecksum { .. }) => {}
+            other => panic!("expected InvalidChecksum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_wire_default_matches_correct_mode() {
+        let s = NmeaSentence::new(
+            TalkerId::GP,
+            SentenceType::HDT,
+            vec!["123.4".into(), "T".into()],
+        );
+        assert_eq!(s.to_wire(), s.to_wire_with(NmeaChecksumMode::Correct));
     }
 
     #[test]
