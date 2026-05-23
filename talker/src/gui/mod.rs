@@ -81,6 +81,7 @@ impl TalkerApp {
             .filter(|&v| v > 0.0)
             .unwrap_or(1.0);
         ctx.set_pixels_per_point(ppp);
+        set_high_contrast_dark_visuals(ctx);
         let mut app = Self {
             profile: Profile::default(),
             profile_path: None,
@@ -478,7 +479,10 @@ impl eframe::App for TalkerApp {
         self.poll_channels(ui.ctx());
         egui::Frame::new()
             .inner_margin(4.0)
-            .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(50, 60, 80)))
+            .stroke(egui::Stroke::new(
+                1.5,
+                egui::Color32::from_rgb(110, 120, 145),
+            ))
             .show(ui, |ui| {
                 self.show_top_bar(ui);
                 self.show_status_bar(ui);
@@ -667,7 +671,7 @@ impl TalkerApp {
                 ui.push_id(i, |ui| {
                     let mut conn_frame = egui::Frame::group(ui.style());
                     conn_frame.stroke =
-                        egui::Stroke::new(1.5, egui::Color32::from_rgb(70, 85, 120));
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(140, 160, 200));
                     conn_frame.show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let error = self.conn_errors.get(i).and_then(|e| e.as_deref());
@@ -1067,6 +1071,25 @@ fn checksum_label(algorithm: ChecksumAlgorithm) -> &'static str {
     }
 }
 
+// ── Theme ─────────────────────────────────────────────────────────────────────
+
+/// Force dark mode and lift the default text + separator contrast so every
+/// element reads clearly against the dark background.
+///
+/// The custom RGB borders elsewhere in this file (outer panel, channel cards)
+/// are tuned for this dark theme, so the theme is set explicitly rather than
+/// left to inherit from the OS.
+fn set_high_contrast_dark_visuals(ctx: &egui::Context) {
+    let mut v = egui::Visuals::dark();
+    let body = egui::Color32::from_gray(230);
+    v.override_text_color = Some(body);
+    v.widgets.noninteractive.fg_stroke.color = body;
+    v.widgets.inactive.fg_stroke.color = body;
+    // Brighten the default frame/group separator so panels don't blur together.
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(80));
+    ctx.set_visuals(v);
+}
+
 // ── Field renderers ───────────────────────────────────────────────────────────
 
 /// Lay out a UTF-8/ASCII text field, drawing `‹XX›` byte markers in a
@@ -1375,9 +1398,9 @@ fn level_color(level: tracing::Level) -> egui::Color32 {
     match level {
         tracing::Level::ERROR => egui::Color32::from_rgb(220, 80, 80),
         tracing::Level::WARN => egui::Color32::from_rgb(220, 180, 60),
-        tracing::Level::DEBUG => egui::Color32::from_rgb(130, 130, 130),
-        tracing::Level::TRACE => egui::Color32::from_rgb(100, 100, 100),
-        _ => egui::Color32::from_rgb(200, 200, 200),
+        tracing::Level::DEBUG => egui::Color32::from_gray(175),
+        tracing::Level::TRACE => egui::Color32::from_gray(150),
+        _ => egui::Color32::from_gray(235),
     }
 }
 
