@@ -703,9 +703,25 @@ impl TalkerApp {
                             }
                             ui.separator();
                             ui.weak(interface_summary(&self.conn_drafts[i]));
+                            let pending = i < self.profile.channels.len()
+                                && self.conn_drafts[i]
+                                    .to_config()
+                                    .is_some_and(|cfg| cfg != self.profile.channels[i].interface);
+                            if pending {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 180, 60),
+                                    "(unapplied — press Enter)",
+                                )
+                                .on_hover_text(
+                                    "Interface parameters have been edited but not \
+                                     yet applied to the running channel. Press Enter \
+                                     in the edited field — or stop and start the \
+                                     channel — to apply them.",
+                                );
+                            }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui
-                                    .small_button("\u{00D7}")
+                                    .button(egui::RichText::new("\u{00D7}").size(18.0).strong())
                                     .on_hover_text("Remove this channel")
                                     .clicked()
                                 {
@@ -839,7 +855,7 @@ fn show_schedule_section(
                         ui.radio_value(&mut entry.payload_kind, PayloadKind::Hex, "Hex");
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui
-                                .small_button("\u{00D7}")
+                                .button(egui::RichText::new("\u{00D7}").size(18.0).strong())
                                 .on_hover_text("Remove this message")
                                 .clicked()
                             {
@@ -1144,36 +1160,20 @@ fn drive_port_hold(
                 started: now,
                 next_fire_at: now + Duration::from_millis(250),
             });
-            tracing::debug!(direction, "port hold: start");
         }
     }
 
     // Ongoing hold.
     if let Some(mut hold) = conn.udp_port_hold {
         if !primary_down {
-            tracing::debug!(
-                direction = hold.direction,
-                held_ms = now.saturating_duration_since(hold.started).as_millis() as u64,
-                "port hold: release"
-            );
             conn.udp_port_hold = None;
         } else {
             // Catch up any deadlines that have already passed in a single
             // frame (handles slow frames cleanly).
-            let mut fired = 0u32;
             while now >= hold.next_fire_at {
                 let interval = port_repeat_interval(now.saturating_duration_since(hold.started));
                 hold.next_fire_at += interval;
                 changed |= port_step(conn, hold.direction);
-                fired += 1;
-            }
-            if fired > 0 {
-                tracing::debug!(
-                    direction = hold.direction,
-                    fired,
-                    held_ms = now.saturating_duration_since(hold.started).as_millis() as u64,
-                    "port hold: fire"
-                );
             }
             conn.udp_port_hold = Some(hold);
             // Wake egui up exactly when the next fire is due, so the loop
@@ -1694,21 +1694,27 @@ fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay) {
             ui.radio_value(&mut display.mode, DisplayMode::Hex, "Hex");
             ui.radio_value(&mut display.mode, DisplayMode::Ascii, "ASCII");
             ui.radio_value(&mut display.mode, DisplayMode::Decoded, "Decoded");
-            if display.mode == DisplayMode::Ascii {
-                ui.separator();
-                ui.label("ctrl-chars:");
-                ui.radio_value(
-                    &mut display.control_style,
-                    ControlStyle::Pictures,
-                    "\u{240A}",
-                );
-                ui.radio_value(&mut display.control_style, ControlStyle::Brackets, "[LF]");
-                ui.radio_value(
-                    &mut display.control_style,
-                    ControlStyle::HexEscapes,
-                    "<0x0A>",
-                );
-            }
+            // Wrap the conditional ctrl-chars block in a stable id scope so
+            // its appearance / disappearance can't shift the auto-derived
+            // ids of the surrounding widgets (Clear button, etc.) and trip
+            // egui's "duplicate widget id" warnings on view-mode changes.
+            ui.push_id("ctrl_chars_block", |ui| {
+                if display.mode == DisplayMode::Ascii {
+                    ui.separator();
+                    ui.label("ctrl-chars:");
+                    ui.radio_value(
+                        &mut display.control_style,
+                        ControlStyle::Pictures,
+                        "\u{240A}",
+                    );
+                    ui.radio_value(&mut display.control_style, ControlStyle::Brackets, "[LF]");
+                    ui.radio_value(
+                        &mut display.control_style,
+                        ControlStyle::HexEscapes,
+                        "<0x0A>",
+                    );
+                }
+            });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("Clear").clicked() {
                     display.clear();
