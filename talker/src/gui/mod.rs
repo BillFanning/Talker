@@ -701,6 +701,8 @@ impl TalkerApp {
                             if self.conn_drafts[i].kind != before_kind {
                                 to_apply.push(i);
                             }
+                            ui.separator();
+                            ui.weak(interface_summary(&self.conn_drafts[i]));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui
                                     .small_button("\u{00D7}")
@@ -1055,6 +1057,42 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     }
 }
 
+/// One-line, human-readable summary of a channel's selected interface and
+/// its parameters, shown in the channel-card header so the active config
+/// is visible at a glance without expanding the editor. Uses the draft's
+/// current strings — invalid or missing parts show as `?`.
+fn interface_summary(conn: &ConnDraft) -> String {
+    fn or_q(s: &str) -> &str {
+        if s.is_empty() {
+            "?"
+        } else {
+            s
+        }
+    }
+    let lp = if conn.local_port.is_empty() {
+        String::new()
+    } else {
+        format!(" (local {})", conn.local_port)
+    };
+    match conn.kind {
+        ConnKind::Serial => format!("Serial: {} @ {}", or_q(&conn.serial_port), conn.baud_rate),
+        ConnKind::Udp => match conn.udp_mode {
+            UdpModeDraft::Unicast => format!("UDP unicast → {}{lp}", or_q(&conn.udp_dest)),
+            UdpModeDraft::Broadcast => format!(
+                "UDP broadcast → {}:{}{lp}",
+                or_q(&conn.udp_broadcast_addr),
+                or_q(&conn.udp_broadcast_port),
+            ),
+            UdpModeDraft::Multicast => format!(
+                "UDP multicast → {}:{}{lp}",
+                or_q(&conn.udp_group),
+                or_q(&conn.udp_mc_port),
+            ),
+        },
+        ConnKind::Tcp => format!("TCP → {}", or_q(&conn.tcp_addr)),
+    }
+}
+
 /// Enumerate the specific reasons the Start button is disabled for a
 /// channel — one human-readable line per problem. Returned in the same
 /// order they appear in the editor (channel fields first, then per-message
@@ -1202,11 +1240,16 @@ fn show_message_preview(ui: &mut egui::Ui, entry: &ScheduleDraft) {
 }
 
 /// Render the per-message timestamp toggles.
+///
+/// No inner separator between the `Timestamp` checkbox and its
+/// sub-toggles — visual grouping comes from the parent horizontal. The
+/// only `ui.separator()` at this nesting level is the one *between* the
+/// timestamp group and the message-checksum group, so the hierarchy reads
+/// "groups are separated; within a group is just spacing".
 fn show_timestamp_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     ui.horizontal(|ui| {
         ui.checkbox(&mut entry.timestamp_enabled, "Timestamp");
         if entry.timestamp_enabled {
-            ui.separator();
             ui.checkbox(&mut entry.ts_date, "Date");
             ui.checkbox(&mut entry.ts_millis, "Milliseconds");
             ui.checkbox(&mut entry.ts_timezone, "Timezone");
@@ -1214,7 +1257,8 @@ fn show_timestamp_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     });
 }
 
-/// Render the per-message checksum controls.
+/// Render the per-message checksum controls. See [`show_timestamp_editor`]
+/// for the separator hierarchy rationale.
 fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     ui.horizontal(|ui| {
         ui.checkbox(&mut entry.checksum_enabled, "Message checksum")
@@ -1224,7 +1268,6 @@ fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                  checksum like NMEA's `*XX` — that one is still emitted.",
             );
         if entry.checksum_enabled {
-            ui.separator();
             egui::ComboBox::from_id_salt("checksum_algorithm")
                 .selected_text(checksum_label(entry.checksum_algorithm))
                 .show_ui(ui, |ui| {
