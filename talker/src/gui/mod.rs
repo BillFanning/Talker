@@ -843,22 +843,21 @@ fn show_schedule_section(
                         .show(ui, |ui| {
                             show_payload_fields(ui, entry);
 
+                            let bad_interval = !entry.interval_ms.is_empty()
+                                && entry.interval_ms.parse::<u64>().is_err();
                             ui.label("Interval (ms)");
-                            let interval_resp = ui.add(
-                                egui::TextEdit::singleline(&mut entry.interval_ms)
-                                    .desired_width(80.0),
-                            );
+                            let interval_resp =
+                                red_bordered(ui, bad_interval, "must be a whole number", |ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut entry.interval_ms)
+                                            .desired_width(80.0),
+                                    )
+                                });
                             ui.end_row();
-                            match entry.interval_ms.parse::<u64>() {
-                                Ok(ms) if interval_resp.lost_focus() => {
+                            if interval_resp.lost_focus() {
+                                if let Ok(ms) = entry.interval_ms.parse::<u64>() {
                                     interval_changes.push((i, ms));
                                 }
-                                Err(_) if !entry.interval_ms.is_empty() => {
-                                    ui.label("");
-                                    ui.label(err_text("must be a whole number"));
-                                    ui.end_row();
-                                }
-                                _ => {}
                             }
                         });
 
@@ -889,21 +888,24 @@ fn show_schedule_section(
 fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     match entry.payload_kind {
         PayloadKind::Hex => {
+            let bad_hex = !entry.hex_data.is_empty() && !hex_valid(&entry.hex_data);
             ui.label("Data (hex)");
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut entry.hex_data)
-                    .desired_width(360.0)
-                    .hint_text("DE AD BE EF"),
+            let r = red_bordered(
+                ui,
+                bad_hex,
+                "invalid hex — use byte pairs like DE AD BE EF",
+                |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut entry.hex_data)
+                            .desired_width(360.0)
+                            .hint_text("DE AD BE EF"),
+                    )
+                },
             );
             if r.changed() {
                 entry.hex_data = entry.hex_data.to_ascii_uppercase();
             }
             ui.end_row();
-            if !entry.hex_data.is_empty() && !hex_valid(&entry.hex_data) {
-                ui.label("");
-                ui.label(err_text("invalid hex — use byte pairs like DE AD BE EF"));
-                ui.end_row();
-            }
         }
         PayloadKind::Utf8 => {
             ui.label("Text");
@@ -1299,10 +1301,19 @@ fn show_serial_fields(ui: &mut egui::Ui, conn: &mut ConnDraft, ports: &[String])
                     }
                 }
                 ui.separator();
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut conn.baud_custom)
-                        .desired_width(68.0)
-                        .hint_text("custom"),
+                let bad_baud = !conn.baud_custom.is_empty()
+                    && conn.baud_custom.parse::<u32>().map_or(true, |b| b == 0);
+                let r = red_bordered(
+                    ui,
+                    bad_baud,
+                    "enter a positive baud rate — e.g. 230400",
+                    |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut conn.baud_custom)
+                                .desired_width(68.0)
+                                .hint_text("custom"),
+                        )
+                    },
                 );
                 if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
                     if let Ok(b) = conn.baud_custom.parse::<u32>() {
@@ -1313,13 +1324,6 @@ fn show_serial_fields(ui: &mut egui::Ui, conn: &mut ConnDraft, ports: &[String])
                 }
             });
             ui.end_row();
-            if !conn.baud_custom.is_empty()
-                && conn.baud_custom.parse::<u32>().map_or(true, |b| b == 0)
-            {
-                ui.label("");
-                ui.label(err_text("enter a positive baud rate — e.g. 230400"));
-                ui.end_row();
-            }
 
             ui.label("Data bits");
             ui.horizontal(|ui| {
@@ -1383,34 +1387,50 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
 
             match conn.udp_mode {
                 UdpModeDraft::Unicast => {
+                    let bad =
+                        !conn.udp_dest.is_empty() && conn.udp_dest.parse::<SocketAddr>().is_err();
                     ui.label("Destination");
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut conn.udp_dest)
-                            .desired_width(220.0)
-                            .hint_text("host:port  (Enter to apply)"),
+                    let r = red_bordered(
+                        ui,
+                        bad,
+                        "enter host:port — e.g. 192.168.1.100:4000",
+                        |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut conn.udp_dest)
+                                    .desired_width(220.0)
+                                    .hint_text("host:port  (Enter to apply)"),
+                            )
+                        },
                     );
                     if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
                         apply = true;
                     }
                     ui.end_row();
-                    if !conn.udp_dest.is_empty() && conn.udp_dest.parse::<SocketAddr>().is_err() {
-                        ui.label("");
-                        ui.label(err_text("enter host:port — e.g. 192.168.1.100:4000"));
-                        ui.end_row();
-                    }
                 }
                 UdpModeDraft::Broadcast => {
+                    let bad_addr = !conn.udp_broadcast_addr.is_empty()
+                        && conn.udp_broadcast_addr.parse::<Ipv4Addr>().is_err();
+                    let bad_port = !conn.udp_broadcast_port.is_empty()
+                        && conn.udp_broadcast_port.parse::<u16>().is_err();
                     ui.label("Destination");
                     ui.horizontal(|ui| {
-                        let addr_r = ui.add(
-                            egui::TextEdit::singleline(&mut conn.udp_broadcast_addr)
-                                .desired_width(140.0)
-                                .hint_text("255.255.255.255"),
+                        let addr_r = red_bordered(
+                            ui,
+                            bad_addr,
+                            "enter an IPv4 address — e.g. 255.255.255.255",
+                            |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut conn.udp_broadcast_addr)
+                                        .desired_width(140.0)
+                                        .hint_text("255.255.255.255"),
+                                )
+                            },
                         );
                         if addr_r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
                         {
                             apply = true;
                         }
+                        ui.label("Port:");
                         if ui
                             .small_button("\u{2212}")
                             .on_hover_text("Decrement port")
@@ -1421,11 +1441,13 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                                 apply = true;
                             }
                         }
-                        let port_r = ui.add(
-                            egui::TextEdit::singleline(&mut conn.udp_broadcast_port)
-                                .desired_width(60.0)
-                                .hint_text("port"),
-                        );
+                        let port_r =
+                            red_bordered(ui, bad_port, "enter a port number 1–65535", |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut conn.udp_broadcast_port)
+                                        .desired_width(60.0),
+                                )
+                            });
                         if port_r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
                         {
                             apply = true;
@@ -1444,71 +1466,58 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                         }
                     });
                     ui.end_row();
-                    let bad_addr = !conn.udp_broadcast_addr.is_empty()
-                        && conn.udp_broadcast_addr.parse::<Ipv4Addr>().is_err();
-                    let bad_port = !conn.udp_broadcast_port.is_empty()
-                        && conn.udp_broadcast_port.parse::<u16>().is_err();
-                    if bad_addr {
-                        ui.label("");
-                        ui.label(err_text("enter an IPv4 address — e.g. 255.255.255.255"));
-                        ui.end_row();
-                    }
-                    if bad_port {
-                        ui.label("");
-                        ui.label(err_text("enter a port number 1–65535"));
-                        ui.end_row();
-                    }
                 }
                 UdpModeDraft::Multicast => {
+                    let bad_group =
+                        !conn.udp_group.is_empty() && conn.udp_group.parse::<Ipv4Addr>().is_err();
+                    let bad_port =
+                        !conn.udp_mc_port.is_empty() && conn.udp_mc_port.parse::<u16>().is_err();
                     ui.label("Group");
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut conn.udp_group)
-                            .desired_width(140.0)
-                            .hint_text("239.x.x.x  (Enter to apply)"),
+                    let r = red_bordered(
+                        ui,
+                        bad_group,
+                        "enter IPv4 multicast address — e.g. 239.0.0.1",
+                        |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut conn.udp_group)
+                                    .desired_width(140.0)
+                                    .hint_text("239.x.x.x  (Enter to apply)"),
+                            )
+                        },
                     );
                     if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
                         apply = true;
                     }
                     ui.end_row();
-                    if !conn.udp_group.is_empty() && conn.udp_group.parse::<Ipv4Addr>().is_err() {
-                        ui.label("");
-                        ui.label(err_text("enter IPv4 multicast address — e.g. 239.0.0.1"));
-                        ui.end_row();
-                    }
 
                     ui.label("Port");
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut conn.udp_mc_port)
-                            .desired_width(80.0)
-                            .hint_text("port"),
-                    );
+                    let r = red_bordered(ui, bad_port, "enter a port number 1–65535", |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut conn.udp_mc_port)
+                                .desired_width(80.0)
+                                .hint_text("port"),
+                        )
+                    });
                     if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
                         apply = true;
                     }
                     ui.end_row();
-                    if !conn.udp_mc_port.is_empty() && conn.udp_mc_port.parse::<u16>().is_err() {
-                        ui.label("");
-                        ui.label(err_text("enter a port number 1–65535"));
-                        ui.end_row();
-                    }
                 }
             }
 
+            let bad_local = !conn.local_port.is_empty() && conn.local_port.parse::<u16>().is_err();
             ui.label("Local port");
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut conn.local_port)
-                    .desired_width(80.0)
-                    .hint_text("auto"),
-            );
+            let r = red_bordered(ui, bad_local, "enter a port number 1–65535", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut conn.local_port)
+                        .desired_width(80.0)
+                        .hint_text("auto"),
+                )
+            });
             if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
                 apply = true;
             }
             ui.end_row();
-            if !conn.local_port.is_empty() && conn.local_port.parse::<u16>().is_err() {
-                ui.label("");
-                ui.label(err_text("enter a port number 1–65535"));
-                ui.end_row();
-            }
         });
 
     apply || (conn.udp_mode != before_mode)
@@ -1524,8 +1533,32 @@ fn level_color(level: tracing::Level) -> egui::Color32 {
     }
 }
 
-fn err_text(msg: &str) -> egui::RichText {
-    egui::RichText::new(msg).color(egui::Color32::RED).small()
+/// Add a single text-input field through `add`, and when `invalid` is true
+/// draw a red border around it and attach a hover tooltip with `msg`.
+/// Returns the field's [`egui::Response`] so callers can still inspect
+/// `.lost_focus()`, `.changed()`, etc.
+///
+/// This replaces the older "extra row of red text below the field" pattern
+/// so the controls beneath an invalid field do not shift while the user
+/// types.
+fn red_bordered<F>(ui: &mut egui::Ui, invalid: bool, msg: &str, add: F) -> egui::Response
+where
+    F: FnOnce(&mut egui::Ui) -> egui::Response,
+{
+    if !invalid {
+        return add(ui);
+    }
+    let red = egui::Color32::from_rgb(220, 80, 80);
+    let inner = ui.scope(|ui| {
+        let v = ui.visuals_mut();
+        v.widgets.inactive.bg_stroke.color = red;
+        v.widgets.inactive.bg_stroke.width = v.widgets.inactive.bg_stroke.width.max(1.0);
+        v.widgets.hovered.bg_stroke.color = red;
+        v.widgets.active.bg_stroke.color = red;
+        v.selection.stroke.color = red;
+        add(ui)
+    });
+    inner.inner.on_hover_text(msg)
 }
 
 fn hex_valid(s: &str) -> bool {
@@ -1545,21 +1578,24 @@ fn show_tcp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
         .num_columns(2)
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
+            let bad_tcp = !conn.tcp_addr.is_empty() && conn.tcp_addr.parse::<SocketAddr>().is_err();
             ui.label("Address");
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut conn.tcp_addr)
-                    .desired_width(220.0)
-                    .hint_text("host:port  (Enter to apply)"),
+            let r = red_bordered(
+                ui,
+                bad_tcp,
+                "enter host:port — e.g. 192.168.1.100:4000",
+                |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut conn.tcp_addr)
+                            .desired_width(220.0)
+                            .hint_text("host:port  (Enter to apply)"),
+                    )
+                },
             );
             if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
                 apply = true;
             }
             ui.end_row();
-            if !conn.tcp_addr.is_empty() && conn.tcp_addr.parse::<SocketAddr>().is_err() {
-                ui.label("");
-                ui.label(err_text("enter host:port — e.g. 192.168.1.100:4000"));
-                ui.end_row();
-            }
         });
 
     apply
