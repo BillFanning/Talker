@@ -1,2 +1,5 @@
 # Rust build output
 /target
+
+# Local working profile — copy profile.example.toml here and edit
+/profile.toml
