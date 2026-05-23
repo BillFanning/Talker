@@ -1400,19 +1400,60 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                     }
                 }
                 UdpModeDraft::Broadcast => {
-                    ui.label("Port");
-                    let r = ui.add(
-                        egui::TextEdit::singleline(&mut conn.udp_broadcast_port)
-                            .desired_width(80.0)
-                            .hint_text("port  (Enter to apply)"),
-                    );
-                    if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                        apply = true;
-                    }
+                    ui.label("Destination");
+                    ui.horizontal(|ui| {
+                        let addr_r = ui.add(
+                            egui::TextEdit::singleline(&mut conn.udp_broadcast_addr)
+                                .desired_width(140.0)
+                                .hint_text("255.255.255.255"),
+                        );
+                        if addr_r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
+                        {
+                            apply = true;
+                        }
+                        if ui
+                            .small_button("\u{2212}")
+                            .on_hover_text("Decrement port")
+                            .clicked()
+                        {
+                            if let Ok(p) = conn.udp_broadcast_port.parse::<u16>() {
+                                conn.udp_broadcast_port = p.saturating_sub(1).max(1).to_string();
+                                apply = true;
+                            }
+                        }
+                        let port_r = ui.add(
+                            egui::TextEdit::singleline(&mut conn.udp_broadcast_port)
+                                .desired_width(60.0)
+                                .hint_text("port"),
+                        );
+                        if port_r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
+                        {
+                            apply = true;
+                        }
+                        if ui
+                            .small_button("+")
+                            .on_hover_text("Increment port")
+                            .clicked()
+                        {
+                            if let Ok(p) = conn.udp_broadcast_port.parse::<u16>() {
+                                if p < u16::MAX {
+                                    conn.udp_broadcast_port = (p + 1).to_string();
+                                    apply = true;
+                                }
+                            }
+                        }
+                    });
                     ui.end_row();
-                    if !conn.udp_broadcast_port.is_empty()
-                        && conn.udp_broadcast_port.parse::<u16>().is_err()
-                    {
+                    let bad_addr = !conn.udp_broadcast_addr.is_empty()
+                        && conn.udp_broadcast_addr.parse::<Ipv4Addr>().is_err();
+                    let bad_port = !conn.udp_broadcast_port.is_empty()
+                        && conn.udp_broadcast_port.parse::<u16>().is_err();
+                    if bad_addr {
+                        ui.label("");
+                        ui.label(err_text("enter an IPv4 address — e.g. 255.255.255.255"));
+                        ui.end_row();
+                    }
+                    if bad_port {
                         ui.label("");
                         ui.label(err_text("enter a port number 1–65535"));
                         ui.end_row();
