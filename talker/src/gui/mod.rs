@@ -1020,10 +1020,11 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                     }
                 });
                 ui.separator();
-                ui.label("*XX:").on_hover_text(
-                    "The protocol-internal NMEA checksum (`*XX` at end of sentence). \
-                     Distinct from the per-message Checksum row below, which wraps \
-                     an outer checksum around the complete output.",
+                ui.label("NMEA checksum:").on_hover_text(
+                    "The protocol-internal `*XX` byte at the end of an NMEA \
+                     sentence. Distinct from the `Message checksum` row below, \
+                     which is an outer checksum wrapped around the complete \
+                     rendered message (timestamp + payload + NMEA `*XX`).",
                 );
                 ui.radio_value(
                     &mut entry.nmea_checksum_mode,
@@ -1216,7 +1217,12 @@ fn show_timestamp_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
 /// Render the per-message checksum controls.
 fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     ui.horizontal(|ui| {
-        ui.checkbox(&mut entry.checksum_enabled, "Checksum");
+        ui.checkbox(&mut entry.checksum_enabled, "Message checksum")
+            .on_hover_text(
+                "Outer checksum appended to the complete rendered message \
+                 (timestamp + payload). Independent of any protocol-internal \
+                 checksum like NMEA's `*XX` — that one is still emitted.",
+            );
         if entry.checksum_enabled {
             ui.separator();
             egui::ComboBox::from_id_salt("checksum_algorithm")
