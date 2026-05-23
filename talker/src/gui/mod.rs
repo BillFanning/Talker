@@ -832,11 +832,11 @@ fn show_schedule_section(
                     ui.horizontal(|ui| {
                         ui.strong(format!("Message {}", i + 1));
                         ui.separator();
-                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Hex, "Hex");
+                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Nmea, "NMEA");
+                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Ascii, "ASCII");
                         ui.radio_value(&mut entry.payload_kind, PayloadKind::Utf8, "UTF-8");
                         ui.radio_value(&mut entry.payload_kind, PayloadKind::Utf16, "UTF-16");
-                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Ascii, "ASCII");
-                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Nmea, "NMEA");
+                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Hex, "Hex");
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui
                                 .small_button("\u{00D7}")
@@ -1065,6 +1065,9 @@ fn show_filtered_picker(
     options: &[&'static str],
     selected: &mut String,
 ) {
+    // Pin the popup to a consistent shape so the Talker picker (2-char
+    // entries) and the Sentence picker (3-char entries) look the same.
+    ui.set_min_width(140.0);
     let r = ui.add(
         egui::TextEdit::singleline(filter)
             .desired_width(120.0)
@@ -1073,7 +1076,9 @@ fn show_filtered_picker(
     r.request_focus();
     let needle = filter.to_ascii_uppercase();
     egui::ScrollArea::vertical()
+        .min_scrolled_height(300.0)
         .max_height(300.0)
+        .auto_shrink([false, false])
         .show(ui, |ui| {
             for entry in options {
                 if (needle.is_empty() || entry.contains(needle.as_str()))
@@ -1301,21 +1306,43 @@ fn interface_summary(conn: &ConnDraft) -> String {
         format!(" (local {})", conn.local_port)
     };
     match conn.kind {
-        ConnKind::Serial => format!("Serial: {} @ {}", or_q(&conn.serial_port), conn.baud_rate),
+        ConnKind::Serial => {
+            let data = conn.data_bits;
+            let parity = match conn.parity {
+                1 => "Odd",
+                2 => "Even",
+                _ => "None",
+            };
+            let stop = conn.stop_bits;
+            let flow = match conn.flow_control {
+                1 => "XON/XOFF",
+                2 => "RTS/CTS",
+                _ => "None",
+            };
+            format!(
+                "Serial: {} {},{},{},{} flow:{}",
+                or_q(&conn.serial_port),
+                conn.baud_rate,
+                data,
+                parity,
+                stop,
+                flow,
+            )
+        }
         ConnKind::Udp => match conn.udp_mode {
-            UdpModeDraft::Unicast => format!("UDP unicast → {}{lp}", or_q(&conn.udp_dest)),
+            UdpModeDraft::Unicast => format!("UDP unicast {}{lp}", or_q(&conn.udp_dest)),
             UdpModeDraft::Broadcast => format!(
-                "UDP broadcast → {}:{}{lp}",
+                "UDP broadcast {}:{}{lp}",
                 or_q(&conn.udp_broadcast_addr),
                 or_q(&conn.udp_broadcast_port),
             ),
             UdpModeDraft::Multicast => format!(
-                "UDP multicast → {}:{}{lp}",
+                "UDP multicast {}:{}{lp}",
                 or_q(&conn.udp_group),
                 or_q(&conn.udp_mc_port),
             ),
         },
-        ConnKind::Tcp => format!("TCP → {}", or_q(&conn.tcp_addr)),
+        ConnKind::Tcp => format!("TCP {}", or_q(&conn.tcp_addr)),
     }
 }
 
@@ -1835,8 +1862,8 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
         .show(ui, |ui| {
             ui.label("Mode");
             ui.horizontal(|ui| {
-                ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Unicast, "Unicast");
                 ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Broadcast, "Broadcast");
+                ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Unicast, "Unicast");
                 ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Multicast, "Multicast");
             });
             ui.end_row();
