@@ -83,6 +83,7 @@ impl TalkerApp {
         ctx.set_pixels_per_point(ppp);
         set_high_contrast_dark_visuals(ctx);
         install_control_pictures_fallback_font(ctx);
+        bump_non_monospace_text_size(ctx, 0.5);
         let mut app = Self {
             profile: Profile::default(),
             profile_path: None,
@@ -1105,6 +1106,20 @@ fn set_high_contrast_dark_visuals(ctx: &egui::Context) {
     ctx.set_visuals_of(egui::Theme::Light, v);
 }
 
+/// Add `delta` points to every text style in both themes *except* the
+/// Monospace family, so the display pane's output data (rendered with
+/// `RichText::monospace()`) keeps its original size while the rest of the
+/// UI (labels, buttons, headings, byte markers) is slightly larger.
+fn bump_non_monospace_text_size(ctx: &egui::Context, delta: f32) {
+    ctx.all_styles_mut(|style| {
+        for font_id in style.text_styles.values_mut() {
+            if font_id.family != egui::FontFamily::Monospace {
+                font_id.size += delta;
+            }
+        }
+    });
+}
+
 /// Register a Unicode Control Pictures fallback font.
 ///
 /// The default `egui` fonts (Hack, Ubuntu-Light, NotoEmoji, emoji-icon) cover
@@ -1196,14 +1211,18 @@ fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay) {
             ui.radio_value(&mut display.mode, DisplayMode::Decoded, "Decoded");
             if display.mode == DisplayMode::Ascii {
                 ui.separator();
-                ui.label("Controls:");
+                ui.label("ctrl-char:");
                 ui.radio_value(
                     &mut display.control_style,
                     ControlStyle::Pictures,
                     "\u{240A}",
                 );
                 ui.radio_value(&mut display.control_style, ControlStyle::Brackets, "[LF]");
-                ui.radio_value(&mut display.control_style, ControlStyle::HexEscapes, "<0x>");
+                ui.radio_value(
+                    &mut display.control_style,
+                    ControlStyle::HexEscapes,
+                    "<0x0A>",
+                );
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("Clear").clicked() {
