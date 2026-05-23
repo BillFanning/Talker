@@ -1217,15 +1217,9 @@ fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay) {
             .stick_to_bottom(true)
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                // Render the entire buffer as a single label, messages joined
-                // by '\n'. Using one Label per message inserts egui's
-                // item_spacing between consecutive widgets, which reads as an
-                // unwanted blank line. With a single label, the only line
-                // breaks are the per-message separator and whatever '\n' the
-                // message itself contains (only possible in Decoded mode).
-                // `.wrap()` keeps long Hex rows breaking at the right edge.
-                let text: String = display.lines().collect::<Vec<_>>().join("\n");
-                ui.add(egui::Label::new(egui::RichText::new(text).monospace()).wrap());
+                for line in display.lines() {
+                    ui.label(egui::RichText::new(line).monospace());
+                }
             });
     });
 }
