@@ -906,21 +906,18 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
         PayloadKind::Hex => {
             let bad_hex = !entry.hex_data.is_empty() && !hex_valid(&entry.hex_data);
             ui.label("Data (hex)");
-            let r = red_bordered(
+            let _ = red_bordered(
                 ui,
                 bad_hex,
                 "invalid hex — use byte pairs like DE AD BE EF",
                 |ui| {
                     ui.add(
-                        egui::TextEdit::singleline(&mut entry.hex_data)
+                        egui::TextEdit::singleline(&mut UppercaseHex(&mut entry.hex_data))
                             .desired_width(360.0)
                             .hint_text("DE AD BE EF"),
                     )
                 },
             );
-            if r.changed() {
-                entry.hex_data = entry.hex_data.to_ascii_uppercase();
-            }
             ui.end_row();
         }
         PayloadKind::Utf8 => {
@@ -1059,12 +1056,17 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
 
 /// Drive one frame of hold-to-repeat for the broadcast port's ± buttons.
 ///
-/// - A simple click (button down + up before the initial delay elapses)
-///   changes the port by exactly 1.
-/// - Holding either button fires once immediately, then waits for a 400 ms
-///   initial delay, then auto-repeats at a rate that *accelerates* the
-///   longer the button is held (see [`port_repeat_interval`]).
+/// - A simple click changes the port by exactly 1.
+/// - Holding either button fires once immediately, then waits ~250 ms, then
+///   auto-repeats at a rate that *accelerates* the longer the button is
+///   held (see [`port_repeat_interval`]).
 /// - Switching from one button to the other while held resets the state.
+///
+/// Uses absolute `Instant` deadlines (no per-frame `dt` accumulation), so the
+/// cadence stays correct even when the framerate is jittery. Schedules the
+/// next egui repaint precisely at the next fire instant via
+/// `request_repaint_after`, so the loop keeps running without depending on
+/// other input events.
 ///
 /// Returns `true` if the port value changed this frame.
 fn drive_port_hold(
@@ -1073,6 +1075,8 @@ fn drive_port_hold(
     r_minus: &egui::Response,
     r_plus: &egui::Response,
 ) -> bool {
+    use std::time::{Duration, Instant};
+
     let direction: i8 = if r_minus.is_pointer_button_down_on() {
         -1
     } else if r_plus.is_pointer_button_down_on() {
@@ -1084,26 +1088,37 @@ fn drive_port_hold(
     let mut changed = false;
 
     if direction != 0 {
-        let dt = ui.ctx().input(|i| i.stable_dt);
+        let now = Instant::now();
         let needs_reset = conn.udp_port_hold.is_none_or(|h| h.direction != direction);
         if needs_reset {
-            // First frame held (or switched buttons): fire once, start delay.
+            // First frame held (or switched buttons): fire once, then wait
+            // out the initial delay before auto-repeat kicks in.
             changed |= port_step(conn, direction);
             conn.udp_port_hold = Some(PortHold {
                 direction,
-                next_fire_in: -0.4, // 400 ms initial delay before auto-repeat
-                total_held: 0.0,
+                started: now,
+                next_fire_at: now + Duration::from_millis(250),
             });
-        } else if let Some(h) = conn.udp_port_hold.as_mut() {
-            h.total_held += dt;
-            h.next_fire_in += dt;
-            if h.next_fire_in >= 0.0 {
-                let interval = port_repeat_interval(h.total_held);
-                h.next_fire_in -= interval;
+        } else if let Some(mut hold) = conn.udp_port_hold {
+            // Catch up any deadlines that have already passed (handles slow
+            // frames cleanly — we never lose a tick to a long delta).
+            // `hold` is a Copy of the field, so calling `port_step(conn, …)`
+            // inside the loop doesn't conflict with the borrow.
+            while now >= hold.next_fire_at {
+                let interval = port_repeat_interval(now.saturating_duration_since(hold.started));
+                hold.next_fire_at += interval;
                 changed |= port_step(conn, direction);
             }
+            conn.udp_port_hold = Some(hold);
         }
-        ui.ctx().request_repaint();
+        // Wake egui up exactly when the next fire is due. The mutable
+        // borrow above has dropped, so re-read the option here.
+        if let Some(h) = conn.udp_port_hold {
+            ui.ctx()
+                .request_repaint_after(h.next_fire_at.saturating_duration_since(now));
+        } else {
+            ui.ctx().request_repaint();
+        }
     } else {
         // Quick tap (down + up inside the same frame, before
         // is_pointer_button_down_on saw it).
@@ -1134,51 +1149,91 @@ fn port_step(conn: &mut ConnDraft, direction: i8) -> bool {
     true
 }
 
-/// Acceleration curve for the ± port hold-to-repeat. Total seconds held
-/// → seconds between successive repeats.
+/// Acceleration curve for the ± port hold-to-repeat.
+/// Time-elapsed-since-press → delay until the next repeat.
 ///
-/// Tiered (not exponential) so the cadence is predictable when the user
-/// is targeting a specific port number.
-fn port_repeat_interval(total_held: f32) -> f32 {
-    match total_held {
-        t if t < 1.0 => 0.15,  // ~7 / s for the first second
-        t if t < 3.0 => 0.075, // ~13 / s next two seconds
-        t if t < 6.0 => 0.035, // ~28 / s next three seconds
-        _ => 0.015,            // ~65 / s after that
+/// Tiered (not exponential) so the cadence is predictable when the user is
+/// targeting a specific port number. The initial 250 ms delay before the
+/// first auto-repeat is handled separately in [`drive_port_hold`].
+fn port_repeat_interval(elapsed: std::time::Duration) -> std::time::Duration {
+    use std::time::Duration;
+    match elapsed.as_secs_f32() {
+        t if t < 1.0 => Duration::from_millis(100), // 10 / s for the first second
+        t if t < 3.0 => Duration::from_millis(50),  // 20 / s next two seconds
+        t if t < 6.0 => Duration::from_millis(25),  // 40 / s next three seconds
+        _ => Duration::from_millis(10),             // 100 / s after that
     }
 }
 
 /// Render `bytes` as a single-line preview string.
 ///
-/// - Trailing CR/LF is stripped (NMEA's `\r\n` terminator) so the preview
-///   stays on one visual line.
-/// - Valid UTF-8 sequences are emitted as characters, *except* control
-///   characters, which are emitted as `‹XX›` markers so they are visible
-///   and don't break the line.
-/// - Invalid UTF-8 bytes (e.g. the binary message-checksum byte appended
-///   after an NMEA sentence, or extended-codepage bytes in Ascii mode)
-///   are also emitted as `‹XX›` markers. This avoids the U+FFFD-tofu the
-///   bundled fonts would otherwise show.
+/// Every printable ASCII byte (`0x20..=0x7E`) is emitted as-is; **every
+/// other byte** — control characters, CR/LF, anything ≥ 0x80, and the
+/// individual bytes of any multi-byte UTF-8 sequence — becomes a `‹XX›`
+/// marker. This guarantees that the bundled fonts (Hack / Ubuntu-Light
+/// plus the Cascadia Control-Pictures subset) can render every glyph the
+/// preview emits, so nothing tofus. The tradeoff: pretty Unicode display
+/// is lost in the preview — `café` shows as `caf‹C3›‹A9›` — but the user
+/// can see the exact bytes that will go on the wire, which matters more
+/// for a tool like this.
+///
+/// Embedded `\r` and `\n` therefore appear as `‹0D›‹0A›` (visible, no
+/// real line break), so the preview always renders on a single line and
+/// no separate trim step is needed.
 fn preview_text(bytes: &[u8]) -> String {
-    let trimmed = match bytes {
-        [rest @ .., b'\r', b'\n'] => rest,
-        [rest @ .., b'\n'] | [rest @ .., b'\r'] => rest,
-        _ => bytes,
-    };
-    let mut out = String::with_capacity(trimmed.len());
-    for chunk in trimmed.utf8_chunks() {
-        for c in chunk.valid().chars() {
-            if c.is_control() {
-                out.push_str(&format!("\u{2039}{:02X}\u{203A}", c as u32));
-            } else {
-                out.push(c);
-            }
-        }
-        for &b in chunk.invalid() {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if (0x20..=0x7E).contains(&b) {
+            out.push(b as char);
+        } else {
             out.push_str(&format!("\u{2039}{b:02X}\u{203A}"));
         }
     }
     out
+}
+
+/// `egui::TextBuffer` wrapper around a `&mut String` that **uppercases every
+/// character on insert**, so a hex field's value can never momentarily contain
+/// a lowercase letter (no one-frame flash between keystroke and post-hoc
+/// `to_ascii_uppercase`). Used for the message editor's Hex data field.
+struct UppercaseHex<'a>(&'a mut String);
+
+impl egui::TextBuffer for UppercaseHex<'_> {
+    fn is_mutable(&self) -> bool {
+        true
+    }
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+    fn insert_text(&mut self, text: &str, char_index: usize) -> usize {
+        let upper = text.to_ascii_uppercase();
+        let byte_idx = self
+            .0
+            .char_indices()
+            .nth(char_index)
+            .map_or(self.0.len(), |(i, _)| i);
+        self.0.insert_str(byte_idx, &upper);
+        upper.chars().count()
+    }
+    fn delete_char_range(&mut self, char_range: std::ops::Range<usize>) {
+        let start = self
+            .0
+            .char_indices()
+            .nth(char_range.start)
+            .map_or(self.0.len(), |(i, _)| i);
+        let end = self
+            .0
+            .char_indices()
+            .nth(char_range.end)
+            .map_or(self.0.len(), |(i, _)| i);
+        self.0.replace_range(start..end, "");
+    }
+    fn type_id(&self) -> std::any::TypeId {
+        // `UppercaseHex<'a>` isn't `'static`, so we can't use `TypeId::of::<Self>()`.
+        // Use a `'static` marker — egui only needs *some* stable TypeId.
+        struct UppercaseHexMarker;
+        std::any::TypeId::of::<UppercaseHexMarker>()
+    }
 }
 
 /// One-line, human-readable summary of a channel's selected interface and

@@ -29,16 +29,18 @@ pub enum UdpModeDraft {
 
 /// Hold-to-repeat state for a single ± port control. Lives only at runtime;
 /// never serialised.
+///
+/// Uses absolute `Instant` deadlines rather than accumulating per-frame `dt`,
+/// so the repeat cadence is correct even when the framerate is jittery.
 #[derive(Debug, Clone, Copy)]
 pub struct PortHold {
     /// −1 for the minus button, +1 for the plus button.
     pub direction: i8,
-    /// Seconds until the next repeat fires. Negative while we wait out the
-    /// initial delay, then drives the per-frame repeat cadence.
-    pub next_fire_in: f32,
-    /// Total seconds the button has been held — used to accelerate the
-    /// repeat interval (see `port_repeat_interval` in `gui/mod.rs`).
-    pub total_held: f32,
+    /// When the button was first pressed — used to accelerate the repeat
+    /// interval (see `port_repeat_interval` in `gui/mod.rs`).
+    pub started: std::time::Instant,
+    /// Wall-clock instant of the next scheduled fire.
+    pub next_fire_at: std::time::Instant,
 }
 
 pub struct ConnDraft {
