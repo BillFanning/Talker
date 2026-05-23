@@ -1382,7 +1382,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
             ui.end_row();
 
             match conn.udp_mode {
-                UdpModeDraft::Unicast | UdpModeDraft::Broadcast => {
+                UdpModeDraft::Unicast => {
                     ui.label("Destination");
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut conn.udp_dest)
@@ -1396,6 +1396,25 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                     if !conn.udp_dest.is_empty() && conn.udp_dest.parse::<SocketAddr>().is_err() {
                         ui.label("");
                         ui.label(err_text("enter host:port — e.g. 192.168.1.100:4000"));
+                        ui.end_row();
+                    }
+                }
+                UdpModeDraft::Broadcast => {
+                    ui.label("Port");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut conn.udp_broadcast_port)
+                            .desired_width(80.0)
+                            .hint_text("port  (Enter to apply)"),
+                    );
+                    if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                        apply = true;
+                    }
+                    ui.end_row();
+                    if !conn.udp_broadcast_port.is_empty()
+                        && conn.udp_broadcast_port.parse::<u16>().is_err()
+                    {
+                        ui.label("");
+                        ui.label(err_text("enter a port number 1–65535"));
                         ui.end_row();
                     }
                 }

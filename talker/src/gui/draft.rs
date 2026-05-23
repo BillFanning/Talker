@@ -39,10 +39,11 @@ pub struct ConnDraft {
     pub flow_control: u8, // 0=None 1=Software 2=Hardware
     // udp
     pub udp_mode: UdpModeDraft,
-    pub udp_dest: String,    // unicast / broadcast destination (host:port)
-    pub udp_group: String,   // multicast group address
-    pub udp_mc_port: String, // multicast port
-    pub local_port: String,  // optional local bind port
+    pub udp_dest: String,           // unicast destination (host:port)
+    pub udp_broadcast_port: String, // broadcast port (sent to 255.255.255.255:<port>)
+    pub udp_group: String,          // multicast group address
+    pub udp_mc_port: String,        // multicast port
+    pub local_port: String,         // optional local bind port
     // tcp
     pub tcp_addr: String,
 }
@@ -60,6 +61,7 @@ impl Default for ConnDraft {
             flow_control: 0,
             udp_mode: UdpModeDraft::Unicast,
             udp_dest: String::new(),
+            udp_broadcast_port: String::new(),
             udp_group: String::new(),
             udp_mc_port: String::new(),
             local_port: String::new(),
@@ -106,21 +108,25 @@ impl From<&InterfaceConfig> for ConnDraft {
                 }
             }
             InterfaceConfig::Udp(u) => {
-                let (udp_mode, udp_dest, udp_group, udp_mc_port) = match &u.mode {
+                let (udp_mode, udp_dest, udp_broadcast_port, udp_group, udp_mc_port) = match &u.mode
+                {
                     UdpMode::Unicast { destination } => (
                         UdpModeDraft::Unicast,
                         destination.to_string(),
                         String::new(),
                         String::new(),
+                        String::new(),
                     ),
                     UdpMode::Broadcast { destination } => (
                         UdpModeDraft::Broadcast,
-                        destination.to_string(),
+                        String::new(),
+                        destination.port().to_string(),
                         String::new(),
                         String::new(),
                     ),
                     UdpMode::Multicast { group, port, .. } => (
                         UdpModeDraft::Multicast,
+                        String::new(),
                         String::new(),
                         group.to_string(),
                         port.to_string(),
@@ -130,6 +136,7 @@ impl From<&InterfaceConfig> for ConnDraft {
                     kind: ConnKind::Udp,
                     udp_mode,
                     udp_dest,
+                    udp_broadcast_port,
                     udp_group,
                     udp_mc_port,
                     local_port: u.local_port.map(|p| p.to_string()).unwrap_or_default(),
@@ -182,7 +189,12 @@ impl ConnDraft {
             ConnKind::Udp => {
                 let mut udp = match self.udp_mode {
                     UdpModeDraft::Unicast => UdpConfig::unicast(self.udp_dest.parse().ok()?),
-                    UdpModeDraft::Broadcast => UdpConfig::broadcast(self.udp_dest.parse().ok()?),
+                    UdpModeDraft::Broadcast => {
+                        // Broadcast always targets the limited-broadcast address
+                        // (255.255.255.255); the GUI exposes only the port.
+                        let port: u16 = self.udp_broadcast_port.parse().ok()?;
+                        UdpConfig::broadcast(SocketAddr::from((Ipv4Addr::BROADCAST, port)))
+                    }
                     UdpModeDraft::Multicast => {
                         let group: Ipv4Addr = self.udp_group.parse().ok()?;
                         let port: u16 = self.udp_mc_port.parse().ok()?;
