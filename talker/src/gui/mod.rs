@@ -1211,7 +1211,7 @@ fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay) {
             ui.radio_value(&mut display.mode, DisplayMode::Decoded, "Decoded");
             if display.mode == DisplayMode::Ascii {
                 ui.separator();
-                ui.label("ctrl-char:");
+                ui.label("ctrl-chars:");
                 ui.radio_value(
                     &mut display.control_style,
                     ControlStyle::Pictures,
