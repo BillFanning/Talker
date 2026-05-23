@@ -1,11 +1,11 @@
 pub mod ais;
 pub mod checksum;
+pub mod sentence_type;
+pub mod talker_id;
 
 mod error;
 mod proprietary;
 mod sentence;
-mod sentence_type;
-mod talker_id;
 
 pub use ais::AisSentence;
 pub use error::NmeaError;

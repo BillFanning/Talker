@@ -255,6 +255,10 @@ pub struct ScheduleDraft {
     pub nmea_sentence_type: String,
     pub nmea_fields: String, // comma-separated field values
     pub nmea_checksum_mode: NmeaChecksumMode,
+    /// Live filter text for the talker-picker popup (not serialized).
+    pub nmea_talker_filter: String,
+    /// Live filter text for the sentence-picker popup (not serialized).
+    pub nmea_sentence_filter: String,
     // common
     pub interval_ms: String,
     // timestamp
@@ -285,6 +289,8 @@ impl Default for ScheduleDraft {
             nmea_sentence_type: String::new(),
             nmea_fields: String::new(),
             nmea_checksum_mode: NmeaChecksumMode::Correct,
+            nmea_talker_filter: String::new(),
+            nmea_sentence_filter: String::new(),
             interval_ms: "1000".to_string(),
             timestamp_enabled: false,
             ts_date: true,

@@ -991,12 +991,13 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                     entry.nmea_talker = entry.nmea_talker.to_ascii_uppercase();
                 }
                 ui.menu_button("v", |ui| {
-                    for id in &["GP", "GN", "GL", "GA", "GB", "GQ", "P"] {
-                        if ui.button(*id).clicked() {
-                            entry.nmea_talker = id.to_string();
-                            ui.close();
-                        }
-                    }
+                    show_filtered_picker(
+                        ui,
+                        "filter talkers",
+                        &mut entry.nmea_talker_filter,
+                        nmea0183::talker_id::ALL,
+                        &mut entry.nmea_talker,
+                    );
                 });
                 ui.separator();
                 let r = ui.add(
@@ -1008,15 +1009,13 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                     entry.nmea_sentence_type = entry.nmea_sentence_type.to_ascii_uppercase();
                 }
                 ui.menu_button("v", |ui| {
-                    for st in &[
-                        "GGA", "RMC", "VTG", "GLL", "GSA", "GSV", "HDT", "HDM", "ZDA", "GNS",
-                        "VHW", "DBT", "DPT", "MTW", "MWV", "RSA", "ROT",
-                    ] {
-                        if ui.button(*st).clicked() {
-                            entry.nmea_sentence_type = st.to_string();
-                            ui.close();
-                        }
-                    }
+                    show_filtered_picker(
+                        ui,
+                        "filter sentences",
+                        &mut entry.nmea_sentence_filter,
+                        nmea0183::sentence_type::ALL,
+                        &mut entry.nmea_sentence_type,
+                    );
                 });
                 ui.separator();
                 ui.label("NMEA checksum:").on_hover_text(
@@ -1054,6 +1053,40 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     }
 }
 
+/// Filterable, scrollable popup body used for the NMEA Talker and Sentence
+/// pickers. Renders a small TextEdit at the top, then a scrollable list of
+/// `options` whose entries case-insensitively contain the filter text.
+/// Clicking an entry assigns it into `selected` (uppercase preserved) and
+/// closes the popup.
+fn show_filtered_picker(
+    ui: &mut egui::Ui,
+    hint: &str,
+    filter: &mut String,
+    options: &[&'static str],
+    selected: &mut String,
+) {
+    let r = ui.add(
+        egui::TextEdit::singleline(filter)
+            .desired_width(120.0)
+            .hint_text(hint),
+    );
+    r.request_focus();
+    let needle = filter.to_ascii_uppercase();
+    egui::ScrollArea::vertical()
+        .max_height(300.0)
+        .show(ui, |ui| {
+            for entry in options {
+                if (needle.is_empty() || entry.contains(needle.as_str()))
+                    && ui.button(*entry).clicked()
+                {
+                    *selected = (*entry).to_string();
+                    filter.clear();
+                    ui.close();
+                }
+            }
+        });
+}
+
 /// Drive one frame of hold-to-repeat for the broadcast port's ± buttons.
 ///
 /// - A simple click changes the port by exactly 1.
@@ -1077,58 +1110,72 @@ fn drive_port_hold(
 ) -> bool {
     use std::time::{Duration, Instant};
 
-    let direction: i8 = if r_minus.is_pointer_button_down_on() {
-        -1
-    } else if r_plus.is_pointer_button_down_on() {
-        1
-    } else {
-        0
-    };
-
     let mut changed = false;
+    let now = Instant::now();
 
-    if direction != 0 {
-        let now = Instant::now();
-        let needs_reset = conn.udp_port_hold.is_none_or(|h| h.direction != direction);
-        if needs_reset {
-            // First frame held (or switched buttons): fire once, then wait
-            // out the initial delay before auto-repeat kicks in.
+    // Use *global* pointer state, not Response::is_pointer_button_down_on,
+    // because that per-widget flag depends on the widget's egui id being
+    // present every frame — a single frame where it isn't tracked drops
+    // the flag and ends the hold. Global primary_down stays true while the
+    // mouse button is physically down regardless of what egui can or can't
+    // see about the widget.
+    let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+    let primary_down = ui.input(|i| i.pointer.primary_down());
+
+    // Initial press: pointer was just pressed AND was hovering one of our
+    // buttons. Fire once and start the hold.
+    if primary_pressed {
+        let direction: i8 = if r_minus.hovered() {
+            -1
+        } else if r_plus.hovered() {
+            1
+        } else {
+            0
+        };
+        if direction != 0 {
             changed |= port_step(conn, direction);
             conn.udp_port_hold = Some(PortHold {
                 direction,
                 started: now,
                 next_fire_at: now + Duration::from_millis(250),
             });
-        } else if let Some(mut hold) = conn.udp_port_hold {
-            // Catch up any deadlines that have already passed (handles slow
-            // frames cleanly — we never lose a tick to a long delta).
-            // `hold` is a Copy of the field, so calling `port_step(conn, …)`
-            // inside the loop doesn't conflict with the borrow.
+            tracing::debug!(direction, "port hold: start");
+        }
+    }
+
+    // Ongoing hold.
+    if let Some(mut hold) = conn.udp_port_hold {
+        if !primary_down {
+            tracing::debug!(
+                direction = hold.direction,
+                held_ms = now.saturating_duration_since(hold.started).as_millis() as u64,
+                "port hold: release"
+            );
+            conn.udp_port_hold = None;
+        } else {
+            // Catch up any deadlines that have already passed in a single
+            // frame (handles slow frames cleanly).
+            let mut fired = 0u32;
             while now >= hold.next_fire_at {
                 let interval = port_repeat_interval(now.saturating_duration_since(hold.started));
                 hold.next_fire_at += interval;
-                changed |= port_step(conn, direction);
+                changed |= port_step(conn, hold.direction);
+                fired += 1;
+            }
+            if fired > 0 {
+                tracing::debug!(
+                    direction = hold.direction,
+                    fired,
+                    held_ms = now.saturating_duration_since(hold.started).as_millis() as u64,
+                    "port hold: fire"
+                );
             }
             conn.udp_port_hold = Some(hold);
-        }
-        // Wake egui up exactly when the next fire is due. The mutable
-        // borrow above has dropped, so re-read the option here.
-        if let Some(h) = conn.udp_port_hold {
+            // Wake egui up exactly when the next fire is due, so the loop
+            // keeps running without depending on any other input event.
             ui.ctx()
-                .request_repaint_after(h.next_fire_at.saturating_duration_since(now));
-        } else {
-            ui.ctx().request_repaint();
+                .request_repaint_after(hold.next_fire_at.saturating_duration_since(now));
         }
-    } else {
-        // Quick tap (down + up inside the same frame, before
-        // is_pointer_button_down_on saw it).
-        if r_minus.clicked() && conn.udp_port_hold.is_none() {
-            changed |= port_step(conn, -1);
-        }
-        if r_plus.clicked() && conn.udp_port_hold.is_none() {
-            changed |= port_step(conn, 1);
-        }
-        conn.udp_port_hold = None;
     }
 
     changed

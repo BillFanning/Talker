@@ -162,6 +162,17 @@ pub enum TalkerId {
     Custom(String),
 }
 
+/// All standard two-character talker IDs in this enum, in declaration order.
+/// Intended for UIs that want to present every option (e.g. a filterable
+/// dropdown). Does not include the `Custom(String)` variant.
+pub const ALL: &[&str] = &[
+    "AB", "AD", "AG", "AI", "AN", "AP", "AR", "AT", "AX", "CD", "CR", "CS", "CT", "CV", "CX", "DE",
+    "DF", "EC", "EP", "ER", "GA", "GB", "BD", "GI", "GL", "GN", "GP", "GQ", "HC", "HE", "HF", "HN",
+    "II", "IN", "LA", "LC", "MP", "OM", "TR", "NL", "RA", "SA", "SD", "SN", "SS", "TI", "U0", "U1",
+    "U2", "U3", "U4", "U5", "U6", "U7", "U8", "U9", "VD", "VM", "VR", "VW", "WI", "YC", "YD", "YF",
+    "YL", "YP", "YR", "YS", "YT", "YV", "YX", "ZA", "ZC", "ZQ",
+];
+
 impl TalkerId {
     pub fn as_str(&self) -> &str {
         match self {
@@ -337,6 +348,20 @@ impl FromStr for TalkerId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_constant_matches_enum() {
+        // Every entry in `ALL` must parse back to a named variant — not the
+        // `Custom` catch-all — so the const stays in sync with the enum.
+        for s in ALL {
+            let parsed: TalkerId = s.parse().expect("ALL entry parses");
+            assert!(
+                !matches!(parsed, TalkerId::Custom(_)),
+                "ALL contains {s:?} but it parsed as Custom — the enum is missing this variant",
+            );
+            assert_eq!(parsed.as_str(), *s, "round-trip mismatch for {s:?}");
+        }
+    }
 
     #[test]
     fn known_ids_round_trip() {

@@ -201,6 +201,20 @@ pub enum SentenceType {
     Custom(String),
 }
 
+/// All standard sentence-type mnemonics in this enum, in declaration order.
+/// Intended for UIs that want to present every option (e.g. a filterable
+/// dropdown). Does not include the `Custom(String)` variant.
+pub const ALL: &[&str] = &[
+    "AAM", "ABK", "ABM", "ACK", "AIR", "AKD", "ALA", "ALM", "APA", "APB", "BEC", "BOD", "BWC",
+    "BWR", "BWW", "DBK", "DBS", "DBT", "DCN", "DPT", "DSC", "DSE", "DSI", "DSR", "DTM", "FSI",
+    "GBS", "GGA", "GLC", "GLL", "GNS", "GRS", "GSA", "GST", "GSV", "GTD", "GXA", "HDG", "HDM",
+    "HDT", "HFB", "HSC", "ITS", "LCD", "MDA", "MHU", "MSK", "MSS", "MTA", "MTW", "MWD", "MWV",
+    "OLN", "OSD", "RMA", "RMB", "RMC", "ROT", "RPM", "RSA", "RSD", "RTE", "SFI", "STN", "TDS",
+    "TFI", "THS", "TLL", "TPC", "TPR", "TPT", "TRF", "TTM", "TUT", "TXT", "VBW", "VDM", "VDO",
+    "VDR", "VHW", "VLW", "VPW", "VTG", "VWR", "VWT", "WCV", "WNC", "WPL", "XDR", "XTE", "XTR",
+    "ZDA", "ZDL", "ZFO", "ZTG",
+];
+
 impl SentenceType {
     pub fn as_str(&self) -> &str {
         match self {
@@ -420,6 +434,18 @@ impl FromStr for SentenceType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_constant_matches_enum() {
+        for s in ALL {
+            let parsed: SentenceType = s.parse().expect("ALL entry parses");
+            assert!(
+                !matches!(parsed, SentenceType::Custom(_)),
+                "ALL contains {s:?} but it parsed as Custom — the enum is missing this variant",
+            );
+            assert_eq!(parsed.as_str(), *s, "round-trip mismatch for {s:?}");
+        }
+    }
 
     #[test]
     fn known_types_round_trip() {
