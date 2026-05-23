@@ -1078,16 +1078,22 @@ fn checksum_label(algorithm: ChecksumAlgorithm) -> &'static str {
 ///
 /// The custom RGB borders elsewhere in this file (outer panel, channel cards)
 /// are tuned for this dark theme, so the theme is set explicitly rather than
-/// left to inherit from the OS.
+/// left to inherit from the OS. The visuals are written into *both* the Dark
+/// and Light theme slots so `eframe`'s persistence cannot resurrect an older
+/// style on the next launch.
 fn set_high_contrast_dark_visuals(ctx: &egui::Context) {
-    let mut v = egui::Visuals::dark();
     let body = egui::Color32::from_gray(230);
+    let separator = egui::Stroke::new(1.0, egui::Color32::from_gray(90));
+
+    let mut v = egui::Visuals::dark();
     v.override_text_color = Some(body);
     v.widgets.noninteractive.fg_stroke.color = body;
     v.widgets.inactive.fg_stroke.color = body;
-    // Brighten the default frame/group separator so panels don't blur together.
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(80));
-    ctx.set_visuals(v);
+    v.widgets.noninteractive.bg_stroke = separator;
+
+    ctx.set_theme(egui::ThemePreference::Dark);
+    ctx.set_visuals_of(egui::Theme::Dark, v.clone());
+    ctx.set_visuals_of(egui::Theme::Light, v);
 }
 
 // ── Field renderers ───────────────────────────────────────────────────────────
