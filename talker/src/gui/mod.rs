@@ -721,7 +721,16 @@ impl TalkerApp {
                                         to_start = Some(i);
                                     }
                                     if !can {
-                                        btn.on_disabled_hover_text("Add a valid message first");
+                                        let tip = start_blockers(
+                                            &self.conn_drafts[i],
+                                            &self.sched_drafts[i],
+                                        )
+                                        .join("\n");
+                                        btn.on_disabled_hover_text(if tip.is_empty() {
+                                            "Add a valid message first".to_string()
+                                        } else {
+                                            tip
+                                        });
                                     }
                                 }
                             });
@@ -861,8 +870,13 @@ fn show_schedule_section(
                             }
                         });
 
-                    show_timestamp_editor(ui, entry);
-                    show_checksum_editor(ui, entry);
+                    ui.horizontal(|ui| {
+                        show_timestamp_editor(ui, entry);
+                        ui.separator();
+                        show_checksum_editor(ui, entry);
+                    });
+
+                    show_message_preview(ui, entry);
                 });
             });
             ui.add_space(4.0);
@@ -967,7 +981,7 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             ui.end_row();
         }
         PayloadKind::Nmea => {
-            ui.label("Talker");
+            ui.label("Talker / Sentence");
             ui.horizontal(|ui| {
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut entry.nmea_talker)
@@ -985,11 +999,7 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                         }
                     }
                 });
-            });
-            ui.end_row();
-
-            ui.label("Sentence");
-            ui.horizontal(|ui| {
+                ui.separator();
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut entry.nmea_sentence_type)
                         .desired_width(50.0)
@@ -1021,6 +1031,127 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             ui.end_row();
         }
     }
+}
+
+/// Enumerate the specific reasons the Start button is disabled for a
+/// channel — one human-readable line per problem. Returned in the same
+/// order they appear in the editor (channel fields first, then per-message
+/// issues from top to bottom).
+fn start_blockers(conn: &ConnDraft, messages: &[ScheduleDraft]) -> Vec<String> {
+    let mut out = Vec::new();
+    out.extend(channel_blockers(conn));
+    if messages.is_empty() {
+        out.push("No messages defined — add at least one".to_string());
+    } else {
+        for (i, m) in messages.iter().enumerate() {
+            out.extend(message_blockers(i, m));
+        }
+        if !messages.iter().any(|m| m.to_message_config().is_some()) {
+            out.push("No message is fully filled in".to_string());
+        }
+    }
+    out
+}
+
+fn channel_blockers(conn: &ConnDraft) -> Vec<String> {
+    let mut out = Vec::new();
+    match conn.kind {
+        ConnKind::Serial => {
+            if conn.serial_port.is_empty() {
+                out.push("Channel: select a serial port".to_string());
+            }
+            if !conn.baud_custom.is_empty()
+                && conn.baud_custom.parse::<u32>().map_or(true, |b| b == 0)
+            {
+                out.push("Channel: baud rate must be a positive number".to_string());
+            }
+        }
+        ConnKind::Udp => {
+            match conn.udp_mode {
+                UdpModeDraft::Unicast => {
+                    if conn.udp_dest.is_empty() {
+                        out.push("Channel: destination is empty".to_string());
+                    } else if conn.udp_dest.parse::<SocketAddr>().is_err() {
+                        out.push("Channel: destination must be host:port".to_string());
+                    }
+                }
+                UdpModeDraft::Broadcast => {
+                    if conn.udp_broadcast_addr.is_empty()
+                        || conn.udp_broadcast_addr.parse::<Ipv4Addr>().is_err()
+                    {
+                        out.push("Channel: broadcast address must be IPv4".to_string());
+                    }
+                    if conn.udp_broadcast_port.is_empty()
+                        || conn.udp_broadcast_port.parse::<u16>().is_err()
+                    {
+                        out.push("Channel: broadcast port must be 1–65535".to_string());
+                    }
+                }
+                UdpModeDraft::Multicast => {
+                    if conn.udp_group.is_empty() || conn.udp_group.parse::<Ipv4Addr>().is_err() {
+                        out.push("Channel: multicast group must be IPv4".to_string());
+                    }
+                    if conn.udp_mc_port.is_empty() || conn.udp_mc_port.parse::<u16>().is_err() {
+                        out.push("Channel: multicast port must be 1–65535".to_string());
+                    }
+                }
+            }
+            if !conn.local_port.is_empty() && conn.local_port.parse::<u16>().is_err() {
+                out.push("Channel: local port must be 1–65535".to_string());
+            }
+        }
+        ConnKind::Tcp => {
+            if conn.tcp_addr.is_empty() {
+                out.push("Channel: address is empty".to_string());
+            } else if conn.tcp_addr.parse::<SocketAddr>().is_err() {
+                out.push("Channel: address must be host:port".to_string());
+            }
+        }
+    }
+    out
+}
+
+fn message_blockers(idx: usize, entry: &ScheduleDraft) -> Vec<String> {
+    let mut out = Vec::new();
+    let n = idx + 1;
+    if entry.interval_ms.is_empty() {
+        out.push(format!("Message {n}: interval is empty"));
+    } else if entry.interval_ms.parse::<u64>().is_err() {
+        out.push(format!("Message {n}: interval must be a whole number"));
+    }
+    match entry.payload_kind {
+        PayloadKind::Hex if !hex_valid(&entry.hex_data) => {
+            out.push(format!("Message {n}: hex is empty or invalid"));
+        }
+        PayloadKind::Nmea => {
+            if entry.nmea_talker.is_empty() {
+                out.push(format!("Message {n}: NMEA talker is empty"));
+            }
+            if entry.nmea_sentence_type.is_empty() {
+                out.push(format!("Message {n}: NMEA sentence type is empty"));
+            }
+        }
+        // UTF-8 / UTF-16 / ASCII payloads accept any string at this layer.
+        _ => {}
+    }
+    out
+}
+
+/// Render the read-only "this is what would be sent" preview row.
+///
+/// Compiles the draft each frame and renders the wire bytes with the
+/// timestamp baked in for the current instant. Because egui only repaints
+/// on input, the timestamp does not tick on its own — it updates whenever
+/// the user interacts with the GUI.
+fn show_message_preview(ui: &mut egui::Ui, entry: &ScheduleDraft) {
+    ui.horizontal(|ui| {
+        ui.label("Preview:");
+        let text = match entry.to_message_config().and_then(|m| m.compile().ok()) {
+            Some(compiled) => String::from_utf8_lossy(&compiled.render()).into_owned(),
+            None => "(message is incomplete)".to_string(),
+        };
+        ui.label(egui::RichText::new(text).monospace());
+    });
 }
 
 /// Render the per-message timestamp toggles.
@@ -1545,20 +1676,28 @@ fn red_bordered<F>(ui: &mut egui::Ui, invalid: bool, msg: &str, add: F) -> egui:
 where
     F: FnOnce(&mut egui::Ui) -> egui::Response,
 {
-    if !invalid {
-        return add(ui);
-    }
+    // Always wrap in a `ui.scope` regardless of `invalid` — egui derives a
+    // widget's id from its position in the ui tree, so a TextEdit that is
+    // sometimes inside a scope and sometimes not gets a new id whenever
+    // validity flips. The old code did that, which dropped keyboard focus
+    // the moment a keystroke made the field invalid.
     let red = egui::Color32::from_rgb(220, 80, 80);
     let inner = ui.scope(|ui| {
-        let v = ui.visuals_mut();
-        v.widgets.inactive.bg_stroke.color = red;
-        v.widgets.inactive.bg_stroke.width = v.widgets.inactive.bg_stroke.width.max(1.0);
-        v.widgets.hovered.bg_stroke.color = red;
-        v.widgets.active.bg_stroke.color = red;
-        v.selection.stroke.color = red;
+        if invalid {
+            let v = ui.visuals_mut();
+            v.widgets.inactive.bg_stroke.color = red;
+            v.widgets.inactive.bg_stroke.width = v.widgets.inactive.bg_stroke.width.max(1.0);
+            v.widgets.hovered.bg_stroke.color = red;
+            v.widgets.active.bg_stroke.color = red;
+            v.selection.stroke.color = red;
+        }
         add(ui)
     });
-    inner.inner.on_hover_text(msg)
+    if invalid {
+        inner.inner.on_hover_text(msg)
+    } else {
+        inner.inner
+    }
 }
 
 fn hex_valid(s: &str) -> bool {
