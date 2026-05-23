@@ -700,7 +700,11 @@ impl TalkerApp {
                                 to_apply.push(i);
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.small_button("\u{2715}").clicked() {
+                                if ui
+                                    .small_button("\u{00D7}")
+                                    .on_hover_text("Remove this channel")
+                                    .clicked()
+                                {
                                     to_remove = Some(i);
                                 }
                                 if running {
@@ -821,7 +825,11 @@ fn show_schedule_section(
                         ui.radio_value(&mut entry.payload_kind, PayloadKind::Ascii, "ASCII");
                         ui.radio_value(&mut entry.payload_kind, PayloadKind::Nmea, "NMEA");
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("\u{2715}").clicked() {
+                            if ui
+                                .small_button("\u{00D7}")
+                                .on_hover_text("Remove this message")
+                                .clicked()
+                            {
                                 to_remove = Some(i);
                             }
                         });
