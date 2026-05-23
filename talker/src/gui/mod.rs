@@ -1009,9 +1009,9 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                 ui.menu_button("v", |ui| {
                     show_filtered_picker(
                         ui,
-                        "filter talkers",
+                        "filter by code or description",
                         &mut entry.nmea_talker_filter,
-                        nmea0183::talker_id::ALL,
+                        nmea0183::talker_id::ALL_WITH_DESC,
                         &mut entry.nmea_talker,
                     );
                 });
@@ -1027,9 +1027,9 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                 ui.menu_button("v", |ui| {
                     show_filtered_picker(
                         ui,
-                        "filter sentences",
+                        "filter by code or description",
                         &mut entry.nmea_sentence_filter,
-                        nmea0183::sentence_type::ALL,
+                        nmea0183::sentence_type::ALL_WITH_DESC,
                         &mut entry.nmea_sentence_type,
                     );
                 });
@@ -1071,36 +1071,38 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
 
 /// Filterable, scrollable popup body used for the NMEA Talker and Sentence
 /// pickers. Renders a small TextEdit at the top, then a scrollable list of
-/// `options` whose entries case-insensitively contain the filter text.
-/// Clicking an entry assigns it into `selected` (uppercase preserved) and
-/// closes the popup.
+/// `(code, description)` rows. The filter is case-insensitive and matches
+/// against BOTH the code and the description, so typing "depth" narrows the
+/// sentence list to DBK/DBS/DBT/DPT etc. Clicking a row commits the code
+/// into `selected` and closes the popup.
 fn show_filtered_picker(
     ui: &mut egui::Ui,
     hint: &str,
     filter: &mut String,
-    options: &[&'static str],
+    options: &[(&'static str, &'static str)],
     selected: &mut String,
 ) {
-    // Pin the popup to a consistent shape so the Talker picker (2-char
-    // entries) and the Sentence picker (3-char entries) look the same.
-    ui.set_min_width(140.0);
+    // Pin the popup so the Talker and Sentence pickers look the same and
+    // so the (often long) descriptions don't keep widening it.
+    ui.set_min_width(360.0);
     let r = ui.add(
         egui::TextEdit::singleline(filter)
-            .desired_width(120.0)
+            .desired_width(340.0)
             .hint_text(hint),
     );
     r.request_focus();
-    let needle = filter.to_ascii_uppercase();
+    let needle = filter.to_ascii_lowercase();
     egui::ScrollArea::vertical()
         .min_scrolled_height(300.0)
         .max_height(300.0)
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for entry in options {
-                if (needle.is_empty() || entry.contains(needle.as_str()))
-                    && ui.button(*entry).clicked()
-                {
-                    *selected = (*entry).to_string();
+            for (code, desc) in options {
+                let matches = needle.is_empty()
+                    || code.to_ascii_lowercase().contains(&needle)
+                    || desc.to_ascii_lowercase().contains(&needle);
+                if matches && ui.button(format!("{code}  —  {desc}")).clicked() {
+                    *selected = (*code).to_string();
                     filter.clear();
                     ui.close();
                 }
@@ -1125,7 +1127,8 @@ fn show_filtered_picker(
 /// Returns `true` if the port value changed this frame.
 fn drive_port_hold(
     ui: &egui::Ui,
-    conn: &mut ConnDraft,
+    hold: &mut Option<PortHold>,
+    port_field: &mut String,
     r_minus: &egui::Response,
     r_plus: &egui::Response,
 ) -> bool {
@@ -1154,8 +1157,8 @@ fn drive_port_hold(
             0
         };
         if direction != 0 {
-            changed |= port_step(conn, direction);
-            conn.udp_port_hold = Some(PortHold {
+            changed |= port_step(port_field, direction);
+            *hold = Some(PortHold {
                 direction,
                 started: now,
                 next_fire_at: now + Duration::from_millis(250),
@@ -1164,32 +1167,32 @@ fn drive_port_hold(
     }
 
     // Ongoing hold.
-    if let Some(mut hold) = conn.udp_port_hold {
+    if let Some(mut h) = *hold {
         if !primary_down {
-            conn.udp_port_hold = None;
+            *hold = None;
         } else {
             // Catch up any deadlines that have already passed in a single
             // frame (handles slow frames cleanly).
-            while now >= hold.next_fire_at {
-                let interval = port_repeat_interval(now.saturating_duration_since(hold.started));
-                hold.next_fire_at += interval;
-                changed |= port_step(conn, hold.direction);
+            while now >= h.next_fire_at {
+                let interval = port_repeat_interval(now.saturating_duration_since(h.started));
+                h.next_fire_at += interval;
+                changed |= port_step(port_field, h.direction);
             }
-            conn.udp_port_hold = Some(hold);
+            *hold = Some(h);
             // Wake egui up exactly when the next fire is due, so the loop
             // keeps running without depending on any other input event.
             ui.ctx()
-                .request_repaint_after(hold.next_fire_at.saturating_duration_since(now));
+                .request_repaint_after(h.next_fire_at.saturating_duration_since(now));
         }
     }
 
     changed
 }
 
-/// Step the broadcast port by `direction` (±1), clamped to 1..=65535.
+/// Step a port-number string by `direction` (±1), clamped to 1..=65535.
 /// Returns `true` if the value actually changed.
-fn port_step(conn: &mut ConnDraft, direction: i8) -> bool {
-    let Ok(p) = conn.udp_broadcast_port.parse::<u16>() else {
+fn port_step(port_field: &mut String, direction: i8) -> bool {
+    let Ok(p) = port_field.parse::<u16>() else {
         return false;
     };
     let new = match direction {
@@ -1197,7 +1200,7 @@ fn port_step(conn: &mut ConnDraft, direction: i8) -> bool {
         1 if p < u16::MAX => p + 1,
         _ => return false,
     };
-    conn.udp_broadcast_port = new.to_string();
+    *port_field = new.to_string();
     true
 }
 
@@ -1937,7 +1940,13 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                         let r_plus = ui
                             .small_button("+")
                             .on_hover_text("Increment port (hold to accelerate)");
-                        if drive_port_hold(ui, conn, &r_minus, &r_plus) {
+                        if drive_port_hold(
+                            ui,
+                            &mut conn.udp_port_hold,
+                            &mut conn.udp_broadcast_port,
+                            &r_minus,
+                            &r_plus,
+                        ) {
                             apply = true;
                         }
                     });
@@ -1948,35 +1957,57 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                         !conn.udp_group.is_empty() && conn.udp_group.parse::<Ipv4Addr>().is_err();
                     let bad_port =
                         !conn.udp_mc_port.is_empty() && conn.udp_mc_port.parse::<u16>().is_err();
-                    ui.label("Group");
-                    let r = red_bordered(
-                        ui,
-                        bad_group,
-                        "enter IPv4 multicast address — e.g. 239.0.0.1",
-                        |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut conn.udp_group)
-                                    .desired_width(140.0)
-                                    .hint_text("239.x.x.x  (Enter to apply)"),
-                            )
-                        },
+                    ui.label("Multicast group").on_hover_text(
+                        "IPv4 multicast group address (must be in the 224.0.0.0 – \
+                         239.255.255.255 range). Receivers must subscribe to the same \
+                         group + port to see these packets. Common admin-local picks \
+                         live in 239.x.x.x.",
                     );
-                    if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                        apply = true;
-                    }
-                    ui.end_row();
-
-                    ui.label("Port");
-                    let r = red_bordered(ui, bad_port, "enter a port number 1–65535", |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut conn.udp_mc_port)
-                                .desired_width(80.0)
-                                .hint_text("port"),
-                        )
+                    ui.horizontal(|ui| {
+                        let addr_r = red_bordered(
+                            ui,
+                            bad_group,
+                            "enter IPv4 multicast address — e.g. 239.0.0.1",
+                            |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut conn.udp_group)
+                                        .desired_width(140.0)
+                                        .hint_text("239.0.0.1"),
+                                )
+                            },
+                        );
+                        if addr_r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
+                        {
+                            apply = true;
+                        }
+                        ui.label("Port:");
+                        let r_minus = ui
+                            .small_button("\u{2212}")
+                            .on_hover_text("Decrement port (hold to accelerate)");
+                        let port_r =
+                            red_bordered(ui, bad_port, "enter a port number 1–65535", |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut conn.udp_mc_port)
+                                        .desired_width(60.0),
+                                )
+                            });
+                        if port_r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
+                        {
+                            apply = true;
+                        }
+                        let r_plus = ui
+                            .small_button("+")
+                            .on_hover_text("Increment port (hold to accelerate)");
+                        if drive_port_hold(
+                            ui,
+                            &mut conn.udp_port_hold,
+                            &mut conn.udp_mc_port,
+                            &r_minus,
+                            &r_plus,
+                        ) {
+                            apply = true;
+                        }
                     });
-                    if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
-                        apply = true;
-                    }
                     ui.end_row();
                 }
             }

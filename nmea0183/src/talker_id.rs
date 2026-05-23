@@ -173,6 +173,86 @@ pub const ALL: &[&str] = &[
     "YL", "YP", "YR", "YS", "YT", "YV", "YX", "ZA", "ZC", "ZQ",
 ];
 
+/// `(code, description)` pairs for every entry in [`ALL`], in the same order.
+/// Descriptions are short single-line summaries lifted from the variant doc
+/// comments. Intended for UIs that want to render `GP — GPS` style rows.
+pub const ALL_WITH_DESC: &[(&str, &str)] = &[
+    ("AB", "Independent AIS base station"),
+    ("AD", "Dependent AIS base station"),
+    ("AG", "Autopilot, general"),
+    ("AI", "Mobile Class A or B AIS station"),
+    ("AN", "AIS aid to navigation station"),
+    ("AP", "Autopilot, magnetic"),
+    ("AR", "AIS receiving station"),
+    ("AT", "AIS transmitting station"),
+    ("AX", "AIS simplex repeater"),
+    ("CD", "Communications, DSC (digital selective calling)"),
+    ("CR", "Communications, data receiver (beacon receiver)"),
+    ("CS", "Communications, satellite"),
+    ("CT", "Communications, radio-telephone (MF/HF)"),
+    ("CV", "Communications, radio-telephone (VHF)"),
+    ("CX", "Communications, scanning receiver"),
+    ("DE", "DECCA navigation (obsolete)"),
+    ("DF", "Direction finder"),
+    ("EC", "ECDIS (electronic chart display)"),
+    ("EP", "EPIRB (emergency position-indicating radio beacon)"),
+    ("ER", "Engine room monitoring systems"),
+    ("GA", "Galileo"),
+    ("GB", "BeiDou (CNSS)"),
+    ("BD", "BeiDou (alternate, legacy designation)"),
+    ("GI", "NavIC / IRNSS"),
+    ("GL", "GLONASS"),
+    ("GN", "Combined / multi-constellation GNSS"),
+    ("GP", "GPS"),
+    ("GQ", "QZSS"),
+    ("HC", "Heading, magnetic compass"),
+    ("HE", "Heading, north-seeking gyro"),
+    ("HF", "Heading, fluxgate compass"),
+    ("HN", "Heading, non north-seeking gyro"),
+    ("II", "Integrated instrumentation"),
+    ("IN", "Integrated navigation"),
+    ("LA", "Loran A (obsolete)"),
+    ("LC", "Loran C (obsolete)"),
+    ("MP", "Microwave positioning system (obsolete)"),
+    ("OM", "OMEGA navigation system (obsolete)"),
+    ("TR", "TRANSIT navigation system (obsolete)"),
+    ("NL", "Navigation light controller"),
+    ("RA", "RADAR and/or ARPA"),
+    ("SA", "Physical shore AIS station"),
+    ("SD", "Sounder, depth"),
+    ("SN", "Electronic positioning system, other / general"),
+    ("SS", "Sounder, scanning"),
+    ("TI", "Turn rate indicator"),
+    ("U0", "User-configured 0"),
+    ("U1", "User-configured 1"),
+    ("U2", "User-configured 2"),
+    ("U3", "User-configured 3"),
+    ("U4", "User-configured 4"),
+    ("U5", "User-configured 5"),
+    ("U6", "User-configured 6"),
+    ("U7", "User-configured 7"),
+    ("U8", "User-configured 8"),
+    ("U9", "User-configured 9"),
+    ("VD", "Velocity sensor, Doppler"),
+    ("VM", "Velocity sensor, magnetic"),
+    ("VR", "Voyage data recorder"),
+    ("VW", "Velocity sensor, mechanical (water)"),
+    ("WI", "Weather instruments"),
+    ("YC", "Transducer, temperature (obsolete)"),
+    ("YD", "Transducer, displacement (obsolete)"),
+    ("YF", "Transducer, frequency (obsolete)"),
+    ("YL", "Transducer, level (obsolete)"),
+    ("YP", "Transducer, pressure (obsolete)"),
+    ("YR", "Transducer, flow rate (obsolete)"),
+    ("YS", "Transducer, status (obsolete)"),
+    ("YT", "Transducer, tachometer (obsolete)"),
+    ("YV", "Transducer, volume (obsolete)"),
+    ("YX", "Transducer, general (obsolete)"),
+    ("ZA", "Timekeeper, atomic clock"),
+    ("ZC", "Timekeeper, chronometer"),
+    ("ZQ", "Timekeeper, quartz"),
+];
+
 impl TalkerId {
     pub fn as_str(&self) -> &str {
         match self {
@@ -360,6 +440,17 @@ mod tests {
                 "ALL contains {s:?} but it parsed as Custom — the enum is missing this variant",
             );
             assert_eq!(parsed.as_str(), *s, "round-trip mismatch for {s:?}");
+        }
+    }
+
+    #[test]
+    fn all_with_desc_is_aligned_with_all() {
+        // Same length, same codes in the same order — so callers can pick
+        // either constant without losing entries.
+        assert_eq!(ALL.len(), ALL_WITH_DESC.len());
+        for (i, (code, desc)) in ALL_WITH_DESC.iter().enumerate() {
+            assert_eq!(*code, ALL[i], "ALL_WITH_DESC[{i}] code mismatch");
+            assert!(!desc.is_empty(), "ALL_WITH_DESC[{i}] description is empty");
         }
     }
 
