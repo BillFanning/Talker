@@ -275,15 +275,18 @@ impl TalkerApp {
         self.stop_connection(i);
         self.flush_drafts_to_profile();
 
+        // 1-based for log strings — matches the UI label "Channel N".
+        let n = i + 1;
+
         let Some(cfg) = self.conn_drafts.get(i).and_then(|d| d.to_config()) else {
-            tracing::warn!("channel {i} config invalid");
+            tracing::warn!("channel {n} config invalid");
             return;
         };
 
         let interface = match cfg.open() {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("failed to open channel {i}: {e:#}");
+                tracing::error!("failed to open channel {n}: {e:#}");
                 self.error_count += 1;
                 if i < self.conn_errors.len() {
                     self.conn_errors[i] = Some(format!("{e:#}"));
@@ -301,7 +304,7 @@ impl TalkerApp {
         let schedule = match Schedule::compile(&messages, Instant::now()) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("channel {i} schedule error: {e:#}");
+                tracing::error!("channel {n} schedule error: {e:#}");
                 return;
             }
         };
@@ -325,7 +328,7 @@ impl TalkerApp {
             });
         }
         let message_count = messages.len();
-        tracing::info!("channel {i} started ({message_count}-message schedule)");
+        tracing::info!("channel {n} started ({message_count}-message schedule)");
     }
 
     fn stop_connection(&mut self, i: usize) {
@@ -707,7 +710,7 @@ impl TalkerApp {
                             // indicator's appearance / disappearance can't
                             // shift sibling auto-ids between layout passes.
                             ui.push_id("iface_summary", |ui| {
-                                ui.weak(interface_summary(&self.conn_drafts[i]));
+                                show_interface_summary(ui, &self.conn_drafts[i]);
                             });
                             let pending = i < self.profile.channels.len()
                                 && self.conn_drafts[i]
@@ -1439,6 +1442,36 @@ impl egui::TextBuffer for UppercaseHex<'_> {
     }
 }
 
+/// Render [`interface_summary`] in the channel-card header, splitting on `?`
+/// markers so unknown / unfilled fields show up as a **bold red** glyph
+/// rather than blending into the rest of the weak-grey summary text.
+fn show_interface_summary(ui: &mut egui::Ui, conn: &ConnDraft) {
+    let text = interface_summary(conn);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let mut buf = String::new();
+        let flush = |ui: &mut egui::Ui, buf: &mut String| {
+            if !buf.is_empty() {
+                ui.weak(std::mem::take(buf));
+            }
+        };
+        for c in text.chars() {
+            if c == '?' {
+                flush(ui, &mut buf);
+                ui.label(
+                    egui::RichText::new("?")
+                        .color(egui::Color32::from_rgb(220, 80, 80))
+                        .strong()
+                        .size(16.0),
+                );
+            } else {
+                buf.push(c);
+            }
+        }
+        flush(ui, &mut buf);
+    });
+}
+
 /// One-line, human-readable summary of a channel's selected interface and
 /// its parameters, shown in the channel-card header so the active config
 /// is visible at a glance without expanding the editor. Uses the draft's
@@ -1656,7 +1689,7 @@ fn show_timestamp_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
         if entry.timestamp_enabled {
             ui.checkbox(&mut entry.ts_date, "Date");
             ui.checkbox(&mut entry.ts_millis, "Milliseconds");
-            ui.checkbox(&mut entry.ts_timezone, "Timezone");
+            ui.checkbox(&mut entry.ts_timezone, "Z (UTC)");
         }
     });
 }
@@ -1829,6 +1862,10 @@ fn show_insert_byte_button(ui: &mut egui::Ui, text: &mut String, hex: &mut Strin
                     .desired_width(48.0)
                     .hint_text("1B"),
             );
+            // Auto-focus the hex field so the user can start typing right
+            // away. Idempotent — egui doesn't keep resetting the caret if
+            // the field already has focus.
+            resp.request_focus();
             let value = u8::from_str_radix(hex.trim(), 16).ok();
             let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let insert = ui.add_enabled(value.is_some(), egui::Button::new("Insert"));
