@@ -702,55 +702,71 @@ impl TalkerApp {
                                 to_apply.push(i);
                             }
                             ui.separator();
-                            ui.weak(interface_summary(&self.conn_drafts[i]));
+                            // Give each widget after the radios a stable
+                            // string-source id, so the conditional `pending`
+                            // indicator's appearance / disappearance can't
+                            // shift sibling auto-ids between layout passes.
+                            ui.push_id("iface_summary", |ui| {
+                                ui.weak(interface_summary(&self.conn_drafts[i]));
+                            });
                             let pending = i < self.profile.channels.len()
                                 && self.conn_drafts[i]
                                     .to_config()
                                     .is_some_and(|cfg| cfg != self.profile.channels[i].interface);
-                            if pending {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(220, 180, 60),
-                                    "(unapplied — press Enter)",
-                                )
-                                .on_hover_text(
-                                    "Interface parameters have been edited but not \
-                                     yet applied to the running channel. Press Enter \
-                                     in the edited field — or stop and start the \
-                                     channel — to apply them.",
-                                );
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui
-                                    .button(egui::RichText::new("\u{00D7}").size(18.0).strong())
-                                    .on_hover_text("Remove this channel")
-                                    .clicked()
-                                {
-                                    to_remove = Some(i);
+                            ui.push_id("pending_indicator", |ui| {
+                                if pending {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(220, 180, 60),
+                                        "(unapplied — press Enter)",
+                                    )
+                                    .on_hover_text(
+                                        "Interface parameters have been edited but not \
+                                         yet applied to the running channel. Press Enter \
+                                         in the edited field — or stop and start the \
+                                         channel — to apply them.",
+                                    );
                                 }
-                                if running {
-                                    if ui.small_button("\u{25a0}").on_hover_text("Stop").clicked() {
-                                        to_stop = Some(i);
+                            });
+                            ui.push_id("channel_actions", |ui| {
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .button(egui::RichText::new("\u{00D7}").size(18.0).strong())
+                                        .on_hover_text("Remove this channel")
+                                        .clicked()
+                                    {
+                                        to_remove = Some(i);
                                     }
-                                } else {
-                                    let can = self.can_start_connection(i);
-                                    let btn =
-                                        ui.add_enabled(can, egui::Button::new("\u{25b6}").small());
-                                    if btn.clicked() {
-                                        to_start = Some(i);
+                                    if running {
+                                        if ui
+                                            .small_button("\u{25a0}")
+                                            .on_hover_text("Stop")
+                                            .clicked()
+                                        {
+                                            to_stop = Some(i);
+                                        }
+                                    } else {
+                                        let can = self.can_start_connection(i);
+                                        let btn = ui.add_enabled(
+                                            can,
+                                            egui::Button::new("\u{25b6}").small(),
+                                        );
+                                        if btn.clicked() {
+                                            to_start = Some(i);
+                                        }
+                                        if !can {
+                                            let tip = start_blockers(
+                                                &self.conn_drafts[i],
+                                                &self.sched_drafts[i],
+                                            )
+                                            .join("\n");
+                                            btn.on_disabled_hover_text(if tip.is_empty() {
+                                                "Add a valid message first".to_string()
+                                            } else {
+                                                tip
+                                            });
+                                        }
                                     }
-                                    if !can {
-                                        let tip = start_blockers(
-                                            &self.conn_drafts[i],
-                                            &self.sched_drafts[i],
-                                        )
-                                        .join("\n");
-                                        btn.on_disabled_hover_text(if tip.is_empty() {
-                                            "Add a valid message first".to_string()
-                                        } else {
-                                            tip
-                                        });
-                                    }
-                                }
+                                });
                             });
                         });
                         ui.separator();
