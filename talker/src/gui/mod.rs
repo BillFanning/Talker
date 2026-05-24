@@ -60,12 +60,32 @@ struct TalkerApp {
     log_rx: crossbeam_channel::Receiver<LogEvent>,
     log_lines: Vec<(String, egui::Color32)>,
     sent_counts: Vec<u64>,
+    /// Per-message send counts. Outer index: channel. Inner index: message
+    /// within the channel's compiled schedule. Grows on demand when a
+    /// status arrives for an index past the current vector length.
+    message_sent_counts: Vec<Vec<u64>>,
     displays: Vec<ChannelDisplay>,
     error_count: u64,
     last_title: String,
     serial_ports: Vec<String>,
     pixels_per_point: f32,
     zoom_held_timer: Option<f32>, // None = not held; Some(t) = held, t<0 in delay, t>=0 repeating
+    /// Mutations that the channel-card render loop has requested. Drained at
+    /// the END of each frame (after egui's layout passes complete) — never
+    /// mid-frame — so the state changes can't cause widgets to appear,
+    /// disappear, or change identity between egui's first and second layout
+    /// passes (which trips the "Widget rect changed id between passes" warn).
+    deferred: DeferredActions,
+}
+
+#[derive(Default)]
+struct DeferredActions {
+    apply: Vec<usize>,
+    start: Option<usize>,
+    stop: Option<usize>,
+    remove: Option<usize>,
+    add_channel: bool,
+    refresh_ports: bool,
 }
 
 impl TalkerApp {
@@ -95,12 +115,14 @@ impl TalkerApp {
             log_rx,
             log_lines: Vec::new(),
             sent_counts: Vec::new(),
+            message_sent_counts: Vec::new(),
             displays: Vec::new(),
             error_count: 0,
             last_title: String::new(),
             serial_ports: Vec::new(),
             pixels_per_point: ppp,
             zoom_held_timer: None,
+            deferred: DeferredActions::default(),
         };
         app.refresh_serial_ports();
 
@@ -141,6 +163,33 @@ impl TalkerApp {
 
     fn can_start_any(&self) -> bool {
         (0..self.conn_drafts.len()).any(|i| self.can_start_connection(i))
+    }
+
+    /// Compare the draft for channel `i` against the applied config (what
+    /// the talker thread is actually using). Returns `(interface_drift,
+    /// message_drift)`:
+    ///
+    /// - `interface_drift`: the draft's interface params don't match the
+    ///   applied interface. Can be applied live by pressing Enter (sends
+    ///   `UpdateInterface` to the talker thread).
+    /// - `message_drift`: the message list compiled from drafts differs
+    ///   from the applied message list. Currently requires a stop+start
+    ///   to apply — the scheduler is compiled at channel open time and
+    ///   can't be hot-swapped today.
+    fn detect_drift(&self, i: usize) -> (bool, bool) {
+        let Some(applied) = self.profile.channels.get(i) else {
+            return (false, false);
+        };
+        let iface_drift = self.conn_drafts[i]
+            .to_config()
+            .is_some_and(|cfg| cfg != applied.interface);
+        let draft_messages: Vec<_> = self
+            .sched_drafts
+            .get(i)
+            .map(|s| s.iter().filter_map(|d| d.to_message_config()).collect())
+            .unwrap_or_default();
+        let msg_drift = draft_messages != applied.messages;
+        (iface_drift, msg_drift)
     }
 
     fn refresh_serial_ports(&mut self) {
@@ -186,6 +235,9 @@ impl TalkerApp {
                 self.conn_errors = vec![None; n];
                 self.talkers = (0..n).map(|_| None).collect();
                 self.sent_counts = vec![0; n];
+                self.message_sent_counts = (0..n)
+                    .map(|j| vec![0u64; p.channels.get(j).map(|c| c.messages.len()).unwrap_or(0)])
+                    .collect();
                 self.displays = (0..n).map(|_| ChannelDisplay::default()).collect();
                 self.profile = p;
                 self.profile_path = Some(path.to_path_buf());
@@ -219,6 +271,7 @@ impl TalkerApp {
         self.conn_errors.clear();
         self.talkers.clear();
         self.sent_counts.clear();
+        self.message_sent_counts.clear();
         self.displays.clear();
         self.error_count = 0;
         tracing::info!("new profile");
@@ -314,6 +367,11 @@ impl TalkerApp {
         }
         if i < self.sent_counts.len() {
             self.sent_counts[i] = 0;
+        }
+        // Zero per-message counts, sized to the now-active schedule.
+        let message_count = messages.len();
+        if i < self.message_sent_counts.len() {
+            self.message_sent_counts[i] = vec![0u64; message_count];
         }
 
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(32);
@@ -440,9 +498,20 @@ impl TalkerApp {
             any_running = true;
             for status in statuses {
                 match status {
-                    TalkerStatus::Sent { count, payload } => {
+                    TalkerStatus::Sent {
+                        message_index,
+                        message_count,
+                        total_count,
+                        payload,
+                    } => {
                         if i < self.sent_counts.len() {
-                            self.sent_counts[i] = count;
+                            self.sent_counts[i] = total_count;
+                        }
+                        if let Some(per_msg) = self.message_sent_counts.get_mut(i) {
+                            if message_index >= per_msg.len() {
+                                per_msg.resize(message_index + 1, 0);
+                            }
+                            per_msg[message_index] = message_count;
                         }
                         if i < self.conn_errors.len() {
                             self.conn_errors[i] = None;
@@ -494,6 +563,9 @@ impl eframe::App for TalkerApp {
                 self.show_log_panel(ui);
                 self.show_central(ui);
             });
+        // Apply user-requested mutations AFTER the layout closes — never
+        // inside it — so egui's two-pass layout sees one consistent state.
+        self.process_deferred();
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -678,9 +750,9 @@ impl TalkerApp {
                     conn_frame.stroke =
                         egui::Stroke::new(1.5, egui::Color32::from_rgb(140, 160, 200));
                     conn_frame.show(ui, |ui| {
+                        let running = self.is_connection_running(i);
                         ui.horizontal(|ui| {
                             let error = self.conn_errors.get(i).and_then(|e| e.as_deref());
-                            let running = self.is_connection_running(i);
                             let (dot_color, dot_tip): (egui::Color32, &str) = if !running {
                                 (egui::Color32::GRAY, "not running")
                             } else if let Some(msg) = error {
@@ -712,23 +784,13 @@ impl TalkerApp {
                             ui.push_id("iface_summary", |ui| {
                                 show_interface_summary(ui, &self.conn_drafts[i]);
                             });
-                            let pending = i < self.profile.channels.len()
-                                && self.conn_drafts[i]
-                                    .to_config()
-                                    .is_some_and(|cfg| cfg != self.profile.channels[i].interface);
+                            // Drift detection: compare the draft against the
+                            // applied config + applied messages. Interface
+                            // drift can be applied live (press Enter); message
+                            // drift requires a stop+start.
+                            let (iface_drift, msg_drift) = self.detect_drift(i);
                             ui.push_id("pending_indicator", |ui| {
-                                if pending {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(220, 180, 60),
-                                        "(unapplied — press Enter)",
-                                    )
-                                    .on_hover_text(
-                                        "Interface parameters have been edited but not \
-                                         yet applied to the running channel. Press Enter \
-                                         in the edited field — or stop and start the \
-                                         channel — to apply them.",
-                                    );
-                                }
+                                show_unapplied_badge(ui, running, iface_drift, msg_drift);
                             });
                             ui.push_id("channel_actions", |ui| {
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -821,8 +883,18 @@ impl TalkerApp {
                         }
 
                         ui.separator();
-                        let interval_changes =
-                            show_schedule_section(ui, &mut self.sched_drafts[i], &mut self.dirty);
+                        let per_message_counts: &[u64] = self
+                            .message_sent_counts
+                            .get(i)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]);
+                        let interval_changes = show_schedule_section(
+                            ui,
+                            &mut self.sched_drafts[i],
+                            &mut self.dirty,
+                            per_message_counts,
+                            running,
+                        );
                         for (msg_index, interval_ms) in interval_changes {
                             if let Some(Some(handle)) = self.talkers.get(i) {
                                 let _ = handle.cmd_tx.try_send(TalkerCommand::SetInterval {
@@ -843,38 +915,74 @@ impl TalkerApp {
             }
         });
 
-        for i in to_apply {
-            self.apply_connection(i);
-        }
+        // Stash mutations on `self.deferred`. Processed AFTER egui's layout
+        // closure returns (see `process_deferred`), so multi-pass layout
+        // can't see two different snapshots of the channel state within a
+        // single frame.
+        self.deferred.apply.extend(to_apply);
         if let Some(i) = to_start {
-            self.start_connection(i);
+            self.deferred.start = Some(i);
         }
         if let Some(i) = to_stop {
-            self.stop_connection(i);
+            self.deferred.stop = Some(i);
         }
         if let Some(i) = to_remove {
+            self.deferred.remove = Some(i);
+        }
+        if add_one {
+            self.deferred.add_channel = true;
+        }
+        if do_refresh_ports {
+            self.deferred.refresh_ports = true;
+        }
+    }
+
+    /// Apply every mutation queued on `self.deferred` during the just-
+    /// completed egui layout. Called from the end of `ui()`, OUTSIDE any
+    /// egui `show()` closure, so the state changes can't interleave with
+    /// egui's two-pass layout.
+    fn process_deferred(&mut self) {
+        let mut d = std::mem::take(&mut self.deferred);
+        // Dedup applies — multiple radio-clicks in one frame on the same
+        // channel are pointless to apply twice.
+        d.apply.sort_unstable();
+        d.apply.dedup();
+        for i in d.apply {
+            self.apply_connection(i);
+        }
+        if let Some(i) = d.start {
+            self.start_connection(i);
+        }
+        if let Some(i) = d.stop {
+            self.stop_connection(i);
+        }
+        if let Some(i) = d.remove {
             self.stop_connection(i);
             self.conn_drafts.remove(i);
             self.sched_drafts.remove(i);
             self.conn_errors.remove(i);
             self.talkers.remove(i);
             self.sent_counts.remove(i);
+            if i < self.message_sent_counts.len() {
+                self.message_sent_counts.remove(i);
+            }
             self.displays.remove(i);
             if i < self.profile.channels.len() {
                 self.profile.channels.remove(i);
             }
             self.dirty = true;
         }
-        if add_one {
+        if d.add_channel {
             self.conn_drafts.push(ConnDraft::default());
             self.sched_drafts.push(Vec::new());
             self.conn_errors.push(None);
             self.talkers.push(None);
+            self.message_sent_counts.push(Vec::new());
             self.sent_counts.push(0);
             self.displays.push(ChannelDisplay::default());
             self.dirty = true;
         }
-        if do_refresh_ports {
+        if d.refresh_ports {
             self.refresh_serial_ports();
         }
     }
@@ -886,6 +994,8 @@ fn show_schedule_section(
     ui: &mut egui::Ui,
     entries: &mut Vec<ScheduleDraft>,
     dirty: &mut bool,
+    per_message_counts: &[u64],
+    channel_running: bool,
 ) -> Vec<(usize, u64)> {
     let mut to_remove: Option<usize> = None;
     let mut add_one = false;
@@ -960,6 +1070,9 @@ fn show_schedule_section(
                     });
 
                     show_message_preview(ui, entry);
+
+                    let sent = per_message_counts.get(i).copied().unwrap_or(0);
+                    show_message_status(ui, channel_running, sent);
                 });
             });
             ui.add_space(4.0);
@@ -1442,6 +1555,53 @@ impl egui::TextBuffer for UppercaseHex<'_> {
     }
 }
 
+/// Amber pill in the channel-card header when the user has edited fields
+/// that haven't reached the running talker thread yet. Hides itself when
+/// there's no drift (or when the channel isn't running and the user is
+/// just composing — they'll apply by pressing Start anyway).
+///
+/// - **Interface drift** can be applied live (press Enter in the edited
+///   field; the talker thread reopens the interface).
+/// - **Message drift** currently needs a stop+start — the schedule is
+///   compiled at channel open and can't be hot-swapped today.
+fn show_unapplied_badge(ui: &mut egui::Ui, running: bool, iface_drift: bool, msg_drift: bool) {
+    if !running || !(iface_drift || msg_drift) {
+        return;
+    }
+    let (label, tip) = match (iface_drift, msg_drift) {
+        (true, true) => (
+            "RESTART NEEDED",
+            "Both interface parameters and the message list have been edited.\n\
+             Press Stop then Start to apply both — message changes can't be \
+             applied without a restart.",
+        ),
+        (false, true) => (
+            "RESTART NEEDED",
+            "Message edits (payload, interval rules, timestamp/checksum toggles, \
+             added/removed messages) only take effect when the channel restarts. \
+             Press Stop then Start.",
+        ),
+        (true, false) => (
+            "APPLY NEEDED",
+            "Interface parameters have been edited but not yet applied to the \
+             running channel. Press Enter in the edited field — or stop and \
+             start the channel — to apply them.",
+        ),
+        (false, false) => unreachable!(),
+    };
+    let bg = egui::Color32::from_rgb(220, 180, 60);
+    let fg = egui::Color32::BLACK;
+    egui::Frame::default()
+        .fill(bg)
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).color(fg).strong().size(12.0));
+        })
+        .response
+        .on_hover_text(tip);
+}
+
 /// Render [`interface_summary`] in the channel-card header, splitting on `?`
 /// markers so unknown / unfilled fields show up as a **bold red** glyph
 /// rather than blending into the rest of the weak-grey summary text.
@@ -1676,6 +1836,27 @@ fn show_message_preview(ui: &mut egui::Ui, entry: &ScheduleDraft) {
     });
 }
 
+/// Per-message status line at the bottom of each message group:
+/// a coloured state dot plus the message's running send count.
+///
+/// State follows the channel — messages aren't independently scheduled
+/// from the user's perspective. "Active" = channel is running and this
+/// message will fire on its interval. "Idle" = channel is stopped, so
+/// the count is the last value seen.
+fn show_message_status(ui: &mut egui::Ui, channel_running: bool, sent: u64) {
+    ui.horizontal(|ui| {
+        let (dot_color, state) = if channel_running {
+            (egui::Color32::from_rgb(80, 200, 80), "Active")
+        } else {
+            (egui::Color32::GRAY, "Idle")
+        };
+        ui.colored_label(dot_color, "\u{2022}");
+        ui.label(state);
+        ui.separator();
+        ui.label(format!("Sent: {sent}"));
+    });
+}
+
 /// Render the per-message timestamp toggles.
 ///
 /// No inner separator between the `Timestamp` checkbox and its
@@ -1868,7 +2049,18 @@ fn show_insert_byte_button(ui: &mut egui::Ui, text: &mut String, hex: &mut Strin
             resp.request_focus();
             let value = u8::from_str_radix(hex.trim(), 16).ok();
             let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let insert = ui.add_enabled(value.is_some(), egui::Button::new("Insert"));
+            let mut insert = ui.add_enabled(value.is_some(), egui::Button::new("Insert"));
+            if value.is_none() {
+                let why = if hex.trim().is_empty() {
+                    "Type 1–2 hex digits first (e.g. 1B, 0D, FF)".to_string()
+                } else {
+                    format!(
+                        "`{}` is not a valid hex byte — use 1–2 digits 0–9 / A–F",
+                        hex.trim()
+                    )
+                };
+                insert = insert.on_disabled_hover_text(why);
+            }
             if let Some(b) = value {
                 if insert.clicked() || entered {
                     text.push_str(&format!("\u{2039}{b:02X}\u{203A}"));

@@ -19,9 +19,16 @@ pub enum TalkerCommand {
 
 /// A status update sent from a talker thread to the UI thread.
 pub enum TalkerStatus {
-    /// A message was sent — the running count and the bytes put on the wire.
+    /// A message was sent. Carries both per-channel and per-message counts
+    /// plus the wire bytes (for the display pane).
     Sent {
-        count: u64,
+        /// Which message in the channel's schedule fired.
+        message_index: usize,
+        /// Running send count for this *specific message*.
+        message_count: u64,
+        /// Running send count across all messages in this channel.
+        total_count: u64,
+        /// Exact bytes put on the wire.
         payload: Vec<u8>,
     },
     ConnectionError {
@@ -47,7 +54,11 @@ pub fn run_talker(
     cmd_rx: crossbeam_channel::Receiver<TalkerCommand>,
     status_tx: crossbeam_channel::Sender<TalkerStatus>,
 ) {
-    let mut sent_count = 0u64;
+    let mut total_count = 0u64;
+    // Per-message send counts, indexed by the message's position in the
+    // compiled schedule. Grows on demand if the schedule yields an index
+    // beyond the current vector length.
+    let mut per_message_counts: Vec<u64> = Vec::new();
 
     loop {
         for cmd in cmd_rx.try_iter() {
@@ -72,11 +83,17 @@ pub fn run_talker(
         }
 
         match schedule.poll(Instant::now()) {
-            Tick::Send { payload, .. } => match interface.send(&payload) {
+            Tick::Send { index, payload } => match interface.send(&payload) {
                 Ok(()) => {
-                    sent_count += 1;
+                    total_count += 1;
+                    if index >= per_message_counts.len() {
+                        per_message_counts.resize(index + 1, 0);
+                    }
+                    per_message_counts[index] += 1;
                     let _ = status_tx.try_send(TalkerStatus::Sent {
-                        count: sent_count,
+                        message_index: index,
+                        message_count: per_message_counts[index],
+                        total_count,
                         payload,
                     });
                 }
