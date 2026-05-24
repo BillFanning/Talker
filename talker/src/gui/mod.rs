@@ -1078,7 +1078,7 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                 );
                 if r.changed() {
                     entry.nmea_sentence_type = entry.nmea_sentence_type.to_ascii_uppercase();
-                    prefill_nmea_fields_if_empty(entry);
+                    prefill_nmea_fields(entry);
                 }
                 let sentence_before = entry.nmea_sentence_type.clone();
                 ui.menu_button("v", |ui| {
@@ -1091,7 +1091,7 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                     );
                 });
                 if entry.nmea_sentence_type != sentence_before {
-                    prefill_nmea_fields_if_empty(entry);
+                    prefill_nmea_fields(entry);
                 }
                 ui.separator();
                 ui.label("NMEA checksum:").on_hover_text(
@@ -1119,12 +1119,17 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             ui.end_row();
 
             ui.label("Fields");
-            ui.add(
+            let fields_r = ui.add(
                 egui::TextEdit::singleline(&mut entry.nmea_fields)
                     .id_salt("payload_nmea_fields")
                     .desired_width(360.0)
                     .hint_text("comma-separated, e.g. 123519,4807.038,N,01131.000,E"),
             );
+            if fields_r.changed() {
+                // User edited by hand — protect Fields from being overwritten
+                // by future auto-fills on sentence-type changes.
+                entry.nmea_fields_autofilled = false;
+            }
             ui.end_row();
         }
     }
@@ -1173,14 +1178,29 @@ fn nmea_example_fields(sentence: &str) -> Option<&'static str> {
     }
 }
 
-/// If `entry.nmea_fields` is empty and there's a known example for the
-/// currently selected sentence type, pre-fill it. Won't overwrite anything
-/// the user has typed.
-fn prefill_nmea_fields_if_empty(entry: &mut ScheduleDraft) {
-    if entry.nmea_fields.is_empty() {
-        if let Some(example) = nmea_example_fields(&entry.nmea_sentence_type) {
-            entry.nmea_fields = example.to_string();
-        }
+/// Pre-fill `entry.nmea_fields` with a sample for the current sentence
+/// type when it's safe to do so:
+///
+/// - The Fields box is empty, OR
+/// - The Fields box was previously auto-filled and the user hasn't edited
+///   it since (`nmea_fields_autofilled == true`).
+///
+/// Anything the user has typed by hand is left alone.
+fn prefill_nmea_fields(entry: &mut ScheduleDraft) {
+    let safe_to_overwrite = entry.nmea_fields.is_empty() || entry.nmea_fields_autofilled;
+    if !safe_to_overwrite {
+        return;
+    }
+    if let Some(example) = nmea_example_fields(&entry.nmea_sentence_type) {
+        entry.nmea_fields = example.to_string();
+        entry.nmea_fields_autofilled = true;
+    } else if entry.nmea_fields_autofilled {
+        // No example for this new sentence type. Clear any stale auto-fill
+        // from the previous sentence type — keeping it would confuse the
+        // user. (Leave user-typed content alone, which is why we only do
+        // this when the autofilled flag is set.)
+        entry.nmea_fields.clear();
+        entry.nmea_fields_autofilled = false;
     }
 }
 
@@ -1780,24 +1800,33 @@ fn marker_layouter(
 
 /// An "Insert Byte" button whose popup appends a `‹XX›` marker to `text`.
 fn show_insert_byte_button(ui: &mut egui::Ui, text: &mut String, hex: &mut String) {
-    ui.menu_button("Insert Byte", |ui| {
-        ui.label("Byte value (hex):");
-        let resp = ui.add(
-            egui::TextEdit::singleline(hex)
-                .desired_width(48.0)
-                .hint_text("1B"),
-        );
-        let value = u8::from_str_radix(hex.trim(), 16).ok();
-        let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let insert = ui.add_enabled(value.is_some(), egui::Button::new("Insert"));
-        if let Some(b) = value {
-            if insert.clicked() || entered {
-                text.push_str(&format!("\u{2039}{b:02X}\u{203A}"));
-                hex.clear();
-                ui.close();
+    // Default menu close behavior is `CloseOnClick`, which closes the menu
+    // the moment the user clicks anywhere inside — including the TextEdit
+    // (which has to be clicked to gain focus). Switch to `CloseOnClickOutside`
+    // so the popup stays open while the user types the hex value.
+    egui::containers::menu::MenuButton::new("Insert Byte")
+        .config(
+            egui::containers::menu::MenuConfig::new()
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+        )
+        .ui(ui, |ui| {
+            ui.label("Byte value (hex):");
+            let resp = ui.add(
+                egui::TextEdit::singleline(hex)
+                    .desired_width(48.0)
+                    .hint_text("1B"),
+            );
+            let value = u8::from_str_radix(hex.trim(), 16).ok();
+            let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let insert = ui.add_enabled(value.is_some(), egui::Button::new("Insert"));
+            if let Some(b) = value {
+                if insert.clicked() || entered {
+                    text.push_str(&format!("\u{2039}{b:02X}\u{203A}"));
+                    hex.clear();
+                    ui.close();
+                }
             }
-        }
-    });
+        });
 }
 
 /// Render a channel's real-time outbound display pane (spec §5.7).

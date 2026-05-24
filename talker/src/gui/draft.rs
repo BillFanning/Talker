@@ -166,7 +166,15 @@ impl From<&InterfaceConfig> for ConnDraft {
 
 impl ConnDraft {
     pub fn to_config(&self) -> Option<InterfaceConfig> {
-        let local_port = self.local_port.parse::<u16>().ok();
+        // Empty local_port = "let the OS pick". Non-empty but unparseable
+        // (e.g. "444444444" > u16::MAX) is a user mistake; fail the whole
+        // build so the channel can't start and the disabled-Start tooltip
+        // surfaces the error. (Previously we silently fell back to None.)
+        let local_port = if self.local_port.is_empty() {
+            None
+        } else {
+            Some(self.local_port.parse::<u16>().ok()?)
+        };
         match self.kind {
             ConnKind::Serial => {
                 if self.serial_port.is_empty() {
@@ -255,6 +263,11 @@ pub struct ScheduleDraft {
     pub nmea_sentence_type: String,
     pub nmea_fields: String, // comma-separated field values
     pub nmea_checksum_mode: NmeaChecksumMode,
+    /// True when `nmea_fields` was last set by the auto-prefill helper —
+    /// not by the user typing. Lets the sentence-picker safely overwrite
+    /// stale example fields when the user picks a new sentence type, but
+    /// leave alone anything the user has actually edited.
+    pub nmea_fields_autofilled: bool,
     /// Live filter text for the talker-picker popup (not serialized).
     pub nmea_talker_filter: String,
     /// Live filter text for the sentence-picker popup (not serialized).
@@ -289,6 +302,7 @@ impl Default for ScheduleDraft {
             nmea_sentence_type: String::new(),
             nmea_fields: String::new(),
             nmea_checksum_mode: NmeaChecksumMode::Correct,
+            nmea_fields_autofilled: false,
             nmea_talker_filter: String::new(),
             nmea_sentence_filter: String::new(),
             interval_ms: "1000".to_string(),
