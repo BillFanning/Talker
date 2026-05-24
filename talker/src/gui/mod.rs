@@ -772,11 +772,32 @@ impl TalkerApp {
                         ui.separator();
 
                         let (changed, refresh) = match self.conn_drafts[i].kind {
+                            // Each kind gets its own push_id namespace so
+                            // the very different widget trees produced by
+                            // Serial / UDP / TCP can't shift each other's
+                            // auto-ids across egui's two layout passes.
                             ConnKind::Serial => {
-                                show_serial_fields(ui, &mut self.conn_drafts[i], &self.serial_ports)
+                                ui.push_id("serial_body", |ui| {
+                                    show_serial_fields(
+                                        ui,
+                                        &mut self.conn_drafts[i],
+                                        &self.serial_ports,
+                                    )
+                                })
+                                .inner
                             }
-                            ConnKind::Udp => (show_udp_fields(ui, &mut self.conn_drafts[i]), false),
-                            ConnKind::Tcp => (show_tcp_fields(ui, &mut self.conn_drafts[i]), false),
+                            ConnKind::Udp => {
+                                ui.push_id("udp_body", |ui| {
+                                    (show_udp_fields(ui, &mut self.conn_drafts[i]), false)
+                                })
+                                .inner
+                            }
+                            ConnKind::Tcp => {
+                                ui.push_id("tcp_body", |ui| {
+                                    (show_tcp_fields(ui, &mut self.conn_drafts[i]), false)
+                                })
+                                .inner
+                            }
                         };
                         if changed {
                             to_apply.push(i);
@@ -893,6 +914,7 @@ fn show_schedule_section(
                                 red_bordered(ui, bad_interval, "must be a whole number", |ui| {
                                     ui.add(
                                         egui::TextEdit::singleline(&mut entry.interval_ms)
+                                            .id_salt("interval_ms")
                                             .desired_width(80.0),
                                     )
                                 });
@@ -945,6 +967,7 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                 |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut UppercaseHex(&mut entry.hex_data))
+                            .id_salt("payload_hex")
                             .desired_width(360.0)
                             .hint_text("DE AD BE EF"),
                     )
@@ -958,6 +981,7 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                 let mut layouter = marker_layouter;
                 ui.add(
                     egui::TextEdit::singleline(&mut entry.utf8_text)
+                        .id_salt("payload_utf8")
                         .desired_width(300.0)
                         .hint_text("Unicode text")
                         .layouter(&mut layouter),
@@ -970,6 +994,7 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             ui.label("Text");
             ui.add(
                 egui::TextEdit::singleline(&mut entry.utf16_text)
+                    .id_salt("payload_utf16")
                     .desired_width(360.0)
                     .hint_text("Unicode text"),
             );
@@ -989,6 +1014,7 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                 let mut layouter = marker_layouter;
                 ui.add(
                     egui::TextEdit::singleline(&mut entry.ascii_text)
+                        .id_salt("payload_ascii")
                         .desired_width(300.0)
                         .hint_text("text")
                         .layouter(&mut layouter),
@@ -1016,6 +1042,7 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             ui.horizontal(|ui| {
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut entry.nmea_talker)
+                        .id_salt("payload_nmea_talker")
                         .desired_width(40.0)
                         .hint_text("GP"),
                 );
@@ -1034,6 +1061,7 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                 ui.separator();
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut entry.nmea_sentence_type)
+                        .id_salt("payload_nmea_sentence")
                         .desired_width(50.0)
                         .hint_text("GGA"),
                 );
@@ -1077,6 +1105,7 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             ui.label("Fields");
             ui.add(
                 egui::TextEdit::singleline(&mut entry.nmea_fields)
+                    .id_salt("payload_nmea_fields")
                     .desired_width(360.0)
                     .hint_text("comma-separated, e.g. 123519,4807.038,N,01131.000,E"),
             );
@@ -1818,6 +1847,7 @@ fn show_serial_fields(ui: &mut egui::Ui, conn: &mut ConnDraft, ports: &[String])
                     |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut conn.baud_custom)
+                                .id_salt("serial_baud_custom")
                                 .desired_width(68.0)
                                 .hint_text("custom"),
                         )
@@ -1905,6 +1935,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                         |ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut conn.udp_dest)
+                                    .id_salt("udp_unicast_dest")
                                     .desired_width(220.0)
                                     .hint_text("host:port  (Enter to apply)"),
                             )
@@ -1929,6 +1960,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                             |ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut conn.udp_broadcast_addr)
+                                        .id_salt("udp_broadcast_addr")
                                         .desired_width(140.0)
                                         .hint_text("255.255.255.255"),
                                 )
@@ -1946,6 +1978,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                             red_bordered(ui, bad_port, "enter a port number 1–65535", |ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut conn.udp_broadcast_port)
+                                        .id_salt("udp_broadcast_port")
                                         .desired_width(60.0),
                                 )
                             });
@@ -1987,6 +2020,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                             |ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut conn.udp_group)
+                                        .id_salt("udp_multicast_group")
                                         .desired_width(140.0)
                                         .hint_text("239.0.0.1"),
                                 )
@@ -2004,6 +2038,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                             red_bordered(ui, bad_port, "enter a port number 1–65535", |ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut conn.udp_mc_port)
+                                        .id_salt("udp_multicast_port")
                                         .desired_width(60.0),
                                 )
                             });
@@ -2033,6 +2068,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
             let r = red_bordered(ui, bad_local, "enter a port number 1–65535", |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut conn.local_port)
+                        .id_salt("udp_local_port")
                         .desired_width(80.0)
                         .hint_text("auto"),
                 )
@@ -2118,6 +2154,7 @@ fn show_tcp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                 |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut conn.tcp_addr)
+                            .id_salt("tcp_addr")
                             .desired_width(220.0)
                             .hint_text("host:port  (Enter to apply)"),
                     )
