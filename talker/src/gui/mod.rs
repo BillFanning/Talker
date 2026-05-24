@@ -912,7 +912,20 @@ fn show_schedule_section(
                         });
                     });
 
-                    egui::Grid::new("message_grid")
+                    // Per-kind Grid id so each payload variant lives in its
+                    // own egui id namespace. Without this, switching kinds
+                    // makes the layout's widget set change shape inside the
+                    // same Grid — and any auto-derived id whose position
+                    // shifts triggers "id changed between passes" warnings
+                    // on the next layout pass.
+                    let grid_id = match entry.payload_kind {
+                        PayloadKind::Hex => "message_grid_hex",
+                        PayloadKind::Utf8 => "message_grid_utf8",
+                        PayloadKind::Utf16 => "message_grid_utf16",
+                        PayloadKind::Ascii => "message_grid_ascii",
+                        PayloadKind::Nmea => "message_grid_nmea",
+                    };
+                    egui::Grid::new(grid_id)
                         .num_columns(2)
                         .spacing([8.0, 4.0])
                         .show(ui, |ui| {
@@ -2010,7 +2023,15 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     let before_mode = conn.udp_mode;
     let mut apply = false;
 
-    egui::Grid::new("udp_grid")
+    // Per-mode Grid id so the very different widget trees produced by
+    // Unicast / Broadcast / Multicast each get their own id namespace —
+    // see the equivalent message_grid_<kind> trick in the message editor.
+    let grid_id = match conn.udp_mode {
+        UdpModeDraft::Unicast => "udp_grid_unicast",
+        UdpModeDraft::Broadcast => "udp_grid_broadcast",
+        UdpModeDraft::Multicast => "udp_grid_multicast",
+    };
+    egui::Grid::new(grid_id)
         .num_columns(2)
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
