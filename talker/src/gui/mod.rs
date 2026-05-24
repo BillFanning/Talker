@@ -607,13 +607,13 @@ impl TalkerApp {
                     (
                         egui::Color32::from_rgb(80, 200, 80),
                         if running == total && total > 0 {
-                            "\u{25cf} All running".to_string()
+                            "\u{2022} All running".to_string()
                         } else {
-                            format!("\u{25cf} {running}/{total} running")
+                            format!("\u{2022} {running}/{total} running")
                         },
                     )
                 } else {
-                    (egui::Color32::GRAY, "\u{25cf} Stopped".to_string())
+                    (egui::Color32::GRAY, "\u{2022} Stopped".to_string())
                 };
                 ui.colored_label(color, label);
                 ui.separator();
@@ -685,7 +685,7 @@ impl TalkerApp {
                             } else {
                                 (egui::Color32::from_rgb(80, 200, 80), "ok")
                             };
-                            ui.colored_label(dot_color, "\u{25cf}")
+                            ui.colored_label(dot_color, "\u{2022}")
                                 .on_hover_text(dot_tip);
 
                             ui.strong(format!("Channel {}", i + 1));
@@ -746,24 +746,35 @@ impl TalkerApp {
                                         }
                                     } else {
                                         let can = self.can_start_connection(i);
-                                        let btn = ui.add_enabled(
-                                            can,
-                                            egui::Button::new("\u{25b6}").small(),
-                                        );
-                                        if btn.clicked() {
-                                            to_start = Some(i);
-                                        }
-                                        if !can {
-                                            let tip = start_blockers(
+                                        // Compute the disabled-hover tip *before* the
+                                        // widget is added, so we can chain
+                                        // `on_disabled_hover_text` directly on the
+                                        // Response — egui only displays the tooltip
+                                        // when the call is part of the same Response
+                                        // chain as the widget add.
+                                        let tip = if !can {
+                                            let t = start_blockers(
                                                 &self.conn_drafts[i],
                                                 &self.sched_drafts[i],
                                             )
                                             .join("\n");
-                                            btn.on_disabled_hover_text(if tip.is_empty() {
+                                            if t.is_empty() {
                                                 "Add a valid message first".to_string()
                                             } else {
-                                                tip
-                                            });
+                                                t
+                                            }
+                                        } else {
+                                            String::new()
+                                        };
+                                        let mut btn = ui.add_enabled(
+                                            can,
+                                            egui::Button::new("\u{25b6}").small(),
+                                        );
+                                        if !can {
+                                            btn = btn.on_disabled_hover_text(tip);
+                                        }
+                                        if btn.clicked() {
+                                            to_start = Some(i);
                                         }
                                     }
                                 });
@@ -1067,7 +1078,9 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                 );
                 if r.changed() {
                     entry.nmea_sentence_type = entry.nmea_sentence_type.to_ascii_uppercase();
+                    prefill_nmea_fields_if_empty(entry);
                 }
+                let sentence_before = entry.nmea_sentence_type.clone();
                 ui.menu_button("v", |ui| {
                     show_filtered_picker(
                         ui,
@@ -1077,6 +1090,9 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                         &mut entry.nmea_sentence_type,
                     );
                 });
+                if entry.nmea_sentence_type != sentence_before {
+                    prefill_nmea_fields_if_empty(entry);
+                }
                 ui.separator();
                 ui.label("NMEA checksum:").on_hover_text(
                     "The protocol-internal `*XX` byte at the end of an NMEA \
@@ -1110,6 +1126,60 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                     .hint_text("comma-separated, e.g. 123519,4807.038,N,01131.000,E"),
             );
             ui.end_row();
+        }
+    }
+}
+
+/// Example comma-separated field values for common NMEA sentence types.
+/// Returned with no trailing `*XX` (the checksum is added downstream).
+/// Used to auto-fill the Fields box when the user picks a sentence type
+/// and the Fields box is currently empty — so brand-new messages start
+/// from a realistic sample rather than a blank.
+fn nmea_example_fields(sentence: &str) -> Option<&'static str> {
+    match sentence {
+        "GGA" => Some("123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,"),
+        "RMC" => Some("220516,A,5133.82,N,00042.24,W,173.8,231.8,130694,004.2,W"),
+        "VTG" => Some("054.7,T,034.4,M,005.5,N,010.2,K"),
+        "GLL" => Some("4916.45,N,12311.12,W,225444,A"),
+        "GSA" => Some("A,3,19,28,14,18,27,22,31,39,,,,,1.7,1.0,1.3"),
+        "GSV" => Some("2,1,08,01,40,083,46,02,17,308,41,12,07,344,39,14,22,228,45"),
+        "GNS" => Some("122310.2,3722.425671,N,12258.856215,W,DA,15,0.9,1005.543,6.5,5.2,23"),
+        "HDT" => Some("123.4,T"),
+        "HDM" => Some("123.4,M"),
+        "HDG" => Some("123.4,1.2,E,2.0,W"),
+        "THS" => Some("123.4,A"),
+        "ROT" => Some("35.6,A"),
+        "ZDA" => Some("201530.00,04,07,2002,00,00"),
+        "VHW" => Some("123.4,T,123.4,M,1.0,N,1.852,K"),
+        "VBW" => Some("11.0,01.0,A,12.0,02.0,A"),
+        "VLW" => Some("12345.6,N,123.4,N"),
+        "DBT" => Some("5.0,f,1.5,M,0.8,F"),
+        "DBK" => Some("5.0,f,1.5,M,0.8,F"),
+        "DBS" => Some("5.0,f,1.5,M,0.8,F"),
+        "DPT" => Some("3.4,0.5"),
+        "MTW" => Some("17.9,C"),
+        "MWV" => Some("019.0,R,15.5,N,A"),
+        "MWD" => Some("019.0,T,021.0,M,015.5,N,007.97,M"),
+        "MDA" => Some("30.12,I,1.02,B,17.9,C,,,53,,,,019.0,T,021.0,M,15.5,N,007.97,M"),
+        "XDR" => Some("C,17.9,C,TEMP1"),
+        "RSA" => Some("0.5,A,,V"),
+        "RPM" => Some("S,1,1000.0,5.0,A"),
+        "APB" => Some("A,A,0.10,R,N,V,V,011.0,T,DEST,011.0,T,011.0,T"),
+        "BOD" => Some("097.0,T,103.2,M,POINTB,POINTA"),
+        "XTE" => Some("A,A,0.10,R,N"),
+        "GBS" => Some("125027,1.2,1.3,3.2,12,0.04,-0.3,7.5"),
+        "GST" => Some("172814.0,0.006,0.023,0.020,273.6,0.023,0.020,0.031"),
+        _ => None,
+    }
+}
+
+/// If `entry.nmea_fields` is empty and there's a known example for the
+/// currently selected sentence type, pre-fill it. Won't overwrite anything
+/// the user has typed.
+fn prefill_nmea_fields_if_empty(entry: &mut ScheduleDraft) {
+    if entry.nmea_fields.is_empty() {
+        if let Some(example) = nmea_example_fields(&entry.nmea_sentence_type) {
+            entry.nmea_fields = example.to_string();
         }
     }
 }
