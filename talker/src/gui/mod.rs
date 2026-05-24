@@ -809,6 +809,35 @@ impl TalkerApp {
                                         {
                                             to_stop = Some(i);
                                         }
+                                        // ↻ Restart, shown only when there's
+                                        // drift to apply. start_connection
+                                        // internally calls stop_connection
+                                        // first, so deferring `start` here
+                                        // gives us a clean stop+apply+start.
+                                        if iface_drift || msg_drift {
+                                            let restart = ui.add(
+                                                egui::Button::new(
+                                                    egui::RichText::new("\u{21BA}")
+                                                        .color(egui::Color32::from_rgb(
+                                                            220, 180, 60,
+                                                        ))
+                                                        .strong()
+                                                        .size(16.0),
+                                                )
+                                                .small(),
+                                            );
+                                            if restart
+                                                .on_hover_text(
+                                                    "Restart channel — stops the \
+                                                     current send loop, applies \
+                                                     the current draft (interface \
+                                                     + messages), and starts again.",
+                                                )
+                                                .clicked()
+                                            {
+                                                to_start = Some(i);
+                                            }
+                                        }
                                     } else {
                                         let can = self.can_start_connection(i);
                                         // Compute the disabled-hover tip *before* the
@@ -2048,7 +2077,14 @@ fn show_insert_byte_button(ui: &mut egui::Ui, text: &mut String, hex: &mut Strin
             // the field already has focus.
             resp.request_focus();
             let value = u8::from_str_radix(hex.trim(), 16).ok();
-            let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // Enter while the popup is open commits — gated on hex being
+            // valid, not on `resp.lost_focus()` (which doesn't always fire
+            // for popup-hosted TextEdits, so Enter would otherwise feel
+            // dead). We only consume the Enter when the value parses, so an
+            // empty / invalid field doesn't swallow Enter for anything else.
+            let entered = resp.has_focus()
+                && value.is_some()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let mut insert = ui.add_enabled(value.is_some(), egui::Button::new("Insert"));
             if value.is_none() {
                 let why = if hex.trim().is_empty() {
