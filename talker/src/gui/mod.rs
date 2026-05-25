@@ -385,7 +385,6 @@ impl TalkerApp {
                 thread,
             });
         }
-        let message_count = messages.len();
         tracing::info!("channel {n} started ({message_count}-message schedule)");
     }
 

@@ -58,10 +58,8 @@ pub struct ConnDraft {
     pub udp_dest: String,           // unicast destination (host:port)
     pub udp_broadcast_addr: String, // broadcast destination address (defaults to 255.255.255.255)
     pub udp_broadcast_port: String, // broadcast destination port
-    /// Transient state for the broadcast port's ± hold-to-repeat. `None`
-    /// when nothing is being held; otherwise carries the pressed direction
-    /// (−1 or +1), seconds until the next repeat fires (negative = still
-    /// waiting), and total seconds held (used to accelerate the rate).
+    /// Transient state for the broadcast / multicast port's ± hold-to-repeat.
+    /// `None` when nothing is being held; otherwise see [`PortHold`].
     pub udp_port_hold: Option<PortHold>,
     pub udp_group: String,   // multicast group address
     pub udp_mc_port: String, // multicast port
