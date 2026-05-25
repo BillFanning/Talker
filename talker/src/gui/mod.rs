@@ -734,234 +734,197 @@ impl TalkerApp {
     }
 
     fn show_connections_tab(&mut self, ui: &mut egui::Ui) {
-        let mut to_apply: Vec<usize> = Vec::new();
-        let mut to_remove: Option<usize> = None;
-        let mut to_start: Option<usize> = None;
-        let mut to_stop: Option<usize> = None;
-        let mut add_one = false;
-        let mut do_refresh_ports = false;
-
         ScrollArea::vertical().show(ui, |ui| {
             let n = self.conn_drafts.len();
             for i in 0..n {
                 ui.push_id(i, |ui| {
-                    let mut conn_frame = egui::Frame::group(ui.style());
-                    conn_frame.stroke =
-                        egui::Stroke::new(1.5, egui::Color32::from_rgb(140, 160, 200));
-                    conn_frame.show(ui, |ui| {
-                        let running = self.is_connection_running(i);
-                        ui.horizontal(|ui| {
-                            let error = self.conn_errors.get(i).and_then(|e| e.as_deref());
-                            let (dot_color, dot_tip): (egui::Color32, &str) = if !running {
-                                (egui::Color32::GRAY, "not running")
-                            } else if let Some(msg) = error {
-                                (egui::Color32::RED, msg)
-                            } else {
-                                (egui::Color32::from_rgb(80, 200, 80), "ok")
-                            };
-                            ui.colored_label(dot_color, "\u{2022}")
-                                .on_hover_text(dot_tip);
-
-                            ui.strong(format!("Channel {}", i + 1));
-                            ui.separator();
-                            let before_kind = self.conn_drafts[i].kind;
-                            ui.radio_value(
-                                &mut self.conn_drafts[i].kind,
-                                ConnKind::Serial,
-                                "Serial",
-                            );
-                            ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Udp, "UDP");
-                            ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Tcp, "TCP");
-                            if self.conn_drafts[i].kind != before_kind {
-                                to_apply.push(i);
-                            }
-                            ui.separator();
-                            // Give each widget after the radios a stable
-                            // string-source id, so the conditional `pending`
-                            // indicator's appearance / disappearance can't
-                            // shift sibling auto-ids between layout passes.
-                            ui.push_id("iface_summary", |ui| {
-                                show_interface_summary(ui, &self.conn_drafts[i]);
-                            });
-                            // Drift detection: compare the draft against the
-                            // applied config + applied messages. Interface
-                            // drift can be applied live (press Enter); message
-                            // drift requires a stop+start.
-                            let (iface_drift, msg_drift) = self.detect_drift(i);
-                            ui.push_id("pending_indicator", |ui| {
-                                show_unapplied_badge(ui, running, iface_drift, msg_drift);
-                            });
-                            ui.push_id("channel_actions", |ui| {
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    if ui
-                                        .button(egui::RichText::new("\u{00D7}").size(18.0).strong())
-                                        .on_hover_text("Remove this channel")
-                                        .clicked()
-                                    {
-                                        to_remove = Some(i);
-                                    }
-                                    if running {
-                                        if ui
-                                            .small_button("\u{25a0}")
-                                            .on_hover_text("Stop")
-                                            .clicked()
-                                        {
-                                            to_stop = Some(i);
-                                        }
-                                        // ↻ Restart, shown only when there's
-                                        // drift to apply. start_connection
-                                        // internally calls stop_connection
-                                        // first, so deferring `start` here
-                                        // gives us a clean stop+apply+start.
-                                        if iface_drift || msg_drift {
-                                            let restart = ui.add(
-                                                egui::Button::new(
-                                                    egui::RichText::new("\u{21BA}")
-                                                        .color(egui::Color32::from_rgb(
-                                                            220, 180, 60,
-                                                        ))
-                                                        .strong()
-                                                        .size(16.0),
-                                                )
-                                                .small(),
-                                            );
-                                            if restart
-                                                .on_hover_text(
-                                                    "Restart channel — stops the \
-                                                     current send loop, applies \
-                                                     the current draft (interface \
-                                                     + messages), and starts again.",
-                                                )
-                                                .clicked()
-                                            {
-                                                to_start = Some(i);
-                                            }
-                                        }
-                                    } else {
-                                        let can = self.can_start_connection(i);
-                                        // Compute the disabled-hover tip *before* the
-                                        // widget is added, so we can chain
-                                        // `on_disabled_hover_text` directly on the
-                                        // Response — egui only displays the tooltip
-                                        // when the call is part of the same Response
-                                        // chain as the widget add.
-                                        let tip = if !can {
-                                            let t = start_blockers(
-                                                &self.conn_drafts[i],
-                                                &self.sched_drafts[i],
-                                            )
-                                            .join("\n");
-                                            if t.is_empty() {
-                                                "Add a valid message first".to_string()
-                                            } else {
-                                                t
-                                            }
-                                        } else {
-                                            String::new()
-                                        };
-                                        let mut btn = ui.add_enabled(
-                                            can,
-                                            egui::Button::new("\u{25b6}").small(),
-                                        );
-                                        if !can {
-                                            btn = btn.on_disabled_hover_text(tip);
-                                        }
-                                        if btn.clicked() {
-                                            to_start = Some(i);
-                                        }
-                                    }
-                                });
-                            });
-                        });
-                        ui.separator();
-
-                        let (changed, refresh) = match self.conn_drafts[i].kind {
-                            // Each kind gets its own push_id namespace so
-                            // the very different widget trees produced by
-                            // Serial / UDP / TCP can't shift each other's
-                            // auto-ids across egui's two layout passes.
-                            ConnKind::Serial => {
-                                ui.push_id("serial_body", |ui| {
-                                    show_serial_fields(
-                                        ui,
-                                        &mut self.conn_drafts[i],
-                                        &self.serial_ports,
-                                    )
-                                })
-                                .inner
-                            }
-                            ConnKind::Udp => {
-                                ui.push_id("udp_body", |ui| {
-                                    (show_udp_fields(ui, &mut self.conn_drafts[i]), false)
-                                })
-                                .inner
-                            }
-                            ConnKind::Tcp => {
-                                ui.push_id("tcp_body", |ui| {
-                                    (show_tcp_fields(ui, &mut self.conn_drafts[i]), false)
-                                })
-                                .inner
-                            }
-                        };
-                        if changed {
-                            to_apply.push(i);
-                        }
-                        if refresh {
-                            do_refresh_ports = true;
-                        }
-
-                        ui.separator();
-                        let per_message_counts: &[u64] = self
-                            .message_sent_counts
-                            .get(i)
-                            .map(|v| v.as_slice())
-                            .unwrap_or(&[]);
-                        let interval_changes = show_schedule_section(
-                            ui,
-                            &mut self.sched_drafts[i],
-                            &mut self.dirty,
-                            per_message_counts,
-                            running,
-                        );
-                        for (msg_index, interval_ms) in interval_changes {
-                            if let Some(Some(handle)) = self.talkers.get(i) {
-                                let _ = handle.cmd_tx.try_send(TalkerCommand::SetInterval {
-                                    index: msg_index,
-                                    interval_ms,
-                                });
-                            }
-                        }
-
-                        ui.separator();
-                        show_display_pane(ui, &mut self.displays[i]);
-                    });
+                    self.show_channel_card(ui, i);
                 });
                 ui.add_space(6.0);
             }
             if ui.button("+ Add Channel").clicked() {
-                add_one = true;
+                self.deferred.add_channel = true;
             }
         });
+    }
 
-        // Stash mutations on `self.deferred`. Processed AFTER egui's layout
-        // closure returns (see `process_deferred`), so multi-pass layout
-        // can't see two different snapshots of the channel state within a
-        // single frame.
-        self.deferred.apply.extend(to_apply);
-        if let Some(i) = to_start {
-            self.deferred.start = Some(i);
+    fn show_channel_card(&mut self, ui: &mut egui::Ui, i: usize) {
+        let mut conn_frame = egui::Frame::group(ui.style());
+        conn_frame.stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(140, 160, 200));
+        conn_frame.show(ui, |ui| {
+            let running = self.is_connection_running(i);
+            ui.horizontal(|ui| {
+                self.show_channel_header(ui, i, running);
+            });
+            ui.separator();
+            self.show_channel_body(ui, i, running);
+            ui.separator();
+            show_display_pane(ui, &mut self.displays[i]);
+        });
+    }
+
+    fn show_channel_header(&mut self, ui: &mut egui::Ui, i: usize, running: bool) {
+        let error = self.conn_errors.get(i).and_then(|e| e.as_deref());
+        let (dot_color, dot_tip): (egui::Color32, &str) = if !running {
+            (egui::Color32::GRAY, "not running")
+        } else if let Some(msg) = error {
+            (egui::Color32::RED, msg)
+        } else {
+            (egui::Color32::from_rgb(80, 200, 80), "ok")
+        };
+        ui.colored_label(dot_color, "\u{2022}")
+            .on_hover_text(dot_tip);
+
+        ui.strong(format!("Channel {}", i + 1));
+        ui.separator();
+        let before_kind = self.conn_drafts[i].kind;
+        ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Serial, "Serial");
+        ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Udp, "UDP");
+        ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Tcp, "TCP");
+        if self.conn_drafts[i].kind != before_kind {
+            self.deferred.apply.push(i);
         }
-        if let Some(i) = to_stop {
-            self.deferred.stop = Some(i);
-        }
-        if let Some(i) = to_remove {
+        ui.separator();
+        // Stable id sources on every conditional widget that follows, so
+        // the appearing / disappearing pending indicator can't shift the
+        // sibling auto-ids between egui's two layout passes.
+        ui.push_id("iface_summary", |ui| {
+            show_interface_summary(ui, &self.conn_drafts[i]);
+        });
+        let (iface_drift, msg_drift) = self.detect_drift(i);
+        ui.push_id("pending_indicator", |ui| {
+            show_unapplied_badge(ui, running, iface_drift, msg_drift);
+        });
+        ui.push_id("channel_actions", |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                self.show_channel_actions(ui, i, running, iface_drift, msg_drift);
+            });
+        });
+    }
+
+    /// Right-side action button cluster: × remove, then either ■ Stop (+ ↻
+    /// Restart when drift exists) when running or ▶ Start when not. Called
+    /// from inside a `right_to_left` layout, so the first widget rendered
+    /// here appears rightmost.
+    fn show_channel_actions(
+        &mut self,
+        ui: &mut egui::Ui,
+        i: usize,
+        running: bool,
+        iface_drift: bool,
+        msg_drift: bool,
+    ) {
+        if ui
+            .button(egui::RichText::new("\u{00D7}").size(18.0).strong())
+            .on_hover_text("Remove this channel")
+            .clicked()
+        {
             self.deferred.remove = Some(i);
         }
-        if add_one {
-            self.deferred.add_channel = true;
+        if running {
+            if ui.small_button("\u{25a0}").on_hover_text("Stop").clicked() {
+                self.deferred.stop = Some(i);
+            }
+            // ↻ Restart, shown only when there's drift to apply.
+            // start_connection internally calls stop_connection first, so
+            // deferring `start` here gives us a clean stop+apply+start.
+            if iface_drift || msg_drift {
+                let restart = ui.add(
+                    egui::Button::new(
+                        egui::RichText::new("\u{21BA}")
+                            .color(egui::Color32::from_rgb(220, 180, 60))
+                            .strong()
+                            .size(16.0),
+                    )
+                    .small(),
+                );
+                if restart
+                    .on_hover_text(
+                        "Restart channel — stops the current send loop, applies \
+                         the current draft (interface + messages), and starts again.",
+                    )
+                    .clicked()
+                {
+                    self.deferred.start = Some(i);
+                }
+            }
+        } else {
+            let can = self.can_start_connection(i);
+            // Compute the disabled-hover tip *before* the widget is added,
+            // so we can chain `on_disabled_hover_text` directly on the
+            // Response — egui only displays the tooltip when the call is
+            // part of the same Response chain as the widget add.
+            let tip = if !can {
+                let t = start_blockers(&self.conn_drafts[i], &self.sched_drafts[i]).join("\n");
+                if t.is_empty() {
+                    "Add a valid message first".to_string()
+                } else {
+                    t
+                }
+            } else {
+                String::new()
+            };
+            let mut btn = ui.add_enabled(can, egui::Button::new("\u{25b6}").small());
+            if !can {
+                btn = btn.on_disabled_hover_text(tip);
+            }
+            if btn.clicked() {
+                self.deferred.start = Some(i);
+            }
         }
-        if do_refresh_ports {
+    }
+
+    fn show_channel_body(&mut self, ui: &mut egui::Ui, i: usize, running: bool) {
+        let (changed, refresh) = match self.conn_drafts[i].kind {
+            // Each kind gets its own push_id namespace so the very
+            // different widget trees produced by Serial / UDP / TCP can't
+            // shift each other's auto-ids across egui's two layout passes.
+            ConnKind::Serial => {
+                ui.push_id("serial_body", |ui| {
+                    show_serial_fields(ui, &mut self.conn_drafts[i], &self.serial_ports)
+                })
+                .inner
+            }
+            ConnKind::Udp => {
+                ui.push_id("udp_body", |ui| {
+                    (show_udp_fields(ui, &mut self.conn_drafts[i]), false)
+                })
+                .inner
+            }
+            ConnKind::Tcp => {
+                ui.push_id("tcp_body", |ui| {
+                    (show_tcp_fields(ui, &mut self.conn_drafts[i]), false)
+                })
+                .inner
+            }
+        };
+        if changed {
+            self.deferred.apply.push(i);
+        }
+        if refresh {
             self.deferred.refresh_ports = true;
+        }
+
+        ui.separator();
+        let per_message_counts: &[u64] = self
+            .message_sent_counts
+            .get(i)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let interval_changes = show_schedule_section(
+            ui,
+            &mut self.sched_drafts[i],
+            &mut self.dirty,
+            per_message_counts,
+            running,
+        );
+        for (msg_index, interval_ms) in interval_changes {
+            if let Some(Some(handle)) = self.talkers.get(i) {
+                let _ = handle.cmd_tx.try_send(TalkerCommand::SetInterval {
+                    index: msg_index,
+                    interval_ms,
+                });
+            }
         }
     }
 
@@ -1122,173 +1085,184 @@ fn show_schedule_section(
 }
 
 /// Render the payload-format fields for one message into the surrounding grid.
+/// Each `PayloadKind` arm has its own renderer below.
 fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     match entry.payload_kind {
-        PayloadKind::Hex => {
-            let bad_hex = !entry.hex_data.is_empty() && !hex_valid(&entry.hex_data);
-            ui.label("Data (hex)");
-            let _ = red_bordered(
-                ui,
-                bad_hex,
-                "invalid hex — use byte pairs like DE AD BE EF",
-                |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut UppercaseHex(&mut entry.hex_data))
-                            .id_salt("payload_hex")
-                            .desired_width(360.0)
-                            .hint_text("DE AD BE EF"),
-                    )
-                },
-            );
-            ui.end_row();
-        }
-        PayloadKind::Utf8 => {
-            ui.label("Text");
-            ui.horizontal(|ui| {
-                let mut layouter = marker_layouter;
-                ui.add(
-                    egui::TextEdit::singleline(&mut entry.utf8_text)
-                        .id_salt("payload_utf8")
-                        .desired_width(300.0)
-                        .hint_text("Unicode text")
-                        .layouter(&mut layouter),
-                );
-                show_insert_byte_button(ui, &mut entry.utf8_text, &mut entry.insert_byte_hex);
-            });
-            ui.end_row();
-        }
-        PayloadKind::Utf16 => {
-            ui.label("Text");
-            ui.add(
-                egui::TextEdit::singleline(&mut entry.utf16_text)
-                    .id_salt("payload_utf16")
-                    .desired_width(360.0)
-                    .hint_text("Unicode text"),
-            );
-            ui.end_row();
-            ui.label("Byte order");
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut entry.utf16_big_endian, true, "Big-endian");
-                ui.radio_value(&mut entry.utf16_big_endian, false, "Little-endian");
-                ui.separator();
-                ui.checkbox(&mut entry.utf16_bom, "BOM");
-            });
-            ui.end_row();
-        }
-        PayloadKind::Ascii => {
-            ui.label("Text");
-            ui.horizontal(|ui| {
-                let mut layouter = marker_layouter;
-                ui.add(
-                    egui::TextEdit::singleline(&mut entry.ascii_text)
-                        .id_salt("payload_ascii")
-                        .desired_width(300.0)
-                        .hint_text("text")
-                        .layouter(&mut layouter),
-                );
-                show_insert_byte_button(ui, &mut entry.ascii_text, &mut entry.insert_byte_hex);
-            });
-            ui.end_row();
-            ui.label("Code page");
-            egui::ComboBox::from_id_salt("code_page")
-                .selected_text(code_page_label(entry.ascii_code_page))
-                .show_ui(ui, |ui| {
-                    for cp in [
-                        CodePage::Iso8859_1,
-                        CodePage::Windows1252,
-                        CodePage::Cp437,
-                        CodePage::MacRoman,
-                    ] {
-                        ui.selectable_value(&mut entry.ascii_code_page, cp, code_page_label(cp));
-                    }
-                });
-            ui.end_row();
-        }
-        PayloadKind::Nmea => {
-            ui.label("Talker / Sentence");
-            ui.horizontal(|ui| {
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut entry.nmea_talker)
-                        .id_salt("payload_nmea_talker")
-                        .desired_width(40.0)
-                        .hint_text("GP"),
-                );
-                if r.changed() {
-                    entry.nmea_talker = entry.nmea_talker.to_ascii_uppercase();
-                }
-                ui.menu_button("v", |ui| {
-                    show_filtered_picker(
-                        ui,
-                        "filter by code or description",
-                        &mut entry.nmea_talker_filter,
-                        nmea0183::talker_id::ALL_WITH_DESC,
-                        &mut entry.nmea_talker,
-                    );
-                });
-                ui.separator();
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut entry.nmea_sentence_type)
-                        .id_salt("payload_nmea_sentence")
-                        .desired_width(50.0)
-                        .hint_text("GGA"),
-                );
-                if r.changed() {
-                    entry.nmea_sentence_type = entry.nmea_sentence_type.to_ascii_uppercase();
-                    prefill_nmea_fields(entry);
-                }
-                let sentence_before = entry.nmea_sentence_type.clone();
-                ui.menu_button("v", |ui| {
-                    show_filtered_picker(
-                        ui,
-                        "filter by code or description",
-                        &mut entry.nmea_sentence_filter,
-                        nmea0183::sentence_type::ALL_WITH_DESC,
-                        &mut entry.nmea_sentence_type,
-                    );
-                });
-                if entry.nmea_sentence_type != sentence_before {
-                    prefill_nmea_fields(entry);
-                }
-                ui.separator();
-                ui.label("NMEA checksum:").on_hover_text(
-                    "The protocol-internal `*XX` byte at the end of an NMEA \
-                     sentence. Distinct from the `Message checksum` row below, \
-                     which is an outer checksum wrapped around the complete \
-                     rendered message (timestamp + payload + NMEA `*XX`).",
-                );
-                ui.radio_value(
-                    &mut entry.nmea_checksum_mode,
-                    NmeaChecksumMode::Correct,
-                    "include",
-                );
-                ui.radio_value(
-                    &mut entry.nmea_checksum_mode,
-                    NmeaChecksumMode::Omit,
-                    "omit",
-                );
-                ui.radio_value(
-                    &mut entry.nmea_checksum_mode,
-                    NmeaChecksumMode::Wrong,
-                    "wrong",
-                );
-            });
-            ui.end_row();
-
-            ui.label("Fields");
-            let fields_r = ui.add(
-                egui::TextEdit::singleline(&mut entry.nmea_fields)
-                    .id_salt("payload_nmea_fields")
-                    .desired_width(360.0)
-                    .hint_text("comma-separated, e.g. 123519,4807.038,N,01131.000,E"),
-            );
-            if fields_r.changed() {
-                // User edited by hand — protect Fields from being overwritten
-                // by future auto-fills on sentence-type changes.
-                entry.nmea_fields_autofilled = false;
-            }
-            ui.end_row();
-        }
+        PayloadKind::Hex => show_hex_payload(ui, entry),
+        PayloadKind::Utf8 => show_utf8_payload(ui, entry),
+        PayloadKind::Utf16 => show_utf16_payload(ui, entry),
+        PayloadKind::Ascii => show_ascii_payload(ui, entry),
+        PayloadKind::Nmea => show_nmea_payload(ui, entry),
     }
+}
+
+fn show_hex_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+    let bad_hex = !entry.hex_data.is_empty() && !hex_valid(&entry.hex_data);
+    ui.label("Data (hex)");
+    let _ = red_bordered(
+        ui,
+        bad_hex,
+        "invalid hex — use byte pairs like DE AD BE EF",
+        |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut UppercaseHex(&mut entry.hex_data))
+                    .id_salt("payload_hex")
+                    .desired_width(360.0)
+                    .hint_text("DE AD BE EF"),
+            )
+        },
+    );
+    ui.end_row();
+}
+
+fn show_utf8_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+    ui.label("Text");
+    ui.horizontal(|ui| {
+        let mut layouter = marker_layouter;
+        ui.add(
+            egui::TextEdit::singleline(&mut entry.utf8_text)
+                .id_salt("payload_utf8")
+                .desired_width(300.0)
+                .hint_text("Unicode text")
+                .layouter(&mut layouter),
+        );
+        show_insert_byte_button(ui, &mut entry.utf8_text, &mut entry.insert_byte_hex);
+    });
+    ui.end_row();
+}
+
+fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+    ui.label("Text");
+    ui.add(
+        egui::TextEdit::singleline(&mut entry.utf16_text)
+            .id_salt("payload_utf16")
+            .desired_width(360.0)
+            .hint_text("Unicode text"),
+    );
+    ui.end_row();
+    ui.label("Byte order");
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut entry.utf16_big_endian, true, "Big-endian");
+        ui.radio_value(&mut entry.utf16_big_endian, false, "Little-endian");
+        ui.separator();
+        ui.checkbox(&mut entry.utf16_bom, "BOM");
+    });
+    ui.end_row();
+}
+
+fn show_ascii_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+    ui.label("Text");
+    ui.horizontal(|ui| {
+        let mut layouter = marker_layouter;
+        ui.add(
+            egui::TextEdit::singleline(&mut entry.ascii_text)
+                .id_salt("payload_ascii")
+                .desired_width(300.0)
+                .hint_text("text")
+                .layouter(&mut layouter),
+        );
+        show_insert_byte_button(ui, &mut entry.ascii_text, &mut entry.insert_byte_hex);
+    });
+    ui.end_row();
+    ui.label("Code page");
+    egui::ComboBox::from_id_salt("code_page")
+        .selected_text(code_page_label(entry.ascii_code_page))
+        .show_ui(ui, |ui| {
+            for cp in [
+                CodePage::Iso8859_1,
+                CodePage::Windows1252,
+                CodePage::Cp437,
+                CodePage::MacRoman,
+            ] {
+                ui.selectable_value(&mut entry.ascii_code_page, cp, code_page_label(cp));
+            }
+        });
+    ui.end_row();
+}
+
+fn show_nmea_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+    ui.label("Talker / Sentence");
+    ui.horizontal(|ui| {
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut entry.nmea_talker)
+                .id_salt("payload_nmea_talker")
+                .desired_width(40.0)
+                .hint_text("GP"),
+        );
+        if r.changed() {
+            entry.nmea_talker = entry.nmea_talker.to_ascii_uppercase();
+        }
+        ui.menu_button("v", |ui| {
+            show_filtered_picker(
+                ui,
+                "filter by code or description",
+                &mut entry.nmea_talker_filter,
+                nmea0183::talker_id::ALL_WITH_DESC,
+                &mut entry.nmea_talker,
+            );
+        });
+        ui.separator();
+        let r = ui.add(
+            egui::TextEdit::singleline(&mut entry.nmea_sentence_type)
+                .id_salt("payload_nmea_sentence")
+                .desired_width(50.0)
+                .hint_text("GGA"),
+        );
+        if r.changed() {
+            entry.nmea_sentence_type = entry.nmea_sentence_type.to_ascii_uppercase();
+            prefill_nmea_fields(entry);
+        }
+        let sentence_before = entry.nmea_sentence_type.clone();
+        ui.menu_button("v", |ui| {
+            show_filtered_picker(
+                ui,
+                "filter by code or description",
+                &mut entry.nmea_sentence_filter,
+                nmea0183::sentence_type::ALL_WITH_DESC,
+                &mut entry.nmea_sentence_type,
+            );
+        });
+        if entry.nmea_sentence_type != sentence_before {
+            prefill_nmea_fields(entry);
+        }
+        ui.separator();
+        ui.label("NMEA checksum:").on_hover_text(
+            "The protocol-internal `*XX` byte at the end of an NMEA \
+             sentence. Distinct from the `Message checksum` row below, \
+             which is an outer checksum wrapped around the complete \
+             rendered message (timestamp + payload + NMEA `*XX`).",
+        );
+        ui.radio_value(
+            &mut entry.nmea_checksum_mode,
+            NmeaChecksumMode::Correct,
+            "include",
+        );
+        ui.radio_value(
+            &mut entry.nmea_checksum_mode,
+            NmeaChecksumMode::Omit,
+            "omit",
+        );
+        ui.radio_value(
+            &mut entry.nmea_checksum_mode,
+            NmeaChecksumMode::Wrong,
+            "wrong",
+        );
+    });
+    ui.end_row();
+
+    ui.label("Fields");
+    let fields_r = ui.add(
+        egui::TextEdit::singleline(&mut entry.nmea_fields)
+            .id_salt("payload_nmea_fields")
+            .desired_width(360.0)
+            .hint_text("comma-separated, e.g. 123519,4807.038,N,01131.000,E"),
+    );
+    if fields_r.changed() {
+        // User edited by hand — protect Fields from being overwritten
+        // by future auto-fills on sentence-type changes.
+        entry.nmea_fields_autofilled = false;
+    }
+    ui.end_row();
 }
 
 /// Example comma-separated field values for common NMEA sentence types.
@@ -2298,162 +2272,171 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
         .num_columns(2)
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
-            ui.label("Mode");
-            ui.horizontal(|ui| {
-                ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Broadcast, "Broadcast");
-                ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Unicast, "Unicast");
-                ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Multicast, "Multicast");
-            });
-            ui.end_row();
-
-            match conn.udp_mode {
-                UdpModeDraft::Unicast => {
-                    let bad = invalid_parse::<SocketAddr>(&conn.udp_dest);
-                    ui.label("Destination");
-                    let r = red_bordered(
-                        ui,
-                        bad,
-                        "enter host:port — e.g. 192.168.1.100:4000",
-                        |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut conn.udp_dest)
-                                    .id_salt("udp_unicast_dest")
-                                    .desired_width(220.0)
-                                    .hint_text("host:port  (Enter to apply)"),
-                            )
-                        },
-                    );
-                    if enter_committed(&r, ui) {
-                        apply = true;
-                    }
-                    ui.end_row();
-                }
-                UdpModeDraft::Broadcast => {
-                    let bad_addr = invalid_parse::<Ipv4Addr>(&conn.udp_broadcast_addr);
-                    let bad_port = invalid_parse::<u16>(&conn.udp_broadcast_port);
-                    ui.label("Destination");
-                    ui.horizontal(|ui| {
-                        let addr_r = red_bordered(
-                            ui,
-                            bad_addr,
-                            "enter an IPv4 address — e.g. 255.255.255.255",
-                            |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut conn.udp_broadcast_addr)
-                                        .id_salt("udp_broadcast_addr")
-                                        .desired_width(140.0)
-                                        .hint_text("255.255.255.255"),
-                                )
-                            },
-                        );
-                        if enter_committed(&addr_r, ui) {
-                            apply = true;
-                        }
-                        ui.label("Port:");
-                        let r_minus = ui
-                            .small_button("\u{2212}")
-                            .on_hover_text("Decrement port (hold to accelerate)");
-                        let port_r =
-                            red_bordered(ui, bad_port, "enter a port number 1–65535", |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut conn.udp_broadcast_port)
-                                        .id_salt("udp_broadcast_port")
-                                        .desired_width(60.0),
-                                )
-                            });
-                        if enter_committed(&port_r, ui) {
-                            apply = true;
-                        }
-                        let r_plus = ui
-                            .small_button("+")
-                            .on_hover_text("Increment port (hold to accelerate)");
-                        if drive_port_hold(
-                            ui,
-                            &mut conn.udp_port_hold,
-                            &mut conn.udp_broadcast_port,
-                            &r_minus,
-                            &r_plus,
-                        ) {
-                            apply = true;
-                        }
-                    });
-                    ui.end_row();
-                }
-                UdpModeDraft::Multicast => {
-                    let bad_group = invalid_parse::<Ipv4Addr>(&conn.udp_group);
-                    let bad_port = invalid_parse::<u16>(&conn.udp_mc_port);
-                    ui.label("Multicast group").on_hover_text(
-                        "IPv4 multicast group address (must be in the 224.0.0.0 – \
-                         239.255.255.255 range). Receivers must subscribe to the same \
-                         group + port to see these packets. Common admin-local picks \
-                         live in 239.x.x.x.",
-                    );
-                    ui.horizontal(|ui| {
-                        let addr_r = red_bordered(
-                            ui,
-                            bad_group,
-                            "enter IPv4 multicast address — e.g. 239.0.0.1",
-                            |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut conn.udp_group)
-                                        .id_salt("udp_multicast_group")
-                                        .desired_width(140.0)
-                                        .hint_text("239.0.0.1"),
-                                )
-                            },
-                        );
-                        if enter_committed(&addr_r, ui) {
-                            apply = true;
-                        }
-                        ui.label("Port:");
-                        let r_minus = ui
-                            .small_button("\u{2212}")
-                            .on_hover_text("Decrement port (hold to accelerate)");
-                        let port_r =
-                            red_bordered(ui, bad_port, "enter a port number 1–65535", |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut conn.udp_mc_port)
-                                        .id_salt("udp_multicast_port")
-                                        .desired_width(60.0),
-                                )
-                            });
-                        if enter_committed(&port_r, ui) {
-                            apply = true;
-                        }
-                        let r_plus = ui
-                            .small_button("+")
-                            .on_hover_text("Increment port (hold to accelerate)");
-                        if drive_port_hold(
-                            ui,
-                            &mut conn.udp_port_hold,
-                            &mut conn.udp_mc_port,
-                            &r_minus,
-                            &r_plus,
-                        ) {
-                            apply = true;
-                        }
-                    });
-                    ui.end_row();
-                }
-            }
-
-            let bad_local = invalid_parse::<u16>(&conn.local_port);
-            ui.label("Local port");
-            let r = red_bordered(ui, bad_local, "enter a port number 1–65535", |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut conn.local_port)
-                        .id_salt("udp_local_port")
-                        .desired_width(80.0)
-                        .hint_text("auto"),
-                )
-            });
-            if enter_committed(&r, ui) {
-                apply = true;
-            }
-            ui.end_row();
+            apply |= show_udp_mode_row(ui, conn);
+            apply |= match conn.udp_mode {
+                UdpModeDraft::Unicast => show_udp_unicast_row(ui, conn),
+                UdpModeDraft::Broadcast => show_udp_broadcast_row(ui, conn),
+                UdpModeDraft::Multicast => show_udp_multicast_row(ui, conn),
+            };
+            apply |= show_udp_local_port_row(ui, conn);
         });
 
     apply || (conn.udp_mode != before_mode)
+}
+
+fn show_udp_mode_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
+    ui.label("Mode");
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Broadcast, "Broadcast");
+        ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Unicast, "Unicast");
+        ui.radio_value(&mut conn.udp_mode, UdpModeDraft::Multicast, "Multicast");
+    });
+    ui.end_row();
+    false
+}
+
+fn show_udp_unicast_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
+    let bad = invalid_parse::<SocketAddr>(&conn.udp_dest);
+    ui.label("Destination");
+    let r = red_bordered(
+        ui,
+        bad,
+        "enter host:port — e.g. 192.168.1.100:4000",
+        |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut conn.udp_dest)
+                    .id_salt("udp_unicast_dest")
+                    .desired_width(220.0)
+                    .hint_text("host:port  (Enter to apply)"),
+            )
+        },
+    );
+    let apply = enter_committed(&r, ui);
+    ui.end_row();
+    apply
+}
+
+fn show_udp_broadcast_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
+    let bad_addr = invalid_parse::<Ipv4Addr>(&conn.udp_broadcast_addr);
+    let bad_port = invalid_parse::<u16>(&conn.udp_broadcast_port);
+    ui.label("Destination");
+    let apply = show_addr_port_row(
+        ui,
+        AddrPortRow {
+            addr_field: &mut conn.udp_broadcast_addr,
+            addr_id_salt: "udp_broadcast_addr",
+            addr_hint: "255.255.255.255",
+            addr_invalid_msg: "enter an IPv4 address — e.g. 255.255.255.255",
+            bad_addr,
+            port_field: &mut conn.udp_broadcast_port,
+            port_id_salt: "udp_broadcast_port",
+            bad_port,
+            port_hold: &mut conn.udp_port_hold,
+        },
+    );
+    ui.end_row();
+    apply
+}
+
+fn show_udp_multicast_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
+    let bad_group = invalid_parse::<Ipv4Addr>(&conn.udp_group);
+    let bad_port = invalid_parse::<u16>(&conn.udp_mc_port);
+    ui.label("Multicast group").on_hover_text(
+        "IPv4 multicast group address (must be in the 224.0.0.0 – \
+         239.255.255.255 range). Receivers must subscribe to the same \
+         group + port to see these packets. Common admin-local picks \
+         live in 239.x.x.x.",
+    );
+    let apply = show_addr_port_row(
+        ui,
+        AddrPortRow {
+            addr_field: &mut conn.udp_group,
+            addr_id_salt: "udp_multicast_group",
+            addr_hint: "239.0.0.1",
+            addr_invalid_msg: "enter IPv4 multicast address — e.g. 239.0.0.1",
+            bad_addr: bad_group,
+            port_field: &mut conn.udp_mc_port,
+            port_id_salt: "udp_multicast_port",
+            bad_port,
+            port_hold: &mut conn.udp_port_hold,
+        },
+    );
+    ui.end_row();
+    apply
+}
+
+fn show_udp_local_port_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
+    let bad_local = invalid_parse::<u16>(&conn.local_port);
+    ui.label("Local port");
+    let r = red_bordered(ui, bad_local, "enter a port number 1–65535", |ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut conn.local_port)
+                .id_salt("udp_local_port")
+                .desired_width(80.0)
+                .hint_text("auto"),
+        )
+    });
+    let apply = enter_committed(&r, ui);
+    ui.end_row();
+    apply
+}
+
+/// Parameters for [`show_addr_port_row`] — shared between the Broadcast
+/// and Multicast UDP-mode editors, which both render a `[addr] Port: [-]
+/// [port] [+]` strip with the same hold-to-repeat ± behaviour but
+/// against different fields with different ids / hints / validation.
+struct AddrPortRow<'a> {
+    addr_field: &'a mut String,
+    addr_id_salt: &'a str,
+    addr_hint: &'a str,
+    addr_invalid_msg: &'a str,
+    bad_addr: bool,
+    port_field: &'a mut String,
+    port_id_salt: &'a str,
+    bad_port: bool,
+    port_hold: &'a mut Option<PortHold>,
+}
+
+/// Render the right-hand side of a Broadcast or Multicast row: address
+/// TextEdit, "Port:" label, hold-to-repeat ± buttons around the port
+/// TextEdit. Returns `true` if the user committed an edit (Enter on either
+/// field, or a ± click that changed the port).
+fn show_addr_port_row(ui: &mut egui::Ui, p: AddrPortRow) -> bool {
+    let mut apply = false;
+    ui.horizontal(|ui| {
+        let addr_r = red_bordered(ui, p.bad_addr, p.addr_invalid_msg, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(p.addr_field)
+                    .id_salt(p.addr_id_salt)
+                    .desired_width(140.0)
+                    .hint_text(p.addr_hint),
+            )
+        });
+        if enter_committed(&addr_r, ui) {
+            apply = true;
+        }
+        ui.label("Port:");
+        let r_minus = ui
+            .small_button("\u{2212}")
+            .on_hover_text("Decrement port (hold to accelerate)");
+        let port_r = red_bordered(ui, p.bad_port, "enter a port number 1–65535", |ui| {
+            ui.add(
+                egui::TextEdit::singleline(p.port_field)
+                    .id_salt(p.port_id_salt)
+                    .desired_width(60.0),
+            )
+        });
+        if enter_committed(&port_r, ui) {
+            apply = true;
+        }
+        let r_plus = ui
+            .small_button("+")
+            .on_hover_text("Increment port (hold to accelerate)");
+        if drive_port_hold(ui, p.port_hold, p.port_field, &r_minus, &r_plus) {
+            apply = true;
+        }
+    });
+    apply
 }
 
 fn level_color(level: tracing::Level) -> egui::Color32 {
