@@ -1072,8 +1072,7 @@ fn show_schedule_section(
                         .show(ui, |ui| {
                             show_payload_fields(ui, entry);
 
-                            let bad_interval = !entry.interval_ms.is_empty()
-                                && entry.interval_ms.parse::<u64>().is_err();
+                            let bad_interval = invalid_parse::<u64>(&entry.interval_ms);
                             ui.label("Interval (ms)");
                             let interval_resp =
                                 red_bordered(ui, bad_interval, "must be a whole number", |ui| {
@@ -1781,7 +1780,7 @@ fn channel_blockers(conn: &ConnDraft) -> Vec<String> {
                     }
                 }
             }
-            if !conn.local_port.is_empty() && conn.local_port.parse::<u16>().is_err() {
+            if invalid_parse::<u16>(&conn.local_port) {
                 out.push("Channel: local port must be 1–65535".to_string());
             }
         }
@@ -2229,7 +2228,7 @@ fn show_serial_fields(ui: &mut egui::Ui, conn: &mut ConnDraft, ports: &[String])
                         )
                     },
                 );
-                if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                if enter_committed(&r, ui) {
                     if let Ok(b) = conn.baud_custom.parse::<u32>() {
                         if b > 0 {
                             conn.baud_rate = b;
@@ -2309,8 +2308,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
 
             match conn.udp_mode {
                 UdpModeDraft::Unicast => {
-                    let bad =
-                        !conn.udp_dest.is_empty() && conn.udp_dest.parse::<SocketAddr>().is_err();
+                    let bad = invalid_parse::<SocketAddr>(&conn.udp_dest);
                     ui.label("Destination");
                     let r = red_bordered(
                         ui,
@@ -2325,16 +2323,14 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                             )
                         },
                     );
-                    if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                    if enter_committed(&r, ui) {
                         apply = true;
                     }
                     ui.end_row();
                 }
                 UdpModeDraft::Broadcast => {
-                    let bad_addr = !conn.udp_broadcast_addr.is_empty()
-                        && conn.udp_broadcast_addr.parse::<Ipv4Addr>().is_err();
-                    let bad_port = !conn.udp_broadcast_port.is_empty()
-                        && conn.udp_broadcast_port.parse::<u16>().is_err();
+                    let bad_addr = invalid_parse::<Ipv4Addr>(&conn.udp_broadcast_addr);
+                    let bad_port = invalid_parse::<u16>(&conn.udp_broadcast_port);
                     ui.label("Destination");
                     ui.horizontal(|ui| {
                         let addr_r = red_bordered(
@@ -2350,8 +2346,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                                 )
                             },
                         );
-                        if addr_r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
-                        {
+                        if enter_committed(&addr_r, ui) {
                             apply = true;
                         }
                         ui.label("Port:");
@@ -2366,8 +2361,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                                         .desired_width(60.0),
                                 )
                             });
-                        if port_r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
-                        {
+                        if enter_committed(&port_r, ui) {
                             apply = true;
                         }
                         let r_plus = ui
@@ -2386,10 +2380,8 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                     ui.end_row();
                 }
                 UdpModeDraft::Multicast => {
-                    let bad_group =
-                        !conn.udp_group.is_empty() && conn.udp_group.parse::<Ipv4Addr>().is_err();
-                    let bad_port =
-                        !conn.udp_mc_port.is_empty() && conn.udp_mc_port.parse::<u16>().is_err();
+                    let bad_group = invalid_parse::<Ipv4Addr>(&conn.udp_group);
+                    let bad_port = invalid_parse::<u16>(&conn.udp_mc_port);
                     ui.label("Multicast group").on_hover_text(
                         "IPv4 multicast group address (must be in the 224.0.0.0 – \
                          239.255.255.255 range). Receivers must subscribe to the same \
@@ -2410,8 +2402,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                                 )
                             },
                         );
-                        if addr_r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
-                        {
+                        if enter_committed(&addr_r, ui) {
                             apply = true;
                         }
                         ui.label("Port:");
@@ -2426,8 +2417,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                                         .desired_width(60.0),
                                 )
                             });
-                        if port_r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter))
-                        {
+                        if enter_committed(&port_r, ui) {
                             apply = true;
                         }
                         let r_plus = ui
@@ -2447,7 +2437,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                 }
             }
 
-            let bad_local = !conn.local_port.is_empty() && conn.local_port.parse::<u16>().is_err();
+            let bad_local = invalid_parse::<u16>(&conn.local_port);
             ui.label("Local port");
             let r = red_bordered(ui, bad_local, "enter a port number 1–65535", |ui| {
                 ui.add(
@@ -2457,7 +2447,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                         .hint_text("auto"),
                 )
             });
-            if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+            if enter_committed(&r, ui) {
                 apply = true;
             }
             ui.end_row();
@@ -2512,6 +2502,24 @@ where
     }
 }
 
+/// True when the user "committed" the contents of a TextEdit by pressing
+/// Enter on the way out — the pattern we use to apply interface-field
+/// changes to the running talker thread.
+fn enter_committed(r: &egui::Response, ui: &egui::Ui) -> bool {
+    r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+}
+
+/// True when `s` is a non-empty string that fails to parse as `T`.
+/// Used to drive the red-border / start-blocker validation: empty means
+/// "user hasn't typed anything here yet" (not an error to surface),
+/// whereas non-empty + parse fail means the user typed something wrong.
+fn invalid_parse<T>(s: &str) -> bool
+where
+    T: std::str::FromStr,
+{
+    !s.is_empty() && s.parse::<T>().is_err()
+}
+
 fn hex_valid(s: &str) -> bool {
     let stripped: String = s
         .chars()
@@ -2529,7 +2537,7 @@ fn show_tcp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
         .num_columns(2)
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
-            let bad_tcp = !conn.tcp_addr.is_empty() && conn.tcp_addr.parse::<SocketAddr>().is_err();
+            let bad_tcp = invalid_parse::<SocketAddr>(&conn.tcp_addr);
             ui.label("Address");
             let r = red_bordered(
                 ui,
@@ -2544,7 +2552,7 @@ fn show_tcp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
                     )
                 },
             );
-            if r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+            if enter_committed(&r, ui) {
                 apply = true;
             }
             ui.end_row();
