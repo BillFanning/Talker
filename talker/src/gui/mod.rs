@@ -12,7 +12,9 @@ use egui::{Align, Layout, ScrollArea};
 use crate::core::{
     channel::ChannelConfig,
     logging::{LogEvent, LoggingConfig},
-    message::{segments, ChecksumAlgorithm, CodePage, NmeaChecksumMode, Segment},
+    message::{
+        repair_after_edit, segments, ChecksumAlgorithm, CodePage, NmeaChecksumMode, Segment,
+    },
     profile::Profile,
     scheduler::Schedule,
 };
@@ -1118,13 +1120,12 @@ fn show_hex_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
 fn show_utf8_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     ui.label("Text");
     ui.horizontal(|ui| {
-        let mut layouter = marker_layouter;
-        ui.add(
-            egui::TextEdit::singleline(&mut entry.utf8_text)
-                .id_salt("payload_utf8")
-                .desired_width(300.0)
-                .hint_text("Unicode text")
-                .layouter(&mut layouter),
+        marker_aware_text_edit(
+            ui,
+            &mut entry.utf8_text,
+            "payload_utf8",
+            300.0,
+            "Unicode text",
         );
         show_insert_byte_button(ui, &mut entry.utf8_text, &mut entry.insert_byte_hex);
     });
@@ -1153,14 +1154,7 @@ fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
 fn show_ascii_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     ui.label("Text");
     ui.horizontal(|ui| {
-        let mut layouter = marker_layouter;
-        ui.add(
-            egui::TextEdit::singleline(&mut entry.ascii_text)
-                .id_salt("payload_ascii")
-                .desired_width(300.0)
-                .hint_text("text")
-                .layouter(&mut layouter),
-        );
+        marker_aware_text_edit(ui, &mut entry.ascii_text, "payload_ascii", 300.0, "text");
         show_insert_byte_button(ui, &mut entry.ascii_text, &mut entry.insert_byte_hex);
     });
     ui.end_row();
@@ -1456,7 +1450,16 @@ fn drive_port_hold(
 
 /// Step a port-number string by `direction` (±1), clamped to 1..=65535.
 /// Returns `true` if the value actually changed.
+///
+/// An empty field bootstraps to `1` on either button — otherwise the
+/// buttons would silently do nothing until the user typed a starting
+/// number. A non-empty but unparseable value (e.g. `444444444`) is left
+/// alone so the user's typo isn't trashed.
 fn port_step(port_field: &mut String, direction: i8) -> bool {
+    if port_field.is_empty() {
+        *port_field = "1".to_string();
+        return true;
+    }
     let Ok(p) = port_field.parse::<u16>() else {
         return false;
     };
@@ -2026,6 +2029,42 @@ fn marker_layouter(
     ui.fonts_mut(|f| f.layout_job(job))
 }
 
+/// Single-line TextEdit for text that may contain `‹XX›` byte markers.
+///
+/// Coloured-marker highlighting via [`marker_layouter`] plus *atomic*
+/// marker deletion: any single-keypress edit that disturbs a complete
+/// marker (typed inside, backspaced from inside or immediately adjacent)
+/// removes the whole 4-character marker rather than leaving an orphan
+/// `‹` / `›` that would later fail to encode.
+///
+/// The pre-edit text is stashed in `egui::Memory` keyed by the salt, so
+/// the helper compares against last frame's value.
+fn marker_aware_text_edit(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    salt: &'static str,
+    width: f32,
+    hint: &str,
+) -> egui::Response {
+    let stash_id = ui.id().with("marker_prev").with(salt);
+    let prev: String = ui
+        .memory(|m| m.data.get_temp::<String>(stash_id))
+        .unwrap_or_else(|| text.clone());
+    let mut layouter = marker_layouter;
+    let resp = ui.add(
+        egui::TextEdit::singleline(text)
+            .id_salt(salt)
+            .desired_width(width)
+            .hint_text(hint)
+            .layouter(&mut layouter),
+    );
+    if resp.changed() {
+        repair_after_edit(&prev, text);
+    }
+    ui.memory_mut(|m| m.data.insert_temp(stash_id, text.clone()));
+    resp
+}
+
 /// An "Insert Byte" button whose popup appends a `‹XX›` marker to `text`.
 fn show_insert_byte_button(ui: &mut egui::Ui, text: &mut String, hex: &mut String) {
     // Default menu close behavior is `CloseOnClick`, which closes the menu
@@ -2038,44 +2077,59 @@ fn show_insert_byte_button(ui: &mut egui::Ui, text: &mut String, hex: &mut Strin
                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
         )
         .ui(ui, |ui| {
-            ui.label("Byte value (hex):");
-            let resp = ui.add(
-                egui::TextEdit::singleline(hex)
-                    .desired_width(48.0)
-                    .hint_text("1B"),
+            // Three rows — label, hex entry, Insert button — in a fixed
+            // 160-px wide child UI with a non-justified top-down layout.
+            // The fixed width keeps the popup compact enough to fit
+            // below the trigger button (egui's auto-placement flips
+            // popups above when they'd be too wide for the space below).
+            // A bare `ui.vertical` would inherit the menu's
+            // `top_down_justified` layout, which stretches each row to
+            // the full layout width — re-introducing the same flip.
+            ui.allocate_ui_with_layout(
+                egui::vec2(160.0, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.label("Byte value (hex):");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(hex)
+                            .desired_width(140.0)
+                            .hint_text("1B"),
+                    );
+                    // Auto-focus the hex field so the user can start typing
+                    // right away. Idempotent — egui doesn't keep resetting
+                    // the caret if the field already has focus.
+                    resp.request_focus();
+                    let value = u8::from_str_radix(hex.trim(), 16).ok();
+                    // Enter while the popup is open commits — gated on hex
+                    // being valid, not on `resp.lost_focus()` (which doesn't
+                    // always fire for popup-hosted TextEdits, so Enter would
+                    // otherwise feel dead). Only consume Enter when the
+                    // value parses, so an empty / invalid field doesn't
+                    // swallow Enter for anything else.
+                    let entered = resp.has_focus()
+                        && value.is_some()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let mut insert = ui.add_enabled(value.is_some(), egui::Button::new("Insert"));
+                    if value.is_none() {
+                        let why = if hex.trim().is_empty() {
+                            "Type 1–2 hex digits first (e.g. 1B, 0D, FF)".to_string()
+                        } else {
+                            format!(
+                                "`{}` is not a valid hex byte — use 1–2 digits 0–9 / A–F",
+                                hex.trim()
+                            )
+                        };
+                        insert = insert.on_disabled_hover_text(why);
+                    }
+                    if let Some(b) = value {
+                        if insert.clicked() || entered {
+                            text.push_str(&format!("\u{2039}{b:02X}\u{203A}"));
+                            hex.clear();
+                            ui.close();
+                        }
+                    }
+                },
             );
-            // Auto-focus the hex field so the user can start typing right
-            // away. Idempotent — egui doesn't keep resetting the caret if
-            // the field already has focus.
-            resp.request_focus();
-            let value = u8::from_str_radix(hex.trim(), 16).ok();
-            // Enter while the popup is open commits — gated on hex being
-            // valid, not on `resp.lost_focus()` (which doesn't always fire
-            // for popup-hosted TextEdits, so Enter would otherwise feel
-            // dead). We only consume the Enter when the value parses, so an
-            // empty / invalid field doesn't swallow Enter for anything else.
-            let entered = resp.has_focus()
-                && value.is_some()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let mut insert = ui.add_enabled(value.is_some(), egui::Button::new("Insert"));
-            if value.is_none() {
-                let why = if hex.trim().is_empty() {
-                    "Type 1–2 hex digits first (e.g. 1B, 0D, FF)".to_string()
-                } else {
-                    format!(
-                        "`{}` is not a valid hex byte — use 1–2 digits 0–9 / A–F",
-                        hex.trim()
-                    )
-                };
-                insert = insert.on_disabled_hover_text(why);
-            }
-            if let Some(b) = value {
-                if insert.clicked() || entered {
-                    text.push_str(&format!("\u{2039}{b:02X}\u{203A}"));
-                    hex.clear();
-                    ui.close();
-                }
-            }
         });
 }
 

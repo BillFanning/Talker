@@ -25,27 +25,46 @@ pub enum CodePage {
 
 /// Encode `text` into bytes using `code_page`.
 ///
-/// Returns an error naming the first character the code page cannot represent.
+/// On failure, the error lists *every* distinct character the code page
+/// cannot represent — not just the first — so a user fixing the text
+/// doesn't have to recompile after each individual character.
 pub(super) fn encode(text: &str, code_page: CodePage) -> anyhow::Result<Vec<u8>> {
-    text.chars().map(|c| encode_char(c, code_page)).collect()
+    let mut out = Vec::with_capacity(text.len());
+    let mut bad: std::collections::BTreeSet<char> = std::collections::BTreeSet::new();
+    for c in text.chars() {
+        match encode_char(c, code_page) {
+            Some(b) => out.push(b),
+            None => {
+                bad.insert(c);
+            }
+        }
+    }
+    if bad.is_empty() {
+        return Ok(out);
+    }
+    let list: Vec<String> = bad
+        .iter()
+        .map(|c| format!("'{c}' (U+{:04X})", *c as u32))
+        .collect();
+    anyhow::bail!(
+        "{} character{} not representable in code page {code_page:?}: {}",
+        bad.len(),
+        if bad.len() == 1 { "" } else { "s" },
+        list.join(", ")
+    )
 }
 
-fn encode_char(c: char, code_page: CodePage) -> anyhow::Result<u8> {
+fn encode_char(c: char, code_page: CodePage) -> Option<u8> {
     let cp = c as u32;
     if cp < 0x80 {
-        return Ok(cp as u8);
+        return Some(cp as u8);
     }
-    let byte = match code_page {
+    match code_page {
         CodePage::Iso8859_1 => (cp <= 0xFF).then_some(cp as u8),
         CodePage::Windows1252 => encode_windows1252(c),
         CodePage::Cp437 => find_in_high(&CP437_HIGH, c),
         CodePage::MacRoman => find_in_high(&MAC_ROMAN_HIGH, c),
-    };
-    byte.ok_or_else(|| {
-        anyhow::anyhow!(
-            "character {c:?} (U+{cp:04X}) is not representable in code page {code_page:?}"
-        )
-    })
+    }
 }
 
 /// Find `c` in a 0x80..0xFF mapping table and return its byte.
@@ -183,6 +202,20 @@ mod tests {
     fn unrepresentable_character_is_an_error() {
         let err = encode("中", CodePage::Cp437).unwrap_err();
         assert!(err.to_string().contains("not representable"));
+    }
+
+    #[test]
+    fn error_lists_all_distinct_bad_characters() {
+        // Three different unrepresentable chars (plus a dupe), interleaved
+        // with representable ones — the error should mention all three
+        // distinct ones, deduped.
+        let err = encode("a中b中c日d月", CodePage::Cp437).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("中"), "{msg}");
+        assert!(msg.contains("日"), "{msg}");
+        assert!(msg.contains("月"), "{msg}");
+        // Should be reported as 3 chars, not 4 (中 was deduped).
+        assert!(msg.contains("3 characters"), "{msg}");
     }
 
     /// Every byte 0x80..=0xFF in CP437 and Mac Roman round-trips, and each

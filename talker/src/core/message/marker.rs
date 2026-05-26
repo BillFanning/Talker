@@ -51,6 +51,54 @@ pub fn segments(text: &str) -> Vec<(Range<usize>, Segment)> {
     out
 }
 
+/// Make marker deletion atomic.
+///
+/// `prev` is the text before the user's edit, `curr` the text after. If the
+/// edit disturbed a complete `‹XX›` marker in `prev` (typed inside it,
+/// backspaced from inside or immediately adjacent to it, etc.), strip the
+/// remainder of that marker from `curr` so a single keypress removes the
+/// whole 4-character unit rather than leaving an orphan `‹` or `›`.
+///
+/// Only the simple single-region edit case is handled — multi-marker edits
+/// (e.g. selection-replace spanning two markers) fall through unchanged and
+/// rely on the compile-time error for cleanup. That's acceptable: those
+/// cases are rare and the encoder already names the offending characters.
+pub fn repair_after_edit(prev: &str, curr: &mut String) {
+    if prev == curr.as_str() {
+        return;
+    }
+    // First byte index where prev and curr disagree — the edit point.
+    let div = prev
+        .bytes()
+        .zip(curr.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let delta = curr.len() as i64 - prev.len() as i64;
+    for (range, seg) in segments(prev) {
+        if !matches!(seg, Segment::Byte(_)) {
+            continue;
+        }
+        // Strictly inside the marker: any edit disturbed its contents.
+        // At range.start with delta < 0: a deletion ate the leading '‹'
+        // from the front (e.g. cursor just before '‹', Delete pressed).
+        // Boundary insertions and trailing-side deletions land at
+        // range.start (insert before '‹') or range.end (insert/delete
+        // after '›') and must NOT trigger — those edits are outside.
+        let strict_inside = range.start < div && div < range.end;
+        let delete_at_start = div == range.start && delta < 0;
+        if !(strict_inside || delete_at_start) {
+            continue;
+        }
+        let new_end = range.end as i64 + delta;
+        if new_end < range.start as i64 {
+            return; // pathological — bail rather than mangle further
+        }
+        let new_end = (new_end as usize).min(curr.len());
+        curr.replace_range(range.start..new_end, "");
+        return;
+    }
+}
+
 /// If a complete `‹XX›` marker starts at byte `i`, return its byte value.
 fn match_marker(text: &str, i: usize) -> Option<u8> {
     let after_open = text[i..].strip_prefix(OPEN)?;
@@ -130,5 +178,64 @@ mod tests {
     #[test]
     fn marker_at_end_of_multibyte_text() {
         assert_eq!(parts("café‹1B›"), vec![Segment::Text, Segment::Byte(0x1B)]);
+    }
+
+    // ── repair_after_edit ──────────────────────────────────────────────────────
+
+    /// Simulate an edit: `prev` is the text before, and `applied(prev)`
+    /// returns the text the editor produced. Run `repair_after_edit` on the
+    /// result and check the final state.
+    fn after_edit(prev: &str, applied: impl FnOnce(&str) -> String) -> String {
+        let mut curr = applied(prev);
+        repair_after_edit(prev, &mut curr);
+        curr
+    }
+
+    #[test]
+    fn delete_inside_marker_removes_whole_marker() {
+        // Cursor between '1' and 'B' in 'A‹1B›B', press Delete — egui removes
+        // the 'B'. After repair, the whole marker is gone.
+        let out = after_edit("A‹1B›B", |s| s.replacen('B', "", 1));
+        assert_eq!(out, "AB");
+    }
+
+    #[test]
+    fn backspace_after_closing_removes_whole_marker() {
+        // Cursor right after '›'; backspace removes the '›' (3 UTF-8 bytes).
+        let out = after_edit("A‹1B›B", |s| s.replace('\u{203A}', ""));
+        assert_eq!(out, "AB");
+    }
+
+    #[test]
+    fn delete_at_opening_removes_whole_marker() {
+        // Cursor right before '‹'; delete removes the '‹'.
+        let out = after_edit("A‹1B›B", |s| s.replace('\u{2039}', ""));
+        assert_eq!(out, "AB");
+    }
+
+    #[test]
+    fn typing_inside_marker_removes_whole_marker() {
+        // Cursor between '‹' and '1'; type 'X'.
+        let out = after_edit("A‹1B›B", |_| "A‹X1B›B".to_string());
+        assert_eq!(out, "AB");
+    }
+
+    #[test]
+    fn edit_outside_marker_is_left_alone() {
+        // Prepend a char — the marker is untouched and should stay intact.
+        let out = after_edit("A‹1B›B", |s| format!("Z{s}"));
+        assert_eq!(out, "ZA‹1B›B");
+        // Append after the trailing literal.
+        let out = after_edit("A‹1B›B", |s| format!("{s}Z"));
+        assert_eq!(out, "A‹1B›BZ");
+        // Insert between '›' and the trailing 'B'.
+        let out = after_edit("A‹1B›B", |s| s.replace("›B", "›ZB"));
+        assert_eq!(out, "A‹1B›ZB");
+    }
+
+    #[test]
+    fn unchanged_text_is_unchanged() {
+        let out = after_edit("hello ‹FF› world", |s| s.to_string());
+        assert_eq!(out, "hello ‹FF› world");
     }
 }

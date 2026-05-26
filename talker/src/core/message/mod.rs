@@ -11,7 +11,7 @@ mod timestamp;
 
 pub use checksum::{ChecksumAlgorithm, ChecksumConfig};
 pub use codepage::CodePage;
-pub use marker::{segments, Segment};
+pub use marker::{repair_after_edit, segments, Segment};
 pub use timestamp::TimestampConfig;
 
 use serde::{Deserialize, Serialize};
@@ -244,7 +244,26 @@ fn compile_ascii(text: &str, code_page: CodePage) -> anyhow::Result<Vec<u8>> {
     let mut out = Vec::new();
     for (range, segment) in segments(text) {
         match segment {
-            Segment::Text => out.extend(codepage::encode(&text[range], code_page)?),
+            Segment::Text => {
+                let chunk = &text[range];
+                let bytes = codepage::encode(chunk, code_page).map_err(|e| {
+                    // A stray '‹' or '›' likely means a half-typed or
+                    // partially-deleted byte marker. Most code pages can't
+                    // encode these characters, so the raw "U+2039 not
+                    // representable" error is unhelpful — add a hint that
+                    // points at the marker syntax.
+                    if chunk.contains('\u{2039}') || chunk.contains('\u{203A}') {
+                        e.context(
+                            "text contains '‹' or '›' that isn't part of a complete \
+                             ‹XX› byte marker — complete it with two hex digits and a \
+                             closing '›' (e.g. ‹1B›), or remove the character",
+                        )
+                    } else {
+                        e
+                    }
+                })?;
+                out.extend(bytes);
+            }
             Segment::Byte(b) => out.push(b),
         }
     }
@@ -382,6 +401,20 @@ mod tests {
             text: "AB‹0D›‹0A›".to_string(),
         };
         assert_eq!(p.compile().unwrap(), vec![0x41, 0x42, 0x0D, 0x0A]);
+    }
+
+    #[test]
+    fn compile_ascii_orphan_marker_error_mentions_marker_syntax() {
+        // Stray '‹' with no closing '›' + two hex digits — encoder fails
+        // because U+2039 isn't in ISO-8859-1, but the user-facing error
+        // should point at the marker syntax rather than the raw codepoint.
+        let p = PayloadConfig::Ascii {
+            text: "hello‹world".to_string(),
+            code_page: CodePage::Iso8859_1,
+        };
+        let err = format!("{:#}", p.compile().unwrap_err());
+        assert!(err.contains("byte marker"), "error was: {err}");
+        assert!(err.contains("‹XX›"), "error was: {err}");
     }
 
     #[test]
