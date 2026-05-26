@@ -877,29 +877,61 @@ impl TalkerApp {
     }
 
     fn show_channel_body(&mut self, ui: &mut egui::Ui, i: usize, running: bool) {
-        let (changed, refresh) = match self.conn_drafts[i].kind {
-            // Each kind gets its own push_id namespace so the very
-            // different widget trees produced by Serial / UDP / TCP can't
-            // shift each other's auto-ids across egui's two layout passes.
-            ConnKind::Serial => {
-                ui.push_id("serial_body", |ui| {
-                    show_serial_fields(ui, &mut self.conn_drafts[i], &self.serial_ports)
-                })
-                .inner
-            }
-            ConnKind::Udp => {
-                ui.push_id("udp_body", |ui| {
-                    (show_udp_fields(ui, &mut self.conn_drafts[i]), false)
-                })
-                .inner
-            }
-            ConnKind::Tcp => {
-                ui.push_id("tcp_body", |ui| {
-                    (show_tcp_fields(ui, &mut self.conn_drafts[i]), false)
-                })
-                .inner
-            }
+        // Auto-collapse the connection editor on Start, auto-expand on
+        // Stop. The transition is detected by comparing this frame's
+        // `running` against the previous frame's value stashed in egui
+        // memory. Between transitions, the persistent CollapsingHeader
+        // state honours whatever the user clicks — so mid-run edits are
+        // still possible by manually expanding, and the choice sticks
+        // until the next start/stop.
+        let prev_id = ui.id().with(("conn_section_prev_running", i));
+        let prev_running = ui
+            .memory(|m| m.data.get_temp::<bool>(prev_id))
+            .unwrap_or(running);
+        let force_open = if running && !prev_running {
+            Some(false)
+        } else if !running && prev_running {
+            Some(true)
+        } else {
+            None
         };
+        ui.memory_mut(|m| m.data.insert_temp(prev_id, running));
+
+        let (changed, refresh) = egui::CollapsingHeader::new(if running {
+            "Connection (running — expand to edit)"
+        } else {
+            "Connection"
+        })
+        .id_salt(("conn_section", i))
+        .default_open(!running)
+        .open(force_open)
+        .show(ui, |ui| {
+            match self.conn_drafts[i].kind {
+                // Each kind gets its own push_id namespace so the very
+                // different widget trees produced by Serial / UDP / TCP can't
+                // shift each other's auto-ids across egui's two layout passes.
+                ConnKind::Serial => {
+                    ui.push_id("serial_body", |ui| {
+                        show_serial_fields(ui, &mut self.conn_drafts[i], &self.serial_ports)
+                    })
+                    .inner
+                }
+                ConnKind::Udp => {
+                    ui.push_id("udp_body", |ui| {
+                        (show_udp_fields(ui, &mut self.conn_drafts[i]), false)
+                    })
+                    .inner
+                }
+                ConnKind::Tcp => {
+                    ui.push_id("tcp_body", |ui| {
+                        (show_tcp_fields(ui, &mut self.conn_drafts[i]), false)
+                    })
+                    .inner
+                }
+            }
+        })
+        .body_returned
+        .unwrap_or((false, false));
         if changed {
             self.deferred.apply.push(i);
         }
@@ -995,84 +1027,140 @@ fn show_schedule_section(
     // Message indices whose interval was committed this frame, with the new value.
     let mut interval_changes: Vec<(usize, u64)> = Vec::new();
 
-    ui.collapsing("Messages", |ui| {
-        for (i, entry) in entries.iter_mut().enumerate() {
-            ui.push_id(i, |ui| {
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong(format!("Message {}", i + 1));
-                        ui.separator();
-                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Nmea, "NMEA");
-                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Ascii, "ASCII");
-                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Utf8, "UTF-8");
-                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Utf16, "UTF-16");
-                        ui.radio_value(&mut entry.payload_kind, PayloadKind::Hex, "Hex");
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui
-                                .button(egui::RichText::new("\u{00D7}").size(18.0).strong())
-                                .on_hover_text("Remove this message")
-                                .clicked()
-                            {
-                                to_remove = Some(i);
-                            }
-                        });
-                    });
-
-                    // Per-kind Grid id so each payload variant lives in its
-                    // own egui id namespace. Without this, switching kinds
-                    // makes the layout's widget set change shape inside the
-                    // same Grid — and any auto-derived id whose position
-                    // shifts triggers "id changed between passes" warnings
-                    // on the next layout pass.
-                    let grid_id = match entry.payload_kind {
-                        PayloadKind::Hex => "message_grid_hex",
-                        PayloadKind::Utf8 => "message_grid_utf8",
-                        PayloadKind::Utf16 => "message_grid_utf16",
-                        PayloadKind::Ascii => "message_grid_ascii",
-                        PayloadKind::Nmea => "message_grid_nmea",
-                    };
-                    egui::Grid::new(grid_id)
-                        .num_columns(2)
-                        .spacing([8.0, 4.0])
-                        .show(ui, |ui| {
-                            show_payload_fields(ui, entry);
-
-                            let bad_interval = invalid_parse::<u64>(&entry.interval_ms);
-                            ui.label("Interval (ms)");
-                            let interval_resp =
-                                red_bordered(ui, bad_interval, "must be a whole number", |ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut entry.interval_ms)
-                                            .id_salt("interval_ms")
-                                            .desired_width(80.0),
+    // Collapsed by default — the editors for many channels eat a lot of
+    // vertical real estate. The header summary keeps the at-a-glance
+    // info (count, total sent) visible without expanding.
+    //
+    // `id_salt` keeps the persistent open/closed state stable even
+    // though the title text changes every frame as `total_sent` ticks.
+    // Without it CollapsingHeader derives its id from the label, so a
+    // user expand would be forgotten on the next send.
+    let total_sent: u64 = per_message_counts.iter().sum();
+    let n = entries.len();
+    let header = if n == 0 {
+        "Messages — (none)".to_string()
+    } else if channel_running {
+        format!(
+            "Messages — {n} message{}, Sent: {total_sent}",
+            if n == 1 { "" } else { "s" }
+        )
+    } else {
+        format!("Messages — {n} message{}", if n == 1 { "" } else { "s" })
+    };
+    egui::CollapsingHeader::new(header)
+        .id_salt("messages_section")
+        .default_open(false)
+        .show(ui, |ui| {
+            for (i, entry) in entries.iter_mut().enumerate() {
+                ui.push_id(i, |ui| {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong(format!("Message {}", i + 1));
+                            ui.separator();
+                            ui.radio_value(&mut entry.payload_kind, PayloadKind::Nmea, "NMEA");
+                            ui.radio_value(&mut entry.payload_kind, PayloadKind::Ascii, "ASCII");
+                            ui.radio_value(&mut entry.payload_kind, PayloadKind::Utf8, "UTF-8");
+                            ui.radio_value(&mut entry.payload_kind, PayloadKind::Utf16, "UTF-16");
+                            ui.radio_value(&mut entry.payload_kind, PayloadKind::Hex, "Hex");
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if entry.pending_remove {
+                                    // Confirm step: ✓ commits, ✕ cancels. The
+                                    // confirm button is tinted red so the
+                                    // destructive choice is the visually heavy
+                                    // one rather than the bare-X-shape default.
+                                    if ui
+                                        .small_button("Cancel")
+                                        .on_hover_text("Keep this message")
+                                        .clicked()
+                                    {
+                                        entry.pending_remove = false;
+                                    }
+                                    let confirm = egui::Button::new(
+                                        egui::RichText::new("Remove")
+                                            .color(egui::Color32::WHITE)
+                                            .strong(),
                                     )
-                                });
-                            ui.end_row();
-                            if interval_resp.lost_focus() {
-                                if let Ok(ms) = entry.interval_ms.parse::<u64>() {
-                                    interval_changes.push((i, ms));
+                                    .fill(egui::Color32::from_rgb(180, 60, 60));
+                                    if ui
+                                        .add(confirm)
+                                        .on_hover_text("Permanently remove this message")
+                                        .clicked()
+                                    {
+                                        to_remove = Some(i);
+                                    }
+                                    ui.label(
+                                        egui::RichText::new("Remove this message?")
+                                            .color(egui::Color32::from_rgb(220, 180, 80)),
+                                    );
+                                } else if ui
+                                    .button(egui::RichText::new("\u{00D7}").size(18.0).strong())
+                                    .on_hover_text("Remove this message")
+                                    .clicked()
+                                {
+                                    entry.pending_remove = true;
                                 }
-                            }
+                            });
                         });
 
-                    ui.horizontal(|ui| {
-                        show_timestamp_editor(ui, entry);
-                        ui.separator();
-                        show_checksum_editor(ui, entry);
+                        // Per-kind Grid id so each payload variant lives in its
+                        // own egui id namespace. Without this, switching kinds
+                        // makes the layout's widget set change shape inside the
+                        // same Grid — and any auto-derived id whose position
+                        // shifts triggers "id changed between passes" warnings
+                        // on the next layout pass.
+                        let grid_id = match entry.payload_kind {
+                            PayloadKind::Hex => "message_grid_hex",
+                            PayloadKind::Utf8 => "message_grid_utf8",
+                            PayloadKind::Utf16 => "message_grid_utf16",
+                            PayloadKind::Ascii => "message_grid_ascii",
+                            PayloadKind::Nmea => "message_grid_nmea",
+                        };
+                        egui::Grid::new(grid_id)
+                            .num_columns(2)
+                            .spacing([8.0, 4.0])
+                            .show(ui, |ui| {
+                                show_payload_fields(ui, entry);
+
+                                let bad_interval = invalid_parse::<u64>(&entry.interval_ms);
+                                ui.label("Interval (ms)");
+                                let interval_resp = red_bordered(
+                                    ui,
+                                    bad_interval,
+                                    "must be a whole number",
+                                    |ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut entry.interval_ms)
+                                                .id_salt("interval_ms")
+                                                .desired_width(80.0),
+                                        )
+                                    },
+                                );
+                                ui.end_row();
+                                if interval_resp.lost_focus() {
+                                    if let Ok(ms) = entry.interval_ms.parse::<u64>() {
+                                        interval_changes.push((i, ms));
+                                    }
+                                }
+                            });
+
+                        ui.horizontal(|ui| {
+                            show_timestamp_editor(ui, entry);
+                            ui.separator();
+                            show_checksum_editor(ui, entry);
+                        });
+
+                        show_message_preview(ui, entry);
+
+                        let sent = per_message_counts.get(i).copied().unwrap_or(0);
+                        show_message_status(ui, channel_running, sent);
                     });
-
-                    show_message_preview(ui, entry);
-
-                    let sent = per_message_counts.get(i).copied().unwrap_or(0);
-                    show_message_status(ui, channel_running, sent);
                 });
-            });
-            ui.add_space(4.0);
-        }
-        if ui.small_button("+ Add Message").clicked() {
-            add_one = true;
-        }
-    });
+                ui.add_space(4.0);
+            }
+            if ui.small_button("+ Add Message").clicked() {
+                add_one = true;
+            }
+        });
 
     if let Some(i) = to_remove {
         entries.remove(i);
@@ -1127,7 +1215,12 @@ fn show_utf8_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             300.0,
             "Unicode text",
         );
-        show_insert_byte_button(ui, &mut entry.utf8_text, &mut entry.insert_byte_hex);
+        show_insert_byte_button(
+            ui,
+            &mut entry.utf8_text,
+            &mut entry.insert_byte_hex,
+            "payload_utf8",
+        );
     });
     ui.end_row();
 }
@@ -1155,7 +1248,12 @@ fn show_ascii_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     ui.label("Text");
     ui.horizontal(|ui| {
         marker_aware_text_edit(ui, &mut entry.ascii_text, "payload_ascii", 300.0, "text");
-        show_insert_byte_button(ui, &mut entry.ascii_text, &mut entry.insert_byte_hex);
+        show_insert_byte_button(
+            ui,
+            &mut entry.ascii_text,
+            &mut entry.insert_byte_hex,
+            "payload_ascii",
+        );
     });
     ui.end_row();
     ui.label("Code page");
@@ -1298,6 +1396,11 @@ fn nmea_example_fields(sentence: &str) -> Option<&'static str> {
         "XTE" => Some("A,A,0.10,R,N"),
         "GBS" => Some("125027,1.2,1.3,3.2,12,0.04,-0.3,7.5"),
         "GST" => Some("172814.0,0.006,0.023,0.020,273.6,0.023,0.020,0.031"),
+        // Proprietary — pair with talker P. PASHR (Ashtech attitude):
+        // hhmmss.ss,heading,T,roll,pitch,heave,roll_acc,pitch_acc,heading_acc,quality
+        "ASHR" => Some("123519.00,123.45,T,1.23,-0.50,0.10,0.020,0.020,0.025,1"),
+        // PRDID (Teledyne RDI): pitch,roll,heading — has no checksum.
+        "RDID" => Some("-1.23,2.34,123.45"),
         _ => None,
     }
 }
@@ -1677,19 +1780,14 @@ fn interface_summary(conn: &ConnDraft) -> String {
                 flow,
             )
         }
-        ConnKind::Udp => match conn.udp_mode {
-            UdpModeDraft::Unicast => format!("UDP unicast {}{lp}", or_q(&conn.udp_dest)),
-            UdpModeDraft::Broadcast => format!(
-                "UDP broadcast {}:{}{lp}",
-                or_q(&conn.udp_broadcast_addr),
-                or_q(&conn.udp_broadcast_port),
-            ),
-            UdpModeDraft::Multicast => format!(
-                "UDP multicast {}:{}{lp}",
-                or_q(&conn.udp_group),
-                or_q(&conn.udp_mc_port),
-            ),
-        },
+        ConnKind::Udp => {
+            let (label, pair) = match conn.udp_mode {
+                UdpModeDraft::Unicast => ("unicast", &conn.udp_unicast),
+                UdpModeDraft::Broadcast => ("broadcast", &conn.udp_broadcast),
+                UdpModeDraft::Multicast => ("multicast", &conn.udp_multicast),
+            };
+            format!("UDP {label} {}:{}{lp}", or_q(&pair.addr), or_q(&pair.port),)
+        }
         ConnKind::Tcp => format!("TCP {}", or_q(&conn.tcp_addr)),
     }
 }
@@ -1728,34 +1826,16 @@ fn channel_blockers(conn: &ConnDraft) -> Vec<String> {
             }
         }
         ConnKind::Udp => {
-            match conn.udp_mode {
-                UdpModeDraft::Unicast => {
-                    if conn.udp_dest.is_empty() {
-                        out.push("Channel: destination is empty".to_string());
-                    } else if conn.udp_dest.parse::<SocketAddr>().is_err() {
-                        out.push("Channel: destination must be host:port".to_string());
-                    }
-                }
-                UdpModeDraft::Broadcast => {
-                    if conn.udp_broadcast_addr.is_empty()
-                        || conn.udp_broadcast_addr.parse::<Ipv4Addr>().is_err()
-                    {
-                        out.push("Channel: broadcast address must be IPv4".to_string());
-                    }
-                    if conn.udp_broadcast_port.is_empty()
-                        || conn.udp_broadcast_port.parse::<u16>().is_err()
-                    {
-                        out.push("Channel: broadcast port must be 1–65535".to_string());
-                    }
-                }
-                UdpModeDraft::Multicast => {
-                    if conn.udp_group.is_empty() || conn.udp_group.parse::<Ipv4Addr>().is_err() {
-                        out.push("Channel: multicast group must be IPv4".to_string());
-                    }
-                    if conn.udp_mc_port.is_empty() || conn.udp_mc_port.parse::<u16>().is_err() {
-                        out.push("Channel: multicast port must be 1–65535".to_string());
-                    }
-                }
+            let (mode_label, pair, addr_label) = match conn.udp_mode {
+                UdpModeDraft::Unicast => ("destination", &conn.udp_unicast, "address"),
+                UdpModeDraft::Broadcast => ("broadcast", &conn.udp_broadcast, "address"),
+                UdpModeDraft::Multicast => ("multicast", &conn.udp_multicast, "group"),
+            };
+            if pair.addr.is_empty() || pair.addr.parse::<Ipv4Addr>().is_err() {
+                out.push(format!("Channel: {mode_label} {addr_label} must be IPv4"));
+            }
+            if pair.port.is_empty() || pair.port.parse::<u16>().is_err() {
+                out.push(format!("Channel: {mode_label} port must be 1–65535"));
             }
             if invalid_parse::<u16>(&conn.local_port) {
                 out.push("Channel: local port must be 1–65535".to_string());
@@ -1848,17 +1928,39 @@ fn show_message_preview(ui: &mut egui::Ui, entry: &ScheduleDraft) {
 /// message will fire on its interval. "Idle" = channel is stopped, so
 /// the count is the last value seen.
 fn show_message_status(ui: &mut egui::Ui, channel_running: bool, sent: u64) {
-    ui.horizontal(|ui| {
-        let (dot_color, state) = if channel_running {
-            (egui::Color32::from_rgb(80, 200, 80), "Active")
-        } else {
-            (egui::Color32::GRAY, "Idle")
-        };
-        ui.colored_label(dot_color, "\u{2022}");
-        ui.label(state);
-        ui.separator();
-        ui.label(format!("Sent: {sent}"));
-    });
+    // Footer bar: separator above to split it from the message body, then
+    // a tinted Frame so the "Active / Sent: N" line reads as a status
+    // strip rather than just another row of widgets. Inner margin
+    // matches the channel-summary chrome so all the framed bits in the
+    // GUI feel like the same component.
+    ui.add_space(2.0);
+    ui.separator();
+    let (dot_color, state) = if channel_running {
+        (egui::Color32::from_rgb(80, 200, 80), "Active")
+    } else {
+        (egui::Color32::from_gray(140), "Idle")
+    };
+    let bg = if channel_running {
+        egui::Color32::from_rgb(28, 52, 28)
+    } else {
+        egui::Color32::from_gray(40)
+    };
+    egui::Frame::default()
+        .fill(bg)
+        .corner_radius(egui::CornerRadius::same(3))
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(dot_color, egui::RichText::new("\u{2022}").size(16.0));
+                ui.label(egui::RichText::new(state).strong());
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("Sent: {sent}"))
+                        .strong()
+                        .monospace(),
+                );
+            });
+        });
 }
 
 /// Render the per-message timestamp toggles.
@@ -2031,14 +2133,21 @@ fn marker_layouter(
 
 /// Single-line TextEdit for text that may contain `‹XX›` byte markers.
 ///
-/// Coloured-marker highlighting via [`marker_layouter`] plus *atomic*
-/// marker deletion: any single-keypress edit that disturbs a complete
-/// marker (typed inside, backspaced from inside or immediately adjacent)
-/// removes the whole 4-character marker rather than leaving an orphan
-/// `‹` / `›` that would later fail to encode.
+/// Three marker-aware behaviours layered on a plain `TextEdit`:
 ///
-/// The pre-edit text is stashed in `egui::Memory` keyed by the salt, so
-/// the helper compares against last frame's value.
+///  1. Coloured-marker highlighting via [`marker_layouter`].
+///  2. *Atomic* marker deletion via [`repair_after_edit`]: a single
+///     keystroke that disturbs a complete marker removes the whole
+///     4-character unit rather than leaving an orphan `‹` / `›`.
+///  3. *Cursor jump*: if the caret lands strictly inside a marker
+///     (typed-through, clicked-into, etc.), it snaps to the marker's
+///     near edge — direction of movement when known, closer edge on a
+///     fresh click. Markers behave as single atoms for navigation.
+///
+/// The pre-edit text, previous cursor position, and the widget id are
+/// stashed in `egui::Memory` so [`show_insert_byte_button`] (rendered
+/// from a different ui parent — the popup) can read the target's
+/// cursor and write a new one after inserting markers.
 fn marker_aware_text_edit(
     ui: &mut egui::Ui,
     text: &mut String,
@@ -2046,27 +2155,155 @@ fn marker_aware_text_edit(
     width: f32,
     hint: &str,
 ) -> egui::Response {
-    let stash_id = ui.id().with("marker_prev").with(salt);
-    let prev: String = ui
-        .memory(|m| m.data.get_temp::<String>(stash_id))
+    let stash_prev_text = ui.id().with("marker_prev").with(salt);
+    let stash_prev_cursor = ui.id().with("marker_prev_cursor").with(salt);
+    // Shared (parent-independent) ids the insert-byte popup uses.
+    let shared_cursor_id = egui::Id::new("marker_target_cursor").with(salt);
+    let shared_widget_id = egui::Id::new("marker_target_widget").with(salt);
+
+    let prev_text: String = ui
+        .memory(|m| m.data.get_temp::<String>(stash_prev_text))
         .unwrap_or_else(|| text.clone());
+    let prev_cursor: Option<usize> = ui.memory(|m| m.data.get_temp(stash_prev_cursor));
+
     let mut layouter = marker_layouter;
-    let resp = ui.add(
-        egui::TextEdit::singleline(text)
-            .id_salt(salt)
-            .desired_width(width)
-            .hint_text(hint)
-            .layouter(&mut layouter),
-    );
+    let output = egui::TextEdit::singleline(text)
+        .id_salt(salt)
+        .desired_width(width)
+        .hint_text(hint)
+        .layouter(&mut layouter)
+        .show(ui);
+
+    // TextEdit::show returns AtomLayoutResponse wrapping the actual
+    // Response — unwrap once here so the rest reads naturally.
+    let resp = output.response.response;
     if resp.changed() {
-        repair_after_edit(&prev, text);
+        repair_after_edit(&prev_text, text);
     }
-    ui.memory_mut(|m| m.data.insert_temp(stash_id, text.clone()));
+    ui.memory_mut(|m| m.data.insert_temp(stash_prev_text, text.clone()));
+
+    let widget_id = resp.id;
+    ui.memory_mut(|m| m.data.insert_temp(shared_widget_id, widget_id));
+
+    if let Some(range) = output.cursor_range {
+        // Only snap when there's no active selection — otherwise we'd
+        // yank the user's shift-arrow selection sideways.
+        let has_selection = range.primary != range.secondary;
+        let cursor_char = range.primary.index;
+        let cursor_byte = char_to_byte(text, cursor_char);
+        let mut effective_cursor_char = cursor_char;
+        if !has_selection {
+            for (mrange, seg) in segments(text) {
+                if !matches!(seg, Segment::Byte(_)) {
+                    continue;
+                }
+                if mrange.start < cursor_byte && cursor_byte < mrange.end {
+                    let target_byte = match prev_cursor.map(|p| char_to_byte(text, p)) {
+                        Some(p) if p < cursor_byte => mrange.end,
+                        Some(p) if p > cursor_byte => mrange.start,
+                        // Fresh click or stationary — closer edge, end on tie.
+                        _ => {
+                            if cursor_byte - mrange.start < mrange.end - cursor_byte {
+                                mrange.start
+                            } else {
+                                mrange.end
+                            }
+                        }
+                    };
+                    let target_char = byte_to_char(text, target_byte);
+                    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), widget_id) {
+                        state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::one(
+                                egui::text::CCursor::new(target_char),
+                            )));
+                        state.store(ui.ctx(), widget_id);
+                    }
+                    effective_cursor_char = target_char;
+                    break;
+                }
+            }
+        }
+        ui.memory_mut(|m| {
+            m.data.insert_temp(stash_prev_cursor, effective_cursor_char);
+            m.data.insert_temp(shared_cursor_id, effective_cursor_char);
+        });
+    }
+
     resp
 }
 
-/// An "Insert Byte" button whose popup appends a `‹XX›` marker to `text`.
-fn show_insert_byte_button(ui: &mut egui::Ui, text: &mut String, hex: &mut String) {
+/// Byte position of the character at `char_idx` in `text`. Saturates to
+/// `text.len()` for indices past the end (treat as the after-last position).
+fn char_to_byte(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len())
+}
+
+/// Character position of the byte at `byte_idx`. Clamps `byte_idx` to
+/// `text.len()` first so callers don't have to.
+fn byte_to_char(text: &str, byte_idx: usize) -> usize {
+    let byte_idx = byte_idx.min(text.len());
+    text[..byte_idx].chars().count()
+}
+
+/// Parse the Insert Byte popup's hex input — single byte (`1B`) or a
+/// space- and/or comma-separated list (`1B 0D 0A`, `1B,0D,0A`,
+/// `1B, 0D 0A`). On failure the `Err` is the disabled-button hover text.
+fn parse_hex_bytes(input: &str) -> Result<Vec<u8>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "Type 1–2 hex digits — single byte (1B) or several separated by \
+             spaces / commas (1B 0D 0A)"
+                .to_string(),
+        );
+    }
+    let pieces: Vec<&str> = trimmed
+        .split([' ', ',', '\t'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if pieces.is_empty() {
+        // All separators, no values — e.g. " , , ".
+        return Err("No hex digits found between separators".to_string());
+    }
+    let mut out = Vec::with_capacity(pieces.len());
+    for piece in &pieces {
+        if piece.len() > 2 {
+            return Err(format!(
+                "`{piece}` is more than 2 hex digits — split bytes with a \
+                 space or comma (1B 0D 0A)"
+            ));
+        }
+        match u8::from_str_radix(piece, 16) {
+            Ok(b) => out.push(b),
+            Err(_) => {
+                return Err(format!(
+                    "`{piece}` is not a valid hex byte — use 1–2 digits 0–9 / A–F"
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// "Insert Byte" button whose popup inserts one or more `‹XX›` markers
+/// at the target field's cursor position (or appends, if the field has
+/// never been focused). `target_salt` must match the salt passed to
+/// [`marker_aware_text_edit`] for the field this button drives — that
+/// lets the popup read the saved cursor / widget id out of egui memory.
+fn show_insert_byte_button(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    hex: &mut String,
+    target_salt: &'static str,
+) {
+    let shared_cursor_id = egui::Id::new("marker_target_cursor").with(target_salt);
+    let shared_widget_id = egui::Id::new("marker_target_widget").with(target_salt);
+
     // Default menu close behavior is `CloseOnClick`, which closes the menu
     // the moment the user clicks anywhere inside — including the TextEdit
     // (which has to be clicked to gain focus). Switch to `CloseOnClickOutside`
@@ -2078,7 +2315,7 @@ fn show_insert_byte_button(ui: &mut egui::Ui, text: &mut String, hex: &mut Strin
         )
         .ui(ui, |ui| {
             // Three rows — label, hex entry, Insert button — in a fixed
-            // 160-px wide child UI with a non-justified top-down layout.
+            // 200-px wide child UI with a non-justified top-down layout.
             // The fixed width keeps the popup compact enough to fit
             // below the trigger button (egui's auto-placement flips
             // popups above when they'd be too wide for the space below).
@@ -2086,44 +2323,67 @@ fn show_insert_byte_button(ui: &mut egui::Ui, text: &mut String, hex: &mut Strin
             // `top_down_justified` layout, which stretches each row to
             // the full layout width — re-introducing the same flip.
             ui.allocate_ui_with_layout(
-                egui::vec2(160.0, 0.0),
+                egui::vec2(200.0, 0.0),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    ui.label("Byte value (hex):");
+                    ui.label("Byte value(s) (hex):");
                     let resp = ui.add(
                         egui::TextEdit::singleline(hex)
-                            .desired_width(140.0)
-                            .hint_text("1B"),
+                            .desired_width(180.0)
+                            .hint_text("1B  or  1B 0D 0A"),
                     );
                     // Auto-focus the hex field so the user can start typing
                     // right away. Idempotent — egui doesn't keep resetting
                     // the caret if the field already has focus.
                     resp.request_focus();
-                    let value = u8::from_str_radix(hex.trim(), 16).ok();
-                    // Enter while the popup is open commits — gated on hex
-                    // being valid, not on `resp.lost_focus()` (which doesn't
-                    // always fire for popup-hosted TextEdits, so Enter would
-                    // otherwise feel dead). Only consume Enter when the
-                    // value parses, so an empty / invalid field doesn't
-                    // swallow Enter for anything else.
-                    let entered = resp.has_focus()
-                        && value.is_some()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let mut insert = ui.add_enabled(value.is_some(), egui::Button::new("Insert"));
-                    if value.is_none() {
-                        let why = if hex.trim().is_empty() {
-                            "Type 1–2 hex digits first (e.g. 1B, 0D, FF)".to_string()
-                        } else {
-                            format!(
-                                "`{}` is not a valid hex byte — use 1–2 digits 0–9 / A–F",
-                                hex.trim()
-                            )
-                        };
-                        insert = insert.on_disabled_hover_text(why);
+                    let parse_result = parse_hex_bytes(hex);
+                    let ok = parse_result.is_ok();
+                    // Enter while the popup is open commits — gated on the
+                    // input parsing, not on `resp.lost_focus()` (which
+                    // doesn't always fire for popup-hosted TextEdits, so
+                    // Enter would otherwise feel dead). Only consume Enter
+                    // when the value parses.
+                    let entered =
+                        resp.has_focus() && ok && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let mut insert = ui.add_enabled(ok, egui::Button::new("Insert"));
+                    if let Err(why) = &parse_result {
+                        insert = insert.on_disabled_hover_text(why.clone());
                     }
-                    if let Some(b) = value {
+                    if let Ok(bytes) = &parse_result {
                         if insert.clicked() || entered {
-                            text.push_str(&format!("\u{2039}{b:02X}\u{203A}"));
+                            let markers: String = bytes
+                                .iter()
+                                .map(|b| format!("\u{2039}{b:02X}\u{203A}"))
+                                .collect();
+                            // Cursor byte position from memory; fall back
+                            // to end-of-text if the field was never focused.
+                            let cursor_char: Option<usize> =
+                                ui.memory(|m| m.data.get_temp(shared_cursor_id));
+                            let insert_byte = cursor_char
+                                .map(|c| char_to_byte(text, c))
+                                .unwrap_or(text.len());
+                            text.insert_str(insert_byte, &markers);
+                            // New cursor sits right after the inserted
+                            // markers. Update both the shared stash (so a
+                            // subsequent Insert lands in the right place
+                            // even if the field isn't re-focused first)
+                            // and the actual TextEditState.
+                            let new_cursor_char = byte_to_char(text, insert_byte + markers.len());
+                            ui.memory_mut(|m| {
+                                m.data.insert_temp(shared_cursor_id, new_cursor_char);
+                            });
+                            let widget_id: Option<egui::Id> =
+                                ui.memory(|m| m.data.get_temp(shared_widget_id));
+                            if let Some(wid) = widget_id {
+                                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), wid) {
+                                    state.cursor.set_char_range(Some(
+                                        egui::text::CCursorRange::one(egui::text::CCursor::new(
+                                            new_cursor_char,
+                                        )),
+                                    ));
+                                    state.store(ui.ctx(), wid);
+                                }
+                            }
                             hex.clear();
                             ui.close();
                         }
@@ -2143,14 +2403,16 @@ fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay) {
                  changes how the buffered bytes are rendered here.",
             );
             ui.radio_value(&mut display.mode, DisplayMode::Hex, "Hex");
-            ui.radio_value(&mut display.mode, DisplayMode::Ascii, "ASCII");
-            ui.radio_value(&mut display.mode, DisplayMode::Decoded, "Decoded");
+            ui.radio_value(&mut display.mode, DisplayMode::Rendered, "Rendered");
+            // Raw comes last so the ctrl-chars sub-options below sit
+            // immediately next to the radio they modify.
+            ui.radio_value(&mut display.mode, DisplayMode::Raw, "Raw");
             // Wrap the conditional ctrl-chars block in a stable id scope so
             // its appearance / disappearance can't shift the auto-derived
             // ids of the surrounding widgets (Clear button, etc.) and trip
             // egui's "duplicate widget id" warnings on view-mode changes.
             ui.push_id("ctrl_chars_block", |ui| {
-                if display.mode == DisplayMode::Ascii {
+                if display.mode == DisplayMode::Raw {
                     ui.separator();
                     ui.label("ctrl-chars:");
                     ui.radio_value(
@@ -2314,9 +2576,11 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     let before_mode = conn.udp_mode;
     let mut apply = false;
 
-    // Per-mode Grid id so the very different widget trees produced by
-    // Unicast / Broadcast / Multicast each get their own id namespace —
-    // see the equivalent message_grid_<kind> trick in the message editor.
+    // Per-mode Grid id even though all three modes now render the same
+    // [addr] [port] [local-port] shape — kept as defence-in-depth so any
+    // auto-derived (un-salted) widget id inside the Grid lives in its
+    // own namespace per mode, the same trick `message_grid_<kind>` uses
+    // in the message editor.
     let grid_id = match conn.udp_mode {
         UdpModeDraft::Unicast => "udp_grid_unicast",
         UdpModeDraft::Broadcast => "udp_grid_broadcast",
@@ -2327,11 +2591,7 @@ fn show_udp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
         .spacing([8.0, 4.0])
         .show(ui, |ui| {
             apply |= show_udp_mode_row(ui, conn);
-            apply |= match conn.udp_mode {
-                UdpModeDraft::Unicast => show_udp_unicast_row(ui, conn),
-                UdpModeDraft::Broadcast => show_udp_broadcast_row(ui, conn),
-                UdpModeDraft::Multicast => show_udp_multicast_row(ui, conn),
-            };
+            apply |= show_udp_destination_row(ui, conn);
             apply |= show_udp_local_port_row(ui, conn);
         });
 
@@ -2349,68 +2609,74 @@ fn show_udp_mode_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     false
 }
 
-fn show_udp_unicast_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
-    let bad = invalid_parse::<SocketAddr>(&conn.udp_dest);
-    ui.label("Destination");
-    let r = red_bordered(
-        ui,
-        bad,
-        "enter host:port — e.g. 192.168.1.100:4000",
-        |ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut conn.udp_dest)
-                    .id_salt("udp_unicast_dest")
-                    .desired_width(220.0)
-                    .hint_text("host:port  (Enter to apply)"),
-            )
-        },
-    );
-    let apply = enter_committed(&r, ui);
-    ui.end_row();
-    apply
-}
+/// All three UDP modes have the same shape — an IPv4 address plus a port
+/// — so they share one row helper. The per-mode differences (label, hint
+/// text, validation message, tooltip, id salts, and which pair of
+/// `udp_unicast` / `udp_broadcast` / `udp_multicast` strings to point
+/// at) are looked up from a single match.
+fn show_udp_destination_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
+    let mode = conn.udp_mode;
+    // Compute validation flags up front while we still hold an immutable
+    // borrow — the mutable destructure below precludes re-reading.
+    let pair_ref = match mode {
+        UdpModeDraft::Unicast => &conn.udp_unicast,
+        UdpModeDraft::Broadcast => &conn.udp_broadcast,
+        UdpModeDraft::Multicast => &conn.udp_multicast,
+    };
+    let bad_addr = invalid_parse::<Ipv4Addr>(&pair_ref.addr);
+    let bad_port = invalid_parse::<u16>(&pair_ref.port);
 
-fn show_udp_broadcast_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
-    let bad_addr = invalid_parse::<Ipv4Addr>(&conn.udp_broadcast_addr);
-    let bad_port = invalid_parse::<u16>(&conn.udp_broadcast_port);
-    ui.label("Destination");
+    let (label, label_tip, hint, invalid_msg, addr_salt, port_salt) = match mode {
+        UdpModeDraft::Unicast => (
+            "Destination",
+            None,
+            "192.168.1.100",
+            "enter an IPv4 address — e.g. 192.168.1.100",
+            "udp_unicast_addr",
+            "udp_unicast_port",
+        ),
+        UdpModeDraft::Broadcast => (
+            "Destination",
+            None,
+            "255.255.255.255",
+            "enter an IPv4 address — e.g. 255.255.255.255",
+            "udp_broadcast_addr",
+            "udp_broadcast_port",
+        ),
+        UdpModeDraft::Multicast => (
+            "Multicast group",
+            Some(
+                "IPv4 multicast group address (must be in the 224.0.0.0 – \
+                 239.255.255.255 range). Receivers must subscribe to the same \
+                 group + port to see these packets. Common admin-local picks \
+                 live in 239.x.x.x.",
+            ),
+            "239.0.0.1",
+            "enter IPv4 multicast address — e.g. 239.0.0.1",
+            "udp_multicast_addr",
+            "udp_multicast_port",
+        ),
+    };
+    let label_resp = ui.label(label);
+    if let Some(t) = label_tip {
+        let _ = label_resp.on_hover_text(t);
+    }
+
+    let pair = match mode {
+        UdpModeDraft::Unicast => &mut conn.udp_unicast,
+        UdpModeDraft::Broadcast => &mut conn.udp_broadcast,
+        UdpModeDraft::Multicast => &mut conn.udp_multicast,
+    };
     let apply = show_addr_port_row(
         ui,
         AddrPortRow {
-            addr_field: &mut conn.udp_broadcast_addr,
-            addr_id_salt: "udp_broadcast_addr",
-            addr_hint: "255.255.255.255",
-            addr_invalid_msg: "enter an IPv4 address — e.g. 255.255.255.255",
+            addr_field: &mut pair.addr,
+            addr_id_salt: addr_salt,
+            addr_hint: hint,
+            addr_invalid_msg: invalid_msg,
             bad_addr,
-            port_field: &mut conn.udp_broadcast_port,
-            port_id_salt: "udp_broadcast_port",
-            bad_port,
-            port_hold: &mut conn.udp_port_hold,
-        },
-    );
-    ui.end_row();
-    apply
-}
-
-fn show_udp_multicast_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
-    let bad_group = invalid_parse::<Ipv4Addr>(&conn.udp_group);
-    let bad_port = invalid_parse::<u16>(&conn.udp_mc_port);
-    ui.label("Multicast group").on_hover_text(
-        "IPv4 multicast group address (must be in the 224.0.0.0 – \
-         239.255.255.255 range). Receivers must subscribe to the same \
-         group + port to see these packets. Common admin-local picks \
-         live in 239.x.x.x.",
-    );
-    let apply = show_addr_port_row(
-        ui,
-        AddrPortRow {
-            addr_field: &mut conn.udp_group,
-            addr_id_salt: "udp_multicast_group",
-            addr_hint: "239.0.0.1",
-            addr_invalid_msg: "enter IPv4 multicast address — e.g. 239.0.0.1",
-            bad_addr: bad_group,
-            port_field: &mut conn.udp_mc_port,
-            port_id_salt: "udp_multicast_port",
+            port_field: &mut pair.port,
+            port_id_salt: port_salt,
             bad_port,
             port_hold: &mut conn.udp_port_hold,
         },
@@ -2435,10 +2701,10 @@ fn show_udp_local_port_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
     apply
 }
 
-/// Parameters for [`show_addr_port_row`] — shared between the Broadcast
-/// and Multicast UDP-mode editors, which both render a `[addr] Port: [-]
-/// [port] [+]` strip with the same hold-to-repeat ± behaviour but
-/// against different fields with different ids / hints / validation.
+/// Parameters for [`show_addr_port_row`] — shared by all three UDP-mode
+/// editors. Renders the `[addr] Port: [-] [port] [+]` strip with the same
+/// hold-to-repeat ± behaviour, against per-mode fields / ids / hints /
+/// validation messages.
 struct AddrPortRow<'a> {
     addr_field: &'a mut String,
     addr_id_salt: &'a str,
@@ -2451,10 +2717,10 @@ struct AddrPortRow<'a> {
     port_hold: &'a mut Option<PortHold>,
 }
 
-/// Render the right-hand side of a Broadcast or Multicast row: address
-/// TextEdit, "Port:" label, hold-to-repeat ± buttons around the port
-/// TextEdit. Returns `true` if the user committed an edit (Enter on either
-/// field, or a ± click that changed the port).
+/// Render the right-hand side of a UDP destination row: address TextEdit,
+/// "Port:" label, hold-to-repeat ± buttons around the port TextEdit.
+/// Returns `true` if the user committed an edit (Enter on either field,
+/// or a ± click that changed the port).
 fn show_addr_port_row(ui: &mut egui::Ui, p: AddrPortRow) -> bool {
     let mut apply = false;
     ui.horizontal(|ui| {
@@ -2596,4 +2862,80 @@ fn show_tcp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
         });
 
     apply
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_hex_bytes ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_single_byte() {
+        assert_eq!(parse_hex_bytes("1B").unwrap(), vec![0x1B]);
+        assert_eq!(parse_hex_bytes("ff").unwrap(), vec![0xFF]);
+        assert_eq!(parse_hex_bytes("0").unwrap(), vec![0x00]);
+    }
+
+    #[test]
+    fn parse_space_separated() {
+        assert_eq!(parse_hex_bytes("1B 0D 0A").unwrap(), vec![0x1B, 0x0D, 0x0A]);
+    }
+
+    #[test]
+    fn parse_comma_separated() {
+        assert_eq!(parse_hex_bytes("1B,0D,0A").unwrap(), vec![0x1B, 0x0D, 0x0A]);
+    }
+
+    #[test]
+    fn parse_mixed_separators_and_extra_whitespace() {
+        assert_eq!(
+            parse_hex_bytes("  1B,  0D 0A,   FF  ").unwrap(),
+            vec![0x1B, 0x0D, 0x0A, 0xFF]
+        );
+    }
+
+    #[test]
+    fn parse_rejects_empty() {
+        assert!(parse_hex_bytes("").is_err());
+        assert!(parse_hex_bytes("   ").is_err());
+        assert!(parse_hex_bytes(" , , ").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_non_hex() {
+        let err = parse_hex_bytes("1B XY 0D").unwrap_err();
+        assert!(err.contains("XY"), "{err}");
+    }
+
+    #[test]
+    fn parse_rejects_too_long_piece() {
+        let err = parse_hex_bytes("1B0D").unwrap_err();
+        assert!(err.contains("more than 2"), "{err}");
+    }
+
+    // ── char_to_byte / byte_to_char ───────────────────────────────────────────
+
+    #[test]
+    fn char_byte_round_trip_ascii() {
+        let s = "hello";
+        for i in 0..=s.len() {
+            assert_eq!(byte_to_char(s, char_to_byte(s, i)), i.min(5));
+        }
+    }
+
+    #[test]
+    fn char_byte_handles_multibyte() {
+        // 'A' (1 byte/char) + '‹' (3 bytes/1 char) + 'B' (1 byte/char)
+        let s = "A\u{2039}B";
+        assert_eq!(char_to_byte(s, 0), 0);
+        assert_eq!(char_to_byte(s, 1), 1);
+        assert_eq!(char_to_byte(s, 2), 4);
+        assert_eq!(char_to_byte(s, 3), 5); // saturates to len
+        assert_eq!(byte_to_char(s, 0), 0);
+        assert_eq!(byte_to_char(s, 1), 1);
+        assert_eq!(byte_to_char(s, 4), 2);
+        assert_eq!(byte_to_char(s, 5), 3);
+        assert_eq!(byte_to_char(s, 99), 3); // clamps past end
+    }
 }

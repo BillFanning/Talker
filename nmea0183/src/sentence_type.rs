@@ -25,6 +25,8 @@ pub enum SentenceType {
     APA,
     /// Autopilot sentence B
     APB,
+    /// `$PASHR` — Ashtech attitude/heading. Pair with [`TalkerId::P`].
+    ASHR,
     /// Bearing and distance to waypoint, dead reckoning
     BEC,
     /// Bearing, origin to destination
@@ -115,6 +117,10 @@ pub enum SentenceType {
     OSD,
     /// Waypoints in active route
     R00,
+    /// `$PRDID` — Teledyne RDI ADCP pitch/roll/heading. Pair with
+    /// [`TalkerId::P`]; PRDID has no checksum by convention, so the
+    /// `NmeaChecksumMode::Omit` mode is appropriate when building one.
+    RDID,
     /// Recommended minimum specific Loran-C data (obsolete)
     RMA,
     /// Recommended minimum navigation information
@@ -205,14 +211,14 @@ pub enum SentenceType {
 /// Intended for UIs that want to present every option (e.g. a filterable
 /// dropdown). Does not include the `Custom(String)` variant.
 pub const ALL: &[&str] = &[
-    "AAM", "ABK", "ABM", "ACK", "AIR", "AKD", "ALA", "ALM", "APA", "APB", "BEC", "BOD", "BWC",
-    "BWR", "BWW", "DBK", "DBS", "DBT", "DCN", "DPT", "DSC", "DSE", "DSI", "DSR", "DTM", "FSI",
-    "GBS", "GGA", "GLC", "GLL", "GNS", "GRS", "GSA", "GST", "GSV", "GTD", "GXA", "HDG", "HDM",
-    "HDT", "HFB", "HSC", "ITS", "LCD", "MDA", "MHU", "MSK", "MSS", "MTA", "MTW", "MWD", "MWV",
-    "OLN", "OSD", "R00", "RMA", "RMB", "RMC", "ROT", "RPM", "RSA", "RSD", "RTE", "SFI", "STN",
-    "TDS", "TFI", "THS", "TLL", "TPC", "TPR", "TPT", "TRF", "TTM", "TUT", "TXT", "VBW", "VDM",
-    "VDO", "VDR", "VHW", "VLW", "VPW", "VTG", "VWR", "VWT", "WCV", "WNC", "WPL", "XDR", "XTE",
-    "XTR", "ZDA", "ZDL", "ZFO", "ZTG",
+    "AAM", "ABK", "ABM", "ACK", "AIR", "AKD", "ALA", "ALM", "APA", "APB", "ASHR", "BEC", "BOD",
+    "BWC", "BWR", "BWW", "DBK", "DBS", "DBT", "DCN", "DPT", "DSC", "DSE", "DSI", "DSR", "DTM",
+    "FSI", "GBS", "GGA", "GLC", "GLL", "GNS", "GRS", "GSA", "GST", "GSV", "GTD", "GXA", "HDG",
+    "HDM", "HDT", "HFB", "HSC", "ITS", "LCD", "MDA", "MHU", "MSK", "MSS", "MTA", "MTW", "MWD",
+    "MWV", "OLN", "OSD", "R00", "RDID", "RMA", "RMB", "RMC", "ROT", "RPM", "RSA", "RSD", "RTE",
+    "SFI", "STN", "TDS", "TFI", "THS", "TLL", "TPC", "TPR", "TPT", "TRF", "TTM", "TUT", "TXT",
+    "VBW", "VDM", "VDO", "VDR", "VHW", "VLW", "VPW", "VTG", "VWR", "VWT", "WCV", "WNC", "WPL",
+    "XDR", "XTE", "XTR", "ZDA", "ZDL", "ZFO", "ZTG",
 ];
 
 /// `(code, description)` pairs for every entry in [`ALL`], in the same order.
@@ -229,6 +235,10 @@ pub const ALL_WITH_DESC: &[(&str, &str)] = &[
     ("ALM", "GPS almanac data"),
     ("APA", "Autopilot sentence A"),
     ("APB", "Autopilot sentence B"),
+    (
+        "ASHR",
+        "Ashtech attitude/heading ($PASHR — pair with talker P)",
+    ),
     ("BEC", "Bearing & distance to waypoint, dead reckoning"),
     ("BOD", "Bearing, origin to destination"),
     ("BWC", "Bearing & distance to waypoint, great circle"),
@@ -274,6 +284,10 @@ pub const ALL_WITH_DESC: &[(&str, &str)] = &[
     ("OLN", "Omega lane numbers"),
     ("OSD", "Own ship data"),
     ("R00", "Waypoints in active route"),
+    (
+        "RDID",
+        "Teledyne RDI ADCP pitch/roll/heading ($PRDID — pair with talker P, no checksum)",
+    ),
     (
         "RMA",
         "Recommended minimum specific Loran-C data (obsolete)",
@@ -333,6 +347,7 @@ impl SentenceType {
             Self::ALM => "ALM",
             Self::APA => "APA",
             Self::APB => "APB",
+            Self::ASHR => "ASHR",
             Self::BEC => "BEC",
             Self::BOD => "BOD",
             Self::BWC => "BWC",
@@ -378,6 +393,7 @@ impl SentenceType {
             Self::OLN => "OLN",
             Self::OSD => "OSD",
             Self::R00 => "R00",
+            Self::RDID => "RDID",
             Self::RMA => "RMA",
             Self::RMB => "RMB",
             Self::RMC => "RMC",
@@ -445,6 +461,7 @@ impl FromStr for SentenceType {
             "ALM" => Self::ALM,
             "APA" => Self::APA,
             "APB" => Self::APB,
+            "ASHR" => Self::ASHR,
             "BEC" => Self::BEC,
             "BOD" => Self::BOD,
             "BWC" => Self::BWC,
@@ -490,6 +507,7 @@ impl FromStr for SentenceType {
             "OLN" => Self::OLN,
             "OSD" => Self::OSD,
             "R00" => Self::R00,
+            "RDID" => Self::RDID,
             "RMA" => Self::RMA,
             "RMB" => Self::RMB,
             "RMC" => Self::RMC,
@@ -574,6 +592,7 @@ mod tests {
             (SentenceType::ALM, "ALM"),
             (SentenceType::APA, "APA"),
             (SentenceType::APB, "APB"),
+            (SentenceType::ASHR, "ASHR"),
             (SentenceType::BEC, "BEC"),
             (SentenceType::BOD, "BOD"),
             (SentenceType::BWC, "BWC"),
@@ -619,6 +638,7 @@ mod tests {
             (SentenceType::OLN, "OLN"),
             (SentenceType::OSD, "OSD"),
             (SentenceType::R00, "R00"),
+            (SentenceType::RDID, "RDID"),
             (SentenceType::RMA, "RMA"),
             (SentenceType::RMB, "RMB"),
             (SentenceType::RMC, "RMC"),

@@ -10,13 +10,13 @@ pub enum DisplayMode {
     /// Each byte as two uppercase hex digits.
     #[default]
     Hex,
-    /// Printable ASCII shown as-is; other bytes as control symbols.
-    Ascii,
     /// UTF-8 decoded to text; invalid bytes shown as U+FFFD.
-    Decoded,
+    Rendered,
+    /// Printable ASCII shown as-is; other bytes as control symbols.
+    Raw,
 }
 
-/// How control bytes are rendered in [`DisplayMode::Ascii`].
+/// How control bytes are rendered in [`DisplayMode::Raw`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ControlStyle {
     /// Unicode control pictures (U+2400 block): `␊` `␍` `␛`.
@@ -71,7 +71,7 @@ pub fn render(bytes: &[u8], mode: DisplayMode, control_style: ControlStyle) -> S
             .map(|b| format!("{b:02X}"))
             .collect::<Vec<_>>()
             .join(" "),
-        DisplayMode::Ascii => {
+        DisplayMode::Raw => {
             let mut s = String::new();
             for &b in bytes {
                 if (0x20..=0x7E).contains(&b) {
@@ -82,7 +82,7 @@ pub fn render(bytes: &[u8], mode: DisplayMode, control_style: ControlStyle) -> S
             }
             s
         }
-        DisplayMode::Decoded => String::from_utf8_lossy(bytes).into_owned(),
+        DisplayMode::Rendered => String::from_utf8_lossy(bytes).into_owned(),
     }
 }
 
@@ -136,23 +136,23 @@ mod tests {
         assert_eq!(render(&[], DisplayMode::Hex, ControlStyle::Pictures), "");
     }
 
-    // ── ASCII ─────────────────────────────────────────────────────────────────
+    // ── Raw ───────────────────────────────────────────────────────────────────
 
     #[test]
-    fn ascii_shows_printable_as_is() {
+    fn raw_shows_printable_as_is() {
         assert_eq!(
-            render(b"Hello!", DisplayMode::Ascii, ControlStyle::Pictures),
+            render(b"Hello!", DisplayMode::Raw, ControlStyle::Pictures),
             "Hello!"
         );
     }
 
     #[test]
-    fn ascii_control_pictures() {
+    fn raw_control_pictures() {
         // LF -> U+240A, CR -> U+240D, ESC -> U+241B, DEL -> U+2421
         assert_eq!(
             render(
                 &[0x0A, 0x0D, 0x1B, 0x7F],
-                DisplayMode::Ascii,
+                DisplayMode::Raw,
                 ControlStyle::Pictures,
             ),
             "\u{240A}\u{240D}\u{241B}\u{2421}"
@@ -160,11 +160,11 @@ mod tests {
     }
 
     #[test]
-    fn ascii_control_brackets() {
+    fn raw_control_brackets() {
         assert_eq!(
             render(
                 &[0x0A, 0x0D, 0x1B, 0x7F],
-                DisplayMode::Ascii,
+                DisplayMode::Raw,
                 ControlStyle::Brackets,
             ),
             "[LF][CR][ESC][DEL]"
@@ -172,11 +172,11 @@ mod tests {
     }
 
     #[test]
-    fn ascii_control_hex_escapes() {
+    fn raw_control_hex_escapes() {
         assert_eq!(
             render(
                 &[0x00, 0x1F, 0x7F],
-                DisplayMode::Ascii,
+                DisplayMode::Raw,
                 ControlStyle::HexEscapes,
             ),
             "<0x00><0x1F><0x7F>"
@@ -184,33 +184,33 @@ mod tests {
     }
 
     #[test]
-    fn ascii_high_byte_falls_back_to_hex_escape() {
+    fn raw_high_byte_falls_back_to_hex_escape() {
         // 0x80-0xFF have no picture/bracket symbol, so every style shows hex.
         for style in [
             ControlStyle::Pictures,
             ControlStyle::Brackets,
             ControlStyle::HexEscapes,
         ] {
-            assert_eq!(render(&[0x80], DisplayMode::Ascii, style), "<0x80>");
+            assert_eq!(render(&[0x80], DisplayMode::Raw, style), "<0x80>");
         }
     }
 
     #[test]
-    fn ascii_mixed() {
+    fn raw_mixed() {
         assert_eq!(
-            render(b"AB\r\n", DisplayMode::Ascii, ControlStyle::Brackets),
+            render(b"AB\r\n", DisplayMode::Raw, ControlStyle::Brackets),
             "AB[CR][LF]"
         );
     }
 
-    // ── Decoded ───────────────────────────────────────────────────────────────
+    // ── Rendered ──────────────────────────────────────────────────────────────
 
     #[test]
-    fn decoded_renders_valid_utf8() {
+    fn rendered_decodes_valid_utf8() {
         assert_eq!(
             render(
                 "héllo".as_bytes(),
-                DisplayMode::Decoded,
+                DisplayMode::Rendered,
                 ControlStyle::Pictures
             ),
             "héllo"
@@ -218,8 +218,8 @@ mod tests {
     }
 
     #[test]
-    fn decoded_invalid_bytes_become_replacement_char() {
-        let out = render(&[0xFF, 0xFE], DisplayMode::Decoded, ControlStyle::Pictures);
+    fn rendered_invalid_bytes_become_replacement_char() {
+        let out = render(&[0xFF, 0xFE], DisplayMode::Rendered, ControlStyle::Pictures);
         assert!(out.contains('\u{FFFD}'));
     }
 
@@ -252,7 +252,7 @@ mod tests {
         let mut d = ChannelDisplay::default();
         d.push(vec![0x41, 0x42]);
         assert_eq!(d.lines().next().unwrap(), "41 42");
-        d.mode = DisplayMode::Ascii;
+        d.mode = DisplayMode::Raw;
         assert_eq!(d.lines().next().unwrap(), "AB");
     }
 }

@@ -43,6 +43,15 @@ pub struct PortHold {
     pub next_fire_at: std::time::Instant,
 }
 
+/// One address + port pair, both held as user-editable text. Shared across
+/// the three UDP modes so each can offer the same `[addr] Port: [-][port][+]`
+/// layout without diverging copies.
+#[derive(Default, Clone)]
+pub struct AddrPortPair {
+    pub addr: String,
+    pub port: String,
+}
+
 pub struct ConnDraft {
     pub kind: ConnKind,
     // serial
@@ -55,15 +64,15 @@ pub struct ConnDraft {
     pub flow_control: u8, // 0=None 1=Software 2=Hardware
     // udp
     pub udp_mode: UdpModeDraft,
-    pub udp_dest: String,           // unicast destination (host:port)
-    pub udp_broadcast_addr: String, // broadcast destination address (defaults to 255.255.255.255)
-    pub udp_broadcast_port: String, // broadcast destination port
-    /// Transient state for the broadcast / multicast port's ± hold-to-repeat.
-    /// `None` when nothing is being held; otherwise see [`PortHold`].
+    /// Per-mode destination buffers, kept independently so switching
+    /// modes doesn't trample what was typed for the others.
+    pub udp_unicast: AddrPortPair,
+    pub udp_broadcast: AddrPortPair,
+    pub udp_multicast: AddrPortPair,
+    /// Transient hold-to-repeat state for the active mode's ± port
+    /// buttons. Shared because only one mode is being edited at a time.
     pub udp_port_hold: Option<PortHold>,
-    pub udp_group: String,   // multicast group address
-    pub udp_mc_port: String, // multicast port
-    pub local_port: String,  // optional local bind port
+    pub local_port: String, // optional local bind port
     // tcp
     pub tcp_addr: String,
 }
@@ -80,12 +89,13 @@ impl Default for ConnDraft {
             stop_bits: 1,
             flow_control: 0,
             udp_mode: UdpModeDraft::Unicast,
-            udp_dest: String::new(),
-            udp_broadcast_addr: Ipv4Addr::BROADCAST.to_string(),
-            udp_broadcast_port: String::new(),
+            udp_unicast: AddrPortPair::default(),
+            udp_broadcast: AddrPortPair {
+                addr: Ipv4Addr::BROADCAST.to_string(),
+                port: String::new(),
+            },
+            udp_multicast: AddrPortPair::default(),
             udp_port_hold: None,
-            udp_group: String::new(),
-            udp_mc_port: String::new(),
             local_port: String::new(),
             tcp_addr: String::new(),
         }
@@ -138,17 +148,24 @@ impl From<&InterfaceConfig> for ConnDraft {
                 match &u.mode {
                     UdpMode::Unicast { destination } => {
                         draft.udp_mode = UdpModeDraft::Unicast;
-                        draft.udp_dest = destination.to_string();
+                        draft.udp_unicast = AddrPortPair {
+                            addr: destination.ip().to_string(),
+                            port: destination.port().to_string(),
+                        };
                     }
                     UdpMode::Broadcast { destination } => {
                         draft.udp_mode = UdpModeDraft::Broadcast;
-                        draft.udp_broadcast_addr = destination.ip().to_string();
-                        draft.udp_broadcast_port = destination.port().to_string();
+                        draft.udp_broadcast = AddrPortPair {
+                            addr: destination.ip().to_string(),
+                            port: destination.port().to_string(),
+                        };
                     }
                     UdpMode::Multicast { group, port, .. } => {
                         draft.udp_mode = UdpModeDraft::Multicast;
-                        draft.udp_group = group.to_string();
-                        draft.udp_mc_port = port.to_string();
+                        draft.udp_multicast = AddrPortPair {
+                            addr: group.to_string(),
+                            port: port.to_string(),
+                        };
                     }
                 }
                 draft
@@ -205,18 +222,17 @@ impl ConnDraft {
                 }))
             }
             ConnKind::Udp => {
+                let pair = match self.udp_mode {
+                    UdpModeDraft::Unicast => &self.udp_unicast,
+                    UdpModeDraft::Broadcast => &self.udp_broadcast,
+                    UdpModeDraft::Multicast => &self.udp_multicast,
+                };
+                let addr: Ipv4Addr = pair.addr.parse().ok()?;
+                let port: u16 = pair.port.parse().ok()?;
                 let mut udp = match self.udp_mode {
-                    UdpModeDraft::Unicast => UdpConfig::unicast(self.udp_dest.parse().ok()?),
-                    UdpModeDraft::Broadcast => {
-                        let addr: Ipv4Addr = self.udp_broadcast_addr.parse().ok()?;
-                        let port: u16 = self.udp_broadcast_port.parse().ok()?;
-                        UdpConfig::broadcast(SocketAddr::from((addr, port)))
-                    }
-                    UdpModeDraft::Multicast => {
-                        let group: Ipv4Addr = self.udp_group.parse().ok()?;
-                        let port: u16 = self.udp_mc_port.parse().ok()?;
-                        UdpConfig::multicast(group, port)
-                    }
+                    UdpModeDraft::Unicast => UdpConfig::unicast(SocketAddr::from((addr, port))),
+                    UdpModeDraft::Broadcast => UdpConfig::broadcast(SocketAddr::from((addr, port))),
+                    UdpModeDraft::Multicast => UdpConfig::multicast(addr, port),
                 };
                 udp.local_port = local_port;
                 Some(InterfaceConfig::Udp(udp))
@@ -283,6 +299,11 @@ pub struct ScheduleDraft {
     pub checksum_wrong: bool,
     /// Scratch buffer for the Insert Byte popup; not part of the message.
     pub insert_byte_hex: String,
+    /// True while the user has clicked the message-remove (✕) button but
+    /// hasn't yet confirmed. The header row swaps to "Remove? [✓] [✕]"
+    /// while this is set. Cleared on Confirm, Cancel, or anything that
+    /// makes the message disappear. Not serialised.
+    pub pending_remove: bool,
 }
 
 impl Default for ScheduleDraft {
@@ -312,6 +333,7 @@ impl Default for ScheduleDraft {
             checksum_algorithm: ChecksumAlgorithm::default(),
             checksum_wrong: false,
             insert_byte_hex: String::new(),
+            pending_remove: false,
         }
     }
 }
