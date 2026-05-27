@@ -1,4 +1,5 @@
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::OnceLock;
 
 use crate::core::{
     channel::{
@@ -50,6 +51,46 @@ pub struct PortHold {
 pub struct AddrPortPair {
     pub addr: String,
     pub port: String,
+    /// `true` once the user has explicitly committed this pair —
+    /// either by pressing Enter on a field, starting the channel
+    /// with this mode active, or loading from a saved profile.
+    /// Switches the field-level red-box validation from *lenient*
+    /// (no red on empty or partial typing) to *strict* (red on
+    /// empty too, plus any malformed value). Not serialized.
+    pub submitted: bool,
+}
+
+/// Detect the local machine's primary IPv4 and return its first three
+/// octets followed by a dot — `"192.168.1."` etc. — so a fresh unicast
+/// destination only needs the user to type the last octet.
+///
+/// Uses the classic "bind UDP, connect to a route-able address, read
+/// local_addr" trick. No packet is actually sent; the OS just selects
+/// the outbound interface. Cached behind a [`OnceLock`] so the routing
+/// lookup only happens once per process.
+///
+/// Returns `None` on machines without a routable IPv4 (loopback-only
+/// boxes, fully offline containers) so the field falls back to empty.
+pub fn lan_addr_prefix() -> Option<String> {
+    static CACHED: OnceLock<Option<String>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+            // 8.8.8.8 is a stable public address — `connect` on UDP is
+            // a pure routing lookup, no packet leaves the box.
+            socket.connect("8.8.8.8:80").ok()?;
+            let std::net::IpAddr::V4(v4) = socket.local_addr().ok()?.ip() else {
+                return None;
+            };
+            // Skip loopback / unspecified — they're not what the user
+            // wants pre-filled even if `connect` somehow yields them.
+            if v4.is_loopback() || v4.is_unspecified() {
+                return None;
+            }
+            let o = v4.octets();
+            Some(format!("{}.{}.{}.", o[0], o[1], o[2]))
+        })
+        .clone()
 }
 
 pub struct ConnDraft {
@@ -75,6 +116,12 @@ pub struct ConnDraft {
     pub local_port: String, // optional local bind port
     // tcp
     pub tcp_addr: String,
+    /// True while the user has clicked the channel-remove (✕) button
+    /// on a dirty profile but hasn't yet confirmed. The action area
+    /// swaps to "Discard? [Cancel] [Remove]" while this is set.
+    /// Cleared on Confirm, Cancel, or anything that makes the
+    /// channel disappear. Not serialised.
+    pub pending_remove: bool,
 }
 
 impl Default for ConnDraft {
@@ -89,15 +136,22 @@ impl Default for ConnDraft {
             stop_bits: 1,
             flow_control: 0,
             udp_mode: UdpModeDraft::Unicast,
-            udp_unicast: AddrPortPair::default(),
+            udp_unicast: AddrPortPair {
+                // Prefill the first three octets of the LAN address so
+                // the user only types the last byte. Empty when no LAN
+                // (offline / loopback-only).
+                addr: lan_addr_prefix().unwrap_or_default(),
+                ..Default::default()
+            },
             udp_broadcast: AddrPortPair {
                 addr: Ipv4Addr::BROADCAST.to_string(),
-                port: String::new(),
+                ..Default::default()
             },
             udp_multicast: AddrPortPair::default(),
             udp_port_hold: None,
             local_port: String::new(),
             tcp_addr: String::new(),
+            pending_remove: false,
         }
     }
 }
@@ -145,12 +199,18 @@ impl From<&InterfaceConfig> for ConnDraft {
                     local_port: u.local_port.map(|p| p.to_string()).unwrap_or_default(),
                     ..Default::default()
                 };
+                // A loaded profile's config is treated as already
+                // committed (`submitted = true`) — the user saved it
+                // explicitly, so any empty / malformed fields surface
+                // as red right away rather than waiting for a fresh
+                // Enter press to switch the field into strict mode.
                 match &u.mode {
                     UdpMode::Unicast { destination } => {
                         draft.udp_mode = UdpModeDraft::Unicast;
                         draft.udp_unicast = AddrPortPair {
                             addr: destination.ip().to_string(),
                             port: destination.port().to_string(),
+                            submitted: true,
                         };
                     }
                     UdpMode::Broadcast { destination } => {
@@ -158,6 +218,7 @@ impl From<&InterfaceConfig> for ConnDraft {
                         draft.udp_broadcast = AddrPortPair {
                             addr: destination.ip().to_string(),
                             port: destination.port().to_string(),
+                            submitted: true,
                         };
                     }
                     UdpMode::Multicast { group, port, .. } => {
@@ -165,6 +226,7 @@ impl From<&InterfaceConfig> for ConnDraft {
                         draft.udp_multicast = AddrPortPair {
                             addr: group.to_string(),
                             port: port.to_string(),
+                            submitted: true,
                         };
                     }
                 }
@@ -317,7 +379,7 @@ impl Default for ScheduleDraft {
             utf16_bom: false,
             ascii_text: String::new(),
             ascii_code_page: CodePage::default(),
-            nmea_talker: "GP".to_string(),
+            nmea_talker: String::new(),
             nmea_sentence_type: String::new(),
             nmea_fields: String::new(),
             nmea_checksum_mode: NmeaChecksumMode::Correct,
@@ -326,9 +388,12 @@ impl Default for ScheduleDraft {
             nmea_sentence_filter: String::new(),
             interval_ms: "1000".to_string(),
             timestamp_enabled: false,
-            ts_date: true,
+            // Minimal HH:MM:SS by default — Date / Milliseconds / Z (UTC)
+            // are opt-in. New users overwhelmingly want a short timestamp;
+            // power users can flip the extras on per-message.
+            ts_date: false,
             ts_millis: false,
-            ts_timezone: true,
+            ts_timezone: false,
             checksum_enabled: false,
             checksum_algorithm: ChecksumAlgorithm::default(),
             checksum_wrong: false,
@@ -606,8 +671,11 @@ mod tests {
     fn switching_format_does_not_lose_other_buffers() {
         // A hex message loaded as a draft keeps usable defaults in the other
         // format buffers, so toggling the selector never panics or blanks out.
+        // Talker / sentence_type start empty so the NMEA dropdowns open on
+        // the explicit "(empty)" row instead of a presumed default.
         let draft = ScheduleDraft::from(&MessageConfig::new(PayloadConfig::raw_hex("FF"), 100));
         assert_eq!(draft.payload_kind, PayloadKind::Hex);
-        assert_eq!(draft.nmea_talker, "GP");
+        assert_eq!(draft.nmea_talker, "");
+        assert_eq!(draft.nmea_sentence_type, "");
     }
 }

@@ -20,7 +20,11 @@ pub struct Profile {
     /// [`CURRENT_VERSION`] is rejected at load time.
     #[serde(default = "current_version")]
     pub version: u32,
-    #[serde(default)]
+    /// In-memory display name. **Not serialized** — the file root is
+    /// the authoritative name, so the GUI overlays this from
+    /// `path.file_stem()` on load and save. Old TOMLs that still
+    /// contain `name = "..."` parse cleanly; the field is ignored.
+    #[serde(skip)]
     pub name: String,
     /// The channels defined by this profile. Each channel has one interface
     /// and its own list of messages.
@@ -46,6 +50,10 @@ impl Default for Profile {
 }
 
 impl Profile {
+    /// Construct a new profile with the given in-memory display name.
+    /// The name is **not** persisted to TOML — see [`Profile::name`].
+    /// Useful mostly for tests and quick in-memory construction; the
+    /// GUI overrides the name from the file root on load and save.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -157,7 +165,9 @@ mod tests {
         let original = Profile::new("empty");
         original.save(&path).unwrap();
         let loaded = Profile::load(&path).unwrap();
-        assert_eq!(loaded.name, "empty");
+        // `name` isn't serialized — GUI overlays it from the file stem.
+        // At the library level, a fresh load always returns name = "".
+        assert_eq!(loaded.name, "");
         assert_eq!(loaded.version, CURRENT_VERSION);
         assert!(loaded.channels.is_empty());
         let _ = std::fs::remove_file(&path);
@@ -183,10 +193,22 @@ mod tests {
         profile.save(&path).unwrap();
         let loaded = Profile::load(&path).unwrap();
 
-        assert_eq!(loaded.name, "full");
+        // `name` deliberately isn't round-tripped (see comment above).
         assert_eq!(loaded.channels.len(), 2);
         assert_eq!(loaded.channels[0].messages.len(), 1);
         assert_eq!(loaded.channels[1].messages.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn name_is_not_written_to_toml() {
+        let path = temp_path("named");
+        Profile::new("should-not-appear").save(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("name"),
+            "saved TOML still contains a `name` field: {content}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -225,10 +247,11 @@ mod tests {
     #[test]
     fn load_missing_version_defaults_to_current() {
         let path = temp_path("noversion");
+        // Old-style file with a `name` key — silently ignored by the
+        // skipped `Profile::name`, so this still parses cleanly.
         std::fs::write(&path, "name = \"no-version\"\n").unwrap();
         let loaded = Profile::load(&path).unwrap();
         assert_eq!(loaded.version, CURRENT_VERSION);
-        assert_eq!(loaded.name, "no-version");
         let _ = std::fs::remove_file(&path);
     }
 

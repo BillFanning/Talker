@@ -54,6 +54,37 @@ pub(super) fn encode(text: &str, code_page: CodePage) -> anyhow::Result<Vec<u8>>
     )
 }
 
+/// Decode one byte through `code_page`. Inverse of [`encode_char`].
+/// Every byte 0x00..=0xFF maps to exactly one `char`; the five
+/// undefined bytes in Windows-1252 (0x81, 0x8D, 0x8F, 0x90, 0x9D)
+/// decode to `U+FFFD`. Public so the GUI message preview can mix
+/// decoded characters with its own per-byte chrome (e.g. `‹XX›`
+/// markers for control bytes).
+pub fn decode_byte(b: u8, code_page: CodePage) -> char {
+    if b < 0x80 {
+        return b as char;
+    }
+    let idx = (b - 0x80) as usize;
+    match code_page {
+        CodePage::Iso8859_1 => b as char,
+        CodePage::Windows1252 => decode_windows1252(b),
+        CodePage::Cp437 => CP437_HIGH[idx],
+        CodePage::MacRoman => MAC_ROMAN_HIGH[idx],
+    }
+}
+
+fn decode_windows1252(b: u8) -> char {
+    // 0xA0..=0xFF are identical to ISO-8859-1; only 0x80..=0x9F
+    // need the lookup table.
+    if (0xA0..=0xFF).contains(&b) {
+        return b as char;
+    }
+    CP1252_SPECIAL
+        .iter()
+        .find(|&&(byte, _)| byte == b)
+        .map_or('\u{FFFD}', |&(_, c)| c)
+}
+
 fn encode_char(c: char, code_page: CodePage) -> Option<u8> {
     let cp = c as u32;
     if cp < 0x80 {
@@ -228,5 +259,66 @@ mod tests {
                 assert_eq!(find_in_high(table, c), Some(byte));
             }
         }
+    }
+
+    // ── decode_byte ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_ascii_range_is_identity() {
+        // 0x00..=0x7F decodes the same in every code page.
+        for cp in [
+            CodePage::Iso8859_1,
+            CodePage::Windows1252,
+            CodePage::Cp437,
+            CodePage::MacRoman,
+        ] {
+            for b in 0u8..=0x7F {
+                assert_eq!(decode_byte(b, cp), b as char, "{cp:?} byte {b:02X}");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_iso8859_1_high_is_identity() {
+        // Latin-1 maps 0x80..=0xFF to the same codepoint as the byte
+        // (0x80..=0x9F are C1 controls, 0xA0..=0xFF the printable
+        // Latin-1 range).
+        for b in 0x80u8..=0xFF {
+            assert_eq!(decode_byte(b, CodePage::Iso8859_1), b as char);
+        }
+    }
+
+    #[test]
+    fn decode_cp437_high_bytes_round_trip_through_encode() {
+        // Each byte 0x80..=0xFF decodes to some char, which must
+        // encode back to the original byte — proves the tables are
+        // mutual inverses (no transcription mismatch between encode
+        // and decode).
+        for b in 0x80u8..=0xFF {
+            let mut s = String::new();
+            s.push(decode_byte(b, CodePage::Cp437));
+            assert_eq!(encode(&s, CodePage::Cp437).unwrap(), vec![b]);
+        }
+    }
+
+    #[test]
+    fn decode_windows1252_special_and_undefined() {
+        // Defined special chars in 0x80..=0x9F.
+        assert_eq!(decode_byte(0x80, CodePage::Windows1252), '€');
+        assert_eq!(decode_byte(0x99, CodePage::Windows1252), '™');
+        assert_eq!(decode_byte(0x9F, CodePage::Windows1252), 'Ÿ');
+        // Undefined bytes fall back to the replacement character.
+        for b in [0x81, 0x8D, 0x8F, 0x90, 0x9D] {
+            assert_eq!(decode_byte(b, CodePage::Windows1252), '\u{FFFD}');
+        }
+        // 0xA0..=0xFF identical to Latin-1.
+        assert_eq!(decode_byte(0xE9, CodePage::Windows1252), 'é');
+    }
+
+    #[test]
+    fn decode_mac_roman_known_mappings() {
+        assert_eq!(decode_byte(0x80, CodePage::MacRoman), 'Ä');
+        assert_eq!(decode_byte(0xA0, CodePage::MacRoman), '†');
+        assert_eq!(decode_byte(0xDB, CodePage::MacRoman), '€');
     }
 }

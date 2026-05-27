@@ -10,7 +10,7 @@ mod marker;
 mod timestamp;
 
 pub use checksum::{ChecksumAlgorithm, ChecksumConfig};
-pub use codepage::CodePage;
+pub use codepage::{decode_byte as decode_codepage_byte, CodePage};
 pub use marker::{repair_after_edit, segments, Segment};
 pub use timestamp::TimestampConfig;
 
@@ -270,17 +270,31 @@ fn compile_ascii(text: &str, code_page: CodePage) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Encode UTF-16 text, expanding `‹XX›` markers to raw single bytes
+/// (spec §5.3 — same marker syntax as UTF-8 / ASCII).
+///
+/// A marker emits exactly one byte, which means a UTF-16 message
+/// with an odd number of marker bytes will end up byte-mis-aligned
+/// on the wire. That's the user's call — markers are exposed here
+/// for the same fuzzing / boundary-test use cases they cover in the
+/// other text formats.
 fn encode_utf16(text: &str, byte_order: ByteOrder, bom: bool) -> Vec<u8> {
-    let mut units: Vec<u16> = Vec::new();
+    let push_unit = |out: &mut Vec<u8>, u: u16| match byte_order {
+        ByteOrder::BigEndian => out.extend_from_slice(&u.to_be_bytes()),
+        ByteOrder::LittleEndian => out.extend_from_slice(&u.to_le_bytes()),
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(text.len() * 2 + 2);
     if bom {
-        units.push(0xFEFF);
+        push_unit(&mut out, 0xFEFF);
     }
-    units.extend(text.encode_utf16());
-    let mut out = Vec::with_capacity(units.len() * 2);
-    for u in units {
-        match byte_order {
-            ByteOrder::BigEndian => out.extend_from_slice(&u.to_be_bytes()),
-            ByteOrder::LittleEndian => out.extend_from_slice(&u.to_le_bytes()),
+    for (range, segment) in segments(text) {
+        match segment {
+            Segment::Text => {
+                for u in text[range].encode_utf16() {
+                    push_unit(&mut out, u);
+                }
+            }
+            Segment::Byte(b) => out.push(b),
         }
     }
     out
@@ -362,6 +376,31 @@ mod tests {
         };
         // BOM U+FEFF then 'A' U+0041, little-endian
         assert_eq!(p.compile().unwrap(), vec![0xFF, 0xFE, 0x41, 0x00]);
+    }
+
+    #[test]
+    fn compile_utf16_expands_byte_markers() {
+        // Markers emit raw single bytes, side-by-side with normal
+        // UTF-16 code units. Note this can produce an odd byte
+        // count — that's the user's call.
+        let p = PayloadConfig::Utf16 {
+            text: "A\u{2039}FF\u{203A}B".to_string(),
+            byte_order: ByteOrder::BigEndian,
+            bom: false,
+        };
+        // 'A' → 00 41, marker ‹FF› → FF, 'B' → 00 42  →  5 bytes total
+        assert_eq!(p.compile().unwrap(), vec![0x00, 0x41, 0xFF, 0x00, 0x42]);
+    }
+
+    #[test]
+    fn compile_utf16_marker_with_bom_little_endian() {
+        let p = PayloadConfig::Utf16 {
+            text: "\u{2039}01\u{203A}\u{2039}02\u{203A}".to_string(),
+            byte_order: ByteOrder::LittleEndian,
+            bom: true,
+        };
+        // BOM (LE) FF FE, then two raw marker bytes 01 02
+        assert_eq!(p.compile().unwrap(), vec![0xFF, 0xFE, 0x01, 0x02]);
     }
 
     #[test]

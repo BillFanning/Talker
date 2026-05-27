@@ -11,9 +11,10 @@ use egui::{Align, Layout, ScrollArea};
 
 use crate::core::{
     channel::ChannelConfig,
-    logging::{LogEvent, LoggingConfig},
+    logging::{LogEvent, LogLevel, LogLevelHandle, LoggingConfig},
     message::{
-        repair_after_edit, segments, ChecksumAlgorithm, CodePage, NmeaChecksumMode, Segment,
+        decode_codepage_byte, repair_after_edit, segments, ChecksumAlgorithm, CodePage,
+        NmeaChecksumMode, Segment,
     },
     profile::Profile,
     scheduler::Schedule,
@@ -27,8 +28,12 @@ use thread::{run_talker, TalkerCommand, TalkerHandle, TalkerStatus};
 
 pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
     let (log_tx, log_rx) = crossbeam_channel::bounded::<LogEvent>(512);
-    let _logging = crate::core::logging::init(&LoggingConfig::default(), Some(log_tx))
+    // `logging` stays in scope until `run_native` returns so the
+    // file-appender worker guards aren't dropped early. The reload
+    // handle is cloned out for the GUI's log-level ComboBox.
+    let logging = crate::core::logging::init(&LoggingConfig::default(), Some(log_tx))
         .context("initializing logging")?;
+    let level_handle = logging.level_handle();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 740.0]),
@@ -43,6 +48,7 @@ pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
                 initial_profile,
                 &cc.egui_ctx,
                 cc.storage,
+                level_handle,
             )))
         }),
     )
@@ -61,6 +67,8 @@ struct TalkerApp {
     talkers: Vec<Option<TalkerHandle>>,
     log_rx: crossbeam_channel::Receiver<LogEvent>,
     log_lines: Vec<(String, egui::Color32)>,
+    log_level: LogLevel,
+    log_level_handle: LogLevelHandle,
     sent_counts: Vec<u64>,
     /// Per-message send counts. Outer index: channel. Inner index: message
     /// within the channel's compiled schedule. Grows on demand when a
@@ -96,6 +104,7 @@ impl TalkerApp {
         initial_profile: Option<PathBuf>,
         ctx: &egui::Context,
         storage: Option<&dyn eframe::Storage>,
+        log_level_handle: LogLevelHandle,
     ) -> Self {
         let ppp = storage
             .and_then(|s| s.get_string("pixels_per_point"))
@@ -116,6 +125,8 @@ impl TalkerApp {
             talkers: Vec::new(),
             log_rx,
             log_lines: Vec::new(),
+            log_level: LogLevel::default(),
+            log_level_handle,
             sent_counts: Vec::new(),
             message_sent_counts: Vec::new(),
             displays: Vec::new(),
@@ -204,17 +215,10 @@ impl TalkerApp {
     }
 
     fn window_title(&self) -> String {
-        let name = if self.profile.name.is_empty() {
-            "unnamed"
-        } else {
-            &self.profile.name
-        };
-        let star = if self.dirty { " *" } else { "" };
-        if self.profile_path.is_none() && !self.dirty {
-            "Talker".to_string()
-        } else {
-            format!("Talker \u{2014} {name}{star}")
-        }
+        // Profile name + dirty marker live next to the `Profile:`
+        // text field in the top row — see `show_top_bar`. The title
+        // bar is just the app identity.
+        format!("Talker v{}", env!("CARGO_PKG_VERSION"))
     }
 
     // ── Profile actions ───────────────────────────────────────────────────────
@@ -222,7 +226,14 @@ impl TalkerApp {
     fn load_profile_from_path(&mut self, path: &Path) {
         self.stop_all();
         match Profile::load(path) {
-            Ok(p) => {
+            Ok(mut p) => {
+                // The file root is the profile's name (`name` isn't
+                // serialized — see `Profile::name`). Always overlay
+                // from the path so renaming the file on disk is the
+                // way to rename the profile.
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    p.name = stem.to_string();
+                }
                 let n = p.channels.len();
                 self.conn_drafts = p
                     .channels
@@ -297,28 +308,55 @@ impl TalkerApp {
         self.flush_drafts_to_profile();
         let path = match &self.profile_path {
             Some(p) => p.clone(),
-            None => {
-                let stem = if self.profile.name.is_empty() {
-                    "profile"
-                } else {
-                    &self.profile.name
-                };
-                let name = format!("{stem}.toml");
-                let Some(p) = rfd::FileDialog::new()
-                    .add_filter("TOML Profile", &["toml"])
-                    .set_file_name(&name)
-                    .save_file()
-                else {
-                    return;
-                };
-                p
-            }
+            None => match self.pick_save_path() {
+                Some(p) => p,
+                None => return,
+            },
         };
-        match self.profile.save(&path) {
+        self.write_profile_to(&path);
+    }
+
+    /// Always opens the native save dialog, so the user can fork the
+    /// current profile to a new file. On success the new path becomes
+    /// the bound `profile_path`, so subsequent plain Save writes there.
+    fn save_profile_as(&mut self) {
+        self.flush_drafts_to_profile();
+        let Some(path) = self.pick_save_path() else {
+            return;
+        };
+        self.write_profile_to(&path);
+    }
+
+    fn pick_save_path(&self) -> Option<PathBuf> {
+        let stem = if self.profile.name.is_empty() {
+            "profile"
+        } else {
+            &self.profile.name
+        };
+        let name = format!("{stem}.toml");
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("TOML Profile", &["toml"])
+            .set_file_name(&name);
+        // Seed the dialog at the current profile's directory so
+        // Save As lands next to the original by default.
+        if let Some(parent) = self.profile_path.as_deref().and_then(Path::parent) {
+            dialog = dialog.set_directory(parent);
+        }
+        dialog.save_file()
+    }
+
+    fn write_profile_to(&mut self, path: &Path) {
+        match self.profile.save(path) {
             Ok(()) => {
-                self.profile_path = Some(path);
+                self.profile_path = Some(path.to_path_buf());
+                // Keep the in-memory display name in sync with the
+                // file root — see [`Profile::name`]. Especially
+                // matters after Save As to a new path.
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    self.profile.name = stem.to_string();
+                }
                 self.dirty = false;
-                tracing::info!("profile saved");
+                tracing::info!("profile '{}' saved", self.profile.name);
             }
             Err(e) => tracing::error!("save failed: {e:#}"),
         }
@@ -329,6 +367,20 @@ impl TalkerApp {
     fn start_connection(&mut self, i: usize) {
         self.stop_connection(i);
         self.flush_drafts_to_profile();
+
+        // Starting (or attempting to start) is an explicit commit —
+        // flip the active UDP destination into strict validation so
+        // missing / malformed fields surface as red immediately.
+        if let Some(draft) = self.conn_drafts.get_mut(i) {
+            if matches!(draft.kind, ConnKind::Udp) {
+                let pair = match draft.udp_mode {
+                    UdpModeDraft::Unicast => &mut draft.udp_unicast,
+                    UdpModeDraft::Broadcast => &mut draft.udp_broadcast,
+                    UdpModeDraft::Multicast => &mut draft.udp_multicast,
+                };
+                pair.submitted = true;
+            }
+        }
 
         // 1-based for log strings — matches the UI label "Channel N".
         let n = i + 1;
@@ -457,12 +509,14 @@ impl TalkerApp {
 
     fn poll_channels(&mut self, ctx: &egui::Context) {
         // Keyboard shortcuts
-        let (new, load, save) = ctx.input(|inp| {
+        let (new, load, save, save_as) = ctx.input(|inp| {
             let ctrl = inp.modifiers.ctrl || inp.modifiers.mac_cmd;
+            let shift = inp.modifiers.shift;
             (
-                ctrl && inp.key_pressed(egui::Key::N),
-                ctrl && inp.key_pressed(egui::Key::O),
-                ctrl && inp.key_pressed(egui::Key::S),
+                ctrl && !shift && inp.key_pressed(egui::Key::N),
+                ctrl && !shift && inp.key_pressed(egui::Key::O),
+                ctrl && !shift && inp.key_pressed(egui::Key::S),
+                ctrl && shift && inp.key_pressed(egui::Key::S),
             )
         });
         if new {
@@ -473,6 +527,9 @@ impl TalkerApp {
         }
         if save {
             self.save_profile();
+        }
+        if save_as {
+            self.save_profile_as();
         }
 
         for event in self.log_rx.try_iter() {
@@ -593,14 +650,35 @@ impl TalkerApp {
                 if r.changed() {
                     self.dirty = true;
                 }
+                // Dirty marker: a small amber `*` painted at the
+                // upper-left corner of the field. Uses the painter
+                // (not a label) so it doesn't push surrounding
+                // widgets around when it appears/disappears.
+                if self.dirty {
+                    let pos = r.rect.left_top() + egui::vec2(3.0, 1.0);
+                    ui.painter().text(
+                        pos,
+                        egui::Align2::LEFT_TOP,
+                        "*",
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::from_rgb(220, 180, 60),
+                    );
+                }
                 if ui.button("New").clicked() {
                     self.new_profile();
                 }
                 if ui.button("Load\u{2026}").clicked() {
                     self.load_profile_dialog();
                 }
-                if ui.button("Save").clicked() {
+                if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
                     self.save_profile();
+                }
+                if ui
+                    .button("Save As\u{2026}")
+                    .on_hover_text("Ctrl+Shift+S — write to a new file")
+                    .clicked()
+                {
+                    self.save_profile_as();
                 }
 
                 ui.separator();
@@ -714,6 +792,30 @@ impl TalkerApp {
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("Log");
+                    ui.separator();
+                    ui.label("Level:");
+                    let before = self.log_level;
+                    egui::ComboBox::from_id_salt("log_level")
+                        .selected_text(self.log_level.as_str())
+                        .show_ui(ui, |ui| {
+                            for lvl in [
+                                LogLevel::Trace,
+                                LogLevel::Debug,
+                                LogLevel::Info,
+                                LogLevel::Warn,
+                                LogLevel::Error,
+                            ] {
+                                ui.selectable_value(&mut self.log_level, lvl, lvl.as_str());
+                            }
+                        });
+                    if self.log_level != before {
+                        // Don't log on success — the new filter may hide
+                        // an info-level confirmation, and the ComboBox
+                        // itself shows the active level.
+                        if let Err(e) = self.log_level_handle.set(self.log_level) {
+                            tracing::error!("log level change failed: {e:#}");
+                        }
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("Clear").clicked() {
                             self.log_lines.clear();
@@ -816,12 +918,45 @@ impl TalkerApp {
         iface_drift: bool,
         msg_drift: bool,
     ) {
-        if ui
+        // Confirm step (only relevant when the profile is dirty —
+        // removing a clean profile's channel is reversible by Load).
+        // Mirrors the per-message ✕ confirm UI: Cancel restores the
+        // ✕, red "Remove" commits.
+        if self.conn_drafts[i].pending_remove {
+            if ui
+                .small_button("Cancel")
+                .on_hover_text("Keep this channel")
+                .clicked()
+            {
+                self.conn_drafts[i].pending_remove = false;
+            }
+            let confirm = egui::Button::new(
+                egui::RichText::new("Remove")
+                    .color(egui::Color32::WHITE)
+                    .strong(),
+            )
+            .fill(egui::Color32::from_rgb(180, 60, 60));
+            if ui
+                .add(confirm)
+                .on_hover_text("Remove this channel; unsaved profile changes will be lost")
+                .clicked()
+            {
+                self.deferred.remove = Some(i);
+            }
+            ui.label(
+                egui::RichText::new("Discard channel?")
+                    .color(egui::Color32::from_rgb(220, 180, 80)),
+            );
+        } else if ui
             .button(egui::RichText::new("\u{00D7}").size(18.0).strong())
             .on_hover_text("Remove this channel")
             .clicked()
         {
-            self.deferred.remove = Some(i);
+            if self.dirty {
+                self.conn_drafts[i].pending_remove = true;
+            } else {
+                self.deferred.remove = Some(i);
+            }
         }
         if running {
             if ui.small_button("\u{25a0}").on_hover_text("Stop").clicked() {
@@ -1227,12 +1362,26 @@ fn show_utf8_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
 
 fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     ui.label("Text");
-    ui.add(
-        egui::TextEdit::singleline(&mut entry.utf16_text)
-            .id_salt("payload_utf16")
-            .desired_width(360.0)
-            .hint_text("Unicode text"),
-    );
+    ui.horizontal(|ui| {
+        marker_aware_text_edit(
+            ui,
+            &mut entry.utf16_text,
+            "payload_utf16",
+            300.0,
+            "Unicode text",
+        );
+        // UTF-16's natural insertion granularity is a 16-bit code
+        // unit, not a byte — the popup takes 4 hex digits per unit
+        // and applies the field's byte order so what you type is
+        // what the receiver decodes.
+        show_insert_unit_button(
+            ui,
+            &mut entry.utf16_text,
+            &mut entry.insert_byte_hex,
+            "payload_utf16",
+            entry.utf16_big_endian,
+        );
+    });
     ui.end_row();
     ui.label("Byte order");
     ui.horizontal(|ui| {
@@ -1459,6 +1608,19 @@ fn show_filtered_picker(
         .max_height(300.0)
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            // Empty-selection row, always at the top — lets the user
+            // clear a previously-picked value without retyping or
+            // closing the popup. Skipped when the filter is active so
+            // it doesn't visually compete with real matches.
+            if needle.is_empty()
+                && ui
+                    .button(egui::RichText::new("(empty — clear selection)").italics())
+                    .clicked()
+            {
+                selected.clear();
+                filter.clear();
+                ui.close();
+            }
             for (code, desc) in options {
                 let matches = needle.is_empty()
                     || code.to_ascii_lowercase().contains(&needle)
@@ -1607,12 +1769,34 @@ fn port_repeat_interval(elapsed: std::time::Duration) -> std::time::Duration {
 /// real line break), so the preview always renders on a single line and
 /// no separate trim step is needed.
 fn preview_text(bytes: &[u8]) -> String {
+    // Printable ASCII passes through; anything else (control bytes
+    // and high bytes alike) is opaque to this preview, so render it
+    // as the familiar `‹XX›` byte marker.
+    preview_with(bytes, |b| (0x20..=0x7E).contains(&b).then_some(b as char))
+}
+
+/// Preview text for an `Ascii` payload, decoding high bytes through
+/// `code_page` so the user sees what a code-page-aware receiver would
+/// render. Control bytes (0x00–0x1F and 0x7F) still show as `‹XX›`
+/// byte markers so they're never invisible.
+fn preview_ascii(bytes: &[u8], code_page: CodePage) -> String {
+    preview_with(bytes, |b| match b {
+        0x00..=0x1F | 0x7F => None,
+        _ => Some(decode_codepage_byte(b, code_page)),
+    })
+}
+
+/// Shared body of [`preview_text`] / [`preview_ascii`]: walk `bytes`
+/// and produce one output character per input byte — either the
+/// caller-supplied glyph or, when the caller returns `None`, the
+/// `‹XX›` byte marker. Keeping the marker format and the loop in one
+/// place means new preview variants only need a closure.
+fn preview_with<F: Fn(u8) -> Option<char>>(bytes: &[u8], decode: F) -> String {
     let mut out = String::with_capacity(bytes.len());
     for &b in bytes {
-        if (0x20..=0x7E).contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("\u{2039}{b:02X}\u{203A}"));
+        match decode(b) {
+            Some(c) => out.push(c),
+            None => out.push_str(&format!("\u{2039}{b:02X}\u{203A}")),
         }
     }
     out
@@ -1722,14 +1906,22 @@ fn show_interface_summary(ui: &mut egui::Ui, conn: &ConnDraft) {
                 ui.weak(std::mem::take(buf));
             }
         };
+        // Render the ? as inline text with a red background — RichText
+        // sits on the same text baseline as the surrounding weak-grey
+        // labels, so the badge looks the same size and alignment in
+        // every channel (a Frame-wrapped version offsets vertically
+        // and reads as a different chrome than the rest of the line).
+        // Padded with thin spaces so the background extends past the
+        // glyph instead of clinging to it.
+        let red_bg = egui::Color32::from_rgb(200, 50, 50);
         for c in text.chars() {
             if c == '?' {
                 flush(ui, &mut buf);
                 ui.label(
-                    egui::RichText::new("?")
-                        .color(egui::Color32::from_rgb(220, 80, 80))
+                    egui::RichText::new("\u{2009}?\u{2009}")
+                        .color(egui::Color32::WHITE)
                         .strong()
-                        .size(16.0),
+                        .background_color(red_bg),
                 );
             } else {
                 buf.push(c);
@@ -1744,13 +1936,23 @@ fn show_interface_summary(ui: &mut egui::Ui, conn: &ConnDraft) {
 /// is visible at a glance without expanding the editor. Uses the draft's
 /// current strings — invalid or missing parts show as `?`.
 fn interface_summary(conn: &ConnDraft) -> String {
-    fn or_q(s: &str) -> &str {
-        if s.is_empty() {
+    /// Show `s` if it's non-empty AND `valid(s)` is true; otherwise
+    /// the `?` placeholder — which [`show_interface_summary`] paints
+    /// as a red pill. Drives the at-a-glance "this channel can't
+    /// start yet" cue for both missing AND malformed values.
+    fn or_q(s: &str, valid: impl Fn(&str) -> bool) -> &str {
+        if s.is_empty() || !valid(s) {
             "?"
         } else {
             s
         }
     }
+    // Validators line up with `channel_blockers` so the summary's `?`s
+    // match the disabled-Start tooltip exactly.
+    let ok_ipv4 = |s: &str| s.parse::<Ipv4Addr>().is_ok();
+    let ok_port = |s: &str| s.parse::<u16>().is_ok();
+    let ok_sock = |s: &str| s.parse::<SocketAddr>().is_ok();
+    let ok_any = |_: &str| true;
     let lp = if conn.local_port.is_empty() {
         String::new()
     } else {
@@ -1772,7 +1974,7 @@ fn interface_summary(conn: &ConnDraft) -> String {
             };
             format!(
                 "Serial: {} {},{},{},{} flow:{}",
-                or_q(&conn.serial_port),
+                or_q(&conn.serial_port, ok_any),
                 conn.baud_rate,
                 data,
                 parity,
@@ -1786,9 +1988,13 @@ fn interface_summary(conn: &ConnDraft) -> String {
                 UdpModeDraft::Broadcast => ("broadcast", &conn.udp_broadcast),
                 UdpModeDraft::Multicast => ("multicast", &conn.udp_multicast),
             };
-            format!("UDP {label} {}:{}{lp}", or_q(&pair.addr), or_q(&pair.port),)
+            format!(
+                "UDP {label} {}:{}{lp}",
+                or_q(&pair.addr, ok_ipv4),
+                or_q(&pair.port, ok_port),
+            )
         }
-        ConnKind::Tcp => format!("TCP {}", or_q(&conn.tcp_addr)),
+        ConnKind::Tcp => format!("TCP {}", or_q(&conn.tcp_addr, ok_sock)),
     }
 }
 
@@ -1904,9 +2110,13 @@ fn show_message_preview(ui: &mut egui::Ui, entry: &ScheduleDraft) {
             Some(compiled) => {
                 let bytes = compiled.render_at(reference);
                 match entry.payload_kind {
-                    PayloadKind::Utf8 | PayloadKind::Ascii | PayloadKind::Nmea => {
-                        preview_text(&bytes)
-                    }
+                    // ASCII previews through the message's code page,
+                    // so the user sees what a receiver decoding via
+                    // the same code page would render: byte `0xE9` is
+                    // `é` in ISO-8859-1, `Θ` in CP437, `È` in Mac
+                    // Roman, etc.
+                    PayloadKind::Ascii => preview_ascii(&bytes, entry.ascii_code_page),
+                    PayloadKind::Utf8 | PayloadKind::Nmea => preview_text(&bytes),
                     PayloadKind::Hex | PayloadKind::Utf16 => bytes
                         .iter()
                         .map(|b| format!("{b:02X}"))
@@ -2290,25 +2500,144 @@ fn parse_hex_bytes(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// "Insert Byte" button whose popup inserts one or more `‹XX›` markers
-/// at the target field's cursor position (or appends, if the field has
-/// never been focused). `target_salt` must match the salt passed to
-/// [`marker_aware_text_edit`] for the field this button drives — that
-/// lets the popup read the saved cursor / widget id out of egui memory.
+/// Parse the UTF-16 Insert popup's input — one or more 4-hex-digit
+/// code units, optionally space/comma separated (`0E16`,
+/// `0E16 1F62`, `0E16, 1F62`). Each piece must be exactly 4 hex
+/// digits; the active byte order is applied by the caller, not here.
+fn parse_hex_units(input: &str) -> Result<Vec<u16>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "Type 4 hex digits — single code unit (0E16) or several separated \
+             by spaces / commas (0E16 1F62)"
+                .to_string(),
+        );
+    }
+    let pieces: Vec<&str> = trimmed
+        .split([' ', ',', '\t'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if pieces.is_empty() {
+        return Err("No hex digits found between separators".to_string());
+    }
+    let mut out = Vec::with_capacity(pieces.len());
+    for piece in &pieces {
+        if piece.len() != 4 {
+            return Err(format!(
+                "`{piece}` must be exactly 4 hex digits (one UTF-16 code unit) \
+                 — use spaces or commas to separate units (0E16 1F62)"
+            ));
+        }
+        match u16::from_str_radix(piece, 16) {
+            Ok(u) => out.push(u),
+            Err(_) => {
+                return Err(format!(
+                    "`{piece}` is not a valid hex code unit — use digits 0–9 / A–F"
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Chrome strings for the insert popup — bundled so
+/// [`show_insert_popup`] doesn't take a parade of `&'static str`s.
+struct InsertChrome {
+    button_label: &'static str,
+    field_label: &'static str,
+    hint: &'static str,
+}
+
+/// "Insert Byte" button — popup inserts one or more raw bytes (each
+/// wrapped in a `‹XX›` marker) at the target field's cursor. Used by
+/// UTF-8 and ASCII payloads where the natural insertion unit is a
+/// single byte.
 fn show_insert_byte_button(
     ui: &mut egui::Ui,
     text: &mut String,
     hex: &mut String,
     target_salt: &'static str,
 ) {
+    show_insert_popup(
+        ui,
+        text,
+        hex,
+        target_salt,
+        InsertChrome {
+            button_label: "Insert Byte",
+            field_label: "Byte value(s) (hex):",
+            hint: "1B  or  1B 0D 0A",
+        },
+        parse_hex_bytes,
+    );
+}
+
+/// "Insert Code Unit" button — UTF-16 variant. Each unit is 4 hex
+/// digits (one `u16`), expanded to two raw bytes with the active
+/// byte order applied, then wrapped in `‹XX›‹XX›` markers. Multiple
+/// units can be entered space- or comma-separated.
+fn show_insert_unit_button(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    hex: &mut String,
+    target_salt: &'static str,
+    big_endian: bool,
+) {
+    show_insert_popup(
+        ui,
+        text,
+        hex,
+        target_salt,
+        InsertChrome {
+            button_label: "Insert Code Unit",
+            field_label: "Code unit(s) (4 hex):",
+            hint: "0E16  or  0E16 1F62",
+        },
+        move |s| {
+            let units = parse_hex_units(s)?;
+            let mut out = Vec::with_capacity(units.len() * 2);
+            for u in units {
+                if big_endian {
+                    out.extend_from_slice(&u.to_be_bytes());
+                } else {
+                    out.extend_from_slice(&u.to_le_bytes());
+                }
+            }
+            Ok(out)
+        },
+    );
+}
+
+/// Shared MenuButton + popup chrome that the byte / code-unit insert
+/// buttons hang off. `parse` turns the popup's text into the
+/// sequence of raw bytes to insert; labels / hint live in
+/// [`InsertChrome`]; the `‹XX›`-marker wrapping and cursor
+/// bookkeeping are common to every caller.
+///
+/// `target_salt` must match the salt passed to
+/// [`marker_aware_text_edit`] for the field this drives — that's how
+/// the popup (rendered under a different ui parent) finds the
+/// target's cursor and widget id in egui memory.
+fn show_insert_popup<F>(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    hex: &mut String,
+    target_salt: &'static str,
+    chrome: InsertChrome,
+    parse: F,
+) where
+    F: Fn(&str) -> Result<Vec<u8>, String>,
+{
     let shared_cursor_id = egui::Id::new("marker_target_cursor").with(target_salt);
     let shared_widget_id = egui::Id::new("marker_target_widget").with(target_salt);
 
-    // Default menu close behavior is `CloseOnClick`, which closes the menu
-    // the moment the user clicks anywhere inside — including the TextEdit
-    // (which has to be clicked to gain focus). Switch to `CloseOnClickOutside`
-    // so the popup stays open while the user types the hex value.
-    egui::containers::menu::MenuButton::new("Insert Byte")
+    // Default menu close behavior is `CloseOnClick`, which closes the
+    // menu the moment the user clicks anywhere inside — including the
+    // TextEdit (which has to be clicked to gain focus). Switch to
+    // `CloseOnClickOutside` so the popup stays open while the user
+    // types the hex value.
+    egui::containers::menu::MenuButton::new(chrome.button_label)
         .config(
             egui::containers::menu::MenuConfig::new()
                 .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
@@ -2326,17 +2655,17 @@ fn show_insert_byte_button(
                 egui::vec2(200.0, 0.0),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    ui.label("Byte value(s) (hex):");
+                    ui.label(chrome.field_label);
                     let resp = ui.add(
                         egui::TextEdit::singleline(hex)
                             .desired_width(180.0)
-                            .hint_text("1B  or  1B 0D 0A"),
+                            .hint_text(chrome.hint),
                     );
                     // Auto-focus the hex field so the user can start typing
                     // right away. Idempotent — egui doesn't keep resetting
                     // the caret if the field already has focus.
                     resp.request_focus();
-                    let parse_result = parse_hex_bytes(hex);
+                    let parse_result = parse(hex);
                     let ok = parse_result.is_ok();
                     // Enter while the popup is open commits — gated on the
                     // input parsing, not on `resp.lost_focus()` (which
@@ -2440,9 +2769,30 @@ fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay) {
             .stick_to_bottom(true)
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                for line in display.lines() {
-                    ui.label(egui::RichText::new(line).monospace());
-                }
+                // Render all messages as ONE Label so consecutive sends
+                // flow into each other instead of stacking on separate
+                // rows. The per-message labels we used to render each
+                // gained a row-of-padding inter-message gap that looked
+                // like a stray newline.
+                //
+                // Separator between messages:
+                //  - Hex: a single space, so byte groups stay readable
+                //    ("34 0D 0A 34 0D 0A", not "34 0D 0A34 0D 0A").
+                //  - Raw / Rendered: empty, so the wire-byte stream is
+                //    shown verbatim. Any line breaks the user sees here
+                //    come from the bytes themselves (a 0x0A in Rendered
+                //    mode, etc.) — not synthesized by the display.
+                let sep = if display.mode == DisplayMode::Hex {
+                    " "
+                } else {
+                    ""
+                };
+                let combined: String = display.lines().collect::<Vec<_>>().join(sep);
+                ui.add(
+                    egui::Label::new(egui::RichText::new(combined).monospace())
+                        .wrap()
+                        .selectable(true),
+                );
             });
     });
 }
@@ -2623,8 +2973,21 @@ fn show_udp_destination_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
         UdpModeDraft::Broadcast => &conn.udp_broadcast,
         UdpModeDraft::Multicast => &conn.udp_multicast,
     };
-    let bad_addr = invalid_parse::<Ipv4Addr>(&pair_ref.addr);
-    let bad_port = invalid_parse::<u16>(&pair_ref.port);
+    // Two-mode validation. *Lenient* before the user has submitted
+    // (no red on empty, no red on partial IPv4 like `192.168.1.`),
+    // *strict* after — empty AND any malformed value go red. The
+    // submit flag flips on the first Enter, Start, or profile load.
+    let (bad_addr, bad_port) = if pair_ref.submitted {
+        (
+            pair_ref.addr.parse::<Ipv4Addr>().is_err(),
+            pair_ref.port.parse::<u16>().is_err(),
+        )
+    } else {
+        (
+            invalid_ipv4(&pair_ref.addr),
+            invalid_parse::<u16>(&pair_ref.port),
+        )
+    };
 
     let (label, label_tip, hint, invalid_msg, addr_salt, port_salt) = match mode {
         UdpModeDraft::Unicast => (
@@ -2681,6 +3044,12 @@ fn show_udp_destination_row(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
             port_hold: &mut conn.udp_port_hold,
         },
     );
+    // First explicit commit (Enter on either field, or a ± port
+    // click that changes the value) flips the pair into strict
+    // validation. Stays flipped for the life of the channel.
+    if apply {
+        pair.submitted = true;
+    }
     ui.end_row();
     apply
 }
@@ -2769,39 +3138,54 @@ fn level_color(level: tracing::Level) -> egui::Color32 {
     }
 }
 
-/// Add a single text-input field through `add`, and when `invalid` is true
-/// draw a red border around it and attach a hover tooltip with `msg`.
-/// Returns the field's [`egui::Response`] so callers can still inspect
-/// `.lost_focus()`, `.changed()`, etc.
+/// "Broken value" red-box for any text-input field. Calls `add` to
+/// render the field, and when `invalid` is true tints the fill pink,
+/// paints a 2-px red outline just outside the widget rect, and
+/// attaches `msg` as the hover tooltip. Returns the field's
+/// [`Response`] unchanged so callers can still chain `lost_focus()`,
+/// `changed()`, etc.
 ///
-/// This replaces the older "extra row of red text below the field" pattern
-/// so the controls beneath an invalid field do not shift while the user
-/// types.
+/// Replaces an earlier "red error row below the field" pattern that
+/// pushed surrounding controls around as the user typed.
 fn red_bordered<F>(ui: &mut egui::Ui, invalid: bool, msg: &str, add: F) -> egui::Response
 where
     F: FnOnce(&mut egui::Ui) -> egui::Response,
 {
-    // Always wrap in a `ui.scope` regardless of `invalid` — egui derives a
-    // widget's id from its position in the ui tree, so a TextEdit that is
-    // sometimes inside a scope and sometimes not gets a new id whenever
-    // validity flips. The old code did that, which dropped keyboard focus
-    // the moment a keystroke made the field invalid.
-    let red = egui::Color32::from_rgb(220, 80, 80);
+    /// `220,80,80` — the rest of the GUI's "warning red" (status dot,
+    /// invalid-field outline, profile-summary `?` badge).
+    const RED: egui::Color32 = egui::Color32::from_rgb(220, 80, 80);
+    /// Translucent red — low alpha keeps text legible while making
+    /// the whole field obviously broken at a glance.
+    const TINT: egui::Color32 = egui::Color32::from_rgba_premultiplied(31, 12, 12, 36);
+
+    // Always `ui.scope`, even when valid, so the field's id derives
+    // from a stable position in the ui tree — flipping in and out of
+    // a scope on every keystroke would drop keyboard focus.
     let inner = ui.scope(|ui| {
         if invalid {
+            // Pink fill via the two fields TextEdit might read:
+            //  - `text_edit_bg_color` is the explicit override
+            //  - `extreme_bg_color` is the fallback when the former is `None`
             let v = ui.visuals_mut();
-            v.widgets.inactive.bg_stroke.color = red;
-            v.widgets.inactive.bg_stroke.width = v.widgets.inactive.bg_stroke.width.max(1.0);
-            v.widgets.hovered.bg_stroke.color = red;
-            v.widgets.active.bg_stroke.color = red;
-            v.selection.stroke.color = red;
+            v.text_edit_bg_color = Some(TINT);
+            v.extreme_bg_color = TINT;
         }
         add(ui)
     });
+    let resp = inner.inner;
     if invalid {
-        inner.inner.on_hover_text(msg)
+        // Explicit outline outside the rect — guarantees a visible
+        // 2-px red box regardless of which `Visuals` field a given
+        // egui version's TextEdit uses for its border.
+        ui.painter().rect_stroke(
+            resp.rect,
+            egui::CornerRadius::same(2),
+            egui::Stroke::new(2.0, RED),
+            egui::StrokeKind::Outside,
+        );
+        resp.on_hover_text(msg)
     } else {
-        inner.inner
+        resp
     }
 }
 
@@ -2821,6 +3205,36 @@ where
     T: std::str::FromStr,
 {
     !s.is_empty() && s.parse::<T>().is_err()
+}
+
+/// "Broken value" check for an IPv4-address text field, tolerant of
+/// partial typing.
+///
+/// Empty and not-yet-complete inputs are considered OK so the field
+/// doesn't flash red while the user is mid-type. Only flags red once
+/// the string is unambiguously garbage:
+///
+///  - any character that isn't a digit or `.`
+///  - more than four dot-separated parts
+///  - exactly four parts with none empty, but the whole string still
+///    fails to parse as [`Ipv4Addr`] (e.g. `192.168.1.999`)
+///
+/// In particular the LAN-prefix default `192.168.1.` (4 parts, last
+/// empty) is considered "still being typed" — no red.
+fn invalid_ipv4(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    if s.chars().any(|c| !c.is_ascii_digit() && c != '.') {
+        return true;
+    }
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() > 4 {
+        return true;
+    }
+    parts.len() == 4
+        && parts.iter().all(|p| !p.is_empty())
+        && s.parse::<std::net::Ipv4Addr>().is_err()
 }
 
 fn hex_valid(s: &str) -> bool {
@@ -2914,6 +3328,41 @@ mod tests {
         assert!(err.contains("more than 2"), "{err}");
     }
 
+    // ── parse_hex_units ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_units_single_and_multiple() {
+        assert_eq!(parse_hex_units("0E16").unwrap(), vec![0x0E16]);
+        assert_eq!(parse_hex_units("0E16 1F62").unwrap(), vec![0x0E16, 0x1F62]);
+        assert_eq!(parse_hex_units("0E16,1F62").unwrap(), vec![0x0E16, 0x1F62]);
+        assert_eq!(
+            parse_hex_units("  0E16,  1F62  ").unwrap(),
+            vec![0x0E16, 0x1F62]
+        );
+    }
+
+    #[test]
+    fn parse_units_rejects_wrong_length() {
+        // 3 digits, 5 digits, and a missing space between two units.
+        for input in ["E16", "01F62", "0E161F62"] {
+            let err = parse_hex_units(input).unwrap_err();
+            assert!(err.contains("exactly 4 hex digits"), "{input}: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_units_rejects_non_hex() {
+        let err = parse_hex_units("XYZW").unwrap_err();
+        assert!(err.contains("XYZW"), "{err}");
+    }
+
+    #[test]
+    fn parse_units_rejects_empty() {
+        assert!(parse_hex_units("").is_err());
+        assert!(parse_hex_units("   ").is_err());
+        assert!(parse_hex_units(", ,").is_err());
+    }
+
     // ── char_to_byte / byte_to_char ───────────────────────────────────────────
 
     #[test]
@@ -2937,5 +3386,49 @@ mod tests {
         assert_eq!(byte_to_char(s, 4), 2);
         assert_eq!(byte_to_char(s, 5), 3);
         assert_eq!(byte_to_char(s, 99), 3); // clamps past end
+    }
+
+    // ── invalid_ipv4 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn ipv4_empty_is_not_invalid() {
+        assert!(!invalid_ipv4(""));
+    }
+
+    #[test]
+    fn ipv4_partial_typing_is_not_invalid() {
+        // The user is mid-typing; don't flash red yet.
+        for s in [
+            "1",
+            "19",
+            "192",
+            "192.",
+            "192.168",
+            "192.168.1",
+            "192.168.1.",
+        ] {
+            assert!(!invalid_ipv4(s), "{s:?} should be treated as partial");
+        }
+    }
+
+    #[test]
+    fn ipv4_complete_valid_is_not_invalid() {
+        for s in ["0.0.0.0", "192.168.1.5", "255.255.255.255"] {
+            assert!(!invalid_ipv4(s), "{s:?} parses as Ipv4Addr");
+        }
+    }
+
+    #[test]
+    fn ipv4_garbage_chars_are_invalid() {
+        for s in ["abc", "192.168.1.a", "192-168-1-5", "192.168.1.5 "] {
+            assert!(invalid_ipv4(s), "{s:?} contains non-IPv4 characters");
+        }
+    }
+
+    #[test]
+    fn ipv4_too_many_parts_or_out_of_range_is_invalid() {
+        for s in ["192.168.1.5.6", "192.168.1.300", "1..2.3.4"] {
+            assert!(invalid_ipv4(s), "{s:?} can never be a valid Ipv4Addr");
+        }
     }
 }

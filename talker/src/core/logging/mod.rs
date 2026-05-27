@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::{
-    filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, Layer, Registry,
+    filter::LevelFilter, layer::SubscriberExt, reload, util::SubscriberInitExt, Layer, Registry,
 };
 
 pub use gui_layer::{GuiLogLayer, LogEvent};
@@ -109,12 +109,37 @@ pub enum Rotation {
 
 // ── Runtime handle ────────────────────────────────────────────────────────────
 
+/// Cloneable handle for changing the minimum log level at runtime. The
+/// new level takes effect on the next emitted event.
+#[derive(Clone)]
+pub struct LogLevelHandle(reload::Handle<LevelFilter, Registry>);
+
+impl LogLevelHandle {
+    /// Set the global filter to `level`. Errors only if the
+    /// subscriber has been torn down.
+    pub fn set(&self, level: LogLevel) -> anyhow::Result<()> {
+        self.0
+            .modify(|f| *f = to_level_filter(level))
+            .map_err(|e| anyhow::anyhow!("updating log level: {e}"))
+    }
+}
+
 /// Keeps background logging threads alive for the process lifetime.
 ///
 /// Drop this only when the application is shutting down. Dropping it earlier
 /// will stop file log flushing.
 pub struct LoggingHandle {
     _guards: Vec<tracing_appender::non_blocking::WorkerGuard>,
+    level: LogLevelHandle,
+}
+
+impl LoggingHandle {
+    /// A cloneable handle for runtime log-level changes. Hand to the
+    /// GUI so a ComboBox can adjust the filter without taking the
+    /// `LoggingHandle` away from `run()`'s scope.
+    pub fn level_handle(&self) -> LogLevelHandle {
+        self.level.clone()
+    }
 }
 
 // ── init ──────────────────────────────────────────────────────────────────────
@@ -132,10 +157,14 @@ pub fn init(
 ) -> anyhow::Result<LoggingHandle> {
     let mut guards: Vec<tracing_appender::non_blocking::WorkerGuard> = vec![];
 
+    // Wrap the level filter in a reload layer so the GUI can change
+    // the level at runtime via [`LogLevelHandle::set`].
+    let (filter_layer, level_handle) = reload::Layer::new(to_level_filter(config.level));
+
     // Build all layers into a single vec so the subscriber type stays
     // `Registry` throughout and dynamic dispatch compiles cleanly.
     let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync + 'static>> =
-        vec![Box::new(to_level_filter(config.level))];
+        vec![filter_layer.boxed()];
 
     if config.stdout {
         layers.push(tracing_subscriber::fmt::layer().with_target(false).boxed());
@@ -162,7 +191,10 @@ pub fn init(
         .try_init()
         .context("installing global tracing subscriber (already initialized?)")?;
 
-    Ok(LoggingHandle { _guards: guards })
+    Ok(LoggingHandle {
+        _guards: guards,
+        level: LogLevelHandle(level_handle),
+    })
 }
 
 /// The OS-appropriate directory for log files when no path is configured.

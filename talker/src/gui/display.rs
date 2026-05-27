@@ -8,9 +8,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DisplayMode {
     /// Each byte as two uppercase hex digits.
-    #[default]
     Hex,
     /// UTF-8 decoded to text; invalid bytes shown as U+FFFD.
+    #[default]
     Rendered,
     /// Printable ASCII shown as-is; other bytes as control symbols.
     Raw,
@@ -82,8 +82,42 @@ pub fn render(bytes: &[u8], mode: DisplayMode, control_style: ControlStyle) -> S
             }
             s
         }
-        DisplayMode::Rendered => String::from_utf8_lossy(bytes).into_owned(),
+        DisplayMode::Rendered => rendered_decode(bytes),
     }
+}
+
+/// Best-effort UTF-8 decode for [`DisplayMode::Rendered`].
+///
+/// Valid UTF-8 sequences decode normally. Any invalid byte falls back
+/// to a Latin-1 interpretation — every byte `0x00..=0xFF` maps 1:1 to
+/// `U+0000..=U+00FF`, which means every byte has a glyph in every
+/// system font. Notably this turns the otherwise-tofu replacement
+/// character for stray high bytes (`0xEE` etc.) into a printable
+/// Latin-1 character (`î`), making the Rendered pane usable for
+/// mixed text + binary streams rather than substituting U+FFFD.
+fn rendered_decode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match std::str::from_utf8(&bytes[i..]) {
+            Ok(valid) => {
+                out.push_str(valid);
+                break;
+            }
+            Err(e) => {
+                let up_to = e.valid_up_to();
+                if up_to > 0 {
+                    // Safe: `from_utf8` says these bytes are valid.
+                    out.push_str(std::str::from_utf8(&bytes[i..i + up_to]).unwrap());
+                }
+                // The byte at `i + up_to` is the first invalid one —
+                // emit it as its Latin-1 char and advance past it.
+                out.push(bytes[i + up_to] as char);
+                i += up_to + 1;
+            }
+        }
+    }
+    out
 }
 
 /// Render a non-printable byte per `style`. Styles with no symbol for a byte
@@ -218,16 +252,31 @@ mod tests {
     }
 
     #[test]
-    fn rendered_invalid_bytes_become_replacement_char() {
+    fn rendered_invalid_bytes_fall_back_to_latin1() {
+        // Best-effort decode: invalid UTF-8 bytes are mapped 1:1 to
+        // their Latin-1 codepoint so they have a glyph in every font.
+        // 0xFF → U+00FF (ÿ), 0xFE → U+00FE (þ).
         let out = render(&[0xFF, 0xFE], DisplayMode::Rendered, ControlStyle::Pictures);
-        assert!(out.contains('\u{FFFD}'));
+        assert_eq!(out, "\u{00FF}\u{00FE}");
+    }
+
+    #[test]
+    fn rendered_mixes_utf8_and_high_bytes() {
+        // "A" (1 byte, valid ASCII) + 0xEE (invalid UTF-8 start) +
+        // "B" (valid ASCII): the high byte falls back to Latin-1
+        // (`î`), surrounding valid text decodes normally.
+        let out = render(b"A\xEEB", DisplayMode::Rendered, ControlStyle::Pictures);
+        assert_eq!(out, "A\u{00EE}B");
     }
 
     // ── ChannelDisplay buffer ─────────────────────────────────────────────────
 
     #[test]
     fn buffer_caps_at_capacity() {
-        let mut d = ChannelDisplay::default();
+        let mut d = ChannelDisplay {
+            mode: DisplayMode::Hex,
+            ..Default::default()
+        };
         for i in 0..(CAPACITY + 25) {
             d.push(vec![i as u8]);
         }
@@ -249,7 +298,10 @@ mod tests {
 
     #[test]
     fn lines_use_the_current_mode() {
-        let mut d = ChannelDisplay::default();
+        let mut d = ChannelDisplay {
+            mode: DisplayMode::Hex,
+            ..Default::default()
+        };
         d.push(vec![0x41, 0x42]);
         assert_eq!(d.lines().next().unwrap(), "41 42");
         d.mode = DisplayMode::Raw;

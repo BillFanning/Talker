@@ -3,9 +3,11 @@
 #
 # Copy this file to `profile.toml` and edit it for local testing;
 # `profile.toml` is gitignored, so your edits won't be committed.
+#
+# The profile's display name is the file root — rename this file
+# (e.g. `udp-broadcast-gga.toml`) to change how it appears in the GUI.
 
 version = 2
-name = "udp-broadcast-gga"
 
 [[channels]]
 
