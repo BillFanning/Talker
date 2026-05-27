@@ -1,5 +1,8 @@
 # Rust build output
 /target
 
-# Local working profile — copy profile.example.toml here and edit
-/profile.toml
+# User profiles live at the repo root and are kept local — only the
+# tracked sample / build manifest are committed.
+/*.toml
+!/Cargo.toml
+!/profile.example.toml
