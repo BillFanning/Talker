@@ -114,6 +114,7 @@ impl TalkerApp {
         ctx.set_pixels_per_point(ppp);
         set_high_contrast_dark_visuals(ctx);
         install_control_pictures_fallback_font(ctx);
+        install_unicode_fallback_fonts(ctx);
         bump_non_monospace_text_size(ctx, 0.5);
         let mut app = Self {
             profile: Profile::default(),
@@ -2335,6 +2336,64 @@ fn install_control_pictures_fallback_font(ctx: &egui::Context) {
     ));
 }
 
+/// Register Noto Sans script files as fallback fonts so non-Latin
+/// Unicode codepoints (Greek, Cyrillic, Thai, Arabic, Hebrew,
+/// Devanagari, common symbols) render with real glyphs instead of
+/// tofu in the message editor / preview / output pane.
+///
+/// Lowest-priority fallbacks for both `Monospace` and `Proportional`,
+/// so the default Hack / Ubuntu still wins for the Latin range. CJK
+/// is *not* included — the additional ~10 MB isn't worth it for the
+/// typical talker use case. See `assets/fonts/README.md` for the
+/// rationale and file list.
+fn install_unicode_fallback_fonts(ctx: &egui::Context) {
+    // (registration name, file bytes). Order doesn't matter — each
+    // font only contributes glyphs in its own coverage range, so
+    // there's no per-font priority among them.
+    const FONTS: &[(&str, &[u8])] = &[
+        (
+            "noto_sans",
+            include_bytes!("../../assets/fonts/NotoSans-Regular.ttf"),
+        ),
+        (
+            "noto_sans_symbols2",
+            include_bytes!("../../assets/fonts/NotoSansSymbols2-Regular.ttf"),
+        ),
+        (
+            "noto_sans_thai",
+            include_bytes!("../../assets/fonts/NotoSansThai-Regular.ttf"),
+        ),
+        (
+            "noto_sans_arabic",
+            include_bytes!("../../assets/fonts/NotoSansArabic-Regular.ttf"),
+        ),
+        (
+            "noto_sans_hebrew",
+            include_bytes!("../../assets/fonts/NotoSansHebrew-Regular.ttf"),
+        ),
+        (
+            "noto_sans_devanagari",
+            include_bytes!("../../assets/fonts/NotoSansDevanagari-Regular.ttf"),
+        ),
+    ];
+    for (name, bytes) in FONTS {
+        ctx.add_font(egui::epaint::text::FontInsert::new(
+            name,
+            egui::FontData::from_static(bytes),
+            vec![
+                egui::epaint::text::InsertFontFamily {
+                    family: egui::FontFamily::Monospace,
+                    priority: egui::epaint::text::FontPriority::Lowest,
+                },
+                egui::epaint::text::InsertFontFamily {
+                    family: egui::FontFamily::Proportional,
+                    priority: egui::epaint::text::FontPriority::Lowest,
+                },
+            ],
+        ));
+    }
+}
+
 // ── Field renderers ───────────────────────────────────────────────────────────
 
 /// Lay out a UTF-8/ASCII text field, drawing `‹XX›` byte markers in a
@@ -2648,14 +2707,14 @@ fn show_insert_unit_button(
         hex,
         target_salt,
         InsertChrome {
-            // Hint deliberately uses BMP codepoints the default
-            // egui font (Latin-1 + Control Pictures) can render —
-            // `00E9` is `é`, `00B5` is `µ`. Asian codepoints like
-            // `0E16` (`ฃ`) show as tofu unless a wider fallback
-            // font is bundled.
+            // `0E16` is Thai `ฃ` — only renders because we bundle
+            // Noto Sans Thai as a fallback (see
+            // `install_unicode_fallback_fonts`). CJK is *not*
+            // bundled, so codepoints in U+4E00–9FFF still show as
+            // tofu.
             button_label: "Insert Code Unit",
             field_label: "Code unit(s) (4 hex):",
-            hint: "00E9  or  00E9 00B5",
+            hint: "0E16  or  0E16 1F62",
         },
         move |s| {
             let units = parse_hex_units(s)?;
