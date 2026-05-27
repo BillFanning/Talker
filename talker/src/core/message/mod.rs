@@ -149,6 +149,15 @@ pub enum PayloadConfig {
         byte_order: ByteOrder,
         #[serde(default)]
         bom: bool,
+        /// When `true`, the text is parsed for `‹XX›` byte markers
+        /// (spec §5.3) and each marker emits one raw byte alongside
+        /// the normal UTF-16-encoded text. When `false` (default),
+        /// `‹` and `›` are treated as literal characters and the
+        /// text encodes cleanly to well-formed UTF-16. Off by
+        /// default so the typical Unicode workflow stays simple;
+        /// flip on for fuzz / corruption tests.
+        #[serde(default)]
+        allow_raw_bytes: bool,
     },
     /// Text encoded with a single-byte code page.
     Ascii {
@@ -200,7 +209,8 @@ impl PayloadConfig {
                 text,
                 byte_order,
                 bom,
-            } => Ok(encode_utf16(text, *byte_order, *bom)),
+                allow_raw_bytes,
+            } => Ok(encode_utf16(text, *byte_order, *bom, *allow_raw_bytes)),
             Self::Ascii { text, code_page } => compile_ascii(text, *code_page),
             Self::Nmea {
                 talker,
@@ -270,15 +280,18 @@ fn compile_ascii(text: &str, code_page: CodePage) -> anyhow::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Encode UTF-16 text, expanding `‹XX›` markers to raw single bytes
-/// (spec §5.3 — same marker syntax as UTF-8 / ASCII).
+/// Encode UTF-16 text.
 ///
-/// A marker emits exactly one byte, which means a UTF-16 message
-/// with an odd number of marker bytes will end up byte-mis-aligned
-/// on the wire. That's the user's call — markers are exposed here
-/// for the same fuzzing / boundary-test use cases they cover in the
-/// other text formats.
-fn encode_utf16(text: &str, byte_order: ByteOrder, bom: bool) -> Vec<u8> {
+/// `allow_raw_bytes = false` (default): the text encodes cleanly via
+/// `encode_utf16()` — `‹` / `›` are just two more Unicode characters.
+/// The wire is always a whole number of 16-bit code units.
+///
+/// `allow_raw_bytes = true`: the text is parsed for `‹XX›` byte
+/// markers (spec §5.3, same syntax as UTF-8 / ASCII). Each marker
+/// emits one raw byte alongside the normal code units. A message
+/// with an odd count of marker bytes will end up byte-mis-aligned
+/// on the wire — that's the point of the opt-in flag.
+fn encode_utf16(text: &str, byte_order: ByteOrder, bom: bool, allow_raw_bytes: bool) -> Vec<u8> {
     let push_unit = |out: &mut Vec<u8>, u: u16| match byte_order {
         ByteOrder::BigEndian => out.extend_from_slice(&u.to_be_bytes()),
         ByteOrder::LittleEndian => out.extend_from_slice(&u.to_le_bytes()),
@@ -287,14 +300,20 @@ fn encode_utf16(text: &str, byte_order: ByteOrder, bom: bool) -> Vec<u8> {
     if bom {
         push_unit(&mut out, 0xFEFF);
     }
-    for (range, segment) in segments(text) {
-        match segment {
-            Segment::Text => {
-                for u in text[range].encode_utf16() {
-                    push_unit(&mut out, u);
+    if allow_raw_bytes {
+        for (range, segment) in segments(text) {
+            match segment {
+                Segment::Text => {
+                    for u in text[range].encode_utf16() {
+                        push_unit(&mut out, u);
+                    }
                 }
+                Segment::Byte(b) => out.push(b),
             }
-            Segment::Byte(b) => out.push(b),
+        }
+    } else {
+        for u in text.encode_utf16() {
+            push_unit(&mut out, u);
         }
     }
     out
@@ -363,6 +382,7 @@ mod tests {
             text: "AB".to_string(),
             byte_order: ByteOrder::BigEndian,
             bom: false,
+            allow_raw_bytes: false,
         };
         assert_eq!(p.compile().unwrap(), vec![0x00, 0x41, 0x00, 0x42]);
     }
@@ -373,31 +393,52 @@ mod tests {
             text: "A".to_string(),
             byte_order: ByteOrder::LittleEndian,
             bom: true,
+            allow_raw_bytes: false,
         };
         // BOM U+FEFF then 'A' U+0041, little-endian
         assert_eq!(p.compile().unwrap(), vec![0xFF, 0xFE, 0x41, 0x00]);
     }
 
     #[test]
-    fn compile_utf16_expands_byte_markers() {
-        // Markers emit raw single bytes, side-by-side with normal
-        // UTF-16 code units. Note this can produce an odd byte
-        // count — that's the user's call.
+    fn compile_utf16_default_treats_marker_chars_as_literal() {
+        // With raw-bytes OFF, `‹FF›` is just five Unicode characters
+        // — they all encode normally to UTF-16 (‹ = U+2039, FF as
+        // two ASCII chars, › = U+203A).
+        let p = PayloadConfig::Utf16 {
+            text: "\u{2039}FF\u{203A}".to_string(),
+            byte_order: ByteOrder::BigEndian,
+            bom: false,
+            allow_raw_bytes: false,
+        };
+        // ‹ → 20 39, 'F' → 00 46, 'F' → 00 46, › → 20 3A
+        assert_eq!(
+            p.compile().unwrap(),
+            vec![0x20, 0x39, 0x00, 0x46, 0x00, 0x46, 0x20, 0x3A]
+        );
+    }
+
+    #[test]
+    fn compile_utf16_raw_bytes_expands_markers() {
+        // With raw-bytes ON, markers emit single bytes side-by-side
+        // with normal UTF-16 code units. Note this can produce an
+        // odd byte count — that's the user's call.
         let p = PayloadConfig::Utf16 {
             text: "A\u{2039}FF\u{203A}B".to_string(),
             byte_order: ByteOrder::BigEndian,
             bom: false,
+            allow_raw_bytes: true,
         };
         // 'A' → 00 41, marker ‹FF› → FF, 'B' → 00 42  →  5 bytes total
         assert_eq!(p.compile().unwrap(), vec![0x00, 0x41, 0xFF, 0x00, 0x42]);
     }
 
     #[test]
-    fn compile_utf16_marker_with_bom_little_endian() {
+    fn compile_utf16_raw_bytes_with_bom_little_endian() {
         let p = PayloadConfig::Utf16 {
             text: "\u{2039}01\u{203A}\u{2039}02\u{203A}".to_string(),
             byte_order: ByteOrder::LittleEndian,
             bom: true,
+            allow_raw_bytes: true,
         };
         // BOM (LE) FF FE, then two raw marker bytes 01 02
         assert_eq!(p.compile().unwrap(), vec![0xFF, 0xFE, 0x01, 0x02]);
@@ -410,6 +451,7 @@ mod tests {
             text: "\u{1F600}".to_string(),
             byte_order: ByteOrder::BigEndian,
             bom: false,
+            allow_raw_bytes: false,
         };
         assert_eq!(p.compile().unwrap(), vec![0xD8, 0x3D, 0xDE, 0x00]);
     }
@@ -571,6 +613,7 @@ mod tests {
                 text: "hi".to_string(),
                 byte_order: ByteOrder::LittleEndian,
                 bom: true,
+                allow_raw_bytes: false,
             },
             PayloadConfig::Ascii {
                 text: "x".to_string(),

@@ -331,6 +331,10 @@ pub struct ScheduleDraft {
     pub utf16_text: String,
     pub utf16_big_endian: bool,
     pub utf16_bom: bool,
+    /// Mirrors `PayloadConfig::Utf16::allow_raw_bytes`. When `false`
+    /// (default), `‹XX›` in the text is literal; when `true` the
+    /// editor recognises markers and an `Insert Byte` button appears.
+    pub utf16_allow_raw_bytes: bool,
     // ascii
     pub ascii_text: String,
     pub ascii_code_page: CodePage,
@@ -377,6 +381,7 @@ impl Default for ScheduleDraft {
             utf16_text: String::new(),
             utf16_big_endian: true,
             utf16_bom: false,
+            utf16_allow_raw_bytes: false,
             ascii_text: String::new(),
             ascii_code_page: CodePage::default(),
             nmea_talker: String::new(),
@@ -419,11 +424,13 @@ impl From<&MessageConfig> for ScheduleDraft {
                 text,
                 byte_order,
                 bom,
+                allow_raw_bytes,
             } => {
                 d.payload_kind = PayloadKind::Utf16;
                 d.utf16_text = text.clone();
                 d.utf16_big_endian = matches!(byte_order, ByteOrder::BigEndian);
                 d.utf16_bom = *bom;
+                d.utf16_allow_raw_bytes = *allow_raw_bytes;
             }
             PayloadConfig::Ascii { text, code_page } => {
                 d.payload_kind = PayloadKind::Ascii;
@@ -475,6 +482,7 @@ impl ScheduleDraft {
                     ByteOrder::LittleEndian
                 },
                 bom: self.utf16_bom,
+                allow_raw_bytes: self.utf16_allow_raw_bytes,
             },
             PayloadKind::Ascii => PayloadConfig::Ascii {
                 text: self.ascii_text.clone(),
@@ -609,6 +617,7 @@ mod tests {
                 text: "data".to_string(),
                 byte_order: ByteOrder::LittleEndian,
                 bom: true,
+                allow_raw_bytes: false,
             },
             250,
         ));

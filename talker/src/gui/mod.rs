@@ -1363,23 +1363,43 @@ fn show_utf8_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
 fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     ui.label("Text");
     ui.horizontal(|ui| {
-        marker_aware_text_edit(
-            ui,
-            &mut entry.utf16_text,
-            "payload_utf16",
-            300.0,
-            "Unicode text",
-        );
-        // UTF-16's natural insertion granularity is a 16-bit code
-        // unit, not a byte — the popup takes 4 hex digits per unit
-        // and applies the field's byte order so what you type is
-        // what the receiver decodes.
+        // Two editor modes, chosen by `Allow raw bytes`:
+        //   off — plain Unicode editor (what you see is what gets
+        //         encoded). Insert Code Unit inserts the decoded
+        //         glyph (4 hex → one char).
+        //   on  — marker-aware editor + Insert Byte button. Insert
+        //         Code Unit inserts marker pairs with byte order
+        //         applied.
+        if entry.utf16_allow_raw_bytes {
+            marker_aware_text_edit(
+                ui,
+                &mut entry.utf16_text,
+                "payload_utf16",
+                300.0,
+                "Unicode text",
+            );
+            show_insert_byte_button(
+                ui,
+                &mut entry.utf16_text,
+                &mut entry.insert_byte_hex,
+                "payload_utf16",
+            );
+        } else {
+            plain_text_edit_with_cursor(
+                ui,
+                &mut entry.utf16_text,
+                "payload_utf16",
+                300.0,
+                "Unicode text",
+            );
+        }
         show_insert_unit_button(
             ui,
             &mut entry.utf16_text,
             &mut entry.insert_byte_hex,
             "payload_utf16",
             entry.utf16_big_endian,
+            entry.utf16_allow_raw_bytes,
         );
     });
     ui.end_row();
@@ -1389,6 +1409,12 @@ fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
         ui.radio_value(&mut entry.utf16_big_endian, false, "Little-endian");
         ui.separator();
         ui.checkbox(&mut entry.utf16_bom, "BOM");
+        ui.separator();
+        ui.checkbox(&mut entry.utf16_allow_raw_bytes, "Allow raw bytes")
+            .on_hover_text(
+                "Treat ‹XX› in the text as raw bytes (fuzzing escape \
+                 hatch). When off, ‹ and › are literal Unicode chars.",
+            );
     });
     ui.end_row();
 }
@@ -2101,10 +2127,11 @@ fn show_message_preview(ui: &mut egui::Ui, entry: &ScheduleDraft) {
     // 2024-01-01T12:00:00.000Z — a fixed, recognisable sample instant.
     let reference = chrono::DateTime::<chrono::Utc>::from_timestamp(1_704_110_400, 0).unwrap();
     ui.horizontal(|ui| {
-        ui.label("Preview:").on_hover_text(
-            "Sample of the wire bytes that would be sent. \
-                 Timestamps use a fixed reference instant so the value \
-                 doesn't tick — the actual send uses the wall clock.",
+        ui.label("Wire bytes:").on_hover_text(
+            "Literal bytes that would be sent on the wire, rendered \
+                 in a payload-appropriate view. Timestamps use a fixed \
+                 reference instant so the value doesn't tick — the \
+                 actual send uses the wall clock.",
         );
         let text = match entry.to_message_config().and_then(|m| m.compile().ok()) {
             Some(compiled) => {
@@ -2443,6 +2470,33 @@ fn marker_aware_text_edit(
     resp
 }
 
+/// Plain single-line TextEdit that stashes its cursor + widget id
+/// under the same shared ids [`marker_aware_text_edit`] uses, so the
+/// matching `Insert …` popup can find them. Use this for fields
+/// that don't recognise `‹XX›` markers (UTF-16 in its default
+/// Unicode mode).
+fn plain_text_edit_with_cursor(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    salt: &'static str,
+    width: f32,
+    hint: &str,
+) -> egui::Response {
+    let shared_cursor_id = egui::Id::new("marker_target_cursor").with(salt);
+    let shared_widget_id = egui::Id::new("marker_target_widget").with(salt);
+    let output = egui::TextEdit::singleline(text)
+        .id_salt(salt)
+        .desired_width(width)
+        .hint_text(hint)
+        .show(ui);
+    let resp = output.response.response;
+    ui.memory_mut(|m| m.data.insert_temp(shared_widget_id, resp.id));
+    if let Some(range) = output.cursor_range {
+        ui.memory_mut(|m| m.data.insert_temp(shared_cursor_id, range.primary.index));
+    }
+    resp
+}
+
 /// Byte position of the character at `char_idx` in `text`. Saturates to
 /// `text.len()` for indices past the end (treat as the after-last position).
 fn char_to_byte(text: &str, char_idx: usize) -> usize {
@@ -2551,8 +2605,7 @@ struct InsertChrome {
 
 /// "Insert Byte" button — popup inserts one or more raw bytes (each
 /// wrapped in a `‹XX›` marker) at the target field's cursor. Used by
-/// UTF-8 and ASCII payloads where the natural insertion unit is a
-/// single byte.
+/// UTF-8, ASCII, and UTF-16 (with raw-bytes mode on) payloads.
 fn show_insert_byte_button(
     ui: &mut egui::Ui,
     text: &mut String,
@@ -2569,20 +2622,25 @@ fn show_insert_byte_button(
             field_label: "Byte value(s) (hex):",
             hint: "1B  or  1B 0D 0A",
         },
-        parse_hex_bytes,
+        |s| Ok(bytes_to_markers(&parse_hex_bytes(s)?)),
     );
 }
 
 /// "Insert Code Unit" button — UTF-16 variant. Each unit is 4 hex
-/// digits (one `u16`), expanded to two raw bytes with the active
-/// byte order applied, then wrapped in `‹XX›‹XX›` markers. Multiple
-/// units can be entered space- or comma-separated.
+/// digits (one `u16`). What gets inserted depends on `allow_raw_bytes`:
+///
+///  - `false` (default): the units decode as UTF-16 to actual
+///    Unicode characters and are inserted verbatim. `0E16` inserts
+///    `ฃ`, surrogate pairs are recognised, lone surrogates error.
+///  - `true`: each unit splits into two raw bytes per `big_endian`
+///    and is inserted as a pair of `‹XX›` markers.
 fn show_insert_unit_button(
     ui: &mut egui::Ui,
     text: &mut String,
     hex: &mut String,
     target_salt: &'static str,
     big_endian: bool,
+    allow_raw_bytes: bool,
 ) {
     show_insert_popup(
         ui,
@@ -2590,35 +2648,59 @@ fn show_insert_unit_button(
         hex,
         target_salt,
         InsertChrome {
+            // Hint deliberately uses BMP codepoints the default
+            // egui font (Latin-1 + Control Pictures) can render —
+            // `00E9` is `é`, `00B5` is `µ`. Asian codepoints like
+            // `0E16` (`ฃ`) show as tofu unless a wider fallback
+            // font is bundled.
             button_label: "Insert Code Unit",
             field_label: "Code unit(s) (4 hex):",
-            hint: "0E16  or  0E16 1F62",
+            hint: "00E9  or  00E9 00B5",
         },
         move |s| {
             let units = parse_hex_units(s)?;
-            let mut out = Vec::with_capacity(units.len() * 2);
-            for u in units {
-                if big_endian {
-                    out.extend_from_slice(&u.to_be_bytes());
-                } else {
-                    out.extend_from_slice(&u.to_le_bytes());
+            if allow_raw_bytes {
+                let mut bytes = Vec::with_capacity(units.len() * 2);
+                for u in &units {
+                    if big_endian {
+                        bytes.extend_from_slice(&u.to_be_bytes());
+                    } else {
+                        bytes.extend_from_slice(&u.to_le_bytes());
+                    }
                 }
+                Ok(bytes_to_markers(&bytes))
+            } else {
+                String::from_utf16(&units).map_err(|_| {
+                    "lone surrogate — pair high (D800–DBFF) and low (DC00–DFFF) \
+                     surrogates together (e.g. D83D DE00 for 😀)"
+                        .to_string()
+                })
             }
-            Ok(out)
         },
     );
 }
 
+/// Wrap each byte in a `‹XX›` marker (uppercase hex). The string is
+/// what gets inserted into a marker-aware text field.
+fn bytes_to_markers(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("\u{2039}{b:02X}\u{203A}"))
+        .collect()
+}
+
 /// Shared MenuButton + popup chrome that the byte / code-unit insert
-/// buttons hang off. `parse` turns the popup's text into the
-/// sequence of raw bytes to insert; labels / hint live in
-/// [`InsertChrome`]; the `‹XX›`-marker wrapping and cursor
-/// bookkeeping are common to every caller.
+/// buttons hang off. `parse` turns the popup's text into the literal
+/// string to splice into the target field at the cursor — bytes get
+/// marker-wrapped by the caller's parser, glyph mode produces real
+/// Unicode characters. Labels / hint live in [`InsertChrome`]; the
+/// cursor bookkeeping is common to every caller.
 ///
 /// `target_salt` must match the salt passed to
-/// [`marker_aware_text_edit`] for the field this drives — that's how
-/// the popup (rendered under a different ui parent) finds the
-/// target's cursor and widget id in egui memory.
+/// [`marker_aware_text_edit`] (or `marker_aware_text_edit_opts`) for
+/// the field this drives — that's how the popup (rendered under a
+/// different ui parent) finds the target's cursor and widget id in
+/// egui memory.
 fn show_insert_popup<F>(
     ui: &mut egui::Ui,
     text: &mut String,
@@ -2627,7 +2709,7 @@ fn show_insert_popup<F>(
     chrome: InsertChrome,
     parse: F,
 ) where
-    F: Fn(&str) -> Result<Vec<u8>, String>,
+    F: Fn(&str) -> Result<String, String>,
 {
     let shared_cursor_id = egui::Id::new("marker_target_cursor").with(target_salt);
     let shared_widget_id = egui::Id::new("marker_target_widget").with(target_salt);
@@ -2678,12 +2760,8 @@ fn show_insert_popup<F>(
                     if let Err(why) = &parse_result {
                         insert = insert.on_disabled_hover_text(why.clone());
                     }
-                    if let Ok(bytes) = &parse_result {
+                    if let Ok(insertion) = &parse_result {
                         if insert.clicked() || entered {
-                            let markers: String = bytes
-                                .iter()
-                                .map(|b| format!("\u{2039}{b:02X}\u{203A}"))
-                                .collect();
                             // Cursor byte position from memory; fall back
                             // to end-of-text if the field was never focused.
                             let cursor_char: Option<usize> =
@@ -2691,13 +2769,13 @@ fn show_insert_popup<F>(
                             let insert_byte = cursor_char
                                 .map(|c| char_to_byte(text, c))
                                 .unwrap_or(text.len());
-                            text.insert_str(insert_byte, &markers);
+                            text.insert_str(insert_byte, insertion);
                             // New cursor sits right after the inserted
-                            // markers. Update both the shared stash (so a
+                            // text. Update both the shared stash (so a
                             // subsequent Insert lands in the right place
                             // even if the field isn't re-focused first)
                             // and the actual TextEditState.
-                            let new_cursor_char = byte_to_char(text, insert_byte + markers.len());
+                            let new_cursor_char = byte_to_char(text, insert_byte + insertion.len());
                             ui.memory_mut(|m| {
                                 m.data.insert_temp(shared_cursor_id, new_cursor_char);
                             });
