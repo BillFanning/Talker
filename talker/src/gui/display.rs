@@ -82,42 +82,8 @@ pub fn render(bytes: &[u8], mode: DisplayMode, control_style: ControlStyle) -> S
             }
             s
         }
-        DisplayMode::Rendered => rendered_decode(bytes),
+        DisplayMode::Rendered => crate::core::message::decode_utf8_lossy_latin1(bytes),
     }
-}
-
-/// Best-effort UTF-8 decode for [`DisplayMode::Rendered`].
-///
-/// Valid UTF-8 sequences decode normally. Any invalid byte falls back
-/// to a Latin-1 interpretation — every byte `0x00..=0xFF` maps 1:1 to
-/// `U+0000..=U+00FF`, which means every byte has a glyph in every
-/// system font. Notably this turns the otherwise-tofu replacement
-/// character for stray high bytes (`0xEE` etc.) into a printable
-/// Latin-1 character (`î`), making the Rendered pane usable for
-/// mixed text + binary streams rather than substituting U+FFFD.
-fn rendered_decode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match std::str::from_utf8(&bytes[i..]) {
-            Ok(valid) => {
-                out.push_str(valid);
-                break;
-            }
-            Err(e) => {
-                let up_to = e.valid_up_to();
-                if up_to > 0 {
-                    // Safe: `from_utf8` says these bytes are valid.
-                    out.push_str(std::str::from_utf8(&bytes[i..i + up_to]).unwrap());
-                }
-                // The byte at `i + up_to` is the first invalid one —
-                // emit it as its Latin-1 char and advance past it.
-                out.push(bytes[i + up_to] as char);
-                i += up_to + 1;
-            }
-        }
-    }
-    out
 }
 
 /// Render a non-printable byte per `style`. Styles with no symbol for a byte

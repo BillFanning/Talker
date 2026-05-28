@@ -11,6 +11,78 @@ mod timestamp;
 
 pub use checksum::{ChecksumAlgorithm, ChecksumConfig};
 pub use codepage::{decode_byte as decode_codepage_byte, CodePage};
+
+/// Best-effort UTF-8 decode for human-facing byte previews.
+///
+/// Valid UTF-8 sequences decode normally. Any invalid byte falls
+/// back to a Latin-1 interpretation — every byte `0x00..=0xFF`
+/// maps 1:1 to `U+0000..=U+00FF`, which means every byte has a
+/// glyph in every system font. Notably this turns the otherwise-
+/// tofu replacement character for stray high bytes (`0xEE` etc.)
+/// into a printable Latin-1 character (`î`), making the output
+/// usable for mixed text + binary streams rather than substituting
+/// U+FFFD.
+///
+/// Shared infrastructure: used by the GUI display pane's Rendered
+/// mode and by the CLI `--echo` runner's default format.
+pub fn decode_utf8_lossy_latin1(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match std::str::from_utf8(&bytes[i..]) {
+            Ok(valid) => {
+                out.push_str(valid);
+                break;
+            }
+            Err(e) => {
+                let up_to = e.valid_up_to();
+                if up_to > 0 {
+                    // Safe: `from_utf8` says these bytes are valid.
+                    out.push_str(std::str::from_utf8(&bytes[i..i + up_to]).unwrap());
+                }
+                // The byte at `i + up_to` is the first invalid one —
+                // emit it as its Latin-1 char and advance past it.
+                out.push(bytes[i + up_to] as char);
+                i += up_to + 1;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod decode_utf8_lossy_latin1_tests {
+    use super::*;
+
+    #[test]
+    fn pure_ascii_passes_through() {
+        assert_eq!(decode_utf8_lossy_latin1(b"hello"), "hello");
+    }
+
+    #[test]
+    fn valid_utf8_decodes() {
+        assert_eq!(decode_utf8_lossy_latin1("héllo".as_bytes()), "héllo");
+    }
+
+    #[test]
+    fn lone_high_byte_falls_back_to_latin1() {
+        // 0xEE → î (U+00EE)
+        assert_eq!(decode_utf8_lossy_latin1(&[0xEE]), "\u{00EE}");
+        // 0xFF → ÿ (U+00FF)
+        assert_eq!(decode_utf8_lossy_latin1(&[0xFF]), "\u{00FF}");
+    }
+
+    #[test]
+    fn mixes_utf8_and_high_bytes() {
+        // "A" (ASCII) + 0xEE (invalid UTF-8) + "B" (ASCII)
+        assert_eq!(decode_utf8_lossy_latin1(b"A\xEEB"), "A\u{00EE}B");
+    }
+
+    #[test]
+    fn empty_input_yields_empty() {
+        assert_eq!(decode_utf8_lossy_latin1(b""), "");
+    }
+}
 pub use marker::{repair_after_edit, segments, Segment};
 pub use timestamp::TimestampConfig;
 
