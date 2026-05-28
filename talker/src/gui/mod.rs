@@ -140,12 +140,27 @@ impl TalkerApp {
         };
         app.refresh_serial_ports();
 
-        // CLI arg takes precedence; fall back to last path saved in storage.
+        // CLI arg takes precedence; fall back to last path saved in
+        // storage. The storage path is also filtered through
+        // `Path::exists()` — when the file is gone (renamed, on a
+        // disconnected drive, etc.) we skip the load and start
+        // empty rather than logging the same "file not found"
+        // error on every launch. `profile_path` stays `None`, so
+        // the next `save()` overwrites the stale storage entry
+        // with an empty string and the loop self-clears.
         let path = initial_profile.or_else(|| {
             storage
                 .and_then(|s| s.get_string("last_profile_path"))
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from)
+                .and_then(|p| {
+                    if p.exists() {
+                        Some(p)
+                    } else {
+                        tracing::warn!("last-used profile {p:?} is gone — opening empty");
+                        None
+                    }
+                })
         });
 
         if let Some(p) = path {
