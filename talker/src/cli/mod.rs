@@ -270,16 +270,15 @@ fn run_channel(
     }
 }
 
-/// Print one echo line.
-///
-/// Trailing `\r` / `\n` in the formatted payload is stripped so the
-/// `println!` doesn't double up on payloads that already end in a
-/// line break (most NMEA sentences do). Without this, Rendered mode
-/// would emit an empty line between messages, and Hex mode would on
-/// some terminals that interpret CR+LF in the middle of the line.
+/// Print one echo line. Payload bytes pass straight through the
+/// chosen format; `println!` adds the one terminating newline.
+/// (Earlier revisions stripped trailing `0x0D` / `0x0A` from the
+/// payload to avoid a "double newline" in some output formats; the
+/// extra blank line turned out to be a terminal-rendering thing,
+/// not something Talker actually emits, so the simpler no-trim
+/// form is back.)
 fn echo_line(index: usize, payload: &[u8], format: EchoFormat, tag: bool) {
     let text = format_payload(payload, format);
-    let text = text.trim_end_matches(['\r', '\n']);
     if tag {
         println!("ch{index}: {text}");
     } else {
@@ -625,18 +624,6 @@ mod tests {
         assert!(a.no_tag);
         let b = parse(&["talker", "-p", "x", "--echo"]).unwrap();
         assert!(!b.no_tag);
-    }
-
-    #[test]
-    fn format_payload_trims_trailing_newline_for_rendered() {
-        // NMEA payload ends `\r\n`; the Rendered decode passes those
-        // through as Unicode chars. `echo_line` strips them before
-        // println so the terminal sees exactly one line per send.
-        let nmea = b"$GPGGA,123519\r\n";
-        let rendered = format_payload(nmea, EchoFormat::Rendered);
-        assert!(rendered.ends_with('\n'));
-        let stripped = rendered.trim_end_matches(['\r', '\n']);
-        assert_eq!(stripped, "$GPGGA,123519");
     }
 
     #[test]
