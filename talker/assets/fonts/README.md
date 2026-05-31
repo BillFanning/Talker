@@ -1,23 +1,24 @@
 # Bundled fonts
 
 The default `egui` font stack (Hack, Ubuntu-Light, NotoEmoji,
-emoji-icon-font) covers Latin and basic emoji and nothing else. Every
-file in this directory is a fallback registered at startup
-(`gui/mod.rs::install_*_fallback_fonts`) so the rest of Unicode
-renders with real glyphs in the message editor, preview, output
-pane, and logs instead of tofu boxes.
+emoji-icon-font) covers Latin and basic emoji and nothing else. The
+files in this directory are registered at startup
+(`gui/mod.rs::install_*_font*`): `NotoSans-Regular` is promoted to
+the **primary** proportional UI face, and the rest are fallbacks so
+the wider Unicode range renders with real glyphs in the message
+editor, preview, output pane, and logs instead of tofu boxes.
 
 ## Layout
 
-| File | Purpose |
-|---|---|
-| `CascadiaMono-ControlPictures.ttf` | U+2400–2421 control-character pictures (`␊` `␍` `␛` etc.) for the Raw display mode |
-| `NotoSans-Regular.ttf` | Latin Extended + Greek + Cyrillic + Vietnamese (Noto Sans core) |
-| `NotoSansSymbols2-Regular.ttf` | Math symbols, arrows, geometric shapes, technical / misc symbols |
-| `NotoSansThai-Regular.ttf` | Thai (U+0E00–0E7F) |
-| `NotoSansArabic-Regular.ttf` | Arabic + Supplement + Extended (RTL shaping not done by us; egui renders glyphs only) |
-| `NotoSansHebrew-Regular.ttf` | Hebrew (U+0590–05FF) |
-| `NotoSansDevanagari-Regular.ttf` | Devanagari (Hindi, Sanskrit, Marathi, …) |
+| File | Role | Coverage |
+|---|---|---|
+| `CascadiaMono-ControlPictures.ttf` | fallback | U+2400–2421 control-character pictures (`␊` `␍` `␛` etc.) for the Raw display mode |
+| `NotoSans-Regular.ttf` | **primary UI font** (Highest for Proportional; lowest fallback for Monospace) | Latin Extended + Greek + Cyrillic + Vietnamese (Noto Sans core) |
+| `NotoSansSymbols2-Regular.ttf` | fallback | Math symbols, arrows, geometric shapes, technical / misc symbols |
+| `NotoSansThai-Regular.ttf` | fallback | Thai (U+0E00–0E7F) |
+| `NotoSansArabic-Regular.ttf` | fallback | Arabic + Supplement + Extended (RTL shaping not done by us; egui renders glyphs only) |
+| `NotoSansHebrew-Regular.ttf` | fallback | Hebrew (U+0590–05FF) |
+| `NotoSansDevanagari-Regular.ttf` | fallback | Devanagari (Hindi, Sanskrit, Marathi, …) |
 
 ## What's intentionally *not* included
 

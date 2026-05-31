@@ -57,6 +57,23 @@ pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
+/// The `pixels_per_point` the zoom widget treats as **100%**. This was
+/// the comfortable default on the app's target displays — what the
+/// widget used to label "115%". The widget now shows and steps zoom
+/// relative to this baseline, so a fresh install opens at 100%.
+const ZOOM_BASE_PPP: f32 = 1.15;
+/// One zoom click = ±10 percentage points of [`ZOOM_BASE_PPP`].
+const ZOOM_STEP_PPP: f32 = ZOOM_BASE_PPP * 0.10;
+/// Zoom clamp range, as `pixels_per_point` (50%..=200% of the base).
+const ZOOM_MIN_PPP: f32 = ZOOM_BASE_PPP * 0.5;
+const ZOOM_MAX_PPP: f32 = ZOOM_BASE_PPP * 2.0;
+
+/// Convert a `pixels_per_point` value to the widget's displayed
+/// percentage (relative to [`ZOOM_BASE_PPP`]), rounded to a whole number.
+fn zoom_percent(ppp: f32) -> u32 {
+    (ppp / ZOOM_BASE_PPP * 100.0).round() as u32
+}
+
 struct TalkerApp {
     profile: Profile,
     profile_path: Option<PathBuf>,
@@ -66,7 +83,10 @@ struct TalkerApp {
     conn_errors: Vec<Option<String>>,
     talkers: Vec<Option<TalkerHandle>>,
     log_rx: crossbeam_channel::Receiver<LogEvent>,
-    log_lines: Vec<(String, egui::Color32)>,
+    /// Buffered log lines paired with their level. The level (not a
+    /// baked colour) is stored so the log re-colours live when the
+    /// theme is toggled — see [`level_color`].
+    log_lines: Vec<(String, tracing::Level)>,
     log_level: LogLevel,
     log_level_handle: LogLevelHandle,
     sent_counts: Vec<u64>,
@@ -80,6 +100,9 @@ struct TalkerApp {
     serial_ports: Vec<String>,
     pixels_per_point: f32,
     zoom_held_timer: Option<f32>, // None = not held; Some(t) = held, t<0 in delay, t>=0 repeating
+    /// `true` = dark theme, `false` = light. Persisted; toggled from
+    /// the top-bar sun/moon button next to the zoom control.
+    dark_mode: bool,
     /// Mutations that the channel-card render loop has requested. Drained at
     /// the END of each frame (after egui's layout passes complete) — never
     /// mid-frame — so the state changes can't cause widgets to appear,
@@ -110,9 +133,17 @@ impl TalkerApp {
             .and_then(|s| s.get_string("pixels_per_point"))
             .and_then(|s| s.parse::<f32>().ok())
             .filter(|&v| v > 0.0)
-            .unwrap_or(1.0);
+            // First run opens at 100% on the new scale (= ZOOM_BASE_PPP).
+            .unwrap_or(ZOOM_BASE_PPP);
         ctx.set_pixels_per_point(ppp);
-        set_high_contrast_dark_visuals(ctx);
+        // Default to dark; persisted across runs. Stored as the string
+        // "false" only when the user has switched to light.
+        let dark_mode = storage
+            .and_then(|s| s.get_string("dark_mode"))
+            .map(|s| s != "false")
+            .unwrap_or(true);
+        install_visuals(ctx);
+        apply_theme(ctx, dark_mode);
         install_control_pictures_fallback_font(ctx);
         install_unicode_fallback_fonts(ctx);
         bump_non_monospace_text_size(ctx, 0.5);
@@ -136,6 +167,7 @@ impl TalkerApp {
             serial_ports: Vec::new(),
             pixels_per_point: ppp,
             zoom_held_timer: None,
+            dark_mode,
             deferred: DeferredActions::default(),
         };
         app.refresh_serial_ports();
@@ -550,9 +582,8 @@ impl TalkerApp {
 
         for event in self.log_rx.try_iter() {
             let ts = event.timestamp.format("%H:%M:%S%.3f");
-            let color = level_color(event.level);
             let line = format!("[{ts}] [{:<5}] {}", event.level, event.message);
-            self.log_lines.push((line, color));
+            self.log_lines.push((line, event.level));
         }
         const LOG_CAP: usize = 2000;
         if self.log_lines.len() > LOG_CAP {
@@ -650,6 +681,7 @@ impl eframe::App for TalkerApp {
             .unwrap_or_default();
         storage.set_string("last_profile_path", path_str);
         storage.set_string("pixels_per_point", self.pixels_per_point.to_string());
+        storage.set_string("dark_mode", self.dark_mode.to_string());
     }
 }
 
@@ -699,10 +731,7 @@ impl TalkerApp {
 
                 ui.separator();
                 let r_minus = ui.small_button("−");
-                ui.label(format!(
-                    "{}%",
-                    (self.pixels_per_point * 100.0).round() as u32,
-                ));
+                ui.label(format!("{}%", zoom_percent(self.pixels_per_point)));
                 let r_plus = ui.small_button("+");
 
                 let minus_down = r_minus.is_pointer_button_down_on();
@@ -720,16 +749,18 @@ impl TalkerApp {
                     match self.zoom_held_timer {
                         None => {
                             // First frame pressed — fire immediately.
-                            self.pixels_per_point =
-                                (self.pixels_per_point + direction * 0.1).clamp(0.75, 2.5);
+                            self.pixels_per_point = (self.pixels_per_point
+                                + direction * ZOOM_STEP_PPP)
+                                .clamp(ZOOM_MIN_PPP, ZOOM_MAX_PPP);
                             self.zoom_held_timer = Some(-0.4);
                         }
                         Some(ref mut t) => {
                             *t += dt;
                             if *t >= 0.0 {
                                 *t -= 0.1; // repeat every 100 ms
-                                self.pixels_per_point =
-                                    (self.pixels_per_point + direction * 0.1).clamp(0.75, 2.5);
+                                self.pixels_per_point = (self.pixels_per_point
+                                    + direction * ZOOM_STEP_PPP)
+                                    .clamp(ZOOM_MIN_PPP, ZOOM_MAX_PPP);
                             }
                         }
                     }
@@ -737,12 +768,32 @@ impl TalkerApp {
                 } else {
                     // Fallback: handle a quick tap that releases before is_pointer_button_down_on fires.
                     if r_minus.clicked() && self.zoom_held_timer.is_none() {
-                        self.pixels_per_point = (self.pixels_per_point - 0.1).max(0.75);
+                        self.pixels_per_point =
+                            (self.pixels_per_point - ZOOM_STEP_PPP).max(ZOOM_MIN_PPP);
                     }
                     if r_plus.clicked() && self.zoom_held_timer.is_none() {
-                        self.pixels_per_point = (self.pixels_per_point + 0.1).min(2.5);
+                        self.pixels_per_point =
+                            (self.pixels_per_point + ZOOM_STEP_PPP).min(ZOOM_MAX_PPP);
                     }
                     self.zoom_held_timer = None;
+                }
+
+                ui.separator();
+                // Theme toggle. Uses half-circle glyphs from the
+                // Geometric Shapes block (U+25D0/U+25D1) — the same
+                // block as the ■ ▶ • glyphs the app already renders,
+                // so coverage is guaranteed in the base font (the
+                // Misc-Symbols ☀/☾ dingbats are not). The half-lit
+                // circle reads as a light/dark duality icon; the
+                // tooltip states the action.
+                let (glyph, tip) = if self.dark_mode {
+                    ("\u{25D1}", "Switch to light theme") // ◑
+                } else {
+                    ("\u{25D0}", "Switch to dark theme") // ◐
+                };
+                if ui.small_button(glyph).on_hover_text(tip).clicked() {
+                    self.dark_mode = !self.dark_mode;
+                    apply_theme(ui.ctx(), self.dark_mode);
                 }
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -839,9 +890,13 @@ impl TalkerApp {
                     });
                 });
                 ui.separator();
+                let dark = ui.visuals().dark_mode;
                 ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                    for (line, color) in &self.log_lines {
-                        ui.colored_label(*color, egui::RichText::new(line).monospace());
+                    for (line, level) in &self.log_lines {
+                        ui.colored_label(
+                            level_color(*level, dark),
+                            egui::RichText::new(line).monospace(),
+                        );
                     }
                 });
             });
@@ -1028,61 +1083,40 @@ impl TalkerApp {
     }
 
     fn show_channel_body(&mut self, ui: &mut egui::Ui, i: usize, running: bool) {
-        // Auto-collapse the connection editor on Start, auto-expand on
-        // Stop. The transition is detected by comparing this frame's
-        // `running` against the previous frame's value stashed in egui
-        // memory. Between transitions, the persistent CollapsingHeader
-        // state honours whatever the user clicks — so mid-run edits are
-        // still possible by manually expanding, and the choice sticks
-        // until the next start/stop.
-        let prev_id = ui.id().with(("conn_section_prev_running", i));
-        let prev_running = ui
-            .memory(|m| m.data.get_temp::<bool>(prev_id))
-            .unwrap_or(running);
-        let force_open = if running && !prev_running {
-            Some(false)
-        } else if !running && prev_running {
-            Some(true)
-        } else {
-            None
-        };
-        ui.memory_mut(|m| m.data.insert_temp(prev_id, running));
-
-        let (changed, refresh) = egui::CollapsingHeader::new(if running {
-            "Connection (running — expand to edit)"
-        } else {
-            "Connection"
-        })
-        .id_salt(("conn_section", i))
-        .default_open(!running)
-        .open(force_open)
-        .show(ui, |ui| {
-            match self.conn_drafts[i].kind {
-                // Each kind gets its own push_id namespace so the very
-                // different widget trees produced by Serial / UDP / TCP can't
-                // shift each other's auto-ids across egui's two layout passes.
-                ConnKind::Serial => {
-                    ui.push_id("serial_body", |ui| {
-                        show_serial_fields(ui, &mut self.conn_drafts[i], &self.serial_ports)
-                    })
-                    .inner
+        // Connection stays a plain collapsing section — it does NOT
+        // auto-collapse on run (you often want the interface params
+        // visible while a channel is live). Default open; the user's
+        // expand/collapse choice persists via the stable id_salt.
+        let (changed, refresh) = egui::CollapsingHeader::new("Connection")
+            .id_salt(("conn_section", i))
+            .default_open(true)
+            .show(ui, |ui| {
+                match self.conn_drafts[i].kind {
+                    // Each kind gets its own push_id namespace so the very
+                    // different widget trees produced by Serial / UDP / TCP can't
+                    // shift each other's auto-ids across egui's two layout passes.
+                    ConnKind::Serial => {
+                        ui.push_id("serial_body", |ui| {
+                            show_serial_fields(ui, &mut self.conn_drafts[i], &self.serial_ports)
+                        })
+                        .inner
+                    }
+                    ConnKind::Udp => {
+                        ui.push_id("udp_body", |ui| {
+                            (show_udp_fields(ui, &mut self.conn_drafts[i]), false)
+                        })
+                        .inner
+                    }
+                    ConnKind::Tcp => {
+                        ui.push_id("tcp_body", |ui| {
+                            (show_tcp_fields(ui, &mut self.conn_drafts[i]), false)
+                        })
+                        .inner
+                    }
                 }
-                ConnKind::Udp => {
-                    ui.push_id("udp_body", |ui| {
-                        (show_udp_fields(ui, &mut self.conn_drafts[i]), false)
-                    })
-                    .inner
-                }
-                ConnKind::Tcp => {
-                    ui.push_id("tcp_body", |ui| {
-                        (show_tcp_fields(ui, &mut self.conn_drafts[i]), false)
-                    })
-                    .inner
-                }
-            }
-        })
-        .body_returned
-        .unwrap_or((false, false));
+            })
+            .body_returned
+            .unwrap_or((false, false));
         if changed {
             self.deferred.apply.push(i);
         }
@@ -1178,14 +1212,32 @@ fn show_schedule_section(
     // Message indices whose interval was committed this frame, with the new value.
     let mut interval_changes: Vec<(usize, u64)> = Vec::new();
 
-    // Collapsed by default — the editors for many channels eat a lot of
-    // vertical real estate. The header summary keeps the at-a-glance
-    // info (count, total sent) visible without expanding.
-    //
+    // Auto-collapse the Messages section on Start, auto-expand on
+    // Stop — when a channel is running you mostly want the header
+    // summary (count + total sent), not the full editor. The
+    // transition is detected by comparing this frame's
+    // `channel_running` against the previous frame's value stashed
+    // in egui memory; between transitions the persistent
+    // CollapsingHeader state honours whatever the user clicks, so a
+    // mid-run edit is one expand away and the choice sticks until
+    // the next start/stop.
+    let prev_id = ui.id().with("messages_prev_running");
+    let prev_running = ui
+        .memory(|m| m.data.get_temp::<bool>(prev_id))
+        .unwrap_or(channel_running);
+    let force_open = if channel_running && !prev_running {
+        Some(false)
+    } else if !channel_running && prev_running {
+        Some(true)
+    } else {
+        None
+    };
+    ui.memory_mut(|m| m.data.insert_temp(prev_id, channel_running));
+
     // `id_salt` keeps the persistent open/closed state stable even
-    // though the title text changes every frame as `total_sent` ticks.
-    // Without it CollapsingHeader derives its id from the label, so a
-    // user expand would be forgotten on the next send.
+    // though the title text changes every frame as `total_sent`
+    // ticks. Without it CollapsingHeader derives its id from the
+    // label, so a user expand would be forgotten on the next send.
     let total_sent: u64 = per_message_counts.iter().sum();
     let n = entries.len();
     let header = if n == 0 {
@@ -1200,7 +1252,8 @@ fn show_schedule_section(
     };
     egui::CollapsingHeader::new(header)
         .id_salt("messages_section")
-        .default_open(false)
+        .default_open(true)
+        .open(force_open)
         .show(ui, |ui| {
             for (i, entry) in entries.iter_mut().enumerate() {
                 ui.push_id(i, |ui| {
@@ -2188,15 +2241,24 @@ fn show_message_status(ui: &mut egui::Ui, channel_running: bool, sent: u64) {
     // GUI feel like the same component.
     ui.add_space(2.0);
     ui.separator();
+    let dark = ui.visuals().dark_mode;
     let (dot_color, state) = if channel_running {
         (egui::Color32::from_rgb(80, 200, 80), "Active")
     } else {
-        (egui::Color32::from_gray(140), "Idle")
+        (
+            egui::Color32::from_gray(if dark { 140 } else { 120 }),
+            "Idle",
+        )
     };
-    let bg = if channel_running {
-        egui::Color32::from_rgb(28, 52, 28)
-    } else {
-        egui::Color32::from_gray(40)
+    // Tinted strip behind the status line, keyed to the theme so the
+    // label text (which follows the theme's body colour) stays
+    // legible on it: a deep green / dim grey on dark, a pale green /
+    // light grey on light.
+    let bg = match (channel_running, dark) {
+        (true, true) => egui::Color32::from_rgb(28, 52, 28),
+        (true, false) => egui::Color32::from_rgb(205, 232, 205),
+        (false, true) => egui::Color32::from_gray(40),
+        (false, false) => egui::Color32::from_gray(222),
     };
     egui::Frame::default()
         .fill(bg)
@@ -2296,19 +2358,37 @@ fn checksum_label(algorithm: ChecksumAlgorithm) -> &'static str {
 /// left to inherit from the OS. The visuals are written into *both* the Dark
 /// and Light theme slots so `eframe`'s persistence cannot resurrect an older
 /// style on the next launch.
-fn set_high_contrast_dark_visuals(ctx: &egui::Context) {
-    let body = egui::Color32::from_gray(230);
-    let separator = egui::Stroke::new(1.0, egui::Color32::from_gray(90));
+/// Register the app's high-contrast Dark and Light visuals, one per
+/// egui theme. The caller picks which is active via
+/// [`egui::Context::set_theme`]; this only installs the palettes.
+fn install_visuals(ctx: &egui::Context) {
+    // ── Dark ──
+    let dark_fg = egui::Color32::from_gray(230);
+    let mut dark = egui::Visuals::dark();
+    dark.override_text_color = Some(dark_fg);
+    dark.widgets.noninteractive.fg_stroke.color = dark_fg;
+    dark.widgets.inactive.fg_stroke.color = dark_fg;
+    dark.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(90));
 
-    let mut v = egui::Visuals::dark();
-    v.override_text_color = Some(body);
-    v.widgets.noninteractive.fg_stroke.color = body;
-    v.widgets.inactive.fg_stroke.color = body;
-    v.widgets.noninteractive.bg_stroke = separator;
+    // ── Light ──
+    let light_fg = egui::Color32::from_gray(20);
+    let mut light = egui::Visuals::light();
+    light.override_text_color = Some(light_fg);
+    light.widgets.noninteractive.fg_stroke.color = light_fg;
+    light.widgets.inactive.fg_stroke.color = light_fg;
+    light.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(160));
 
-    ctx.set_theme(egui::ThemePreference::Dark);
-    ctx.set_visuals_of(egui::Theme::Dark, v.clone());
-    ctx.set_visuals_of(egui::Theme::Light, v);
+    ctx.set_visuals_of(egui::Theme::Dark, dark);
+    ctx.set_visuals_of(egui::Theme::Light, light);
+}
+
+/// Apply `dark`/light to `ctx` via [`egui::ThemePreference`].
+fn apply_theme(ctx: &egui::Context, dark: bool) {
+    ctx.set_theme(if dark {
+        egui::ThemePreference::Dark
+    } else {
+        egui::ThemePreference::Light
+    });
 }
 
 /// Add `delta` points to every text style in both themes *except* the
@@ -2351,25 +2431,46 @@ fn install_control_pictures_fallback_font(ctx: &egui::Context) {
     ));
 }
 
-/// Register Noto Sans script files as fallback fonts so non-Latin
-/// Unicode codepoints (Greek, Cyrillic, Thai, Arabic, Hebrew,
-/// Devanagari, common symbols) render with real glyphs instead of
-/// tofu in the message editor / preview / output pane.
+/// Install Noto Sans as the primary proportional UI font, plus the
+/// per-script Noto files as lowest-priority fallbacks.
 ///
-/// Lowest-priority fallbacks for both `Monospace` and `Proportional`,
-/// so the default Hack / Ubuntu still wins for the Latin range. CJK
-/// is *not* included — the additional ~10 MB isn't worth it for the
-/// typical talker use case. See `assets/fonts/README.md` for the
-/// rationale and file list.
+/// `NotoSans-Regular` (Latin / Greek / Cyrillic / Vietnamese) is
+/// registered at **Highest** priority for the `Proportional` family,
+/// so it wins over egui's default Ubuntu-Light for the whole UI —
+/// one consistent humanist sans. It's also a *lowest*-priority
+/// fallback for `Monospace`, so Hack stays the wire-bytes face but
+/// Noto fills any Latin gaps.
+///
+/// The remaining script files (Symbols2, Thai, Arabic, Hebrew,
+/// Devanagari) are lowest-priority fallbacks for both families, so
+/// non-Latin codepoints render with real glyphs instead of tofu in
+/// the message editor / preview / output pane. CJK is *not* included
+/// — the extra ~10 MB isn't worth it for the typical talker use
+/// case. See `assets/fonts/README.md` for the rationale and file list.
 fn install_unicode_fallback_fonts(ctx: &egui::Context) {
-    // (registration name, file bytes). Order doesn't matter — each
-    // font only contributes glyphs in its own coverage range, so
-    // there's no per-font priority among them.
-    const FONTS: &[(&str, &[u8])] = &[
-        (
-            "noto_sans",
-            include_bytes!("../../assets/fonts/NotoSans-Regular.ttf"),
-        ),
+    use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
+    use egui::FontFamily::{Monospace, Proportional};
+
+    // Primary UI face: Noto Sans wins for Proportional, fills gaps
+    // for Monospace.
+    ctx.add_font(FontInsert::new(
+        "noto_sans",
+        egui::FontData::from_static(include_bytes!("../../assets/fonts/NotoSans-Regular.ttf")),
+        vec![
+            InsertFontFamily {
+                family: Proportional,
+                priority: FontPriority::Highest,
+            },
+            InsertFontFamily {
+                family: Monospace,
+                priority: FontPriority::Lowest,
+            },
+        ],
+    ));
+
+    // Per-script fallbacks. Order doesn't matter — each only
+    // contributes glyphs in its own coverage range.
+    const FALLBACKS: &[(&str, &[u8])] = &[
         (
             "noto_sans_symbols2",
             include_bytes!("../../assets/fonts/NotoSansSymbols2-Regular.ttf"),
@@ -2391,18 +2492,18 @@ fn install_unicode_fallback_fonts(ctx: &egui::Context) {
             include_bytes!("../../assets/fonts/NotoSansDevanagari-Regular.ttf"),
         ),
     ];
-    for (name, bytes) in FONTS {
-        ctx.add_font(egui::epaint::text::FontInsert::new(
+    for (name, bytes) in FALLBACKS {
+        ctx.add_font(FontInsert::new(
             name,
             egui::FontData::from_static(bytes),
             vec![
-                egui::epaint::text::InsertFontFamily {
-                    family: egui::FontFamily::Monospace,
-                    priority: egui::epaint::text::FontPriority::Lowest,
+                InsertFontFamily {
+                    family: Monospace,
+                    priority: FontPriority::Lowest,
                 },
-                egui::epaint::text::InsertFontFamily {
-                    family: egui::FontFamily::Proportional,
-                    priority: egui::epaint::text::FontPriority::Lowest,
+                InsertFontFamily {
+                    family: Proportional,
+                    priority: FontPriority::Lowest,
                 },
             ],
         ));
@@ -3280,13 +3381,21 @@ fn show_addr_port_row(ui: &mut egui::Ui, p: AddrPortRow) -> bool {
     apply
 }
 
-fn level_color(level: tracing::Level) -> egui::Color32 {
+/// Log-line colour for `level`, adapted to the active theme.
+///
+/// ERROR / WARN keep saturated reds/ambers that read on either
+/// background. INFO follows the theme's body text. DEBUG / TRACE are
+/// muted greys, lightened on dark and darkened on light so they
+/// stay legible and still read as "less important than INFO".
+fn level_color(level: tracing::Level, dark: bool) -> egui::Color32 {
     match level {
         tracing::Level::ERROR => egui::Color32::from_rgb(220, 80, 80),
-        tracing::Level::WARN => egui::Color32::from_rgb(220, 180, 60),
-        tracing::Level::DEBUG => egui::Color32::from_gray(175),
-        tracing::Level::TRACE => egui::Color32::from_gray(150),
-        _ => egui::Color32::from_gray(235),
+        tracing::Level::WARN if dark => egui::Color32::from_rgb(220, 180, 60),
+        tracing::Level::WARN => egui::Color32::from_rgb(150, 110, 0),
+        tracing::Level::DEBUG => egui::Color32::from_gray(if dark { 175 } else { 95 }),
+        tracing::Level::TRACE => egui::Color32::from_gray(if dark { 150 } else { 120 }),
+        // INFO: the theme's body text colour.
+        _ => egui::Color32::from_gray(if dark { 235 } else { 20 }),
     }
 }
 
@@ -3433,6 +3542,27 @@ fn show_tcp_fields(ui: &mut egui::Ui, conn: &mut ConnDraft) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── zoom widget ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn zoom_base_reads_as_100_percent() {
+        // The old "115%" ppp is the new 100% baseline.
+        assert_eq!(zoom_percent(ZOOM_BASE_PPP), 100);
+    }
+
+    #[test]
+    fn zoom_steps_are_ten_percent() {
+        assert_eq!(zoom_percent(ZOOM_BASE_PPP + ZOOM_STEP_PPP), 110);
+        assert_eq!(zoom_percent(ZOOM_BASE_PPP - ZOOM_STEP_PPP), 90);
+        assert_eq!(zoom_percent(ZOOM_BASE_PPP + 2.0 * ZOOM_STEP_PPP), 120);
+    }
+
+    #[test]
+    fn zoom_clamp_bounds_are_50_and_200() {
+        assert_eq!(zoom_percent(ZOOM_MIN_PPP), 50);
+        assert_eq!(zoom_percent(ZOOM_MAX_PPP), 200);
+    }
 
     // ── parse_hex_bytes ───────────────────────────────────────────────────────
 
