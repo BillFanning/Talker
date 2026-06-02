@@ -4,6 +4,5 @@
 use anyhow::Result;
 
 fn main() -> Result<()> {
-    println!("listener: not yet implemented");
-    Ok(())
+    listener::run()
 }

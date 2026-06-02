@@ -20,11 +20,11 @@ An ADR captures *why* a significant decision was made, not just *what* was decid
 
 ---
 
-## ADR-001 — Workspace structure: two crates, not one
+## ADR-001 — Workspace structure: split reusable NMEA support from `talker`
 
 **Context:** The NMEA 0183 module was identified early as reusable across other projects. The question was whether to keep it as a module inside the `talker` binary or make it a separate library crate.
 
-**Decision:** The project is structured as a Cargo workspace with two members: `talker` (binary) and `nmea0183` (library). The `nmea0183` crate has no dependency on `talker` and no knowledge of its internals.
+**Decision:** The project is structured as a Cargo workspace, initially with `talker` (binary) and `nmea0183` (library). The `nmea0183` crate has no dependency on `talker` and no knowledge of its internals. The workspace now also contains `listener`, a sibling receive/decode crate that shares `nmea0183`.
 
 **Alternatives considered:**
 - Single crate with `nmea0183` as an internal module: simpler initially, but makes future extraction painful — splitting a module into a crate after it has grown requires touching import paths throughout the codebase.
@@ -54,7 +54,7 @@ An ADR captures *why* a significant decision was made, not just *what* was decid
 - Each talker thread is a plain OS thread, easy to reason about and debug.
 - `crossbeam-channel` `select!` macro is used in each talker thread to wait on both the schedule timer and incoming command channels simultaneously without spinning.
 - Each active connection has its own dedicated channel pair with the UI thread.
-- `core::connection` manages a collection of connection instances from the initial implementation; there is no single-connection shortcut to be refactored later.
+- `core::channel` manages a collection of channel instances from the initial implementation; there is no single-channel shortcut to be refactored later.
 - The number of simultaneous connections is bounded by available system resources (serial ports, network sockets), not by any artificial limit in the software.
 
 ---
@@ -145,7 +145,7 @@ An ADR captures *why* a significant decision was made, not just *what* was decid
 
 **Consequences:**
 - `nmea0183` has no dependency on the `crc` crate — its checksum is a byte XOR, implemented inline.
-- `talker`'s `core::data` module uses `crc` for the general checksum feature.
+- `talker`'s `core::message` module uses `crc` for the general checksum feature.
 - The `crc` crate uses a const-generic algorithm table approach; algorithm selection is a compile-time or runtime parameter depending on usage pattern.
 
 ---
@@ -194,28 +194,28 @@ Moved to [`nmea0183/docs/ADR.md`](../../nmea0183/docs/ADR.md) — it is a decisi
 
 ---
 
-## ADR-011 — CLI multi-connection model
+## ADR-011 — CLI multi-channel model
 
 **Context:** The GUI supports multiple simultaneous connections as a first-class feature. The question was whether CLI mode should be one connection per process or support multiple connections in one process.
 
-**Decision:** CLI mode supports multiple simultaneous connections in a single process, using the same `core::connection` collection and per-connection talker thread model as the GUI. The primary mechanism is `--profile`, which may define one or many connections. Ad-hoc multi-connection via repeated CLI flags is deferred.
+**Decision:** CLI mode supports multiple simultaneous channels in a single process, using the same `core::channel` collection and per-channel talker thread model as the GUI. The primary mechanism is `--profile`, which may define one or many channels. Ad-hoc multi-channel via repeated CLI flags is deferred.
 
 **Alternatives considered:**
-- One connection per CLI instance: Simple to implement, but requires users to manage multiple terminal sessions and processes for multi-port work. Inconsistent with the GUI model and defeats the profile system. Rejected.
-- Repeated `--connection` flags for ad-hoc multi-connection: Desirable long-term but adds CLI parsing complexity. Deferred to a future iteration; `--profile` covers the primary use case.
+- One channel per CLI instance: Simple to implement, but requires users to manage multiple terminal sessions and processes for multi-port work. Inconsistent with the GUI model and defeats the profile system. Rejected.
+- Repeated channel flags for ad-hoc multi-channel operation: Desirable long-term but adds CLI parsing complexity. Deferred to a future iteration; `--profile` covers the primary use case.
 
 **Consequences:**
-- `talker --profile <name>` is the canonical way to launch multi-connection sessions from the CLI.
-- The CLI and GUI share identical `core` behavior for connection management. There is no CLI-specific connection limit or shortcut.
-- stdout echo in multi-connection CLI mode outputs data from all connections interleaved. Each line is prefixed with a connection identifier to allow filtering.
+- `talker --profile <name>` is the canonical way to launch multi-channel sessions from the CLI.
+- The CLI and GUI share identical `core` behavior for channel management. There is no CLI-specific channel limit or shortcut.
+- stdout echo in multi-channel CLI mode outputs data from all channels interleaved. Each line is prefixed with a channel identifier to allow filtering.
 
 ---
 
 ## ADR-012 — Binary field types
 
-**Status:** Superseded by the spec v2.0 message-format model (see ADR-015 context and CLAUDE.md "Message Formats"). Spec v2.0 removed the typed-binary-field concept: arbitrary byte sequences are now entered in **Hex** format, and structured data is built through the UTF-8/UTF-16/ASCII/NMEA formats. `core::data` and the `BinaryField` enum were never carried into the v2.0 codebase. This ADR is retained for historical context.
+**Status:** Superseded by the spec v2.0 message-format model (see ADR-015 context and the message-format summary in [`AGENTS.md`](../../AGENTS.md)). Spec v2.0 removed the typed-binary-field concept: arbitrary byte sequences are now entered in **Hex** format, and structured data is built through the UTF-8/UTF-16/ASCII/NMEA formats. `core::data` and the `BinaryField` enum were never carried into the v2.0 codebase. This ADR is retained for historical context.
 
-**Context:** The spec originally deferred the exact set of binary field types. A concrete decision is needed before `core::data` can be implemented.
+**Context:** The spec originally deferred the exact set of binary field types. At the time, a concrete decision was needed before the planned data-construction module could be implemented.
 
 **Decision:** Binary data is constructed as an ordered sequence of typed fields. Supported types are: `u8`, `u16`, `u24`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `f32`, `f64`, and raw bytes (arbitrary hex). Byte order is selectable per field — big-endian (default) or little-endian.
 
@@ -224,7 +224,7 @@ Moved to [`nmea0183/docs/ADR.md`](../../nmea0183/docs/ADR.md) — it is a decisi
 **Rationale for big-endian default:** The majority of marine and survey instruments use big-endian (network byte order). Defaulting to big-endian reduces misconfiguration for the primary target audience.
 
 **Consequences:**
-- `core::data` implements a `BinaryField` enum with one variant per type plus `RawBytes(Vec<u8>)`.
+- The planned data-construction module would have implemented a `BinaryField` enum with one variant per type plus `RawBytes(Vec<u8>)`.
 - Each field carries a `ByteOrder` enum (`BigEndian` | `LittleEndian`).
 - `u24` requires manual encoding (write the 3 most-significant bytes of a `u32`); no standard Rust primitive maps directly to it.
 - Binary message definitions are saved in profiles as an ordered list of field descriptors.

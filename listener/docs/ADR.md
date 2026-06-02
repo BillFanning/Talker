@@ -47,7 +47,7 @@ the same as talker's ADR-001.
 
 **Authoritative text:** spec §72.1.
 
-**Decision:** Profiles carry a single monotonically increasing `schema_version: u32`. Each binary knows one current version. Older additive changes load via field defaults; a profile newer than the binary is refused. This mirrors `talker`'s clean-break versioning (talker ADR-013) deliberately, so the two tools share one mental model.
+**Decision:** Profiles carry a single monotonically increasing `schema_version: u32`. Each binary knows one current version. Additive changes within that supported schema load via field defaults; a profile newer than the binary is refused. A breaking older schema is refused unless an explicit migration for that schema has been implemented. This mirrors `talker`'s clean-break v2 behavior (talker ADR-013) deliberately, so the two tools share one mental model.
 
 ---
 

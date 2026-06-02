@@ -1453,15 +1453,16 @@ one current schema version. On load, Listener compares the profile's
 `schema_version` against the version the running binary supports:
 
 - **Equal** — load normally.
-- **Profile older than the binary** — migrate forward: fill missing fields with
-  `#[serde(default)]` values, log a warning, and optionally rewrite the file at
-  the current version.
+- **Profile older than the binary** — additive changes within the same supported
+  schema load through `#[serde(default)]`; a breaking older schema is refused
+  unless an explicit migration for that schema has been implemented.
 - **Profile newer than the binary** — refuse to load and report the version
   mismatch.
 
-Additive fields use `#[serde(default)]` so older profiles missing newly added
-optional fields load cleanly without a version bump. The version increments only
-on a breaking change that defaults alone cannot absorb.
+Additive fields use `#[serde(default)]` so profiles missing newly added optional
+fields load cleanly without a version bump. The version increments only on a
+breaking change that defaults alone cannot absorb; a version bump must also
+define whether the older breaking schema is migrated or refused.
 
 ## 73. Interface Configuration
 

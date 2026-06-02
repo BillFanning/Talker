@@ -27,7 +27,7 @@ Build in this order — do **not** start with the GUI. Each unit is a `src/` mod
 
 ## Scaffolding
 
-- [ ] Stand up `lib.rs` declaring the §127 modules + thin `main.rs` shim (talker ADR-014 shape).
+- [x] Stand up `lib.rs` declaring the §127 modules + thin `main.rs` shim (talker ADR-014 shape).
 
 _OQ-L1 (single crate vs. multi-crate) is resolved — see ADR-004. Revisit a crate split only when an external consumer or compile-time concern justifies it._
 

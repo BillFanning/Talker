@@ -15,10 +15,11 @@
 
 ### 2.1 Crate Structure
 
-`talker` is a Cargo workspace with two crates:
+`wiredata` is a Cargo workspace with three crates:
 
 - **`talker`** — the binary crate containing the CLI, GUI, and all application logic
 - **`nmea0183`** — a standalone library crate containing all NMEA 0183 support, with no dependency on `talker`
+- **`listener`** — the receive/decode counterpart to `talker`, with its own spec, ADR, and TODO
 
 Each crate keeps its own `docs/` folder (spec, ADR, TODO). There is no
 workspace-root docs directory.
@@ -41,7 +42,7 @@ wiredata/                        # workspace root
 │   │       ├── channel/         # serial, UDP, TCP abstractions; channel collection
 │   │       ├── message/         # message formats, encoding, timestamp, checksum
 │   │       ├── scheduler/       # priority-queue send loop
-│   │       ├── profile/         # profile management and migration
+│   │       ├── profile/         # profile management; schema v2 clean break
 │   │       └── logging/         # logging subsystem
 │   └── tests/                   # integration tests (Rust convention)
 │
@@ -577,17 +578,17 @@ baud = 9600
   algorithm = "crc16_ccitt"
 ```
 
-#### Profile Schema Versioning and Migration
+#### Profile Schema Versioning
 
 Every profile file includes a `version` integer field in its header. The current schema version is `2`. This field enables `talker` to detect and handle schema changes as the program evolves.
 
 **Loading behavior by version:**
 
 - **Matches current version:** load normally.
-- **Older version:** run a migration function that fills in missing fields with defaults, logs a warning, and optionally rewrites the file at the current version.
+- **Older version:** refuse to load and instruct the user to recreate the profile. Version 1 predates release, so the v2 schema deliberately takes a clean break rather than carrying migration code.
 - **Newer version than the running binary understands:** warn the user and refuse to load.
 
-All profile fields use `#[serde(default)]` so that old profiles missing newly added optional fields load cleanly. The version number only increments when a breaking schema change occurs that `serde(default)` cannot handle alone.
+All profile fields use `#[serde(default)]` so that additive changes within schema version 2 can load cleanly when fields are missing. The version number only increments when a breaking schema change occurs that `serde(default)` cannot handle alone; a future breaking version can add migration code at that point.
 
 ---
 
