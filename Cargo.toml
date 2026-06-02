@@ -68,3 +68,19 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # ── Native file dialogs ───────────────────────────────────────────────────────
 rfd = "0.15"
+
+# ── Unique identifiers (channel / display-view / config IDs) ──────────────────
+uuid = { version = "1", features = ["v4"] }
+
+# ── Async runtime (listener only — talker is deliberately sync; ADR-001) ──────
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "net",
+    "io-util",
+    "fs",
+] }
+tokio-util = "0.7"        # CancellationToken for cooperative shutdown (§111)
+async-trait = "0.1"       # async methods in the recorder traits (§142)

@@ -1,1 +1,81 @@
 //! Raw, rendered, and hex display rendering.
+//!
+//! This is `listener-display` (spec §128, §40–§49). Display is presentation
+//! only: it never alters bytes, Messages, metadata, or recordings (§5.4, §40).
+//! The rendering pipeline is pure (no I/O, no async): bytes are decoded per the
+//! Display Encoding (§47) into characters, each character is rendered per the
+//! Character Rendering mode (§46), and the Display Mode (§42) assembles them as
+//! Raw, Rendered, or Hex with optional wrapping.
+//!
+//! The persisted [`DisplayViewConfig`](crate::config) selects these settings;
+//! purely visual options (font, colors) do not affect the produced text and so
+//! live only in that config. The enums here are defined by display (their
+//! functional owner); the config module will reference them.
+
+mod encoding;
+mod render;
+
+pub use render::DisplayView;
+
+use crate::core::{ChannelId, Message, MessageTimestamp};
+
+/// Display Mode — how received data is assembled for a view (§42).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayMode {
+    Raw,
+    Rendered,
+    Hex,
+}
+
+/// Display Encoding — how bytes are decoded into characters (§47, §80.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayEncoding {
+    Ascii,
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+    Latin1,
+}
+
+/// Character Rendering — how each character is displayed (§46, §80.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterRendering {
+    /// The actual character, unchanged (controls are passed through).
+    Native,
+    /// `[CR]` `[LF]` `[TAB]` `[NUL]` `[SP]` …
+    Token,
+    /// `␍` `␊` `␉` `␀` `␠` (Unicode Control Pictures).
+    Glyph,
+    /// `<0D>` `<0A>` `<09>` `<00>` `<20>`
+    HexEscape,
+}
+
+/// Wrapping Mode for a view (§80.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WrappingMode {
+    NoWrap,
+    Wrap,
+}
+
+/// The rendered representation of a Message for one Display View (§141).
+///
+/// Display Recording consumes this *after* rendering (§54) — it is explicitly
+/// not byte-exact and is not a substitute for Raw Recording. Because the
+/// artifact is already formatted, an optional timestamp may be written inline
+/// (§57).
+#[derive(Clone, Debug)]
+pub struct RenderedOutput {
+    pub channel_id: ChannelId,
+    /// `None` in Stream Mode, where Messages are not numbered (§18, §24).
+    pub message_number: Option<u64>,
+    /// The rendered text for this view (Raw/Rendered/Hex, §42).
+    pub text: String,
+    /// Arrival timestamp, if the view writes inline timestamps (§57).
+    pub timestamp: Option<MessageTimestamp>,
+}
+
+/// Renders a completed Message into a view's output (§141). Display formatting
+/// never affects bytes, Messages, metadata, or recordings (§5.4).
+pub trait Renderer {
+    fn render(&self, message: &Message) -> RenderedOutput;
+}

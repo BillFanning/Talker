@@ -13,16 +13,16 @@ Cross off items as they are completed. Add new ones inline as they come up.
 Build in this order — do **not** start with the GUI. Each unit is a `src/` module
 (single crate, per ADR-004 / spec §127):
 
-- [ ] `core/` module — common types, Message/metadata model, `ChannelId`, state enums, errors
-- [ ] `extract/` module
-- [ ] extraction tests
-- [ ] `runtime/` skeleton
-- [ ] queue / backpressure tests (the Transport→Extractor `blocking_send` path, §99)
-- [ ] UDP transport
-- [ ] serial transport (dedicated OS thread + bounded read timeout for cancellation, §111)
-- [ ] TCP listener/connection transport (runtime mints `ChannelId` per accepted connection)
-- [ ] recording
-- [ ] display
+- [x] `core/` module — common types, Message/metadata model, `ChannelId`, state enums, errors
+- [x] `extract/` module
+- [x] extraction tests
+- [x] `runtime/` skeleton
+- [x] queue / backpressure tests (the Transport→Extractor `blocking_send` path, §99)
+- [x] UDP transport
+- [x] serial transport (dedicated OS thread + bounded read timeout for cancellation, §111)
+- [x] TCP listener/connection transport (runtime mints `ChannelId` per accepted connection)
+- [x] recording
+- [x] display
 - [ ] GUI / CLI
 
 ## Scaffolding

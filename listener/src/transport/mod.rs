@@ -1,1 +1,117 @@
 //! Serial, UDP, TCP listener, and TCP connection transports.
+//!
+//! This is `listener-transport` (spec §128). It owns interface handles and
+//! receive buffers and knows nothing about NMEA, display, or recording formats.
+//! This file defines the **push-based transport contract** (§138, ADR-001): the
+//! types every transport emits and the runner traits the runtime drives. The
+//! concrete Serial/UDP/TCP runners are added in later steps; only the contract
+//! lives here for now so the runtime can be wired and tested against it.
+//!
+//! Two output shapes (§138):
+//! - data-bearing sources (Serial, UDP, TCP connection) emit [`ReceivedData`];
+//! - the connection acceptor (TCP listener) emits [`NewConnection`].
+//!
+//! There is no pull-based `receive()`. Lifecycle is cancel-then-await: the
+//! runtime cancels the [`CancellationToken`], then awaits completion via
+//! [`TransportJoinHandle`].
+
+use std::net::SocketAddr;
+
+use tokio::sync::mpsc::Sender;
+use tokio_util::sync::CancellationToken;
+
+use crate::core::{ChannelId, ChunkTime};
+
+pub mod serial;
+pub mod tcp;
+pub mod udp;
+
+pub use serial::{OpenSerialTransport, SerialTransport};
+pub use tcp::{BoundTcpListenerTransport, TcpConnectionTransport, TcpListenerTransport};
+pub use udp::{BoundUdpTransport, UdpMode, UdpTransport};
+
+/// One unit of received data emitted by a data-bearing transport (§104, §138).
+///
+/// Each chunk carries its payload and the [`ChunkTime`] captured when it was
+/// read. Chunk boundaries are an implementation detail, never a user-visible
+/// concept (§24); the extractor decides Message boundaries.
+#[derive(Clone, Debug)]
+pub struct ReceivedData {
+    pub channel_id: ChannelId,
+    pub payload: ReceivedPayload,
+    pub received_at: ChunkTime,
+}
+
+/// The two payload shapes a transport can deliver (§138).
+#[derive(Clone, Debug)]
+pub enum ReceivedPayload {
+    /// A stream chunk; framing is decided by the extractor (Serial, TCP).
+    Bytes(Vec<u8>),
+    /// Already one complete Message; no byte extraction is applied (UDP, §15).
+    Datagram(Vec<u8>),
+}
+
+impl ReceivedPayload {
+    /// The raw bytes of this payload, regardless of shape.
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            ReceivedPayload::Bytes(b) | ReceivedPayload::Datagram(b) => b,
+        }
+    }
+}
+
+/// Emitted by a TCP listener when it accepts a client (§16, §138). The runtime
+/// mints the new connection's [`ChannelId`] on receipt — this event carries the
+/// *listener's* id plus the accepted stream and its metadata.
+#[derive(Debug)]
+pub struct NewConnection {
+    pub listener_channel_id: ChannelId,
+    pub remote_addr: SocketAddr,
+    pub accepted_at: ChunkTime,
+    /// The accepted connection (the reason this event exists). `remote_addr` and
+    /// `accepted_at` are metadata, not identity.
+    pub stream: tokio::net::TcpStream,
+}
+
+/// Unifies a Tokio task handle and a dedicated OS thread so the runtime can
+/// await transport completion uniformly (§138). Joining a blocking thread goes
+/// through an async-observable `oneshot`, so it never blocks a runtime worker.
+pub enum TransportJoinHandle {
+    /// A transport that runs as a Tokio task (UDP, TCP).
+    Task(tokio::task::JoinHandle<()>),
+    /// A transport whose body runs on a dedicated OS thread (Serial); the thread
+    /// signals completion by dropping/sending on this `oneshot`.
+    Thread(tokio::sync::oneshot::Receiver<()>),
+}
+
+impl TransportJoinHandle {
+    /// Await transport completion. Safe to call from an async context: the
+    /// blocking-thread variant awaits a `oneshot` rather than `JoinHandle::join`.
+    pub async fn join(self) {
+        match self {
+            TransportJoinHandle::Task(handle) => {
+                let _ = handle.await;
+            }
+            TransportJoinHandle::Thread(done) => {
+                let _ = done.await;
+            }
+        }
+    }
+}
+
+/// A data-bearing transport: Serial, UDP, or TCP connection (§138).
+///
+/// Serial runs its body on a dedicated OS thread (sending via
+/// `Sender::blocking_send`); UDP/TCP run as Tokio tasks. `run` consumes the
+/// runner, so transports are dispatched by value (e.g. via an enum), not as
+/// `dyn` trait objects.
+pub trait DataTransportRunner {
+    fn run(self, out: Sender<ReceivedData>, cancel: CancellationToken) -> TransportJoinHandle;
+}
+
+/// A connection-accepting transport: the TCP listener (§138). Not a data source
+/// — it emits [`NewConnection`], and the runtime turns each into a TCP
+/// connection channel.
+pub trait ConnectionAcceptorRunner {
+    fn run(self, out: Sender<NewConnection>, cancel: CancellationToken) -> TransportJoinHandle;
+}

@@ -63,6 +63,37 @@ the same as talker's ADR-001.
 - §127 is the literal `src/` module map; §128 boundaries are normative whether a unit is a module (now) or a crate (later).
 - A later split is non-disruptive: extract a module into a `listener-*` member crate when an external consumer or compile-time concern justifies it. That future split, if taken, gets its own ADR.
 
+## ADR-005 — Delimiter extraction emits a Message at every delimiter, including empty payloads
+
+**Authoritative context:** spec §21 (delimiter extraction) and §150 (the
+required "consecutive delimiters" test). The spec mandates the test but does not
+prescribe the outcome, so the behavior is fixed here.
+
+**Decision:** `DelimiterExtractor` completes a Message at **every** delimiter
+occurrence, even when no payload bytes precede it. Consecutive delimiters
+therefore yield empty-payload Messages, and a leading delimiter yields a leading
+empty Message — mirroring standard string-split semantics (`"a\n\nb".split` →
+`["a", "", "b"]`). When `include_delimiter` is true the "empty" Message still
+contains the delimiter bytes; when false its payload is zero-length. Un-terminated
+trailing bytes are an incomplete Message and are discarded at `finish` (§112),
+not emitted as a final empty Message.
+
+**Rationale:** Listener is a forensic receive-side tool — "bad data is often the
+most important data" (§37). Silently collapsing runs of delimiters would hide the
+on-wire structure (e.g. stray blank lines, double CRLFs) that an operator is
+often looking for. Emit-on-every-delimiter is deterministic (§125), matches the
+"extraction defines structure" principle (§5.2), and is the simplest rule to
+reason about. A downstream decoder marks an empty/`$`-less Message as it sees fit
+(§37); extraction does not pre-judge meaning.
+
+**Consequences:**
+- A noisy source can produce many empty Messages; they consume Message Numbers
+  and retention slots like any other Message. Bounding pathological cases
+  (oversized un-terminated buffers, §119/§124) is a separate config/runtime
+  concern, not an extractor responsibility.
+- This rule is observable behavior and is pinned by unit tests in
+  `extract/delimiter.rs`.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

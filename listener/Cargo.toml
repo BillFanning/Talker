@@ -17,3 +17,19 @@ nmea0183 = { path = "../nmea0183" }
 
 # Error handling (application-level)
 anyhow = { workspace = true }
+
+# Library-style typed errors for the core data model (shared error enums, §95)
+thiserror = { workspace = true }
+
+# Channel / display-view / config identifiers (§129, §80.1)
+uuid = { workspace = true }
+
+# Async runtime + cooperative cancellation (ADR-001 / spec §97.1, §111)
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+# Serial port I/O — runs on a dedicated OS thread (ADR-001 / spec §97.1)
+serialport = { workspace = true }
+
+# async methods in the recorder traits (§142)
+async-trait = { workspace = true }
