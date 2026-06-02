@@ -1,0 +1,19 @@
+[package]
+name        = "listener"
+description = "Receive and decode byte-oriented data from serial and network connections"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+rust-version.workspace = true
+
+[[bin]]
+name = "listener"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace crate — listener and talker are equal consumers of nmea0183.
+nmea0183 = { path = "../nmea0183" }
+
+# Error handling (application-level)
+anyhow = { workspace = true }
