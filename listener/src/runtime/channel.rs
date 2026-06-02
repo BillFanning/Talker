@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{ChannelId, RuntimeEvent};
+use crate::decode::Decoder;
 use crate::extract::MessageExtractor;
 use crate::transport::{DataTransportRunner, TransportJoinHandle};
 
@@ -43,7 +44,7 @@ impl ChannelTasks {
     /// Graceful stop (§110): stop reception, close the interface, then let the
     /// pipeline drain the accepted backlog (its sender drops when the transport
     /// task ends, so its receive loop sees the channel close and returns).
-    async fn stop(self) -> ChannelPipeline {
+    pub(crate) async fn stop(self) -> ChannelPipeline {
         self.transport_cancel.cancel();
         self.transport.join().await;
         self.pipeline_task
@@ -53,7 +54,7 @@ impl ChannelTasks {
 
     /// Forced stop (§111, §113): cancel transport and pipeline together; a
     /// queued backlog may be abandoned rather than drained.
-    async fn abort(self) -> ChannelPipeline {
+    pub(crate) async fn abort(self) -> ChannelPipeline {
         self.transport_cancel.cancel();
         self.pipeline_cancel.cancel();
         self.transport.join().await;
@@ -69,6 +70,7 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     channel_id: ChannelId,
     runner: R,
     extractor: Box<dyn MessageExtractor + Send>,
+    decoder: Option<Box<dyn Decoder + Send>>,
     caps: PipelineCapacities,
     raw_recording: bool,
     events: Sender<RuntimeEvent>,
@@ -77,8 +79,11 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     // reader (§97.1, §99). No unbounded intermediate queue is introduced (§97.2).
     let (ingest_tx, ingest_rx) = mpsc::channel(caps.ingest);
 
-    let pipeline =
+    let mut pipeline =
         ChannelPipeline::new(channel_id, extractor, caps, raw_recording).with_event_sender(events);
+    if let Some(decoder) = decoder {
+        pipeline = pipeline.with_decoder(decoder);
+    }
 
     let transport_cancel = CancellationToken::new();
     let pipeline_cancel = CancellationToken::new();
@@ -134,7 +139,15 @@ pub fn start_data_channel<R: DataTransportRunner>(
     raw_recording: bool,
 ) -> RunningChannel {
     let (event_tx, event_rx) = mpsc::channel(caps.events);
-    let tasks = spawn_channel_tasks(channel_id, runner, extractor, caps, raw_recording, event_tx);
+    let tasks = spawn_channel_tasks(
+        channel_id,
+        runner,
+        extractor,
+        None,
+        caps,
+        raw_recording,
+        event_tx,
+    );
     RunningChannel {
         tasks,
         events: event_rx,
@@ -144,10 +157,40 @@ pub fn start_data_channel<R: DataTransportRunner>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::RuntimeEvent;
+    use crate::core::{ChunkTime, RuntimeEvent};
     use crate::extract::StreamExtractor;
     use crate::transport::udp::{UdpMode, UdpTransport};
+    use crate::transport::{ReceivedData, ReceivedPayload};
+    use std::time::Duration;
     use tokio::net::UdpSocket;
+
+    /// A test transport that emits a fixed script of datagrams, then stays alive
+    /// until cancelled. Lets shutdown tests control the accepted backlog.
+    struct ScriptedTransport {
+        channel_id: ChannelId,
+        chunks: Vec<Vec<u8>>,
+    }
+
+    impl DataTransportRunner for ScriptedTransport {
+        fn run(self, out: Sender<ReceivedData>, cancel: CancellationToken) -> TransportJoinHandle {
+            let ScriptedTransport { channel_id, chunks } = self;
+            let handle = tokio::spawn(async move {
+                for chunk in chunks {
+                    let data = ReceivedData {
+                        channel_id,
+                        payload: ReceivedPayload::Datagram(chunk),
+                        received_at: ChunkTime::now(),
+                    };
+                    // Stops early if the pipeline is gone (forced shutdown).
+                    if out.send(data).await.is_err() {
+                        return;
+                    }
+                }
+                cancel.cancelled().await;
+            });
+            TransportJoinHandle::Task(handle)
+        }
+    }
 
     #[tokio::test]
     async fn udp_channel_end_to_end_through_the_pipeline() {
@@ -196,5 +239,52 @@ mod tests {
             retained,
             vec![(1, b"alpha".to_vec()), (2, b"bravo".to_vec())]
         );
+    }
+
+    #[tokio::test]
+    async fn graceful_stop_drains_the_accepted_backlog() {
+        // §110: graceful stop must finish processing already-accepted data.
+        let cid = ChannelId::new();
+        let transport = ScriptedTransport {
+            channel_id: cid,
+            chunks: (0u8..5).map(|i| vec![i]).collect(),
+        };
+        let running = start_data_channel(
+            cid,
+            transport,
+            Box::new(StreamExtractor::new()),
+            PipelineCapacities::default(),
+            false,
+        );
+
+        let pipeline = tokio::time::timeout(Duration::from_secs(5), running.stop())
+            .await
+            .expect("graceful stop hung");
+        // All five datagrams were drained before finalizing.
+        assert_eq!(pipeline.retention().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn forced_abort_completes_without_hanging() {
+        // §111: forced shutdown may abandon the backlog, but must terminate
+        // promptly and cleanly rather than draining it.
+        let cid = ChannelId::new();
+        let transport = ScriptedTransport {
+            channel_id: cid,
+            chunks: (0..1000).map(|i| vec![(i % 256) as u8]).collect(),
+        };
+        let running = start_data_channel(
+            cid,
+            transport,
+            Box::new(StreamExtractor::new()),
+            PipelineCapacities::default(),
+            false,
+        );
+
+        let pipeline = tokio::time::timeout(Duration::from_secs(5), running.abort())
+            .await
+            .expect("forced abort hung");
+        // It terminated; it cannot have retained more than was produced.
+        assert!(pipeline.retention().len() <= 1000);
     }
 }

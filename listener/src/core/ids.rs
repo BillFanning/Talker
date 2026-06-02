@@ -34,7 +34,7 @@ impl fmt::Display for ChannelId {
 }
 
 /// User-visible Channel name (§6). User configurable and need not be unique.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChannelName(String);
 
 impl ChannelName {
@@ -72,7 +72,7 @@ impl Default for DisplayViewId {
 
 /// Stable identity for a configured Channel, persisted in a profile so a saved
 /// workspace round-trips to the same logical channel (§72, §80.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct StableConfigId(Uuid);
 
 impl StableConfigId {

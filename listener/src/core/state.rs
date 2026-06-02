@@ -2,7 +2,7 @@
 //! plus the §9 state-transition rules.
 
 /// The four supported Channel kinds (§7).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChannelKind {
     Serial,
     Udp,

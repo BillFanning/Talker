@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 /// Identifies a decoder protocol (§80.1). Non-exhaustive: additional protocols
 /// may be added without a breaking change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum ProtocolId {
     Nmea0183,

@@ -26,7 +26,7 @@ use super::{DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHan
 const MAX_DATAGRAM: usize = 65_535;
 
 /// How a UDP Channel receives (§15, mirrors `UdpMode` in the profile schema §75).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UdpMode {
     Unicast,
     Broadcast,

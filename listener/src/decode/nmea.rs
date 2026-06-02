@@ -26,7 +26,7 @@ const ALGORITHM: &str = "NMEA XOR";
 
 /// NMEA checksum validation mode (§37). Affects only the `IntegrityStatus`
 /// assigned and the diagnostics raised — never whether a sentence is surfaced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NmeaValidationMode {
     /// Missing checksum is accepted (`NotPresent`); present checksums are
     /// validated (§37.1).

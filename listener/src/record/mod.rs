@@ -30,8 +30,9 @@ pub use file::{DisplayFileRecorder, RawFileRecorder};
 
 /// Which recording system is active for a Channel (§52). Raw is primary;
 /// Display is optional; a Channel may run both.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RecordingMode {
+    #[default]
     Disabled,
     Raw,
     Display,
@@ -42,7 +43,7 @@ pub enum RecordingMode {
 ///
 /// Defined here (record owns file lifecycle, §128); the profile schema will
 /// reference this type when the config module lands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum OverwritePolicy {
     #[default]
     Refuse,

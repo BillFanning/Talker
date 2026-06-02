@@ -70,7 +70,7 @@ chrono = { version = "0.4", features = ["serde"] }
 rfd = "0.15"
 
 # ── Unique identifiers (channel / display-view / config IDs) ──────────────────
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # ── Async runtime (listener only — talker is deliberately sync; ADR-001) ──────
 tokio = { version = "1", features = [

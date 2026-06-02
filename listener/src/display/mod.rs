@@ -20,7 +20,7 @@ pub use render::DisplayView;
 use crate::core::{ChannelId, Message, MessageTimestamp};
 
 /// Display Mode — how received data is assembled for a view (§42).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DisplayMode {
     Raw,
     Rendered,
@@ -28,7 +28,7 @@ pub enum DisplayMode {
 }
 
 /// Display Encoding — how bytes are decoded into characters (§47, §80.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DisplayEncoding {
     Ascii,
     Utf8,
@@ -38,7 +38,7 @@ pub enum DisplayEncoding {
 }
 
 /// Character Rendering — how each character is displayed (§46, §80.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CharacterRendering {
     /// The actual character, unchanged (controls are passed through).
     Native,
@@ -51,7 +51,7 @@ pub enum CharacterRendering {
 }
 
 /// Wrapping Mode for a view (§80.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WrappingMode {
     NoWrap,
     Wrap,

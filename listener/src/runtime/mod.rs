@@ -5,24 +5,26 @@
 //! shutdown. Per ADR-001 it is a Tokio hybrid: async tasks for orchestration
 //! and network I/O, dedicated OS threads for blocking serial reads.
 //!
-//! Implemented so far (skeleton):
+//! Layers:
 //! - [`queue`] — the §99 bounded-queue backpressure policies.
 //! - [`metadata`] — the §106 Message Numbering / metadata stage.
-//! - [`pipeline`] — the §102 per-Channel processing pipeline and its async
-//!   ingest loop ([`pipeline::run_channel`]).
-//!
-//! Still to come (wired with the transports, steps 6–8): the top-level command
-//! loop that owns the channel registry, mints `ChannelId`s for accepted TCP
-//! connections (§97.1), spawns transport runners, and drives the §110 stop
-//! sequence in response to [`crate::core::RuntimeCommand`]s.
+//! - [`pipeline`] — the §102 per-Channel processing pipeline + async ingest loop.
+//! - [`channel`]/[`tcp`] — per-Channel and TCP-listener task orchestration.
+//! - [`build`] — maps validated config to live transports/extractors/decoders.
+//! - [`listener`] — the [`Listener`] orchestrator: registry, §9 state machine,
+//!   start/stop/apply-pending in the [`crate::core::RuntimeCommand`] vocabulary.
 
+pub mod build;
 pub mod channel;
+pub mod listener;
 pub mod metadata;
 pub mod pipeline;
 pub mod queue;
 pub mod tcp;
 
+pub use build::BuildError;
 pub use channel::{start_data_channel, RunningChannel};
+pub use listener::{Listener, OrchestratorError};
 pub use metadata::MessageNumbering;
 pub use pipeline::{run_channel, ChannelPipeline, DecodedMessage, PipelineCapacities};
 pub use queue::{

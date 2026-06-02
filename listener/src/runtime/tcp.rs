@@ -109,6 +109,9 @@ where
                             conn_id,
                             transport,
                             make_extractor(),
+                            // TODO: per-connection decoder from the listener's
+                            // DecoderConfig (start_tcp_listener needs a decoder factory).
+                            None,
                             caps,
                             raw_recording,
                             events.clone(),
