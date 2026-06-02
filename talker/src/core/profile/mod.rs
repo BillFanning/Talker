@@ -270,11 +270,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The sample profile shipped at the repository root must stay valid.
+    /// The sample profile shipped with the crate must stay valid.
     #[test]
     fn sample_profile_toml_loads() {
-        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../profile.toml"));
-        let profile = Profile::load(path).expect("repo profile.toml should load");
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/profiles/profile.example.toml"
+        ));
+        let profile = Profile::load(path).expect("profile.example.toml should load");
         assert_eq!(profile.version, CURRENT_VERSION);
         assert!(!profile.channels.is_empty());
     }

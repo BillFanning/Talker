@@ -16,8 +16,9 @@ use talker::{cli, core, gui};
                   UDP unicast/broadcast/multicast, or TCP client) on a profile-defined \
                   schedule. Run with --gui for the graphical editor, or with \
                   --profile / --profile-path on the command line to start sending \
-                  immediately. Profiles are TOML files (see profile.example.toml) and \
-                  live in the OS-appropriate config directory by default."
+                  immediately. Profiles are TOML files (see \
+                  talker/profiles/profile.example.toml) and live in the \
+                  OS-appropriate config directory by default."
 )]
 struct TopArgs {
     /// Print version information and exit.

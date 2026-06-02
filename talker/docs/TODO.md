@@ -9,6 +9,15 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 ---
 
+## Profiles
+
+- [ ] **Make the profile directory user-configurable.** Default stays the OS config
+  dir (`dirs::config_dir()/talker/profiles`, `core::profile::default_dir`) — the safe,
+  always-writable choice. Add an override so users can point talker at a directory of
+  their choosing (e.g. a `--profile-dir` CLI flag, a `TALKER_PROFILE_DIR` env var, and/or
+  a GUI setting), which also enables a portable "profiles next to the .exe" layout
+  without making it the default. Sample profiles ship in `talker/profiles/`.
+
 ## When writing the project README
 
 - [ ] Document the system packages required on Linux for `eframe` (`libxcb`, `libxkbcommon`, etc.) per ADR-003 consequences.

@@ -1,8 +1,7 @@
 # Rust build output
 /target
 
-# User profiles live at the repo root and are kept local — only the
-# tracked sample / build manifest are committed.
-/*.toml
-!/Cargo.toml
-!/profile.example.toml
+# User profiles live in talker/profiles/ and are kept local — only the
+# tracked sample is committed.
+/talker/profiles/*.toml
+!/talker/profiles/profile.example.toml
