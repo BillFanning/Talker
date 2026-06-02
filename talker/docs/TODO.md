@@ -1,25 +1,13 @@
-# TODO
-**Version:** 1.1
+# TODO — Talker
 
-Implementation reminders — small concrete tasks that need to happen during normal development. Not architectural decisions (those go in the ADR's Open questions section).
+Implementation reminders for the `talker` application and the workspace as a whole.
+Tasks specific to the `nmea0183` library live in
+[`nmea0183/docs/TODO.md`](../../nmea0183/docs/TODO.md). Not architectural decisions
+(those go in the ADR's Open questions section).
 
 Cross off items as they are completed. Add new ones inline as they come up.
 
 ---
-
-## Before publishing `nmea0183` to crates.io
-
-- [ ] Add publication metadata to `nmea0183/Cargo.toml`:
-  - `repository = "..."`
-  - `documentation = "..."` (or rely on docs.rs default)
-  - `readme = "README.md"`
-  - `keywords = ["nmea", "nmea0183", "marine", "gnss", "gps"]` (max 5)
-  - `categories = ["parser-implementations", "encoding"]` (must match crates.io category slugs)
-- [ ] Write `nmea0183/README.md`.
-- [ ] Resolve OQ-4 (library MSRV policy) in a new ADR.
-- [ ] Update `talker/Cargo.toml`: `nmea0183 = { path = "../nmea0183", version = "0.1" }` (per OQ-1), so downstream builds against the published crate resolve while in-workspace builds use the local source.
-
-`#[non_exhaustive]` on `NmeaError` and the public enums (per ADR-004 / ADR-009) is already done.
 
 ## When writing the project README
 
@@ -36,6 +24,5 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 The sections below were open in TODO v1.0 and are now done; kept here so the history is not lost.
 
-- **`nmea0183` source** — serde derives on all public types are gated behind the `serde` feature, and verified to compile both with and without it (`cargo build -p nmea0183` / `--features serde`).
 - **`core::logging`** — `tracing-appender` added to workspace dependencies for rotating file output; dual-mode subscriber implemented (CLI writes to stdout/file; the GUI captures events into a `tracing_subscriber::Layer` that forwards to the UI thread via `crossbeam-channel`).
 - **`core::profile`** — schema v2 with `CURRENT_VERSION` checked on every load; `#[serde(default)]` on all fields; `#[non_exhaustive]` on profile enums. OQ-2 (`toml = "1"` is sufficient) and OQ-3 (profiles use a `talker`-side NMEA representation, so the `nmea0183` `serde` feature stays off) are resolved — see the Open questions section of the ADR.

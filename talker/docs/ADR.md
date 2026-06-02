@@ -6,6 +6,14 @@
 
 ---
 
+This file records workspace-level and `talker`-application decisions. Decisions
+specific to the `nmea0183` library crate live in
+[`nmea0183/docs/ADR.md`](../../nmea0183/docs/ADR.md) (currently ADR-009 and OQ-4).
+ADR numbers are shared across both files and never reused, so the cross-references
+below (e.g. "see ADR-009") remain valid.
+
+---
+
 ## What belongs in an ADR
 
 An ADR captures *why* a significant decision was made, not just *what* was decided. It records the context, the options considered, the choice made, and the consequences — so that anyone joining the project later (or the original author six months later) can understand the reasoning without reconstructing it from scratch. An ADR is not a specification; it complements the spec by explaining the decisions that shaped it.
@@ -163,18 +171,7 @@ An ADR captures *why* a significant decision was made, not just *what* was decid
 
 ## ADR-009 — Talker ID and sentence type extensibility in `nmea0183`
 
-**Context:** NMEA 0183 has ~36 standard talker IDs and many sentence types. New proprietary sentences (`$P...`) are encountered regularly in marine and survey equipment.
-
-**Decision:** 
-- Standard talker IDs are represented as an enum with a `Custom(String)` variant for arbitrary two-character IDs.
-- Sentence types follow the same pattern: an enum with a `Custom(String)` variant.
-- Proprietary sentences use a dedicated `ProprietarySentence` type with named variants for known formats (`Prdid`, `Pashr`) and a `Raw` variant for arbitrary `$P` sentences.
-
-**Consequences:**
-- Named proprietary sentences (`$PRDID`, `$PASHR`) get field-level construction and validation.
-- The `Raw` variant accepts any manufacturer code and comma-separated field string with optional checksum — no validation beyond checksum computation.
-- The `$PASHR` GNSS quality field (field 10) is exposed as a raw `u8` rather than an enum, because Trimble and Novatel define the values differently. The crate documentation must record both vendor conventions explicitly.
-- `$PRDID` does not include a checksum by protocol convention; the builder must not append one.
+Moved to [`nmea0183/docs/ADR.md`](../../nmea0183/docs/ADR.md) — it is a decision internal to the `nmea0183` library. The ADR-009 number is retained there.
 
 ---
 
@@ -306,6 +303,6 @@ The following decisions are deferred until the relevant module is written. They 
 
 **OQ-3 — `nmea0183` serde feature activation in `talker`. — Resolved (v2.0).** `core::profile` uses a **`talker`-side representation**: an NMEA message is stored as `PayloadConfig::Nmea { talker: String, sentence_type: String, fields: Vec<String> }` — plain strings, not `nmea0183` types — and converted to a `nmea0183::NmeaSentence` only at compile time. The profile schema is therefore decoupled from the library's struct shapes, and the `talker` dependency on `nmea0183` does **not** enable the `serde` feature (`nmea0183 = { path = "../nmea0183" }`). The `serde` feature on `nmea0183` itself still exists and is still verified to compile, for the benefit of other potential consumers.
 
-**OQ-4 — `nmea0183` library MSRV policy.** ADR-008 sets the workspace MSRV to current stable Rust. The `nmea0183` library, intended for crates.io publication, may benefit from a looser MSRV to accommodate cautious downstream users. The policy (e.g., N-6 months of stable releases) and the mechanism (per-crate `rust-version` override) are deferred to a future ADR when publication approaches. See ADR-008 for context.
+**OQ-4 — `nmea0183` library MSRV policy.** Moved to [`nmea0183/docs/ADR.md`](../../nmea0183/docs/ADR.md) — it concerns the library's publication policy. See ADR-008 above for the workspace MSRV context it builds on.
 
 New open questions should be added here as they arise during implementation.

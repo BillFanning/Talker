@@ -20,14 +20,19 @@
 - **`talker`** — the binary crate containing the CLI, GUI, and all application logic
 - **`nmea0183`** — a standalone library crate containing all NMEA 0183 support, with no dependency on `talker`
 
+Each crate keeps its own `docs/` folder (spec, ADR, TODO). There is no
+workspace-root docs directory.
+
 ```
-talker/                          # workspace root
+wiredata/                        # workspace root
 ├── Cargo.toml                   # workspace manifest
-├── ADR.md
-├── talker_specification.md
 │
 ├── talker/                      # binary crate
 │   ├── Cargo.toml
+│   ├── docs/
+│   │   ├── ADR.md              # workspace- and talker-level decisions
+│   │   ├── TODO.md
+│   │   └── talker_specification.md
 │   ├── src/
 │   │   ├── main.rs              # entry point; dispatches to CLI or GUI
 │   │   ├── cli/                 # CLI interface module
@@ -40,15 +45,27 @@ talker/                          # workspace root
 │   │       └── logging/         # logging subsystem
 │   └── tests/                   # integration tests (Rust convention)
 │
-└── nmea0183/                    # library crate (publishable independently)
+├── nmea0183/                    # library crate (publishable independently)
+│   ├── Cargo.toml
+│   ├── docs/
+│   │   ├── ADR.md              # nmea0183-specific decisions (ADR-009, OQ-4)
+│   │   ├── TODO.md
+│   │   └── nmea0183_specification.md
+│   ├── src/
+│   │   ├── lib.rs               # public API surface
+│   │   ├── sentence/            # sentence types, construction, parsing
+│   │   ├── talker_id.rs         # talker ID enum and custom variant
+│   │   ├── checksum.rs          # XOR checksum computation and verification
+│   │   └── proprietary/         # $PRDID, $PASHR, and arbitrary $P builder
+│   └── tests/                   # integration tests for nmea0183
+│
+└── listener/                    # receive/decode utility crate
     ├── Cargo.toml
-    ├── src/
-    │   ├── lib.rs               # public API surface
-    │   ├── sentence/            # sentence types, construction, parsing
-    │   ├── talker_id.rs         # talker ID enum and custom variant
-    │   ├── checksum.rs          # XOR checksum computation and verification
-    │   └── proprietary/         # $PRDID, $PASHR, and arbitrary $P builder
-    └── tests/                   # integration tests for nmea0183
+    ├── docs/
+    │   ├── ADR.md              # listener decisions (own ADR numbering)
+    │   ├── TODO.md
+    │   └── listener-spec-v1.1.1.md
+    └── src/
 ```
 
 ### 2.2 Interface Separation
