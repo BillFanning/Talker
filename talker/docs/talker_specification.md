@@ -64,7 +64,7 @@ wiredata/                        # workspace root
     ├── docs/
     │   ├── ADR.md              # listener decisions (own ADR numbering)
     │   ├── TODO.md
-    │   └── listener-spec-v1.1.1.md
+    │   └── listener_specification.md
     └── src/
 ```
 

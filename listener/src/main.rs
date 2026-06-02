@@ -1,5 +1,5 @@
 // listener — receive and decode byte-oriented data from serial and network
-// connections. See docs/listener-spec-v1.1.1.md (under this crate).
+// connections. See docs/listener_specification.md (under this crate).
 
 use anyhow::Result;
 

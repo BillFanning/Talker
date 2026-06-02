@@ -24,7 +24,7 @@ This document defines the functional requirements, architecture, runtime model, 
 This document is intended to be placed at:
 
 ```text
-listener/docs/listener-spec-v1.1.1.md
+listener/docs/listener_specification.md
 ```
 
 Codex and other code-generation tools should treat this specification as authoritative unless the user explicitly revises it.

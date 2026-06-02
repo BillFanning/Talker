@@ -28,13 +28,30 @@ Each crate owns a `docs/` folder:
 |-------|------|-----------|-------|
 | `talker` | [talker/docs/talker_specification.md](talker/docs/talker_specification.md) | [talker/docs/ADR.md](talker/docs/ADR.md) | [talker/docs/TODO.md](talker/docs/TODO.md) |
 | `nmea0183` | [nmea0183/docs/nmea0183_specification.md](nmea0183/docs/nmea0183_specification.md) | [nmea0183/docs/ADR.md](nmea0183/docs/ADR.md) | [nmea0183/docs/TODO.md](nmea0183/docs/TODO.md) |
-| `listener` | [listener/docs/listener-spec-v1.1.1.md](listener/docs/listener-spec-v1.1.1.md) | [listener/docs/ADR.md](listener/docs/ADR.md) | [listener/docs/TODO.md](listener/docs/TODO.md) |
+| `listener` | [listener/docs/listener_specification.md](listener/docs/listener_specification.md) | [listener/docs/ADR.md](listener/docs/ADR.md) | [listener/docs/TODO.md](listener/docs/TODO.md) |
 
 - Record any non-trivial design choice as a **new ADR entry** in the owning crate's
   `ADR.md` (talker and nmea0183 share one ADR number series; listener has its own).
 - Track concrete implementation reminders in the owning crate's `TODO.md`.
 - **Deferred / out-of-scope features** are normative in each spec (e.g. listener spec
   Appendix A). Do not implement them without a spec amendment.
+
+### Document versioning
+
+These rules apply to every versioned document across the workspace (specs, ADRs,
+TODOs, and any other versioned file):
+
+- A document's version number lives **only at the top** of the document (its header) —
+  never repeated anywhere else in the body.
+- **Don't put version numbers in filenames.** Keep the version in the header only, so a
+  bump is a one-line edit with no rename or reference churn. Our specs follow this:
+  `talker_specification.md`, `nmea0183_specification.md`, `listener_specification.md`.
+  (If a filename ever does carry a version, the filename and the in-document version
+  must stay in sync — rename on every change.)
+- **Never change a version number without checking with the user first.** Get explicit
+  approval before any bump.
+- **Every version change ships with a revision note** at the top of the document,
+  summarizing what changed.
 
 ## 3. Scope & workflow discipline
 

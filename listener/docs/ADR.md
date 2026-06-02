@@ -1,14 +1,14 @@
 # Architecture Decision Record — Listener
 
 **Crate:** listener
-**Status:** Draft (tracks listener-spec v1.1.1)
+**Status:** Draft (tracks the listener spec)
 
 ---
 
 This file is the home for `Listener`'s architecture decisions. Some decisions are
 authored inline in the spec where the surrounding context lives — those are listed
 here with a pointer to the authoritative section in
-[`listener-spec-v1.1.1.md`](listener-spec-v1.1.1.md) rather than duplicated. Workspace-
+[`listener_specification.md`](listener_specification.md) rather than duplicated. Workspace-
 and `talker`-level decisions live in [`talker/docs/ADR.md`](../../talker/docs/ADR.md);
 `nmea0183` decisions in [`nmea0183/docs/ADR.md`](../../nmea0183/docs/ADR.md). Listener
 keeps its own ADR numbering (it is a separate crate), so Listener's ADR-001 is *not*
@@ -53,7 +53,7 @@ the same as talker's ADR-001.
 
 ## ADR-004 — Single crate, modular internals (resolves OQ-L1)
 
-**Authoritative text:** spec §127–§128 (revised in listener-spec v1.1.1).
+**Authoritative text:** spec §127–§128 (revised in listener spec v1.1.1).
 
 **Context:** Spec §127 originally sketched a twelve-crate split (`listener-core`, `listener-runtime`, `listener-transport`, `listener-extract`, `listener-decode`, `listener-display`, `listener-record`, `listener-retention`, `listener-config`, `listener-diagnostics`, `listener-cli`, `listener-gui`) and nested `nmea0183` inside `listener`. The crate actually exists as a single `listener` crate alongside `talker` and `nmea0183`.
 
