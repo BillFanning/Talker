@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::config::schema::InterfaceConfig;
 use crate::config::ChannelConfig;
-use crate::core::{ChannelId, ChannelState, RuntimeEvent};
+use crate::core::{ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
 use crate::record::{start_raw_recording, RawFileRecorder, Recording, RecordingMode};
 use crate::transport::{DataTransportRunner, ReceivedData};
 
@@ -27,7 +27,7 @@ use super::build::{
     build_decoder, build_extractor, build_serial, build_tcp_listener, build_udp, BuildError,
 };
 use super::channel::{spawn_monitored_channel, MonitoredChannel};
-use super::pipeline::PipelineCapacities;
+use super::pipeline::{DisplayViewHandle, PipelineCapacities};
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
 
 /// A live Channel's running tasks. Held by the orchestrator so it can stop them.
@@ -43,6 +43,9 @@ struct ManagedChannel {
     pending: Option<ChannelConfig>,
     state: ChannelState,
     handle: Option<ChannelHandle>,
+    /// Pause handles for the running Channel's Display Views (§11, §48); empty
+    /// while Stopped.
+    display_handles: Vec<DisplayViewHandle>,
 }
 
 /// Errors from orchestrating a Channel.
@@ -50,6 +53,8 @@ struct ManagedChannel {
 pub enum OrchestratorError {
     #[error("unknown channel {0}")]
     UnknownChannel(ChannelId),
+    #[error("unknown display view {0:?} on the channel")]
+    UnknownDisplayView(DisplayViewId),
     #[error("illegal channel state transition from {from:?} to {to:?}")]
     IllegalTransition {
         from: ChannelState,
@@ -103,6 +108,7 @@ impl Listener {
                 pending: None,
                 state: ChannelState::Stopped,
                 handle: None,
+                display_handles: Vec::new(),
             },
         );
         id
@@ -122,6 +128,51 @@ impl Listener {
 
     pub fn has_pending(&self, id: ChannelId) -> bool {
         self.channels.get(&id).is_some_and(|c| c.pending.is_some())
+    }
+
+    /// The Display View ids of a running Channel (§48); empty while Stopped.
+    pub fn display_views(&self, channel: ChannelId) -> Vec<DisplayViewId> {
+        self.channels
+            .get(&channel)
+            .map(|c| c.display_handles.iter().map(|h| h.id).collect())
+            .unwrap_or_default()
+    }
+
+    /// Pause one Display View (§11, §50): reception, recording, numbering, and
+    /// other views are unaffected.
+    pub fn pause_display(
+        &self,
+        channel: ChannelId,
+        view: DisplayViewId,
+    ) -> Result<(), OrchestratorError> {
+        self.display_handle(channel, view)?.pause();
+        Ok(())
+    }
+
+    /// Resume a paused Display View (§11).
+    pub fn resume_display(
+        &self,
+        channel: ChannelId,
+        view: DisplayViewId,
+    ) -> Result<(), OrchestratorError> {
+        self.display_handle(channel, view)?.resume();
+        Ok(())
+    }
+
+    fn display_handle(
+        &self,
+        channel: ChannelId,
+        view: DisplayViewId,
+    ) -> Result<&DisplayViewHandle, OrchestratorError> {
+        let managed = self
+            .channels
+            .get(&channel)
+            .ok_or(OrchestratorError::UnknownChannel(channel))?;
+        managed
+            .display_handles
+            .iter()
+            .find(|h| h.id == view)
+            .ok_or(OrchestratorError::UnknownDisplayView(view))
     }
 
     fn set_state(&mut self, id: ChannelId, state: ChannelState) {
@@ -150,8 +201,14 @@ impl Listener {
         self.set_state(id, ChannelState::Starting);
         match self.spawn_channel(id, &config).await {
             Ok(handle) => {
+                let display_handles = match &handle {
+                    ChannelHandle::Data(tasks) => tasks.display_handles().to_vec(),
+                    // A TCP listener has no display itself; its connections do.
+                    ChannelHandle::TcpListener(_) => Vec::new(),
+                };
                 if let Some(channel) = self.channels.get_mut(&id) {
                     channel.handle = Some(handle);
+                    channel.display_handles = display_handles;
                     channel.state = ChannelState::Running;
                 }
                 let _ = self.events_tx.try_send(RuntimeEvent::ChannelStarted(id));
@@ -174,7 +231,10 @@ impl Listener {
         match state {
             ChannelState::Running => {
                 self.set_state(id, ChannelState::Stopping);
-                let handle = self.channels.get_mut(&id).and_then(|c| c.handle.take());
+                let handle = self.channels.get_mut(&id).and_then(|c| {
+                    c.display_handles.clear();
+                    c.handle.take()
+                });
                 match handle {
                     Some(ChannelHandle::Data(tasks)) => {
                         let _ = tasks.stop().await;
@@ -187,6 +247,9 @@ impl Listener {
                 Ok(())
             }
             ChannelState::Faulted => {
+                if let Some(channel) = self.channels.get_mut(&id) {
+                    channel.display_handles.clear();
+                }
                 self.set_state(id, ChannelState::Stopped);
                 let _ = self.events_tx.try_send(RuntimeEvent::ChannelStopped(id));
                 Ok(())
@@ -323,6 +386,8 @@ impl Listener {
             build_extractor(&config.extraction),
             build_decoder(&config.decoder),
             raw_recorder,
+            // One runtime Display View per configured view (§48); at least one.
+            config.display.views.len(),
             self.channel_caps(config),
             self.events_tx.clone(),
         )
@@ -464,6 +529,30 @@ mod tests {
 
         listener.shutdown().await;
         assert_eq!(listener.state(id), Some(ChannelState::Stopped));
+    }
+
+    #[tokio::test]
+    async fn display_views_can_be_paused_by_id() {
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        // The UDP template configures a Raw + Hex display → two views (§84).
+        let id = listener.add_channel(udp_channel());
+        assert!(listener.display_views(id).is_empty()); // none while Stopped
+
+        listener.start(id).await.unwrap();
+        let views = listener.display_views(id);
+        assert_eq!(views.len(), 2);
+
+        // Pause/resume a known view; an unknown view id errors.
+        assert!(listener.pause_display(id, views[0]).is_ok());
+        assert!(listener.resume_display(id, views[0]).is_ok());
+        assert!(matches!(
+            listener.pause_display(id, DisplayViewId::new()),
+            Err(OrchestratorError::UnknownDisplayView(_))
+        ));
+
+        listener.stop(id).await.unwrap();
+        assert!(listener.display_views(id).is_empty()); // cleared on stop
     }
 
     #[tokio::test]

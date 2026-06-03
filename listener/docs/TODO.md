@@ -77,8 +77,12 @@ tests yet.
   spontaneous fault until the user calls `stop` (the event fires; state reconciliation is
   lazy); quantified loss *estimates* (§101 "estimated data loss where practical") are not
   computed — only observable loss is reportable (kernel-dropped UDP is undetectable).
-- [ ] **Multi-view display + pause** — pipeline has one display queue, not N views keyed
-  by `DisplayViewId`; `DisplayState`/Pause-Resume commands (§11/§50) are unimplemented.
+- [x] **Multi-view display + pause** — the pipeline holds N Display Views (§48) keyed by
+  `DisplayViewId`, each with a shared `DisplayViewHandle` pause flag. Pausing one view
+  freezes only its accumulation; reception/recording/numbering/retention and other views
+  are unaffected (§11/§50). Wired through the orchestrator: it creates one runtime view per
+  `DisplayConfig` view, stores the handles, and exposes `display_views`/`pause_display`/
+  `resume_display(channel, view)` (the `RuntimeCommand::PauseDisplay` vocabulary).
 
 ---
 

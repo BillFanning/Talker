@@ -10,13 +10,14 @@
 //! only edge permitted to stall the reader is the Transport→Extractor channel
 //! (§97.1), the bounded `tokio::sync::mpsc` that feeds [`run_channel`].
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{
-    ChannelId, Message, MessageBytes, ProtocolMetadata, RecordingState, RuntimeEvent,
+    ChannelId, DisplayViewId, Message, MessageBytes, ProtocolMetadata, RecordingState, RuntimeEvent,
 };
 use crate::decode::Decoder;
 use crate::extract::MessageExtractor;
@@ -74,6 +75,53 @@ impl ByteSized for DecodedMessage {
     }
 }
 
+/// A handle to one Display View's runtime pause state (§11). Cloneable and
+/// shareable across the pipeline-task boundary: a UI/orchestrator holds a clone
+/// and flips pause/resume without a command channel into the pipeline.
+#[derive(Clone, Debug)]
+pub struct DisplayViewHandle {
+    pub id: DisplayViewId,
+    paused: Arc<AtomicBool>,
+}
+
+impl DisplayViewHandle {
+    fn new_active() -> Self {
+        Self {
+            id: DisplayViewId::new(),
+            paused: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Pause this view: it stops accumulating new display items. Reception,
+    /// recording, numbering, retention, and *other* views are unaffected (§50).
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Relaxed);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+}
+
+/// One Display View's runtime state: its pause handle and bounded history (§87).
+struct PipelineDisplayView {
+    handle: DisplayViewHandle,
+    history: DropOldestQueue<DecodedMessage>,
+}
+
+impl PipelineDisplayView {
+    fn new(capacity: usize) -> Self {
+        Self {
+            handle: DisplayViewHandle::new_active(),
+            history: DropOldestQueue::with_capacity(capacity),
+        }
+    }
+}
+
 /// One Channel's processing pipeline (§102). Driven synchronously via
 /// [`ChannelPipeline::ingest`]; [`run_channel`] is the async loop around it.
 /// (No `Debug` derive: the boxed `dyn MessageExtractor` is not `Debug`.)
@@ -82,7 +130,9 @@ pub struct ChannelPipeline {
     extractor: Box<dyn MessageExtractor + Send>,
     numbering: MessageNumbering,
     decoder: Option<Box<dyn Decoder + Send>>,
-    display: DropOldestQueue<DecodedMessage>,
+    /// Display Views (§48): a Channel may have several, each independently
+    /// paused (§11). The first is the default view created by `new`.
+    display_views: Vec<PipelineDisplayView>,
     retention: MessageRetention<DecodedMessage>,
     diagnostics: DiagnosticsQueue,
     /// Raw Recording handle (§53). `None` when recording is disabled or its
@@ -104,7 +154,7 @@ impl ChannelPipeline {
             extractor,
             numbering: MessageNumbering::new(),
             decoder: None,
-            display: DropOldestQueue::with_capacity(caps.display),
+            display_views: vec![PipelineDisplayView::new(caps.display)],
             retention: MessageRetention::new(Some(caps.retention), caps.retention_bytes),
             diagnostics: DiagnosticsQueue::with_capacity(caps.diagnostics),
             raw_recorder: None,
@@ -217,9 +267,14 @@ impl ChannelPipeline {
             protocol,
         };
 
-        // Display: drop oldest on overflow (§99). Per-item loss is coalesced and
-        // reported later (§101); we do not emit a diagnostic per dropped item.
-        let _ = self.display.push(decoded.clone());
+        // Display fan-out (§48, §108): each Active view accumulates the Message,
+        // dropping oldest on overflow (§99). A Paused view skips accumulation
+        // without affecting reception/retention/numbering or other views (§50).
+        for view in &mut self.display_views {
+            if !view.handle.is_paused() {
+                let _ = view.history.push(decoded.clone());
+            }
+        }
         // Retention: bounded by count and bytes (§88), evicting oldest (§89).
         // Message Numbers are never rewritten, so survivors keep their numbers.
         self.retention.push(decoded);
@@ -249,8 +304,34 @@ impl ChannelPipeline {
         self.numbering.peek()
     }
 
+    /// Add a Display View and return its pause handle (§48). The caller keeps
+    /// the handle to pause/resume the view across the pipeline-task boundary.
+    pub fn add_display_view(&mut self, capacity: usize) -> DisplayViewHandle {
+        let view = PipelineDisplayView::new(capacity);
+        let handle = view.handle.clone();
+        self.display_views.push(view);
+        handle
+    }
+
+    /// Pause/resume handles for every Display View, default first (§48).
+    pub fn display_view_handles(&self) -> Vec<DisplayViewHandle> {
+        self.display_views
+            .iter()
+            .map(|v| v.handle.clone())
+            .collect()
+    }
+
+    /// The retained history of a specific Display View.
+    pub fn display_view(&self, id: DisplayViewId) -> Option<&DropOldestQueue<DecodedMessage>> {
+        self.display_views
+            .iter()
+            .find(|v| v.handle.id == id)
+            .map(|v| &v.history)
+    }
+
+    /// The default Display View's history (the first view, created by `new`).
     pub fn display_queue(&self) -> &DropOldestQueue<DecodedMessage> {
-        &self.display
+        &self.display_views[0].history
     }
 
     pub fn retention(&self) -> &MessageRetention<DecodedMessage> {
@@ -428,6 +509,33 @@ mod tests {
         // Oldest two evicted; survivors keep their original numbers 3,4,5.
         assert_eq!(nums, vec![3, 4, 5]);
         assert_eq!(p.next_message_number(), 6);
+    }
+
+    #[test]
+    fn pausing_one_view_does_not_affect_others_or_reception() {
+        // §11/§50: pausing one Display View must not pause reception, numbering,
+        // retention, or the other views.
+        let cid = ChannelId::new();
+        let mut p = lf_pipeline(cid, PipelineCapacities::default());
+        let default_view = p.display_view_handles()[0].clone();
+        let second_view = p.add_display_view(1024);
+
+        default_view.pause();
+        p.ingest(bytes_chunk(cid, b"1\n2\n3\n"));
+
+        // Paused view accumulated nothing; the active view got all three.
+        assert_eq!(p.display_view(default_view.id).unwrap().len(), 0);
+        assert_eq!(p.display_view(second_view.id).unwrap().len(), 3);
+        // Reception, numbering, and retention were unaffected.
+        assert_eq!(p.retention().len(), 3);
+        assert_eq!(p.next_message_number(), 4);
+
+        // Resuming lets the view accumulate again — but only new Messages (no
+        // backfill of what was missed while paused, §55-style live semantics).
+        default_view.resume();
+        p.ingest(bytes_chunk(cid, b"4\n"));
+        assert_eq!(p.display_view(default_view.id).unwrap().len(), 1);
+        assert_eq!(p.display_view(second_view.id).unwrap().len(), 4);
     }
 
     #[test]

@@ -113,6 +113,7 @@ where
                             // factories). Connections are undecoded/unrecorded.
                             None,
                             None,
+                            1, // one default Display View per connection
                             caps,
                             events.clone(),
                         );
@@ -122,6 +123,7 @@ where
                             pipeline_task,
                             channel_id: _,
                             pipeline_cancel: _,
+                            display_handles: _,
                         } = tasks;
 
                         // Detect disconnect: the transport task ends on EOF/cancel/fault.

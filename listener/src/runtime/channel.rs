@@ -30,7 +30,7 @@ use crate::extract::MessageExtractor;
 use crate::record::Recording;
 use crate::transport::{DataTransportRunner, ReceivedData, TransportJoinHandle, TransportOutcome};
 
-use super::pipeline::{run_channel, ChannelPipeline, PipelineCapacities};
+use super::pipeline::{run_channel, ChannelPipeline, DisplayViewHandle, PipelineCapacities};
 
 /// The transport + pipeline tasks for one Channel. A plain holder, destructured
 /// by [`spawn_monitored_channel`] and the TCP listener supervisor (which each do
@@ -41,16 +41,20 @@ pub(crate) struct ChannelTasks {
     pub(crate) pipeline_cancel: CancellationToken,
     pub(crate) transport: TransportJoinHandle,
     pub(crate) pipeline_task: JoinHandle<ChannelPipeline>,
+    pub(crate) display_handles: Vec<DisplayViewHandle>,
 }
 
 /// Wire a bound data-bearing transport to a fresh pipeline and start both tasks,
 /// emitting events into the supplied sender (§97.2, §102, §137).
+// Internal wiring with distinct, meaningful per-channel inputs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     channel_id: ChannelId,
     runner: R,
     extractor: Box<dyn MessageExtractor + Send>,
     decoder: Option<Box<dyn Decoder + Send>>,
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
+    display_view_count: usize,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
 ) -> ChannelTasks {
@@ -65,6 +69,11 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     if let Some(recorder) = raw_recorder {
         pipeline = pipeline.with_raw_recorder(recorder);
     }
+    // `new` created the default Display View; add the rest to reach the count.
+    for _ in 1..display_view_count.max(1) {
+        pipeline.add_display_view(caps.display);
+    }
+    let display_handles = pipeline.display_view_handles();
 
     let transport_cancel = CancellationToken::new();
     let pipeline_cancel = CancellationToken::new();
@@ -78,6 +87,7 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
         pipeline_cancel,
         transport,
         pipeline_task,
+        display_handles,
     }
 }
 
@@ -91,9 +101,15 @@ pub(crate) struct MonitoredChannel {
     pipeline_cancel: CancellationToken,
     pipeline_task: JoinHandle<ChannelPipeline>,
     monitor: JoinHandle<()>,
+    display_handles: Vec<DisplayViewHandle>,
 }
 
 impl MonitoredChannel {
+    /// Pause/resume handles for this Channel's Display Views (§11, §48).
+    pub(crate) fn display_handles(&self) -> &[DisplayViewHandle] {
+        &self.display_handles
+    }
+
     /// Graceful stop (§110): stop reception; the transport's sender drops, the
     /// pipeline drains the accepted backlog and returns, and the monitor ends.
     pub(crate) async fn stop(self) -> ChannelPipeline {
@@ -123,12 +139,14 @@ impl MonitoredChannel {
 /// transport outcome and emits `ChannelFaulted` if it ended on a fault (§94,
 /// §101). Used for standalone and orchestrated data channels; the TCP supervisor
 /// does its own per-connection monitoring instead.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     channel_id: ChannelId,
     runner: R,
     extractor: Box<dyn MessageExtractor + Send>,
     decoder: Option<Box<dyn Decoder + Send>>,
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
+    display_view_count: usize,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
 ) -> MonitoredChannel {
@@ -139,12 +157,14 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         pipeline_cancel,
         transport,
         pipeline_task,
+        display_handles,
     } = spawn_channel_tasks(
         channel_id,
         runner,
         extractor,
         decoder,
         raw_recorder,
+        display_view_count,
         caps,
         events,
     );
@@ -163,6 +183,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         pipeline_cancel,
         pipeline_task,
         monitor,
+        display_handles,
     }
 }
 
@@ -211,6 +232,7 @@ pub fn start_data_channel<R: DataTransportRunner>(
         extractor,
         None,
         raw_recorder,
+        1, // a single default Display View
         caps,
         event_tx,
     );
