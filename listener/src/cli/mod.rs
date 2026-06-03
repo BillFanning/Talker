@@ -47,6 +47,7 @@ pub struct Cli {
 /// CLI entry point: parse args, build a Tokio runtime, run the event loop.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    crate::diagnostics::init_logging(); // §114; non-fatal if already installed (§117)
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     runtime.block_on(run_cli(cli))
 }

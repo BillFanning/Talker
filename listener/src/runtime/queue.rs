@@ -113,33 +113,9 @@ impl<T> FaultOnFullQueue<T> {
     }
 }
 
-/// Severity of a diagnostic, ordered low → high priority (§92–§95). On
-/// diagnostics overflow the **oldest lowest-priority** entry is dropped first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DiagnosticSeverity {
-    /// Something happened (§92: channel started, client connected, …).
-    Event,
-    /// May affect operation but does not prevent it (§93).
-    Warning,
-    /// Failure to complete or continue an operation (§94).
-    Error,
-}
-
-/// A diagnostic record retained for review (§91–§95).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Diagnostic {
-    pub severity: DiagnosticSeverity,
-    pub message: String,
-}
-
-impl Diagnostic {
-    pub fn new(severity: DiagnosticSeverity, message: impl Into<String>) -> Self {
-        Self {
-            severity,
-            message: message.into(),
-        }
-    }
-}
+// The diagnostic record model lives in the `diagnostics` module (§91–§95);
+// re-exported here because `DiagnosticsQueue` is the §99 fan-out edge over it.
+pub use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
 
 /// A bounded diagnostics buffer that drops the **oldest lowest-priority** entry
 /// first when full (§99). A higher-priority newcomer evicts an older
