@@ -37,3 +37,6 @@ async-trait = { workspace = true }
 # Profile schema serialization (TOML) — §72
 serde = { workspace = true }
 toml = { workspace = true }
+
+# CLI argument parsing (thin presentation layer, §3)
+clap = { workspace = true }

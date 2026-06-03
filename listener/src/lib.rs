@@ -13,7 +13,8 @@ pub mod transport;
 
 use anyhow::Result;
 
+/// Binary entry point: run the CLI (§3). The GUI front-end is a separate path
+/// (not yet implemented).
 pub fn run() -> Result<()> {
-    println!("listener: not yet implemented");
-    Ok(())
+    cli::run()
 }

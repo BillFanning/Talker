@@ -28,7 +28,10 @@ Implementation order per spec §147 (do **not** start with the GUI). Each unit i
 - [x] TCP listener/connection transport (runtime mints `ChannelId` per accepted connection)
 - [x] recording — `RawRecorder`/`DisplayRecorder`, file impls, `OverwritePolicy`, fault/finalize (§56.1)
 - [x] display — encodings, Raw/Rendered/Hex, character rendering, wrapping, `Renderer`
-- [ ] GUI / CLI
+- [x] **CLI** — `listener --profile <toml>` or quick `--udp/--tcp/--serial [--baud] [--nmea]`;
+  loads/validates config, starts channels via the orchestrator, streams `RuntimeEvent`s,
+  Ctrl-C → graceful shutdown. Thin presentation layer (§3); verified end-to-end.
+- [ ] GUI (egui/eframe) — not started
 
 Modules outside the §147 order (§128):
 
