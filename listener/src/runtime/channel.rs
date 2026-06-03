@@ -21,7 +21,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +30,9 @@ use crate::decode::Decoder;
 use crate::display::{DisplayView, RenderedOutput};
 use crate::extract::MessageExtractor;
 use crate::record::Recording;
-use crate::transport::{DataTransportRunner, ReceivedData, TransportJoinHandle, TransportOutcome};
+use crate::transport::{
+    DataTransportRunner, ReceivedData, TransportJoinHandle, TransportNotice, TransportOutcome,
+};
 
 use super::pipeline::{run_channel, ChannelPipeline, DisplayViewHandle, PipelineCapacities};
 use super::snapshot::{ChannelSnapshot, SnapshotRequest};
@@ -38,6 +40,18 @@ use super::snapshot::{ChannelSnapshot, SnapshotRequest};
 /// Bounded request channel for on-demand snapshots (§137, ADR-006). Tiny: a
 /// requester sends a oneshot reply and awaits; the pipeline answers between reads.
 const SNAPSHOT_REQUESTS: usize = 8;
+
+/// Bounded capacity for the transport-notice channel (§95, §101, ADR-007).
+///
+/// Transport notices are **advisory and bounded**, like the other observer paths
+/// (§99): the sender uses `try_send` and drops on a full channel. This is
+/// deliberate — a notice is itself a warning about *possible* reader-stall loss,
+/// and blocking the reader to deliver it would cause the very stall it warns of.
+/// Small but not tiny, so a short burst isn't lost to a transient drain delay; a
+/// dropped-notice counter can be added later if the drop rate ever matters. Only a
+/// serial transport sends here (§97.1); other transports leave the sender
+/// unattached, so the receiver stays empty for the channel's life.
+pub(crate) const TRANSPORT_NOTICES: usize = 16;
 
 /// The transport + pipeline tasks for one Channel. A plain holder, destructured
 /// by [`spawn_monitored_channel`] and the TCP listener supervisor (which each do
@@ -67,6 +81,7 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     display_view_count: usize,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
+    notices_rx: Receiver<TransportNotice>,
 ) -> ChannelTasks {
     // The bounded Transport→Extractor queue — the only edge that may stall the
     // reader (§97.1, §99). No unbounded intermediate queue is introduced (§97.2).
@@ -96,6 +111,7 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     let pipeline_task = tokio::spawn(run_channel(
         ingest_rx,
         snapshot_rx,
+        notices_rx,
         pipeline,
         pipeline_cancel.clone(),
     ));
@@ -187,6 +203,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
     faulted: Arc<AtomicBool>,
+    notices_rx: Receiver<TransportNotice>,
 ) -> MonitoredChannel {
     let monitor_events = events.clone();
     let ChannelTasks {
@@ -207,6 +224,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         display_view_count,
         caps,
         events,
+        notices_rx,
     );
 
     let monitor = tokio::spawn(async move {
@@ -283,6 +301,9 @@ pub fn start_data_channel<R: DataTransportRunner>(
 ) -> RunningChannel {
     let (event_tx, event_rx) = mpsc::channel(caps.events);
     let faulted = Arc::new(AtomicBool::new(false));
+    // A standalone channel has no serial loss reporter wired in; the notice sender
+    // is dropped, so the receiver stays empty for the channel's life.
+    let (_notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
     let tasks = spawn_monitored_channel(
         channel_id,
         runner,
@@ -294,6 +315,7 @@ pub fn start_data_channel<R: DataTransportRunner>(
         caps,
         event_tx,
         faulted.clone(),
+        notice_rx,
     );
     RunningChannel {
         tasks,

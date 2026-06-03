@@ -27,10 +27,11 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::{ChannelId, ChunkTime, RuntimeEvent};
+use crate::core::{ChannelId, ChunkTime};
 
 use super::{
-    DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHandle, TransportOutcome,
+    DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHandle, TransportNotice,
+    TransportOutcome,
 };
 
 /// Read buffer size for one blocking read (a serial chunk; framing is the
@@ -42,11 +43,11 @@ const READ_BUFFER: usize = 4096;
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// How long the reader must be stalled on the Transport→Extractor edge before it
-/// warns of *possible* transport-specific loss (§99, §101; listener ADR-007). A
+/// emits a [`TransportNotice::ReceptionStalled`] (§99, §101; listener ADR-007). A
 /// stall this long means the OS/UART receive buffer has had ample time to overrun.
 /// Heuristic: momentary backpressure that drains quickly is normal and must not
 /// cry loss. The byte count of any overrun is not observable from userland, so the
-/// warning is unquantified (§101 "estimated data loss where practical").
+/// notice carries the stall duration, not a fabricated count (§101).
 const STALL_WARNING: Duration = Duration::from_millis(250);
 
 /// An unopened serial transport description (§14, §74). Call
@@ -148,7 +149,7 @@ impl SerialTransport {
         Ok(OpenSerialTransport {
             channel_id: self.channel_id,
             port,
-            loss_reporter: None,
+            notices: None,
         })
     }
 }
@@ -157,9 +158,10 @@ impl SerialTransport {
 pub struct OpenSerialTransport {
     channel_id: ChannelId,
     port: Box<dyn SerialPort>,
-    /// Optional event sink for transport-specific loss warnings (§101). When set,
-    /// a sustained reader stall emits `WarningRaised` (listener ADR-007).
-    loss_reporter: Option<Sender<RuntimeEvent>>,
+    /// Optional sink for transport notices (§95, §101). When set, a sustained
+    /// reader stall sends `ReceptionStalled`; the pipeline turns it into a
+    /// retained diagnostic + `WarningRaised` (listener ADR-007).
+    notices: Option<Sender<TransportNotice>>,
 }
 
 impl OpenSerialTransport {
@@ -167,12 +169,13 @@ impl OpenSerialTransport {
         self.channel_id
     }
 
-    /// Attach the runtime event stream so a sustained reader stall — the only
-    /// edge that can backpressure the reader (§97.1) — surfaces a possible-loss
-    /// warning (§101, ADR-007). Optional: without it the reader still stalls
-    /// rather than drops; it just stays silent about it.
-    pub fn with_loss_reporter(mut self, events: Sender<RuntimeEvent>) -> Self {
-        self.loss_reporter = Some(events);
+    /// Attach the transport-notice channel so a sustained reader stall — the only
+    /// edge that can backpressure the reader (§97.1) — is reported (§101, ADR-007).
+    /// Optional: without it the reader still stalls rather than drops; it just
+    /// stays silent about it. Serial is the only transport that can stall the
+    /// reader, so it is the only one given a notice sink.
+    pub fn with_notice_sender(mut self, notices: Sender<TransportNotice>) -> Self {
+        self.notices = Some(notices);
         self
     }
 }
@@ -181,7 +184,7 @@ impl DataTransportRunner for OpenSerialTransport {
     fn run(self, out: Sender<ReceivedData>, cancel: CancellationToken) -> TransportJoinHandle {
         let (done_tx, done_rx) = oneshot::channel();
         let channel_id = self.channel_id;
-        let loss_reporter = self.loss_reporter;
+        let notices = self.notices;
         let reader = SerialReader { port: self.port };
         std::thread::Builder::new()
             .name("serial-rx".to_string())
@@ -192,7 +195,7 @@ impl DataTransportRunner for OpenSerialTransport {
                     out,
                     cancel,
                     STALL_WARNING,
-                    loss_reporter,
+                    notices,
                 );
                 // Report the outcome to the async side (never blocks a worker).
                 let _ = done_tx.send(outcome);
@@ -231,16 +234,16 @@ impl BlockingReader for SerialReader {
 /// On the Transport→Extractor edge — the only one permitted to backpressure the
 /// reader (§99) — the loop *stalls* rather than drops, so it loses nothing in
 /// process. A stall longer than `stall_warning` means the OS/UART buffer has had
-/// time to overrun, so it warns of *possible* transport-specific loss through
-/// `loss_reporter` (§101, ADR-007), once per stall episode. The lost byte count
-/// is not observable from userland, so the warning is unquantified.
+/// time to overrun, so it sends a `ReceptionStalled` notice through `notices`
+/// (§101, ADR-007), once per stall episode, carrying the observed stall duration.
+/// The lost byte count is not observable from userland, so it is not reported.
 fn run_blocking_receive_loop(
     channel_id: ChannelId,
     mut reader: impl BlockingReader,
     out: Sender<ReceivedData>,
     cancel: CancellationToken,
     stall_warning: Duration,
-    loss_reporter: Option<Sender<RuntimeEvent>>,
+    notices: Option<Sender<TransportNotice>>,
 ) -> TransportOutcome {
     let mut buf = vec![0u8; READ_BUFFER];
     // One warning per stall episode; reset once the queue accepts again.
@@ -274,9 +277,15 @@ fn run_blocking_receive_loop(
                         // A sustained stall risks a UART/driver overrun upstream of
                         // us — transport-specific loss we flag but cannot quantify
                         // (§101). Momentary backpressure that drains fast is normal.
-                        if !stall_warned && stalled_at.elapsed() >= stall_warning {
-                            if let Some(events) = &loss_reporter {
-                                let _ = events.try_send(RuntimeEvent::WarningRaised(channel_id));
+                        // The notice send is non-blocking (`try_send`): we never
+                        // block the reader to deliver a stall warning.
+                        let waited = stalled_at.elapsed();
+                        if !stall_warned && waited >= stall_warning {
+                            if let Some(notices) = &notices {
+                                let _ = notices.try_send(TransportNotice::ReceptionStalled {
+                                    channel_id,
+                                    stalled_for: waited,
+                                });
                             }
                             stall_warned = true;
                         }
@@ -403,12 +412,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sustained_stall_warns_of_possible_transport_loss() {
-        // §101 / ADR-007: a reader stall longer than the threshold flags possible
-        // transport-specific loss via WarningRaised — once per episode, and never
-        // by dropping data. A short threshold keeps the test quick.
+    async fn sustained_stall_sends_a_reception_stalled_notice() {
+        // §101 / ADR-007: a reader stall longer than the threshold sends a
+        // ReceptionStalled notice carrying the stall duration — once per episode,
+        // and never by dropping data. A short threshold keeps the test quick.
         let (tx, mut rx) = mpsc::channel(1);
-        let (loss_tx, mut loss_rx) = mpsc::channel(8);
+        let (notice_tx, mut notice_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let cid = ChannelId::new();
         // Two chunks: the first fills the cap-1 queue; the second stalls the reader
@@ -417,7 +426,7 @@ mod tests {
         let loop_cancel = cancel.clone();
         let threshold = Duration::from_millis(20);
         std::thread::spawn(move || {
-            run_blocking_receive_loop(cid, reader, tx, loop_cancel, threshold, Some(loss_tx))
+            run_blocking_receive_loop(cid, reader, tx, loop_cancel, threshold, Some(notice_tx))
         });
 
         // Let the reader fill the queue and then stall on the second chunk for
@@ -426,21 +435,27 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");
         assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"2");
 
-        // Exactly the stall warning surfaced, naming the channel; no data lost.
-        assert_eq!(
-            loss_rx.recv().await.unwrap(),
-            RuntimeEvent::WarningRaised(cid)
-        );
+        // Exactly one stall notice surfaced, naming the channel and carrying a
+        // duration ≥ the threshold.
+        match notice_rx.recv().await.unwrap() {
+            TransportNotice::ReceptionStalled {
+                channel_id,
+                stalled_for,
+            } => {
+                assert_eq!(channel_id, cid);
+                assert!(stalled_for >= threshold);
+            }
+        }
 
         cancel.cancel();
     }
 
     #[tokio::test]
-    async fn momentary_backpressure_does_not_warn() {
-        // A queue that drains promptly is normal backpressure, not loss: no
-        // warning even though the reader briefly stalls (§101 false-positive guard).
+    async fn momentary_backpressure_sends_no_notice() {
+        // A queue that drains promptly is normal backpressure, not loss: no notice
+        // even though the reader briefly stalls (§101 false-positive guard).
         let (tx, mut rx) = mpsc::channel(1);
-        let (loss_tx, mut loss_rx) = mpsc::channel(8);
+        let (notice_tx, mut notice_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
         let cid = ChannelId::new();
         let reader = ScriptedReader::new(vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]);
@@ -448,7 +463,7 @@ mod tests {
         // A high threshold the brisk draining below never crosses.
         let threshold = Duration::from_secs(10);
         std::thread::spawn(move || {
-            run_blocking_receive_loop(cid, reader, tx, loop_cancel, threshold, Some(loss_tx))
+            run_blocking_receive_loop(cid, reader, tx, loop_cancel, threshold, Some(notice_tx))
         });
 
         for expected in [b"1", b"2", b"3"] {
@@ -456,7 +471,7 @@ mod tests {
         }
         cancel.cancel();
 
-        // No warning was raised for the brief, self-clearing backpressure.
-        assert!(loss_rx.try_recv().is_err());
+        // No notice for the brief, self-clearing backpressure.
+        assert!(notice_rx.try_recv().is_err());
     }
 }

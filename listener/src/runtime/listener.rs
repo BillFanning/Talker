@@ -28,13 +28,13 @@ use crate::record::{
     start_display_recording, start_raw_recording, DisplayFileRecorder, RawFileRecorder, Recording,
     RecordingMode,
 };
-use crate::transport::{DataTransportRunner, ReceivedData};
+use crate::transport::{DataTransportRunner, ReceivedData, TransportNotice};
 
 use super::build::{
     build_decoder, build_display_view, build_extractor, build_serial, build_tcp_listener,
     build_udp, BuildError,
 };
-use super::channel::{spawn_monitored_channel, MonitoredChannel};
+use super::channel::{spawn_monitored_channel, MonitoredChannel, TRANSPORT_NOTICES};
 use super::pipeline::{DisplayViewHandle, PipelineCapacities};
 use super::snapshot::ChannelSnapshot;
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
@@ -397,18 +397,19 @@ impl Listener {
         match &config.interface {
             InterfaceConfig::Serial(serial) => {
                 // Serial is the one transport whose reader can stall (§97.1); give
-                // it the event stream so a sustained stall warns of possible
-                // transport-specific loss (§101, ADR-007).
+                // it a notice sender so a sustained stall becomes a retained
+                // diagnostic + warning in the pipeline (§101, ADR-007).
+                let (notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
                 let opened = build_serial(id, serial)?
                     .open()
                     .await
                     .map_err(OrchestratorError::SerialOpen)?
-                    .with_loss_reporter(self.events_tx.clone());
+                    .with_notice_sender(notice_tx);
                 let raw = self.build_raw_recorder(id, config).await;
                 let display = self.build_display_recorder(id, config).await;
-                Ok(ChannelHandle::Data(
-                    self.spawn_data(id, opened, config, raw, display, faulted),
-                ))
+                Ok(ChannelHandle::Data(self.spawn_data(
+                    id, opened, config, raw, display, faulted, notice_rx,
+                )))
             }
             InterfaceConfig::Udp(udp) => {
                 let bound = build_udp(id, udp)?
@@ -417,9 +418,11 @@ impl Listener {
                     .map_err(OrchestratorError::Bind)?;
                 let raw = self.build_raw_recorder(id, config).await;
                 let display = self.build_display_recorder(id, config).await;
-                Ok(ChannelHandle::Data(
-                    self.spawn_data(id, bound, config, raw, display, faulted),
-                ))
+                // UDP is async and never stalls the reader; no notices to send.
+                let (_notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
+                Ok(ChannelHandle::Data(self.spawn_data(
+                    id, bound, config, raw, display, faulted, notice_rx,
+                )))
             }
             // The TCP listener supervises per-connection faults itself; a
             // listener-acceptor fault isn't reconciled through this flag (v1).
@@ -454,6 +457,7 @@ impl Listener {
         raw_recorder: Option<Recording<Arc<ReceivedData>>>,
         display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
         faulted: Arc<AtomicBool>,
+        notices_rx: mpsc::Receiver<TransportNotice>,
     ) -> MonitoredChannel {
         spawn_monitored_channel(
             id,
@@ -467,6 +471,7 @@ impl Listener {
             self.channel_caps(config),
             self.events_tx.clone(),
             faulted,
+            notices_rx,
         )
     }
 

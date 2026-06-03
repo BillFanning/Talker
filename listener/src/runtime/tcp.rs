@@ -28,7 +28,7 @@ use crate::extract::MessageExtractor;
 use crate::transport::tcp::{BoundTcpListenerTransport, TcpConnectionTransport};
 use crate::transport::{ConnectionAcceptorRunner, NewConnection, TransportOutcome};
 
-use super::channel::{spawn_channel_tasks, ChannelTasks};
+use super::channel::{spawn_channel_tasks, ChannelTasks, TRANSPORT_NOTICES};
 use super::pipeline::PipelineCapacities;
 
 /// Per-connection state retained by the supervisor for shutdown and disconnect
@@ -112,6 +112,9 @@ where
 
                         let conn_id = ChannelId::new(); // runtime mints (§97.1)
                         let transport = TcpConnectionTransport::new(conn_id, new_conn.stream);
+                        // TCP is async and never stalls the reader (§97.1), so it
+                        // sends no transport notices; drop the sender.
+                        let (_notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
                         let tasks = spawn_channel_tasks(
                             conn_id,
                             transport,
@@ -124,6 +127,7 @@ where
                             1, // one default Display View per connection
                             caps,
                             events.clone(),
+                            notice_rx,
                         );
                         let ChannelTasks {
                             transport: transport_join,

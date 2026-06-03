@@ -16,6 +16,7 @@
 //! [`TransportJoinHandle`].
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
@@ -84,6 +85,30 @@ pub enum TransportOutcome {
     /// Ended on a fatal read/accept error (§94). The reader may have lost data at
     /// the OS before failing — transport-specific loss the runtime reports (§101).
     Faulted(String),
+}
+
+/// A non-terminal, advisory signal from a running transport to its pipeline
+/// (§95, §101; listener ADR-007).
+///
+/// Unlike [`TransportOutcome`] (terminal), a notice reports a condition the
+/// transport detects *while still running*. The transport stays free of the
+/// diagnostics/event vocabulary: it states what happened (self-describing, incl.
+/// which channel), and the pipeline — the owner of the channel's `DiagnosticLog` —
+/// records the `Diagnostic` and emits the matching `RuntimeEvent`. Notices are
+/// **advisory**: the sender uses `try_send` and drops on a full channel (§99); a
+/// notice never blocks the reader (blocking the reader to announce a reader stall
+/// would cause the very stall it warns of).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TransportNotice {
+    /// The reader stalled on the Transport→Extractor edge — the only edge that may
+    /// backpressure the reader (§97.1, §99) — for `stalled_for`. Long enough to
+    /// risk a UART/driver overrun: possible transport-specific loss, unquantifiable
+    /// from userland (§101). `stalled_for` is the observable proxy for "how bad".
+    ReceptionStalled {
+        channel_id: ChannelId,
+        stalled_for: Duration,
+    },
 }
 
 /// Unifies a Tokio task handle and a dedicated OS thread so the runtime can

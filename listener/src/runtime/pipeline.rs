@@ -27,7 +27,7 @@ use crate::display::{DisplayView, RenderedOutput, Renderer};
 use crate::extract::MessageExtractor;
 use crate::record::{Recording, RecordingStopReason};
 use crate::retention::{ByteSized, MessageRetention, RetentionStore};
-use crate::transport::{ReceivedData, ReceivedPayload};
+use crate::transport::{ReceivedData, ReceivedPayload, TransportNotice};
 
 use super::metadata::MessageNumbering;
 use super::queue::DropOldestQueue;
@@ -312,6 +312,29 @@ impl ChannelPipeline {
         }
     }
 
+    /// Record a non-terminal transport notice (§95, §101; ADR-007). The transport
+    /// states *what happened*; the pipeline — the channel's `DiagnosticLog` owner —
+    /// decides how it is recorded and reported, keeping the §95 diagnostic and the
+    /// §137 event paired in one place.
+    pub fn record_notice(&mut self, notice: TransportNotice) {
+        match notice {
+            TransportNotice::ReceptionStalled {
+                channel_id,
+                stalled_for,
+            } => {
+                self.diagnostics.record(Diagnostic::warning(format!(
+                    "reception stalled {} ms on channel {channel_id}; possible transport-specific \
+                     loss (UART/driver overrun) — lost byte count is not observable (§101)",
+                    stalled_for.as_millis(),
+                )));
+                // The matching event (§137); advisory, non-blocking like the rest.
+                if let Some(events) = &self.events {
+                    let _ = events.try_send(RuntimeEvent::WarningRaised(channel_id));
+                }
+            }
+        }
+    }
+
     /// Called at Channel stop (§110, §112): discard any partial Message (§112)
     /// and finalize the recorder — flush and close (§56).
     pub async fn finish(&mut self) {
@@ -433,17 +456,21 @@ impl ChannelPipeline {
 /// caller can finalize/inspect it. Cancellation is cooperative and checked
 /// first (`biased`) so shutdown does not depend on draining the queue (§111).
 ///
-/// Between reads it also serves snapshot requests (§137, ADR-006): a requester
-/// sends a oneshot reply on `snapshots` and the loop answers from current state.
-/// Snapshots are checked ahead of reads (they are rare and cheap) so a request
-/// is served promptly; a closed `snapshots` channel simply stops being polled.
+/// Between reads it also serves snapshot requests (§137, ADR-006) and records
+/// transport notices (§95, §101, ADR-007): a requester sends a oneshot reply on
+/// `snapshots` and the loop answers from current state; a transport sends a
+/// `TransportNotice` on `notices` and the loop records it as a diagnostic. Both
+/// are checked ahead of reads (they are rare and cheap) so they are serviced
+/// promptly; a closed `snapshots`/`notices` channel simply stops being polled.
 pub async fn run_channel(
     mut ingest: Receiver<ReceivedData>,
     mut snapshots: Receiver<SnapshotRequest>,
+    mut notices: Receiver<TransportNotice>,
     mut pipeline: ChannelPipeline,
     cancel: CancellationToken,
 ) -> ChannelPipeline {
     let mut snapshots_open = true;
+    let mut notices_open = true;
     loop {
         tokio::select! {
             biased;
@@ -453,6 +480,10 @@ pub async fn run_channel(
                     let _ = tx.send(pipeline.snapshot());
                 }
                 None => snapshots_open = false, // all requesters gone; keep running
+            },
+            notice = notices.recv(), if notices_open => match notice {
+                Some(notice) => pipeline.record_notice(notice),
+                None => notices_open = false, // transport gone; keep running
             },
             maybe = ingest.recv() => match maybe {
                 Some(data) => pipeline.ingest(data),
@@ -789,9 +820,10 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let p = lf_pipeline(cid, PipelineCapacities::default());
         let (_snap_tx, snap_rx) = tokio::sync::mpsc::channel(4);
+        let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(4);
         tx.send(bytes_chunk(cid, b"X\nY\n")).await.unwrap();
         drop(tx); // loop drains the buffered chunk, then sees the channel close
-        let p = run_channel(rx, snap_rx, p, CancellationToken::new()).await;
+        let p = run_channel(rx, snap_rx, notice_rx, p, CancellationToken::new()).await;
         assert_eq!(p.retention().len(), 2);
     }
 
@@ -801,8 +833,9 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<ReceivedData>(8);
         let p = lf_pipeline(cid, PipelineCapacities::default());
         let (_snap_tx, snap_rx) = tokio::sync::mpsc::channel(4);
+        let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(4);
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(run_channel(rx, snap_rx, p, cancel.clone()));
+        let handle = tokio::spawn(run_channel(rx, snap_rx, notice_rx, p, cancel.clone()));
         cancel.cancel(); // only cancellation can end the loop — tx is still alive
         let p = handle.await.unwrap();
         drop(tx);
@@ -816,9 +849,10 @@ mod tests {
         let cid = ChannelId::new();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let (snap_tx, snap_rx) = tokio::sync::mpsc::channel(4);
+        let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(4);
         let p = lf_pipeline(cid, PipelineCapacities::default());
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(run_channel(rx, snap_rx, p, cancel.clone()));
+        let handle = tokio::spawn(run_channel(rx, snap_rx, notice_rx, p, cancel.clone()));
 
         tx.send(bytes_chunk(cid, b"one\ntwo\n")).await.unwrap();
 
@@ -839,6 +873,46 @@ mod tests {
         assert_eq!(nums, vec![1, 2]);
         assert_eq!(snapshot.display_views.len(), 1);
         assert_eq!(snapshot.display_views[0].messages.len(), 2);
+
+        cancel.cancel();
+        let _ = handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_channel_records_a_transport_notice_as_a_diagnostic() {
+        // ADR-007 seam: a transport notice becomes a retained warning diagnostic
+        // plus a WarningRaised event, both observable without stopping the channel.
+        let cid = ChannelId::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let (snap_tx, snap_rx) = tokio::sync::mpsc::channel(4);
+        let (notice_tx, notice_rx) = tokio::sync::mpsc::channel(4);
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(8);
+        let p = lf_pipeline(cid, PipelineCapacities::default()).with_event_sender(ev_tx);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_channel(rx, snap_rx, notice_rx, p, cancel.clone()));
+
+        notice_tx
+            .send(TransportNotice::ReceptionStalled {
+                channel_id: cid,
+                stalled_for: std::time::Duration::from_millis(500),
+            })
+            .await
+            .unwrap();
+
+        // The matching event surfaces (waiting on it also means record_notice ran).
+        assert_eq!(
+            ev_rx.recv().await.unwrap(),
+            RuntimeEvent::WarningRaised(cid)
+        );
+
+        // A live snapshot shows the retained warning naming the stall duration.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        snap_tx.send(reply_tx).await.unwrap();
+        let snap = reply_rx.await.unwrap();
+        assert_eq!(snap.diagnostics.warnings.len(), 1);
+        assert!(snap.diagnostics.warnings[0]
+            .message
+            .contains("reception stalled 500 ms"));
 
         cancel.cancel();
         let _ = handle.await.unwrap();

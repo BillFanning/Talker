@@ -185,12 +185,14 @@ reporting contract for each.
    overrun, losing bytes *upstream of us*. We can detect the stall; we cannot
    count the lost bytes (no portable userland signal for UART/driver overrun).
    **Contract:** the serial reader watches `blocking_send`; a stall beyond a
-   heuristic threshold (`STALL_WARNING`, 250 ms) raises `WarningRaised(ChannelId)`
-   once per stall episode — an honest "reception stalled; transport-specific loss
-   may have occurred", with **no fabricated byte count**. Momentary backpressure
-   that drains quickly is normal and must not warn.
-   *Status: implemented and tested* (`sustained_stall_warns_of_possible_transport_loss`,
-   `momentary_backpressure_does_not_warn`).
+   heuristic threshold (`STALL_WARNING`, 250 ms) sends a
+   `TransportNotice::ReceptionStalled { channel_id, stalled_for }` once per stall
+   episode — self-describing, carrying the observed stall **duration** (the honest
+   §101 proxy) and **no fabricated byte count**. The pipeline records it as a
+   Warning `Diagnostic` and emits `WarningRaised` (see the seam below). Momentary
+   backpressure that drains quickly is normal and must not notify.
+   *Status: implemented and tested* (`sustained_stall_sends_a_reception_stalled_notice`,
+   `momentary_backpressure_sends_no_notice`, `run_channel_records_a_transport_notice_as_a_diagnostic`).
 
 3. **Fundamentally unobservable — pre-receive kernel/NIC loss.** Kernel-dropped
    UDP datagrams, and any bytes lost in the driver/NIC before our `recv`, leave
@@ -207,18 +209,42 @@ not prevent it"), so `WarningRaised` is the spec-sanctioned signal today. The
 event says *that* a warning occurred on a channel; the descriptive §101 record
 (overflow type, time) belongs in the §95 diagnostics log, which a UI reads.
 
-**Consequences / deferred:**
-- The rich §101 diagnostic *record* for a reader stall (a `Diagnostic` in the
-  channel's `DiagnosticLog`, not just the event) is **deferred**: the transport
-  thread has no path to the pipeline's diagnostics log. Wiring a transport →
-  diagnostics channel is the follow-up; for UART overrun the "estimate" stays
-  *not practical* regardless, so the event-level signal is the substantive part.
-- `WarningRaised` is shared with recording-enable failures (§55). A UI cannot yet
-  distinguish the two from the event alone; the diagnostics log disambiguates
-  once (a) lands. Acceptable for v1.
+**The transport→diagnostics seam (implements tier 2's record).** A transport states
+*what happened* via a `TransportNotice` (in `transport/`, with no dependency on the
+diagnostics/event vocabulary); the **pipeline** — the channel's `DiagnosticLog`
+owner — decides how it is recorded and reported. `run_channel` drains a bounded
+`Receiver<TransportNotice>` in its `select!` (alongside ingest and snapshot
+requests) and calls `record_notice`, which writes a Warning `Diagnostic` (naming
+the channel and stall duration) **and** emits `WarningRaised` — keeping the §95
+record and §137 event paired in one owner. The notice channel is created by the
+orchestrator; only the serial transport is given the sender (`with_notice_sender`),
+because only serial can stall the reader (§97.1). The §95 record is now visible in
+a live `ChannelSnapshot.diagnostics`, which is what a GUI reads.
+
+Why this shape (vs. the alternatives): the transport must not depend on
+`diagnostics`/`RuntimeEvent` (§128 layering), so it emits a transport-local notice,
+not a `Diagnostic`. The notice is **self-describing** (carries its `channel_id`) so
+the pipeline formats and routes it without assuming which channel a notice is for.
+The `run()` transport contract is left unchanged — UDP/TCP are async and never
+stall the reader, so burdening every transport with a notice sender would imply a
+capability they don't have; serial attaches it via a builder instead.
+
+The notice channel is **advisory and bounded** (`TRANSPORT_NOTICES`, 16): the
+sender uses `try_send` and drops on full, named explicitly because the dropped item
+is itself a loss-warning — we accept losing a warning under overload, but we never
+block the reader to keep one (that would cause the stall it warns of). A
+dropped-notice counter can be added later only if the drop rate proves to matter.
+
+**Consequences:**
+- `WarningRaised` is shared with recording-enable failures (§55). A UI cannot
+  distinguish them from the event alone, but the retained `Diagnostic` text now
+  does (the stall record names the channel and duration). Acceptable for v1; a
+  dedicated event variant would be a §137 spec change.
 - UDP/TCP backpressure does not stall an OS thread (async `send().await`), so
-  there is no serial-style stall warning; sustained UDP backpressure manifests as
+  there is no serial-style stall notice; sustained UDP backpressure manifests as
   tier 3 (kernel drops) and is unreportable by design.
+- `TransportNotice` is `#[non_exhaustive]`: future non-terminal transport
+  conditions (e.g. a recoverable read hiccup) extend it without a breaking change.
 
 ## Open questions
 
