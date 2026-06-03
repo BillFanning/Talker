@@ -202,12 +202,16 @@ reporting contract for each.
    v1; reducing it is an operational concern (socket buffer sizing), not a
    reporting one.
 
-**Why `WarningRaised` and not a new event:** the `RuntimeEvent` set is fixed by
-spec §137; adding a `ReceptionStalled`/`DataLoss` variant is a spec change and
-needs sign-off. A reader stall is a §93 Warning ("may affect operation but does
-not prevent it"), so `WarningRaised` is the spec-sanctioned signal today. The
-event says *that* a warning occurred on a channel; the descriptive §101 record
-(overflow type, time) belongs in the §95 diagnostics log, which a UI reads.
+**Event signal — `WarningRaised` then `ReceptionStalled` (superseded by spec
+v1.2).** When this ADR was written the `RuntimeEvent` set was fixed (spec §137), so
+a reader stall reused `WarningRaised` — a §93 Warning — rather than a new variant
+needing sign-off. **Spec v1.2 added a dedicated `ReceptionStalled(ChannelId,
+Duration)` event** (§137) and marked the enum `#[non_exhaustive]`, so the overload
+is retired: the stall now emits `ReceptionStalled` carrying the duration. The
+retained §95 `Diagnostic` remains the **rich detail surface** (channel, time,
+human text); the event is the lightweight signal. (Implementation note: the shipped
+seam still emits `WarningRaised`; flipping it to `ReceptionStalled` is the small
+follow-up that lands with the §136/§137 v1.2 vocabulary.)
 
 **The transport→diagnostics seam (implements tier 2's record).** A transport states
 *what happened* via a `TransportNotice` (in `transport/`, with no dependency on the
@@ -236,10 +240,10 @@ block the reader to keep one (that would cause the stall it warns of). A
 dropped-notice counter can be added later only if the drop rate proves to matter.
 
 **Consequences:**
-- `WarningRaised` is shared with recording-enable failures (§55). A UI cannot
-  distinguish them from the event alone, but the retained `Diagnostic` text now
-  does (the stall record names the channel and duration). Acceptable for v1; a
-  dedicated event variant would be a §137 spec change.
+- `WarningRaised` was shared with recording-enable failures (§55), so a UI could
+  not distinguish them from the event alone. Spec v1.2's dedicated
+  `ReceptionStalled` event removes that ambiguity for stalls; the retained
+  `Diagnostic` text still carries the rich detail (channel, duration).
 - UDP/TCP backpressure does not stall an OS thread (async `send().await`), so
   there is no serial-style stall notice; sustained UDP backpressure manifests as
   tier 3 (kernel drops) and is unreportable by design.

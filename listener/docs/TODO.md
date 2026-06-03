@@ -66,8 +66,10 @@ tests yet.
 - [x] **Decoder entrypoint** — `spawn_channel_tasks` takes a decoder; the orchestrator
   wires it for serial/UDP from `DecoderConfig`, and `start_tcp_listener` now takes a
   per-connection `make_decoder` factory so accepted TCP connections inherit the listener's
-  decoder (§16.2). *Still open*: per-connection **recording** is deferred — distinct files
-  per connection need §59 filename templates (deferred).
+  decoder (§16.2). *Still open*: per-connection **recording** is deferred. §59 now defines a
+  generated naming scheme, so the blocker is narrower — there is no naming/ownership rule for
+  runtime TCP **connection** recordings (which identity goes in the filename: listener id,
+  connection id, remote addr, accept time?) and connections are never persisted (§16.3).
 - [x] **Recorder ↔ pipeline (raw + display)** — Raw Recording feeds the real
   `record::Recording` task at the chunk tap; overflow faults it, emits
   `RuntimeEvent::RecordingFaulted` + a diagnostic, reception continues (§56.1). Display
@@ -128,7 +130,9 @@ decoder); these are separate, deliberately-scoped omissions:
 
 ## Acceptance (§153–§160 — the product-ready bar)
 
-All unverified end-to-end. Each generally needs the wiring above first.
+Not all acceptance criteria are proven end-to-end yet (some are checked or partial
+below; the v1.2 addendum §161–§168 is entirely unproven). Each generally needs the
+wiring above first.
 
 - [ ] §153 Channel operation — create from templates, start/stop independently, run many
 - [ ] §154 TCP connections — accept, one channel/client, independent, not persisted
@@ -143,6 +147,20 @@ All unverified end-to-end. Each generally needs the wiring above first.
 - [ ] §159 Profiles — save/load workspace; load does not start channels, begin recording, or restore runtime state
 - [x] §160 NMEA0183 — decoder behavior proven through a running channel: a valid sentence reports
   integrity Valid + message type, a bad-checksum sentence is retained and annotated Invalid (§37).
+
+### v1.2 acceptance addendum (spec §161–§168) — all unimplemented, all unproven
+
+Per the v1.2 review: build acceptance/tests **before** implementing each, so the
+runtime-surface expansion stays anchored to a product-readiness bar.
+
+- [ ] §161 Serial control lines — live CTS/DSR/DCD/RI display; RTS/DTR set + live-toggle
+- [ ] §162 Auto-reconnect — opt-in `Faulted → Starting` backoff; off by default; TCP connections excluded
+- [ ] §163 File rotation — Hourly/Daily files, correct names/extensions, clean boundaries, name validation
+- [ ] §164 Subsampling — per-sink count/time; raw never subsampled; numbering unaffected, gaps not renumbered
+- [ ] §165 Match rules & triggers — each condition fires its actions; record-from-match-forward; mark never touches raw
+- [ ] §166 Liveness — throughput + idle surfaced, bounded, no reception impact
+- [ ] §167 Network live adjustment — SO_RCVBUF, multicast join/leave + interface; re-bind via apply-pending
+- [ ] §168 Disk-space guard — warn/stop on low disk, clean finalize, reception continues
 
 ---
 
@@ -181,6 +199,8 @@ Out of scope for v1; revisit only with a spec amendment:
 - TCP client mode
 - Distributed operation
 - Advanced synchronization recovery
-- File rotation
+- Size-based file rotation / old-file pruning / advanced filename templating
+  (time-based rotation is supported — spec §59)
+- Pre-trigger / pre-match recording capture (spec §50.2)
 - Persistent diagnostic log rotation
 - Hard real-time guarantees

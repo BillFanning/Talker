@@ -27,6 +27,8 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 - **AIS as a sendable `talker` payload.** The `nmea0183` crate already builds and parses `!AIVDM`/`!AIVDO` and armors the 6-bit payload, but spec v2.0 §5.1 lists exactly five message formats and AIS is not one of them. Exposing AIS in the `talker` message editor — whether as pre-armored raw bytes or as a structured per-message-type editor (Type 1/5/18/24…) — is a feature beyond the current spec. Revisit only with a spec amendment. See the ADR-012 context note and the 2026-05-22 discussion.
 
+- **Manual transmit / inject for troubleshooting.** Captured here because transmit is `talker`'s job, not `listener`'s (listener is strictly receive-side). Beyond talker's scheduled/profile-driven sends, a troubleshooting workflow wants **ad-hoc, one-shot injection** — type or pick a payload and fire it once at a serial port or network endpoint to provoke a device, while `listener` observes the response on the same or another channel. This is the natural talker counterpart to the listener troubleshooting use case (see the listener "primary use cases" notes, 2026-06). A real feature here needs a spec amendment: define how one-shot/manual sends relate to the §5.1 message formats and the scheduler, and whether it's CLI, GUI, or both. Revisit only with that amendment.
+
 ---
 
 ## Completed during the spec v2.0 upgrade
