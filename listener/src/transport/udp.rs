@@ -19,7 +19,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::{ChannelId, ChunkTime};
 
-use super::{DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHandle};
+use super::{
+    DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHandle, TransportOutcome,
+};
 
 /// Maximum size of a single UDP datagram payload (IPv4 theoretical max). The
 /// receive buffer is sized to this so no datagram is ever truncated.
@@ -113,7 +115,7 @@ impl DataTransportRunner for BoundUdpTransport {
                 tokio::select! {
                     biased;
                     // Cooperative cancellation, checked first (§111).
-                    _ = cancel.cancelled() => break,
+                    _ = cancel.cancelled() => return TransportOutcome::Cancelled,
                     res = socket.recv_from(&mut buf) => match res {
                         Ok((n, _from)) => {
                             let data = ReceivedData {
@@ -126,13 +128,13 @@ impl DataTransportRunner for BoundUdpTransport {
                             // loop, which can drop datagrams at the kernel (§97.1,
                             // §101). An `Err` means the pipeline is gone.
                             if out.send(data).await.is_err() {
-                                break;
+                                return TransportOutcome::Completed;
                             }
                         }
-                        // TODO(§94/§101): classify transient (e.g. Windows
-                        // ECONNRESET from an ICMP unreachable) vs fatal errors and
-                        // report transport-specific loss instead of just ending.
-                        Err(_e) => break,
+                        // A receive error ends the transport as a fault (§94). Some
+                        // loss (e.g. kernel-dropped datagrams) is not observable
+                        // from userland; we report the failure we can see (§101).
+                        Err(e) => return TransportOutcome::Faulted(format!("UDP receive failed: {e}")),
                     },
                 }
             }
@@ -171,7 +173,7 @@ mod tests {
         assert!(matches!(first.payload, ReceivedPayload::Datagram(_)));
 
         cancel.cancel();
-        handle.join().await;
+        assert!(matches!(handle.join().await, TransportOutcome::Cancelled));
     }
 
     #[tokio::test]

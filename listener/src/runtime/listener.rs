@@ -7,29 +7,32 @@
 //! request. All channels share one [`RuntimeEvent`] stream (§137).
 //!
 //! Commands are exposed as async methods (`start`/`stop`/`apply_pending`),
-//! the vocabulary of [`crate::core::RuntimeCommand`]. Recording is not yet wired
-//! end-to-end, so a started Channel runs reception/decoding without recording
-//! regardless of its `RecordingConfig` (tracked in the wiring TODO).
+//! the vocabulary of [`crate::core::RuntimeCommand`]. Raw recording is wired for
+//! serial/UDP channels from `RecordingConfig`; a recording-enable failure
+//! surfaces a warning without faulting the Channel (§55). TCP **connection**
+//! channels are not yet decoded or recorded.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
 use crate::config::schema::InterfaceConfig;
 use crate::config::ChannelConfig;
 use crate::core::{ChannelId, ChannelState, RuntimeEvent};
-use crate::transport::DataTransportRunner;
+use crate::record::{start_raw_recording, RawFileRecorder, Recording, RecordingMode};
+use crate::transport::{DataTransportRunner, ReceivedData};
 
 use super::build::{
     build_decoder, build_extractor, build_serial, build_tcp_listener, build_udp, BuildError,
 };
-use super::channel::{spawn_channel_tasks, ChannelTasks};
+use super::channel::{spawn_monitored_channel, MonitoredChannel};
 use super::pipeline::PipelineCapacities;
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
 
 /// A live Channel's running tasks. Held by the orchestrator so it can stop them.
 enum ChannelHandle {
-    Data(ChannelTasks),
+    Data(MonitoredChannel),
     TcpListener(TcpListenerHandle),
 }
 
@@ -272,14 +275,20 @@ impl Listener {
                     .open()
                     .await
                     .map_err(OrchestratorError::SerialOpen)?;
-                Ok(ChannelHandle::Data(self.spawn_data(id, opened, config)))
+                let recorder = self.build_raw_recorder(id, config).await;
+                Ok(ChannelHandle::Data(
+                    self.spawn_data(id, opened, config, recorder),
+                ))
             }
             InterfaceConfig::Udp(udp) => {
                 let bound = build_udp(id, udp)?
                     .bind()
                     .await
                     .map_err(OrchestratorError::Bind)?;
-                Ok(ChannelHandle::Data(self.spawn_data(id, bound, config)))
+                let recorder = self.build_raw_recorder(id, config).await;
+                Ok(ChannelHandle::Data(
+                    self.spawn_data(id, bound, config, recorder),
+                ))
             }
             InterfaceConfig::TcpListener(tcp) => {
                 let bound = build_tcp_listener(id, tcp)?
@@ -287,12 +296,12 @@ impl Listener {
                     .await
                     .map_err(OrchestratorError::Bind)?;
                 // Each accepted connection gets a fresh extractor from this config.
+                // Per-connection recording/decoding is deferred (§16.2).
                 let extraction = config.extraction.clone();
                 let handle = start_tcp_listener(
                     bound,
                     move || build_extractor(&extraction),
                     self.channel_caps(config),
-                    false, // recording wiring pending
                     tcp.max_connections,
                     self.events_tx.clone(),
                 );
@@ -306,16 +315,50 @@ impl Listener {
         id: ChannelId,
         runner: R,
         config: &ChannelConfig,
-    ) -> ChannelTasks {
-        spawn_channel_tasks(
+        raw_recorder: Option<Recording<Arc<ReceivedData>>>,
+    ) -> MonitoredChannel {
+        spawn_monitored_channel(
             id,
             runner,
             build_extractor(&config.extraction),
             build_decoder(&config.decoder),
+            raw_recorder,
             self.channel_caps(config),
-            false, // recording wiring pending
             self.events_tx.clone(),
         )
+    }
+
+    /// Create the Raw Recording handle for a Channel if enabled (§53). Per §55,
+    /// failing to open the file (e.g. a refused overwrite, §121) does **not**
+    /// fault the Channel: recording stays disabled, a warning is surfaced, and
+    /// reception continues (§5.8). Returns `None` when disabled or on failure.
+    async fn build_raw_recorder(
+        &self,
+        id: ChannelId,
+        config: &ChannelConfig,
+    ) -> Option<Recording<Arc<ReceivedData>>> {
+        let recording = &config.recording;
+        if recording.mode != RecordingMode::Raw {
+            return None;
+        }
+        let Some(destination) = &recording.destination else {
+            // Mode is Raw but no destination — cannot record; surface a warning.
+            let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
+            return None;
+        };
+        match RawFileRecorder::create(
+            destination,
+            recording.overwrite_policy,
+            recording.timestamp_enabled,
+        )
+        .await
+        {
+            Ok(recorder) => Some(start_raw_recording(recorder, self.caps.raw_recording)),
+            Err(_err) => {
+                let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
+                None
+            }
+        }
     }
 }
 
@@ -431,5 +474,49 @@ mod tests {
             listener.start(ghost).await,
             Err(OrchestratorError::UnknownChannel(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn recording_enable_failure_does_not_fault_the_channel() {
+        use crate::config::schema::RecordingConfig;
+        use crate::record::{OverwritePolicy, RecordingMode};
+
+        // Pre-create the destination so a Refuse policy makes enabling fail
+        // (§55/§121).
+        let mut path = std::env::temp_dir();
+        path.push(format!("listener-orch-{}.bin", uuid::Uuid::new_v4()));
+        tokio::fs::write(&path, b"existing").await.unwrap();
+
+        let mut listener = Listener::with_default_capacities();
+        let mut events = listener.take_events().unwrap();
+        let mut config = udp_channel();
+        config.recording = RecordingConfig {
+            mode: RecordingMode::Raw,
+            destination: Some(path.clone()),
+            timestamp_enabled: false,
+            overwrite_policy: OverwritePolicy::Refuse,
+        };
+        let id = listener.add_channel(config);
+
+        // Start succeeds: reception runs despite the failed recording enable.
+        listener.start(id).await.unwrap();
+        assert_eq!(listener.state(id), Some(ChannelState::Running));
+
+        // A warning was surfaced for the recording-enable failure (§55).
+        let mut saw_warning = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, RuntimeEvent::WarningRaised(_)) {
+                saw_warning = true;
+            }
+        }
+        assert!(
+            saw_warning,
+            "a WarningRaised event should surface the failure"
+        );
+        // The pre-existing file was not clobbered (§121).
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"existing");
+
+        listener.stop(id).await.unwrap();
+        let _ = tokio::fs::remove_file(&path).await;
     }
 }

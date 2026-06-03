@@ -18,6 +18,8 @@
 //! - forced (§111, §113): cancel both halves at once without guaranteeing the
 //!   backlog is drained.
 
+use std::sync::Arc;
+
 use tokio::sync::mpsc::{self, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -25,43 +27,20 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{ChannelId, RuntimeEvent};
 use crate::decode::Decoder;
 use crate::extract::MessageExtractor;
-use crate::transport::{DataTransportRunner, TransportJoinHandle};
+use crate::record::Recording;
+use crate::transport::{DataTransportRunner, ReceivedData, TransportJoinHandle, TransportOutcome};
 
 use super::pipeline::{run_channel, ChannelPipeline, PipelineCapacities};
 
-/// The transport + pipeline tasks for one Channel and the controls to stop
-/// them. Shared internal building block behind [`RunningChannel`] and the TCP
-/// listener supervisor.
+/// The transport + pipeline tasks for one Channel. A plain holder, destructured
+/// by [`spawn_monitored_channel`] and the TCP listener supervisor (which each do
+/// their own transport-outcome monitoring).
 pub(crate) struct ChannelTasks {
     pub(crate) channel_id: ChannelId,
     pub(crate) transport_cancel: CancellationToken,
     pub(crate) pipeline_cancel: CancellationToken,
     pub(crate) transport: TransportJoinHandle,
     pub(crate) pipeline_task: JoinHandle<ChannelPipeline>,
-}
-
-impl ChannelTasks {
-    /// Graceful stop (§110): stop reception, close the interface, then let the
-    /// pipeline drain the accepted backlog (its sender drops when the transport
-    /// task ends, so its receive loop sees the channel close and returns).
-    pub(crate) async fn stop(self) -> ChannelPipeline {
-        self.transport_cancel.cancel();
-        self.transport.join().await;
-        self.pipeline_task
-            .await
-            .expect("pipeline task should not panic")
-    }
-
-    /// Forced stop (§111, §113): cancel transport and pipeline together; a
-    /// queued backlog may be abandoned rather than drained.
-    pub(crate) async fn abort(self) -> ChannelPipeline {
-        self.transport_cancel.cancel();
-        self.pipeline_cancel.cancel();
-        self.transport.join().await;
-        self.pipeline_task
-            .await
-            .expect("pipeline task should not panic")
-    }
 }
 
 /// Wire a bound data-bearing transport to a fresh pipeline and start both tasks,
@@ -71,18 +50,20 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     runner: R,
     extractor: Box<dyn MessageExtractor + Send>,
     decoder: Option<Box<dyn Decoder + Send>>,
+    raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     caps: PipelineCapacities,
-    raw_recording: bool,
     events: Sender<RuntimeEvent>,
 ) -> ChannelTasks {
     // The bounded Transport→Extractor queue — the only edge that may stall the
     // reader (§97.1, §99). No unbounded intermediate queue is introduced (§97.2).
     let (ingest_tx, ingest_rx) = mpsc::channel(caps.ingest);
 
-    let mut pipeline =
-        ChannelPipeline::new(channel_id, extractor, caps, raw_recording).with_event_sender(events);
+    let mut pipeline = ChannelPipeline::new(channel_id, extractor, caps).with_event_sender(events);
     if let Some(decoder) = decoder {
         pipeline = pipeline.with_decoder(decoder);
+    }
+    if let Some(recorder) = raw_recorder {
+        pipeline = pipeline.with_raw_recorder(recorder);
     }
 
     let transport_cancel = CancellationToken::new();
@@ -100,10 +81,95 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     }
 }
 
+/// A data Channel's controls plus a fault monitor. The transport's join handle
+/// lives in the monitor task — which emits `ChannelFaulted` if the transport
+/// ends on a spontaneous fault (§94/§101) — so `stop`/`abort` synchronize on the
+/// pipeline draining rather than joining the transport directly.
+pub(crate) struct MonitoredChannel {
+    channel_id: ChannelId,
+    transport_cancel: CancellationToken,
+    pipeline_cancel: CancellationToken,
+    pipeline_task: JoinHandle<ChannelPipeline>,
+    monitor: JoinHandle<()>,
+}
+
+impl MonitoredChannel {
+    /// Graceful stop (§110): stop reception; the transport's sender drops, the
+    /// pipeline drains the accepted backlog and returns, and the monitor ends.
+    pub(crate) async fn stop(self) -> ChannelPipeline {
+        self.transport_cancel.cancel();
+        let pipeline = self
+            .pipeline_task
+            .await
+            .expect("pipeline task should not panic");
+        let _ = self.monitor.await;
+        pipeline
+    }
+
+    /// Forced stop (§111, §113): cancel both halves; the backlog may be abandoned.
+    pub(crate) async fn abort(self) -> ChannelPipeline {
+        self.transport_cancel.cancel();
+        self.pipeline_cancel.cancel();
+        let pipeline = self
+            .pipeline_task
+            .await
+            .expect("pipeline task should not panic");
+        let _ = self.monitor.await;
+        pipeline
+    }
+}
+
+/// Like [`spawn_channel_tasks`] but adds a fault monitor that awaits the
+/// transport outcome and emits `ChannelFaulted` if it ended on a fault (§94,
+/// §101). Used for standalone and orchestrated data channels; the TCP supervisor
+/// does its own per-connection monitoring instead.
+pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
+    channel_id: ChannelId,
+    runner: R,
+    extractor: Box<dyn MessageExtractor + Send>,
+    decoder: Option<Box<dyn Decoder + Send>>,
+    raw_recorder: Option<Recording<Arc<ReceivedData>>>,
+    caps: PipelineCapacities,
+    events: Sender<RuntimeEvent>,
+) -> MonitoredChannel {
+    let monitor_events = events.clone();
+    let ChannelTasks {
+        channel_id,
+        transport_cancel,
+        pipeline_cancel,
+        transport,
+        pipeline_task,
+    } = spawn_channel_tasks(
+        channel_id,
+        runner,
+        extractor,
+        decoder,
+        raw_recorder,
+        caps,
+        events,
+    );
+
+    let monitor = tokio::spawn(async move {
+        // A spontaneous fault surfaces as ChannelFaulted; cancel/EOF/pipeline-gone
+        // outcomes are normal ends and emit nothing.
+        if let TransportOutcome::Faulted(_) = transport.join().await {
+            let _ = monitor_events.try_send(RuntimeEvent::ChannelFaulted(channel_id));
+        }
+    });
+
+    MonitoredChannel {
+        channel_id,
+        transport_cancel,
+        pipeline_cancel,
+        pipeline_task,
+        monitor,
+    }
+}
+
 /// A live, standalone Channel: its tasks plus its own event receiver. Returned
 /// by [`start_data_channel`].
 pub struct RunningChannel {
-    tasks: ChannelTasks,
+    tasks: MonitoredChannel,
     events: mpsc::Receiver<RuntimeEvent>,
 }
 
@@ -136,16 +202,16 @@ pub fn start_data_channel<R: DataTransportRunner>(
     runner: R,
     extractor: Box<dyn MessageExtractor + Send>,
     caps: PipelineCapacities,
-    raw_recording: bool,
+    raw_recorder: Option<Recording<Arc<ReceivedData>>>,
 ) -> RunningChannel {
     let (event_tx, event_rx) = mpsc::channel(caps.events);
-    let tasks = spawn_channel_tasks(
+    let tasks = spawn_monitored_channel(
         channel_id,
         runner,
         extractor,
         None,
+        raw_recorder,
         caps,
-        raw_recording,
         event_tx,
     );
     RunningChannel {
@@ -160,7 +226,7 @@ mod tests {
     use crate::core::{ChunkTime, RuntimeEvent};
     use crate::extract::StreamExtractor;
     use crate::transport::udp::{UdpMode, UdpTransport};
-    use crate::transport::{ReceivedData, ReceivedPayload};
+    use crate::transport::{ReceivedData, ReceivedPayload, TransportOutcome};
     use std::time::Duration;
     use tokio::net::UdpSocket;
 
@@ -183,10 +249,11 @@ mod tests {
                     };
                     // Stops early if the pipeline is gone (forced shutdown).
                     if out.send(data).await.is_err() {
-                        return;
+                        return TransportOutcome::Completed;
                     }
                 }
                 cancel.cancelled().await;
+                TransportOutcome::Cancelled
             });
             TransportJoinHandle::Task(handle)
         }
@@ -209,7 +276,7 @@ mod tests {
             bound,
             Box::new(StreamExtractor::new()),
             PipelineCapacities::default(),
-            false,
+            None,
         );
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -254,7 +321,7 @@ mod tests {
             transport,
             Box::new(StreamExtractor::new()),
             PipelineCapacities::default(),
-            false,
+            None,
         );
 
         let pipeline = tokio::time::timeout(Duration::from_secs(5), running.stop())
@@ -278,7 +345,7 @@ mod tests {
             transport,
             Box::new(StreamExtractor::new()),
             PipelineCapacities::default(),
-            false,
+            None,
         );
 
         let pipeline = tokio::time::timeout(Duration::from_secs(5), running.abort())
@@ -286,5 +353,37 @@ mod tests {
             .expect("forced abort hung");
         // It terminated; it cannot have retained more than was produced.
         assert!(pipeline.retention().len() <= 1000);
+    }
+
+    #[tokio::test]
+    async fn spontaneous_transport_fault_emits_channel_faulted() {
+        // §94/§101: a transport that ends on a fault (not a stop) surfaces a
+        // ChannelFaulted event via the channel's fault monitor.
+        struct FaultingTransport;
+        impl DataTransportRunner for FaultingTransport {
+            fn run(
+                self,
+                _out: Sender<ReceivedData>,
+                _cancel: CancellationToken,
+            ) -> TransportJoinHandle {
+                TransportJoinHandle::Task(tokio::spawn(async move {
+                    TransportOutcome::Faulted("device error".to_string())
+                }))
+            }
+        }
+
+        let cid = ChannelId::new();
+        let mut running = start_data_channel(
+            cid,
+            FaultingTransport,
+            Box::new(StreamExtractor::new()),
+            PipelineCapacities::default(),
+            None,
+        );
+        assert_eq!(
+            running.events().recv().await.unwrap(),
+            RuntimeEvent::ChannelFaulted(cid)
+        );
+        let _ = running.stop().await;
     }
 }

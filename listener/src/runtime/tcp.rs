@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::{ChannelId, RuntimeEvent};
 use crate::extract::MessageExtractor;
 use crate::transport::tcp::{BoundTcpListenerTransport, TcpConnectionTransport};
-use crate::transport::{ConnectionAcceptorRunner, NewConnection};
+use crate::transport::{ConnectionAcceptorRunner, NewConnection, TransportOutcome};
 
 use super::channel::{spawn_channel_tasks, ChannelTasks};
 use super::pipeline::PipelineCapacities;
@@ -65,7 +65,6 @@ pub fn start_tcp_listener<F>(
     bound: BoundTcpListenerTransport,
     make_extractor: F,
     caps: PipelineCapacities,
-    raw_recording: bool,
     max_connections: Option<u32>,
     events: Sender<RuntimeEvent>,
 ) -> TcpListenerHandle
@@ -84,7 +83,7 @@ where
 
         let mut connections: HashMap<ChannelId, Connection> = HashMap::new();
         // Each entry awaits a connection's transport completion and yields its id.
-        let mut monitors: JoinSet<ChannelId> = JoinSet::new();
+        let mut monitors: JoinSet<(ChannelId, TransportOutcome)> = JoinSet::new();
         let mut listener_open = true;
 
         loop {
@@ -109,11 +108,12 @@ where
                             conn_id,
                             transport,
                             make_extractor(),
-                            // TODO: per-connection decoder from the listener's
-                            // DecoderConfig (start_tcp_listener needs a decoder factory).
+                            // TODO: per-connection decoder + recorder from the
+                            // listener's config (start_tcp_listener would need
+                            // factories). Connections are undecoded/unrecorded.
+                            None,
                             None,
                             caps,
-                            raw_recording,
                             events.clone(),
                         );
                         let ChannelTasks {
@@ -124,10 +124,10 @@ where
                             pipeline_cancel: _,
                         } = tasks;
 
-                        // Detect disconnect: the transport task ends on EOF/cancel.
+                        // Detect disconnect: the transport task ends on EOF/cancel/fault.
                         monitors.spawn(async move {
-                            transport_join.join().await;
-                            conn_id
+                            let outcome = transport_join.join().await;
+                            (conn_id, outcome)
                         });
                         connections.insert(conn_id, Connection { transport_cancel, pipeline_task });
                         let _ = events.try_send(RuntimeEvent::TcpClientConnected(conn_id));
@@ -136,10 +136,14 @@ where
                 },
 
                 Some(joined) = monitors.join_next(), if !monitors.is_empty() => {
-                    if let Ok(conn_id) = joined {
+                    if let Ok((conn_id, outcome)) = joined {
                         if let Some(conn) = connections.remove(&conn_id) {
                             // Reception ended; drain the accepted backlog (§110).
                             let _ = conn.pipeline_task.await;
+                            // A read fault is reported before the disconnect (§94/§101).
+                            if let TransportOutcome::Faulted(_) = outcome {
+                                let _ = events.try_send(RuntimeEvent::ChannelFaulted(conn_id));
+                            }
                             let _ = events.try_send(RuntimeEvent::TcpClientDisconnected(conn_id));
                         }
                     }
@@ -149,7 +153,7 @@ where
 
         // Shutdown (§110, §13): stop accepting, then stop every connection.
         listener_cancel.cancel();
-        listener_handle.join().await;
+        let _ = listener_handle.join().await;
         for (conn_id, conn) in connections.drain() {
             conn.transport_cancel.cancel();
             let _ = conn.pipeline_task.await;
@@ -192,7 +196,6 @@ mod tests {
             bound,
             || Box::new(DelimiterExtractor::new(vec![b'\n'], false)),
             PipelineCapacities::default(),
-            false,
             None,
             ev_tx,
         );
@@ -236,7 +239,6 @@ mod tests {
             bound,
             || Box::new(StreamExtractor::new()),
             PipelineCapacities::default(),
-            false,
             Some(1),
             ev_tx,
         );
@@ -268,7 +270,6 @@ mod tests {
             bound,
             || Box::new(DelimiterExtractor::new(vec![b'\n'], false)),
             PipelineCapacities::default(),
-            false,
             None,
             ev_tx,
         );

@@ -1,10 +1,9 @@
 //! Per-Channel processing pipeline (spec §102, §99.1, §108).
 //!
-//! Wires one Channel's processing stages: chunk distribution → extraction →
-//! metadata → fan-out. This is the skeleton substrate the backpressure
-//! invariants (§152) are tested against; the rich display/recording/retention
-//! modules layer onto these fan-out edges in later steps. Decoding (§107) is an
-//! optional stage wired once the `decode` module lands.
+//! Wires one Channel's processing stages: chunk distribution → raw recording
+//! tap (§53) → extraction → metadata → decoding (§107) → fan-out to display,
+//! retention (bounded by count + bytes, §88), and diagnostics. The §152
+//! backpressure invariants are tested against this pipeline.
 //!
 //! Acquisition priority (§5.9, §100): every edge here is non-blocking — display
 //! drops oldest, retention evicts oldest, a recorder faults on overflow. The
@@ -21,13 +20,12 @@ use crate::core::{
 };
 use crate::decode::Decoder;
 use crate::extract::MessageExtractor;
+use crate::record::{Recording, RecordingStopReason};
 use crate::retention::{ByteSized, MessageRetention, RetentionStore};
 use crate::transport::{ReceivedData, ReceivedPayload};
 
 use super::metadata::MessageNumbering;
-use super::queue::{
-    Diagnostic, DiagnosticSeverity, DiagnosticsQueue, DropOldestQueue, FaultOnFullQueue,
-};
+use super::queue::{Diagnostic, DiagnosticSeverity, DiagnosticsQueue, DropOldestQueue};
 
 /// Bounded capacities for a Channel's fan-out edges (§99, §124). Defaults are
 /// generous; real values come from `RetentionConfig`/`RecordingConfig` later.
@@ -61,14 +59,6 @@ impl Default for PipelineCapacities {
     }
 }
 
-/// The raw-recording tap (§53): consumes the chunk stream *before* extraction.
-/// On overflow it faults rather than stalling reception (§56.1).
-#[derive(Debug)]
-struct RawRecorderSink {
-    queue: FaultOnFullQueue<Arc<ReceivedData>>,
-    state: RecordingState,
-}
-
 /// An immutable Message paired with its decoder annotation (§107, ADR-002). The
 /// metadata is read-only and logically separate from the Message (§4.6); it is
 /// `None` when no decoder is configured for the Channel.
@@ -95,7 +85,11 @@ pub struct ChannelPipeline {
     display: DropOldestQueue<DecodedMessage>,
     retention: MessageRetention<DecodedMessage>,
     diagnostics: DiagnosticsQueue,
-    raw_recorder: Option<RawRecorderSink>,
+    /// Raw Recording handle (§53). `None` when recording is disabled or its
+    /// enable failed (§55). Faults non-blockingly on overflow (§56.1).
+    raw_recorder: Option<Recording<Arc<ReceivedData>>>,
+    /// Whether the raw recorder's fault has already been reported.
+    recording_fault_reported: bool,
     events: Option<Sender<RuntimeEvent>>,
 }
 
@@ -104,12 +98,7 @@ impl ChannelPipeline {
         channel_id: ChannelId,
         extractor: Box<dyn MessageExtractor + Send>,
         caps: PipelineCapacities,
-        raw_recording_enabled: bool,
     ) -> Self {
-        let raw_recorder = raw_recording_enabled.then(|| RawRecorderSink {
-            queue: FaultOnFullQueue::with_capacity(caps.raw_recording),
-            state: RecordingState::Enabled,
-        });
         Self {
             channel_id,
             extractor,
@@ -118,9 +107,18 @@ impl ChannelPipeline {
             display: DropOldestQueue::with_capacity(caps.display),
             retention: MessageRetention::new(Some(caps.retention), caps.retention_bytes),
             diagnostics: DiagnosticsQueue::with_capacity(caps.diagnostics),
-            raw_recorder,
+            raw_recorder: None,
+            recording_fault_reported: false,
             events: None,
         }
+    }
+
+    /// Attach a Raw Recording handle (§53). The orchestrator creates it at Start
+    /// (the file open is async and may fail per §55); the pipeline only feeds and
+    /// finalizes it.
+    pub fn with_raw_recorder(mut self, recorder: Recording<Arc<ReceivedData>>) -> Self {
+        self.raw_recorder = Some(recorder);
+        self
     }
 
     /// Attach a runtime event sender so each completed Message emits a
@@ -149,21 +147,27 @@ impl ChannelPipeline {
     pub fn ingest(&mut self, data: ReceivedData) {
         let data = Arc::new(data);
 
-        // 1. Raw recorder tap (pre-extraction). Non-blocking; fault on overflow.
-        let mut recording_faulted = false;
-        if let Some(sink) = self.raw_recorder.as_mut() {
-            if sink.state == RecordingState::Enabled
-                && sink.queue.try_push(Arc::clone(&data)).is_err()
-            {
-                sink.state = RecordingState::Faulted; // §56.1: never stall the reader
-                recording_faulted = true;
+        // 1. Raw recorder tap (pre-extraction, §53). Non-blocking: a full
+        // recorder queue faults the recording rather than stalling reception
+        // (§56.1). `try_record` updates the handle's state internally.
+        let mut recording_just_faulted = false;
+        if let Some(recorder) = self.raw_recorder.as_mut() {
+            if recorder.state() == RecordingState::Enabled {
+                recorder.try_record(Arc::clone(&data));
+                if recorder.state() == RecordingState::Faulted && !self.recording_fault_reported {
+                    self.recording_fault_reported = true;
+                    recording_just_faulted = true;
+                }
             }
         }
-        if recording_faulted {
+        if recording_just_faulted {
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticSeverity::Error,
                 format!("raw recording faulted on channel {}", self.channel_id),
             ));
+            if let Some(events) = &self.events {
+                let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+            }
         }
 
         // 2. Extraction → metadata → fan-out.
@@ -225,9 +229,13 @@ impl ChannelPipeline {
         }
     }
 
-    /// Called at Channel stop: any partial Message is discarded (§112).
-    pub fn finish(&mut self) {
+    /// Called at Channel stop (§110, §112): discard any partial Message (§112)
+    /// and finalize the recorder — flush and close (§56).
+    pub async fn finish(&mut self) {
         let _ = self.extractor.finish();
+        if let Some(recorder) = self.raw_recorder.take() {
+            recorder.finalize(RecordingStopReason::ChannelStopped).await;
+        }
     }
 
     // --- Inspection (used by the runtime and tests) ---
@@ -255,7 +263,7 @@ impl ChannelPipeline {
 
     /// Current raw-recording state, or `None` if raw recording is not attached.
     pub fn raw_recording_state(&self) -> Option<RecordingState> {
-        self.raw_recorder.as_ref().map(|s| s.state)
+        self.raw_recorder.as_ref().map(|r| r.state())
     }
 }
 
@@ -280,7 +288,7 @@ pub async fn run_channel(
             },
         }
     }
-    pipeline.finish();
+    pipeline.finish().await;
     pipeline
 }
 
@@ -290,12 +298,11 @@ mod tests {
     use crate::core::ChunkTime;
     use crate::extract::{DelimiterExtractor, StreamExtractor};
 
-    fn lf_pipeline(cid: ChannelId, caps: PipelineCapacities, raw: bool) -> ChannelPipeline {
+    fn lf_pipeline(cid: ChannelId, caps: PipelineCapacities) -> ChannelPipeline {
         ChannelPipeline::new(
             cid,
             Box::new(DelimiterExtractor::new(vec![b'\n'], false)),
             caps,
-            raw,
         )
     }
 
@@ -318,7 +325,7 @@ mod tests {
     #[test]
     fn bytes_are_extracted_numbered_and_fanned_out() {
         let cid = ChannelId::new();
-        let mut p = lf_pipeline(cid, PipelineCapacities::default(), false);
+        let mut p = lf_pipeline(cid, PipelineCapacities::default());
         p.ingest(bytes_chunk(cid, b"A\nB\n"));
         let nums: Vec<u64> = p.retention().iter().map(|d| d.message.number).collect();
         assert_eq!(nums, vec![1, 2]);
@@ -334,7 +341,6 @@ mod tests {
             cid,
             Box::new(StreamExtractor::new()),
             PipelineCapacities::default(),
-            false,
         );
         p.ingest(datagram(cid, b"hello"));
         assert_eq!(p.retention().len(), 1);
@@ -353,7 +359,6 @@ mod tests {
             cid,
             Box::new(StreamExtractor::new()),
             PipelineCapacities::default(),
-            false,
         )
         .with_decoder(Box::new(NmeaDecoder::standard()));
 
@@ -398,7 +403,7 @@ mod tests {
             retention: 100,
             ..PipelineCapacities::default()
         };
-        let mut p = lf_pipeline(cid, caps, false);
+        let mut p = lf_pipeline(cid, caps);
         p.ingest(bytes_chunk(cid, b"1\n2\n3\n4\n5\n"));
         // Reception continued: all five were numbered and retained.
         assert_eq!(p.next_message_number(), 6);
@@ -417,7 +422,7 @@ mod tests {
             retention: 3,
             ..PipelineCapacities::default()
         };
-        let mut p = lf_pipeline(cid, caps, false);
+        let mut p = lf_pipeline(cid, caps);
         p.ingest(bytes_chunk(cid, b"1\n2\n3\n4\n5\n"));
         let nums: Vec<u64> = p.retention().iter().map(|d| d.message.number).collect();
         // Oldest two evicted; survivors keep their original numbers 3,4,5.
@@ -434,38 +439,82 @@ mod tests {
             retention_bytes: Some(3),
             ..PipelineCapacities::default()
         };
-        let mut p = lf_pipeline(cid, caps, false);
+        let mut p = lf_pipeline(cid, caps);
         // Five 1-byte messages; a 3-byte budget keeps the newest three.
         p.ingest(bytes_chunk(cid, b"1\n2\n3\n4\n5\n"));
         let nums: Vec<u64> = p.retention().iter().map(|d| d.message.number).collect();
         assert_eq!(nums, vec![3, 4, 5]);
     }
 
-    #[test]
-    fn recording_fault_does_not_stop_reception() {
-        // §152 / §56.1: a full recorder faults but reception continues.
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("listener-pipe-{tag}-{}.bin", uuid::Uuid::new_v4()));
+        path
+    }
+
+    #[tokio::test]
+    async fn raw_recording_captures_pre_extraction_bytes() {
+        use crate::record::{start_raw_recording, OverwritePolicy, RawFileRecorder};
+
+        let path = temp_path("capture");
+        let recorder = RawFileRecorder::create(&path, OverwritePolicy::Overwrite, false)
+            .await
+            .unwrap();
         let cid = ChannelId::new();
-        let caps = PipelineCapacities {
-            raw_recording: 0, // force every enqueue to be rejected
-            ..PipelineCapacities::default()
-        };
-        let mut p = lf_pipeline(cid, caps, true);
-        assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
-        p.ingest(bytes_chunk(cid, b"A\nB\n"));
-        // Recorder faulted, but the two messages were still produced.
+        let mut p = lf_pipeline(cid, PipelineCapacities::default())
+            .with_raw_recorder(start_raw_recording(recorder, 64));
+
+        p.ingest(bytes_chunk(cid, b"$GPGGA,"));
+        p.ingest(bytes_chunk(cid, b"123\r\n"));
+        // Finalize flushes + closes the file (drains the recorder queue).
+        p.finish().await;
+
+        // Raw recording is byte-exact and pre-extraction (§53): the CRLF and the
+        // un-split chunk boundary are both present.
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"$GPGGA,123\r\n");
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn recording_overflow_faults_emits_event_and_reception_continues() {
+        // §56.1 / §152: a full recorder queue faults recording (emitting
+        // RecordingFaulted) but reception, extraction, and retention continue.
+        use crate::record::{start_raw_recording, OverwritePolicy, RawFileRecorder};
+
+        let path = temp_path("overflow");
+        let recorder = RawFileRecorder::create(&path, OverwritePolicy::Overwrite, false)
+            .await
+            .unwrap();
+        let cid = ChannelId::new();
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(16);
+        // Recorder queue capacity 1; two back-to-back sync ingests with no await
+        // between cannot let the recorder task drain, so the second overflows.
+        let mut p = lf_pipeline(cid, PipelineCapacities::default())
+            .with_event_sender(ev_tx)
+            .with_raw_recorder(start_raw_recording(recorder, 1));
+
+        p.ingest(bytes_chunk(cid, b"A\n"));
+        p.ingest(bytes_chunk(cid, b"B\n"));
+
         assert_eq!(p.raw_recording_state(), Some(RecordingState::Faulted));
+        // Reception continued: both messages extracted and retained.
         assert_eq!(p.retention().len(), 2);
-        assert!(p
-            .diagnostics()
-            .iter()
-            .any(|d| d.severity == DiagnosticSeverity::Error));
+
+        let mut saw_fault = false;
+        while let Ok(event) = ev_rx.try_recv() {
+            if matches!(event, RuntimeEvent::RecordingFaulted(_)) {
+                saw_fault = true;
+            }
+        }
+        assert!(saw_fault, "RecordingFaulted event must be emitted");
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]
     async fn run_channel_drains_then_stops_when_sender_drops() {
         let cid = ChannelId::new();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let p = lf_pipeline(cid, PipelineCapacities::default(), false);
+        let p = lf_pipeline(cid, PipelineCapacities::default());
         tx.send(bytes_chunk(cid, b"X\nY\n")).await.unwrap();
         drop(tx); // loop drains the buffered chunk, then sees the channel close
         let p = run_channel(rx, p, CancellationToken::new()).await;
@@ -476,7 +525,7 @@ mod tests {
     async fn run_channel_stops_on_cancellation_with_live_sender() {
         let cid = ChannelId::new();
         let (tx, rx) = tokio::sync::mpsc::channel::<ReceivedData>(8);
-        let p = lf_pipeline(cid, PipelineCapacities::default(), false);
+        let p = lf_pipeline(cid, PipelineCapacities::default());
         let cancel = CancellationToken::new();
         let handle = tokio::spawn(run_channel(rx, p, cancel.clone()));
         cancel.cancel(); // only cancellation can end the loop — tx is still alive

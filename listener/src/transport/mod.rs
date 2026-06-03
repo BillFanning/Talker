@@ -73,28 +73,41 @@ pub struct NewConnection {
     pub stream: tokio::net::TcpStream,
 }
 
+/// Why a transport's receive/accept loop ended (§94, §101, §111).
+#[derive(Debug)]
+pub enum TransportOutcome {
+    /// Ended because its cancellation token was triggered — a normal stop (§111).
+    Cancelled,
+    /// Ended normally: TCP EOF (the client closed), or the downstream pipeline
+    /// went away. Not a fault.
+    Completed,
+    /// Ended on a fatal read/accept error (§94). The reader may have lost data at
+    /// the OS before failing — transport-specific loss the runtime reports (§101).
+    Faulted(String),
+}
+
 /// Unifies a Tokio task handle and a dedicated OS thread so the runtime can
 /// await transport completion uniformly (§138). Joining a blocking thread goes
 /// through an async-observable `oneshot`, so it never blocks a runtime worker.
 pub enum TransportJoinHandle {
     /// A transport that runs as a Tokio task (UDP, TCP).
-    Task(tokio::task::JoinHandle<()>),
+    Task(tokio::task::JoinHandle<TransportOutcome>),
     /// A transport whose body runs on a dedicated OS thread (Serial); the thread
-    /// signals completion by dropping/sending on this `oneshot`.
-    Thread(tokio::sync::oneshot::Receiver<()>),
+    /// reports its outcome on this `oneshot`.
+    Thread(tokio::sync::oneshot::Receiver<TransportOutcome>),
 }
 
 impl TransportJoinHandle {
-    /// Await transport completion. Safe to call from an async context: the
-    /// blocking-thread variant awaits a `oneshot` rather than `JoinHandle::join`.
-    pub async fn join(self) {
+    /// Await transport completion and learn why it ended (§101). Safe to call
+    /// from an async context: the blocking-thread variant awaits a `oneshot`
+    /// rather than `JoinHandle::join`. A panicked task / dropped sender reports
+    /// `Completed`.
+    pub async fn join(self) -> TransportOutcome {
         match self {
             TransportJoinHandle::Task(handle) => {
-                let _ = handle.await;
+                handle.await.unwrap_or(TransportOutcome::Completed)
             }
-            TransportJoinHandle::Thread(done) => {
-                let _ = done.await;
-            }
+            TransportJoinHandle::Thread(done) => done.await.unwrap_or(TransportOutcome::Completed),
         }
     }
 }

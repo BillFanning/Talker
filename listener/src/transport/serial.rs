@@ -28,7 +28,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::{ChannelId, ChunkTime};
 
-use super::{DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHandle};
+use super::{
+    DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHandle, TransportOutcome,
+};
 
 /// Read buffer size for one blocking read (a serial chunk; framing is the
 /// extractor's job, §105).
@@ -161,9 +163,9 @@ impl DataTransportRunner for OpenSerialTransport {
         std::thread::Builder::new()
             .name("serial-rx".to_string())
             .spawn(move || {
-                run_blocking_receive_loop(channel_id, reader, out, cancel);
-                // Signal completion to the async side (never blocks a worker).
-                let _ = done_tx.send(());
+                let outcome = run_blocking_receive_loop(channel_id, reader, out, cancel);
+                // Report the outcome to the async side (never blocks a worker).
+                let _ = done_tx.send(outcome);
             })
             .expect("failed to spawn serial receive thread");
         TransportJoinHandle::Thread(done_rx)
@@ -200,12 +202,12 @@ fn run_blocking_receive_loop(
     mut reader: impl BlockingReader,
     out: Sender<ReceivedData>,
     cancel: CancellationToken,
-) {
+) -> TransportOutcome {
     let mut buf = vec![0u8; READ_BUFFER];
     loop {
         // Cooperative cancellation, observed between bounded reads (§111).
         if cancel.is_cancelled() {
-            break;
+            return TransportOutcome::Cancelled;
         }
         match reader.read(&mut buf) {
             // Timeout / no data: loop back to re-check cancellation.
@@ -220,12 +222,12 @@ fn run_blocking_receive_loop(
                 // extractor queue backpressures here rather than dropping data.
                 // An `Err` means the pipeline is gone.
                 if out.blocking_send(data).is_err() {
-                    break;
+                    return TransportOutcome::Completed;
                 }
             }
-            // TODO(§94/§101): classify transient vs fatal and report
-            // transport-specific loss instead of just ending the loop.
-            Err(_e) => break,
+            // A read error ends the loop as a fault (§94). A UART/driver overrun
+            // may have lost bytes before this; that loss is reported here (§101).
+            Err(e) => return TransportOutcome::Faulted(format!("serial read failed: {e}")),
         }
     }
 }
@@ -275,8 +277,8 @@ mod tests {
         let (done_tx, done_rx) = oneshot::channel();
         let loop_cancel = cancel.clone();
         std::thread::spawn(move || {
-            run_blocking_receive_loop(cid, reader, tx, loop_cancel);
-            let _ = done_tx.send(());
+            let outcome = run_blocking_receive_loop(cid, reader, tx, loop_cancel);
+            let _ = done_tx.send(outcome);
         });
 
         assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"AB");
@@ -284,7 +286,36 @@ mod tests {
 
         // The reader is now idle; cancellation must end the loop within a timeout.
         cancel.cancel();
-        done_rx.await.unwrap();
+        assert!(matches!(
+            done_rx.await.unwrap(),
+            TransportOutcome::Cancelled
+        ));
+    }
+
+    #[tokio::test]
+    async fn fatal_read_error_yields_a_faulted_outcome() {
+        struct FailingReader;
+        impl BlockingReader for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("device gone"))
+            }
+        }
+
+        let (tx, _rx) = mpsc::channel(4);
+        let (done_tx, done_rx) = oneshot::channel();
+        std::thread::spawn(move || {
+            let outcome = run_blocking_receive_loop(
+                ChannelId::new(),
+                FailingReader,
+                tx,
+                CancellationToken::new(),
+            );
+            let _ = done_tx.send(outcome);
+        });
+        assert!(matches!(
+            done_rx.await.unwrap(),
+            TransportOutcome::Faulted(_)
+        ));
     }
 
     #[tokio::test]

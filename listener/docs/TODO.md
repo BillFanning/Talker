@@ -58,18 +58,25 @@ tests yet.
 - [x] **Decoder entrypoint** — `spawn_channel_tasks` takes a decoder; the orchestrator
   wires it for serial/UDP from `DecoderConfig`. *Still open*: TCP **connection** channels
   are undecoded (`start_tcp_listener` needs a per-connection decoder factory).
-- [ ] **Recorder ↔ pipeline** — pipeline still uses the synchronous `FaultOnFullQueue`
-  stub for the raw tap and emits a diagnostic, not `RuntimeEvent::RecordingFaulted`; the
-  real `record::` file tasks are not connected. The orchestrator currently starts every
-  channel with recording **off** regardless of `RecordingConfig`. Display Recording not
-  connected to the display fan-out.
+- [x] **Raw recorder ↔ pipeline** — pipeline feeds the real `record::Recording` task at
+  the chunk tap; overflow faults the recording, emits `RuntimeEvent::RecordingFaulted` +
+  a diagnostic, and reception continues (§56.1); `finish` finalizes the file. The
+  orchestrator creates the recorder at Start from `RecordingConfig`, and a recording-enable
+  failure surfaces a `WarningRaised` without faulting the channel (§55). *Still open*:
+  **Display** Recording is not connected to the display fan-out; TCP-connection recording
+  is deferred.
 - [x] **Retention ↔ pipeline** — pipeline retention is `retention::MessageRetention`
   (count **and** byte limits, §88); the orchestrator derives per-channel limits from
   `RetentionConfig`. *Still open*: event/warning/error retention limits (§80) need the
   `diagnostics` module; display history is still a plain count-bounded queue.
-- [ ] **Transport error / loss reporting (§94/§101)** — UDP/TCP/serial `break` on fatal
-  read/accept errors with `TODO` markers; no warning/error events, no transport-specific
-  loss reporting. Report only *observable* loss (kernel-dropped UDP is not detectable).
+- [x] **Transport error reporting (§94/§101)** — all transports classify why they ended
+  (`TransportOutcome::{Cancelled, Completed, Faulted(reason)}`). A spontaneous transport
+  fault surfaces `ChannelFaulted`: data channels via a per-channel fault monitor
+  (`spawn_monitored_channel`), TCP connections via the supervisor (+ `TcpClientDisconnected`).
+  *Refinements still open*: the orchestrator's internal state stays `Running` after a
+  spontaneous fault until the user calls `stop` (the event fires; state reconciliation is
+  lazy); quantified loss *estimates* (§101 "estimated data loss where practical") are not
+  computed — only observable loss is reportable (kernel-dropped UDP is undetectable).
 - [ ] **Multi-view display + pause** — pipeline has one display queue, not N views keyed
   by `DisplayViewId`; `DisplayState`/Pause-Resume commands (§11/§50) are unimplemented.
 

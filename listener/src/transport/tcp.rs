@@ -26,7 +26,7 @@ use crate::core::{ChannelId, ChunkTime};
 
 use super::{
     ConnectionAcceptorRunner, DataTransportRunner, NewConnection, ReceivedData, ReceivedPayload,
-    TransportJoinHandle,
+    TransportJoinHandle, TransportOutcome,
 };
 
 /// Read buffer size for one stream read (a chunk; framing is the extractor's
@@ -88,7 +88,7 @@ impl ConnectionAcceptorRunner for BoundTcpListenerTransport {
             loop {
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => break,
+                    _ = cancel.cancelled() => return TransportOutcome::Cancelled,
                     res = listener.accept() => match res {
                         Ok((stream, remote_addr)) => {
                             let conn = NewConnection {
@@ -101,12 +101,12 @@ impl ConnectionAcceptorRunner for BoundTcpListenerTransport {
                             // accept/reject (max_connections, §16.1). An `Err`
                             // means the supervisor is gone.
                             if out.send(conn).await.is_err() {
-                                break;
+                                return TransportOutcome::Completed;
                             }
                         }
-                        // TODO(§94): classify accept errors; a transient accept
-                        // failure should not necessarily fault the listener.
-                        Err(_e) => break,
+                        Err(e) => {
+                            return TransportOutcome::Faulted(format!("TCP accept failed: {e}"))
+                        }
                     },
                 }
             }
@@ -144,10 +144,10 @@ impl DataTransportRunner for TcpConnectionTransport {
             loop {
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => break,
+                    _ = cancel.cancelled() => return TransportOutcome::Cancelled,
                     res = stream.read(&mut buf) => match res {
                         // EOF: the client closed the connection (§16, disconnect).
-                        Ok(0) => break,
+                        Ok(0) => return TransportOutcome::Completed,
                         Ok(n) => {
                             let data = ReceivedData {
                                 channel_id,
@@ -157,11 +157,10 @@ impl DataTransportRunner for TcpConnectionTransport {
                             // Awaiting `send` is the one place this transport may
                             // stall (§97.1); an `Err` means the pipeline is gone.
                             if out.send(data).await.is_err() {
-                                break;
+                                return TransportOutcome::Completed;
                             }
                         }
-                        // TODO(§94/§101): classify transient vs fatal errors.
-                        Err(_e) => break,
+                        Err(e) => return TransportOutcome::Faulted(format!("TCP read failed: {e}")),
                     },
                 }
             }
@@ -197,7 +196,7 @@ mod tests {
         assert_eq!(conn.remote_addr, client_addr);
 
         cancel.cancel();
-        handle.join().await;
+        assert!(matches!(handle.join().await, TransportOutcome::Cancelled));
     }
 
     #[tokio::test]
@@ -218,9 +217,9 @@ mod tests {
         assert_eq!(data.payload.bytes(), b"chunk-one");
         assert!(matches!(data.payload, ReceivedPayload::Bytes(_)));
 
-        // Closing the client ends the connection transport (EOF), so the
-        // join handle completes on its own without cancellation.
+        // Closing the client ends the connection transport (EOF), so the join
+        // handle completes on its own — reported as a normal `Completed` outcome.
         drop(client);
-        handle.join().await;
+        assert!(matches!(handle.join().await, TransportOutcome::Completed));
     }
 }
