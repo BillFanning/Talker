@@ -1,9 +1,31 @@
-# Listener Specification v1.1.1
+# Listener Specification v1.2
 
 Status: Draft 1 (revised — concurrency model, recording semantics, and review fixes folded in)
 Audience: human reviewers, Rust implementers, and Codex/code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer + Codex
+
+Revision v1.2 (feature expansion — troubleshooting & long-run logging):
+- §59 — **time-based file rotation** (Hourly/Daily); generated filenames
+  `<channel>_<start-time>` with extensions **`.dat`** (raw data), **`.ssdat`**
+  (subsampled data), **`.disp`** (display recording), **`.log`** (diagnostic log only);
+  filesystem-safe channel-name constraints (§71). Size-based rotation stays deferred.
+- §50.1 — **sink subsampling** (count- or time-based, per display view / message
+  recording; raw data is never subsampled).
+- §50.2 — **Match Rules & Triggers**: a predicate (byte pattern / decoded field / idle /
+  message size) fires actions (highlight, begin/stop recording, mark, notify, pause).
+- §14.3/§14.4 — full **serial control-line** monitor + control (RTS/DTR set and
+  live-toggle; CTS/DSR/DCD/RI live display); port enumeration + hot-plug; RS-422/485
+  phased.
+- §75/§76 — **network live adjustment**: SO_RCVBUF, multicast join/leave + interface.
+- §78 — display extras: per-view **source**, **timestamp format**, **hex grouping**, and
+  per-message **annotation toggles** (number + timestamp) replacing `metadata_visible`.
+- §9.1 opt-in **auto-reconnect**; §91.1 **liveness / activity monitor**; §56.2
+  **disk-space guard** for recording.
+- §136/§137 — command/event vocabulary expanded (incl. a dedicated `ReceptionStalled`
+  event resolving the ADR-007 overload); both enums now `#[non_exhaustive]`.
+Config changes are additive (`#[serde(default)]`), so `schema_version` is unchanged;
+`metadata_visible` is retired (old profiles still load).
 
 Revision v1.1.1:
 - Spec relocated to the crate's own `docs/` directory; document-location paths corrected.
@@ -394,6 +416,26 @@ Running → Starting
 Faulted → Running
 ```
 
+### 9.1 Auto-Reconnect (opt-in)
+
+By default a Faulted Channel stays Faulted until the user acts (§8.5). A Channel
+may opt in to **auto-reconnect**: after a fault that ended a Channel which was
+meant to be Running, the runtime automatically re-attempts Start with backoff
+instead of remaining Faulted. This adds one transition, taken **only** when
+auto-reconnect is enabled:
+
+```text
+Faulted → Starting   (auto-reconnect only, after a backoff delay)
+```
+
+Auto-reconnect is configured per Channel (`ReconnectPolicy`, §80.1) and is
+**disabled by default**, preserving the manual-recovery semantics above. It
+applies to Serial (covering USB hot-plug, §14.4), UDP, and TCP Listener Channels.
+It does **not** apply to TCP Connection Channels: the listener accepts connections
+and does not dial out (TCP client mode is deferred, Appendix A), so a dropped
+client simply ends. Each attempt emits a reconnect event (§137); after
+`max_attempts` (if set) the Channel remains Faulted.
+
 ## 10. Start and Stop
 
 Start and Stop are Channel-level commands.
@@ -550,6 +592,42 @@ Manual RTS/DTR changes shall not affect:
 - Message Extraction
 - Recording
 - Decoding
+
+### 14.3 Live Control-Line State and Control
+
+Control-line handling is a first-class troubleshooting surface, not just an
+open-time setting. While a Serial Channel is Running:
+
+- **Output lines RTS and DTR** are settable at open (§74 `rts`/`dtr`) **and
+  live-toggleable** via runtime commands (`SetRts`/`SetDtr`, §136).
+- **Input lines CTS, DSR, DCD, RI** are **live-monitored**; a change is reflected
+  in Channel status/snapshot and signalled by `ControlLinesChanged` (§137).
+
+The full state is reported as a unit:
+
+```rust
+struct SerialControlLines {
+    rts: bool, dtr: bool,                        // outputs (Listener drives)
+    cts: bool, dsr: bool, dcd: bool, ri: bool,   // inputs (device drives)
+}
+```
+
+Control-line polling is bounded and shall not interfere with reception (§100).
+
+### 14.4 Port Discovery and Hot-Plug
+
+Listener shall **enumerate available serial ports** for selection (a bounded
+blocking operation, §97.1) and shall also accept a **manually entered** port name
+for uncommon or virtual ports it did not enumerate. Ports may appear and disappear
+at runtime (USB-serial adapters): a port that vanishes faults its Channel (§94);
+**auto-reconnect** (§9.1), if enabled, reopens it when it returns.
+
+### 14.5 Electrical Standards
+
+RS-232 is supported first; RS-422 and RS-485 follow. RS-485 is half-duplex and may
+require RTS-driven transmit-direction control; Listener is receive-side, so this is
+minimal, but the RTS control of §14.3 accommodates adapters that share a direction
+line.
 
 ## 15. UDP Channels
 
@@ -1011,7 +1089,9 @@ A Display View may operate on:
 - Stream data
 - Completed Messages
 
-The selected source is independent of Display Mode where practical.
+The selected source is independent of Display Mode where practical, and is
+configured **per view** (`DisplayViewConfig.source`, §78): one view may show the
+raw stream for forensic inspection while another shows completed Messages.
 
 ## 42. Display Modes
 
@@ -1058,7 +1138,8 @@ Rendered Display may apply:
 
 Hex Display shall display each byte as two uppercase hexadecimal digits.
 
-Grouping and spacing may be configurable.
+Grouping and spacing are configurable per view (`HexGrouping`, §78/§80.1): the
+number of bytes per group and groups per line (0 = fit to the display width).
 
 ## 46. Character Rendering
 
@@ -1118,6 +1199,13 @@ Incorrect principle:
 Metadata becomes part of the displayed Message text.
 ```
 
+Which metadata annotates each Message is configured **per view** via
+`MessageAnnotations` (§78): independently toggleable **Message Number** and
+**timestamp** (rendered with the view's `TimestampDisplay`, §133), with room to
+add byte count, reception duration, and integrity later. These annotations also
+govern what a Display Recording (`.disp`, §54) writes inline (§57); they are always
+adjacent, never inserted into Message bytes.
+
 ## 50. Display Pause
 
 When Display is Paused:
@@ -1127,6 +1215,107 @@ When Display is Paused:
 - Decoding continues.
 - Recording continues if enabled.
 - Retention continues according to policy.
+
+## 50.1 Sink Subsampling
+
+A Message-oriented sink may **subsample** — present or record only a subset of
+Messages — to keep a fast stream readable or a log compact. Subsampling is
+**per-sink and independent**: each Display View and each Message-oriented recording
+carries its own.
+
+```rust
+enum Subsample {
+    None,
+    EveryNth(u32),        // count-based: 1 of every N Messages
+    RateLimit(Duration),  // time-based: at most one Message per interval
+}
+```
+
+Subsampling is a **presentation/recording filter only**. It shall not affect
+reception, Message Numbering, retention, or any other sink (cf. §99/§100).
+Subsampled views and logs therefore show **gapped Message Numbers** — the true
+numbers, never renumbered (§89).
+
+**Raw data is never subsampled.** Raw Recording is byte-exact, contiguous, and
+forensic (§5.6/§53/§56); it has no Message boundaries to count and is full-fidelity
+or off. Subsampling applies only to Display Views, Display Recording, and a
+**message-framed** data recording — see §53 for how enabling subsampling changes a
+data recording's output (`.dat` → `.ssdat`).
+
+## 50.2 Match Rules and Triggers
+
+A **Match Rule** evaluates a predicate against received data; on a match it fires
+one or more **Actions**. Highlighting a matched item is one action; recording,
+marking, notifying, and pausing are others. Match Rules are per-Channel and
+**presentation/control only** — they never modify Messages, bytes, recordings, or
+metadata (§40, §103, §116).
+
+**Match conditions** (v1: one condition per rule; compound AND/OR/sequence logic is
+deferred):
+
+```rust
+enum MatchCondition {
+    BytePattern { pattern: Vec<u8> },                       // bytes/hex/text within a Message
+    DecodedField(DecodedMatch),                             // requires a decoder
+    Idle { timeout: Duration },                             // no data for `timeout` (timer-based)
+    MessageSize { min: Option<usize>, max: Option<usize> }, // byte count outside [min, max]
+}
+
+enum DecodedMatch {
+    MessageType(String),       // e.g. "GLL"
+    TalkerId(String),          // e.g. "GP"
+    Integrity(IntegrityStatus),// e.g. Invalid (bad checksum)
+}
+```
+
+`BytePattern` matches over Message bytes in v1 (cross-chunk stream scanning is
+deferred). `DecodedField` matches **only Protocol Metadata already produced by a
+decoder** (§134/§135) — message type, talker id, integrity status — and **not**
+arbitrary protocol field extraction, which is deferred (Appendix A). It requires a
+configured decoder, else the rule never matches and configuration validation warns
+(§71). `Idle` uses the per-Channel activity monitor (§91.1): it fires once when the
+stream has been quiet for `timeout` and re-arms when data resumes.
+
+**Actions:**
+
+```rust
+enum MatchAction {
+    Highlight { style: HighlightStyle },                     // presentation only
+    Record { target: RecordTarget, control: RecordControl }, // begin/stop, from the match forward
+    Mark,                                                    // correlation marker + tagged event
+    Notify { severity: DiagnosticSeverity },                 // raise an event/warning (§92–94)
+    PauseDisplay { view: Option<DisplayViewId> },            // freeze a view, or all
+}
+
+enum RecordTarget { Raw, Display, Both }
+enum RecordControl { Begin, Stop }
+```
+
+- **Record** begins or stops recording **from the match forward**; there is **no
+  pre-match backfill** (§158). Pre-trigger / pre-match capture is deferred.
+- **Mark** drops a correlation marker into the display, the Display Recording
+  (`.disp`), and a tagged event (§137) — **never** into the raw `.dat` byte stream,
+  which stays byte-exact (§5.6/§49).
+- **Notify** raises a diagnostic event/warning (§92–94). **PauseDisplay** freezes a
+  view (or all views, §50); reception and recording continue.
+
+**Configuration** (persists in profiles):
+
+```rust
+struct MatchRule {
+    name: String,
+    condition: MatchCondition,
+    actions: Vec<MatchAction>,
+    enabled: bool,
+}
+```
+
+Rules are part of `ChannelConfig` (§72) as `match_rules: Vec<MatchRule>`.
+
+**Evaluation and constraints.** Rules evaluate per-Message after decoding and
+before fan-out, plus an idle timer for the `Idle` condition. Evaluation is bounded
+and shall not stall reception (§100). One condition per rule; no cross-channel
+rules; no pre-trigger capture — all deferred.
 
 ---
 
@@ -1184,6 +1373,13 @@ sidecar index keyed by byte offset.
 
 Raw Recording is authoritative for the data it contains. It is **not** guaranteed
 complete under sustained overload — see §56.1.
+
+A full-fidelity raw recording is written with the **`.dat`** extension (§59). Raw
+data is **never subsampled** (§50.1): a byte stream has no Message boundaries to
+decimate. If a data recording is configured with a subsample (§50.1), it instead
+produces a **message-framed, decimated** file with the **`.ssdat`** extension — the
+distinct extension signals that the file is *not* byte-exact and *not* complete.
+The byte-exactness guarantee above applies to `.dat` only.
 
 ## 54. Display Recording
 
@@ -1250,6 +1446,26 @@ reception and faults the recording rather than stalling the reader or writing a
 gapped file. A raw recording is therefore guaranteed **contiguous and byte-exact
 for the data it contains, with a known end** — not guaranteed complete.
 
+### 56.2 Disk-Space Guard
+
+To protect long-duration recording (extended logging, §123), a recording may
+configure a **disk-space guard** (`DiskGuard`, §79/§80.1) on its destination
+filesystem:
+
+```rust
+struct DiskGuard {
+    min_free: Option<DiskThreshold>,  // minimum free space (bytes or percent)
+    on_low: LowDiskAction,            // Warn | StopRecording
+}
+```
+
+Free space is **polled periodically**, not checked on every write. When it falls
+below the threshold Listener raises a warning (§93); if `on_low` is
+`StopRecording`, the recorder finalizes the current file cleanly (§56) and stops,
+emitting `RecordingStoppedLowDisk` (§137) while **reception continues** (§96).
+Status/snapshot expose the current recording file, bytes written, free space, and —
+when rotation is configured (§59) — the time remaining until the next rotation.
+
 ## 57. Timestamp Recording
 
 Timestamp recording is optional and is the only metadata a recorder writes.
@@ -1272,14 +1488,48 @@ view's presentation does not pause its recording.
 
 ## 59. Recording File Management
 
-Recording file rotation is deferred (Appendix A).
+Recording supports user-configurable **time-based file rotation**. (Size-based
+rotation and automatic pruning of old files remain deferred — Appendix A.)
 
-Open questions:
+**Rotation period:**
 
-- Size-based rotation
-- Time-based rotation
-- Filename templates
-- Retention policy for recording files
+```rust
+enum RotationPolicy {
+    None,    // single file (the destination is a file)
+    Hourly,
+    Daily,
+}
+```
+
+When `None`, the recording writes to a single destination file. When `Hourly` or
+`Daily`, the `destination` (§79) is treated as a **directory** and Listener
+generates a new file at the start of each period.
+
+**Generated filenames** are `<channel-name>_<start-time><ext>`, where:
+
+- `<start-time>` is the period's start at the **least resolution the period
+  needs**: `Daily` → `YYYY-MM-DD`; `Hourly` → `YYYY-MM-DD_HH`.
+- `<ext>` identifies the file's contents:
+  - **`.dat`** — full-fidelity raw data (byte-exact, never subsampled, §53).
+  - **`.ssdat`** — subsampled data (message-framed, decimated, §50.1/§53).
+  - **`.disp`** — Display Recording (rendered text, §54).
+  - **`.log`** — diagnostic/event log only (§114); not a Channel recording.
+
+Example (Hourly, channel "GPS"): `GPS_2026-06-03_08.dat`.
+
+**Rotation boundary.** At each period boundary Listener finalizes the current file
+(flush + close, §56) and opens the next. A rotation is a clean **file boundary, not
+a gap**: each file stays contiguous and byte-exact for the data it contains (§56),
+and recording does not backfill across the boundary (§158).
+
+**Channel-name constraints.** Because the channel name appears in filenames,
+`ChannelName` is validated **filesystem-safe** at configuration time (§71):
+non-empty, no path separators or reserved characters, a bounded length, and not a
+reserved device name (e.g. Windows `CON`, `PRN`, `COMx`). Invalid names are
+**rejected** by validation, not silently sanitized.
+
+Still deferred (Appendix A): size-based rotation, filename templating beyond this
+scheme, and a retention policy that prunes old recording files.
 
 ---
 
@@ -1417,6 +1667,12 @@ TCP Listener       Valid
 
 Resources that cannot be validated until Start shall be validated during Start.
 
+Validation shall also reject a `ChannelName` that is not **filesystem-safe**
+(§59), because the name is used to generate recording filenames: a name is rejected
+if it is empty, contains path separators or reserved characters, exceeds a bounded
+length, or is a reserved device name (e.g. Windows `CON`, `PRN`, `COMx`). Names are
+rejected, not silently sanitized.
+
 ---
 
 # Part XIV — Configuration Schema
@@ -1443,6 +1699,8 @@ struct ChannelConfig {
     display: DisplayConfig,
     recording: RecordingConfig,
     retention: RetentionConfig,
+    match_rules: Vec<MatchRule>,   // §50.2; default empty
+    reconnect: ReconnectPolicy,    // §9.1; default disabled
 }
 ```
 
@@ -1499,6 +1757,8 @@ struct UdpConfig {
     port: u16,
     mode: UdpMode,
     multicast_group: Option<String>,
+    multicast_interface: Option<String>, // NIC to join on (multi-homed hosts)
+    recv_buffer_bytes: Option<usize>,    // SO_RCVBUF
 }
 
 enum UdpMode {
@@ -1515,8 +1775,27 @@ struct TcpListenerConfig {
     bind_address: String,
     port: u16,
     max_connections: Option<u32>,
+    recv_buffer_bytes: Option<usize>,    // SO_RCVBUF for accepted connections
 }
 ```
+
+### 76.1 Network Live Adjustment (troubleshooting)
+
+Listener shall support live adjustment of network parameters the OS allows without
+a re-bind:
+
+- **Receive buffer (SO_RCVBUF)** — set at open and adjustable live; the primary
+  lever against kernel-dropped UDP datagrams (§101 — loss the OS does not surface).
+  Live changes are best-effort: some platforms only honor a buffer size set
+  before/at bind, so a full change may require a restart (§13).
+- **Multicast membership** — join/leave groups live, and select the join interface
+  on multi-homed hosts (`JoinMulticast` / `LeaveMulticast` / `SetReceiveBuffer`,
+  §136).
+
+Parameters needing a re-bind (bind address, port) change via the §13 apply-pending
+coordinated restart, not live. Live **socket state** — bound address, connected
+peer(s), multicast membership, throughput/last-received — is exposed in
+status/snapshot for troubleshooting.
 
 ## 77. Decoder Configuration
 
@@ -1538,13 +1817,17 @@ struct DisplayConfig {
 
 struct DisplayViewConfig {
     mode: DisplayMode,
+    source: DisplaySource,             // §41: Stream vs Messages
     encoding: DisplayEncoding,
     character_rendering: CharacterRendering,
     font: Option<String>,
     foreground_color: Option<String>,
     background_color: Option<String>,
     wrapping: WrappingMode,
-    metadata_visible: bool,
+    hex_grouping: HexGrouping,         // §45
+    timestamp: TimestampDisplay,       // §133: source + resolution
+    annotations: MessageAnnotations,   // §49/§57: replaces metadata_visible
+    subsample: Subsample,              // §50.1
 }
 ```
 
@@ -1553,9 +1836,14 @@ struct DisplayViewConfig {
 ```rust
 struct RecordingConfig {
     mode: RecordingMode,
-    destination: Option<PathBuf>,
+    destination: Option<PathBuf>,   // a file when rotation = None; a directory otherwise (§59)
     timestamp_enabled: bool,
     overwrite_policy: OverwritePolicy,
+    rotation: RotationPolicy,       // §59; default None
+    subsample: Subsample,           // §50.1; default None. Non-None makes a data recording
+                                    // message-framed (.dat → .ssdat, §53); raw byte output is never subsampled.
+                                    // Ignored for Display recording's byte-exactness (it is already rendered).
+    disk_guard: Option<DiskGuard>,  // §56.2
 }
 ```
 
@@ -1631,6 +1919,42 @@ pub struct DefaultConfig {
     pub display: Option<DisplayConfig>,
     pub retention: Option<RetentionConfig>,
 }
+
+// --- v1.2 additions ---
+// (Subsample §50.1, RotationPolicy §59, MatchRule/MatchCondition/MatchAction/
+//  DecodedMatch/RecordTarget/RecordControl §50.2, DiskGuard §56.2, and
+//  SerialControlLines §14.3 are defined in their body sections.)
+
+pub enum DisplaySource { Stream, Messages } // §41
+
+// §45; groups_per_line 0 = fit to the display width.
+pub struct HexGrouping { pub bytes_per_group: u8, pub groups_per_line: u8 }
+
+// §133 (TimestampSource / TimestampResolution are defined in §133).
+pub struct TimestampDisplay { pub source: TimestampSource, pub resolution: TimestampResolution }
+
+// §49/§57 — replaces `metadata_visible`. Room to grow: byte_count, duration, integrity.
+pub struct MessageAnnotations { pub message_number: bool, pub timestamp: bool }
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MatchRuleId(uuid::Uuid); // §50.2
+
+pub struct HighlightStyle {         // §50.2
+    pub foreground: Option<String>,
+    pub background: Option<String>,
+    pub label: Option<String>,
+}
+
+pub struct ReconnectPolicy {        // §9.1; enabled defaults false
+    pub enabled: bool,
+    pub initial_backoff: std::time::Duration,
+    pub max_backoff: std::time::Duration,
+    pub multiplier: f64,
+    pub max_attempts: Option<u32>,  // None = unlimited
+}
+
+pub enum DiskThreshold { Bytes(u64), Percent(u8) } // §56.2
+pub enum LowDiskAction { Warn, StopRecording }     // §56.2
 ```
 
 ---
@@ -1782,6 +2106,26 @@ Examples:
 - Display Paused
 - Recording Enabled
 - Recording Faulted
+
+### 91.1 Channel Activity and Liveness
+
+Each Channel maintains a lightweight **activity monitor** of pure facts, updated
+per received chunk/Message and exposed in status/snapshot:
+
+```rust
+struct ChannelActivity {
+    last_data_at: Option<Instant>,  // arrival of the last chunk/datagram; None until first data
+    bytes_per_sec: f64,             // rolling
+    messages_per_sec: f64,          // rolling
+}
+```
+
+It answers "is data arriving?" at a glance (throughput, time-since-last-data, a
+derived idle indicator). **Idle-ness is computed by each consumer against its own
+threshold** — a display uses a UI threshold; a Match Rule's `Idle` condition (§50.2)
+uses its own `timeout` — so there is one fact source and no competing definitions
+of "idle". The monitor is bounded and shall not affect reception (§100, §124); it
+is runtime-only and never persisted.
 
 ## 92. Events
 
@@ -2593,6 +2937,7 @@ pub struct IntegrityMetadata {
 ## 136. Runtime Commands
 
 ```rust
+#[non_exhaustive]
 pub enum RuntimeCommand {
     StartChannel(ChannelId),
     StopChannel(ChannelId),
@@ -2601,12 +2946,23 @@ pub enum RuntimeCommand {
     DisableRecording(ChannelId),
     PauseDisplay(ChannelId, DisplayViewId),
     ResumeDisplay(ChannelId, DisplayViewId),
+    // v1.2 — serial control lines (§14.3)
+    SetRts(ChannelId, bool),
+    SetDtr(ChannelId, bool),
+    // v1.2 — network live adjustment (§76.1)
+    JoinMulticast(ChannelId, String /*group*/, Option<String> /*interface*/),
+    LeaveMulticast(ChannelId, String /*group*/),
+    SetReceiveBuffer(ChannelId, usize),
+    // v1.2 — match rules & triggers (§50.2)
+    SetMatchRuleEnabled(ChannelId, MatchRuleId, bool),
+    MarkNow(ChannelId),                       // manual correlation marker
 }
 ```
 
 ## 137. Runtime Events
 
 ```rust
+#[non_exhaustive]
 pub enum RuntimeEvent {
     ChannelStarted(ChannelId),
     ChannelStopped(ChannelId),
@@ -2616,6 +2972,15 @@ pub enum RuntimeEvent {
     WarningRaised(ChannelId),
     TcpClientConnected(ChannelId),
     TcpClientDisconnected(ChannelId),
+    // v1.2 additions
+    ReceptionStalled(ChannelId, Duration),    // §101/ADR-007: dedicated, replaces the WarningRaised overload
+    ControlLinesChanged(ChannelId),           // §14.3: input CTS/DSR/DCD/RI changed — poll snapshot for detail
+    MatchTriggered(ChannelId, MatchRuleId),   // §50.2: a rule fired (Notify/Mark observable here)
+    ChannelReconnecting(ChannelId, u32 /*attempt*/), // §9.1
+    ChannelReconnected(ChannelId),
+    ChannelReconnectGaveUp(ChannelId),
+    DiskSpaceLow(ChannelId),                  // §56.2
+    RecordingStoppedLowDisk(ChannelId),
 }
 ```
 
@@ -2990,6 +3355,65 @@ The NMEA Decoder shall:
 
 ---
 
+# Part XXIX.1 — Acceptance Criteria (v1.2 addendum)
+
+The v1.2 feature set (revision note at the top of this document) is **required**,
+not optional spec detail, and carries its own acceptance bar. Each criterion below
+is unverified end-to-end until proven.
+
+## 161. Serial Control Lines
+
+A user shall be able to: see CTS/DSR/DCD/RI state live and observe it change; set
+RTS/DTR at open and toggle them live while Running. Control-line activity shall not
+affect Message Numbering, Extraction, Recording, or Decoding (§14.2–§14.3).
+
+## 162. Auto-Reconnect
+
+With auto-reconnect enabled on a Serial/UDP/TCP-Listener Channel, a transport fault
+shall trigger automatic re-Start with backoff (`Faulted → Starting`, §9.1), bounded
+by `max_attempts`. With it disabled (the default), a Faulted Channel stays Faulted.
+TCP Connection Channels shall not auto-reconnect.
+
+## 163. File Rotation
+
+An Hourly/Daily recording shall produce period files named
+`<channel>_<start-time><ext>` with the correct extension (`.dat`/`.ssdat`/`.disp`),
+finalize each file cleanly at the boundary (no gap, no backfill), and reject a
+filesystem-unsafe channel name at config time (§59, §71).
+
+## 164. Subsampling
+
+Count- and time-based subsampling shall apply per sink (display view / message
+recording) without affecting reception, Message Numbering, retention, or other
+sinks; subsampled output shall show gapped (not renumbered) Message Numbers. Raw
+data (`.dat`) shall never be subsampled (§50.1).
+
+## 165. Match Rules and Triggers
+
+Each match condition (byte pattern, decoded field, idle, message size) shall fire
+its actions; `Record` shall begin/stop from the match forward with no pre-match
+backfill; `Mark` shall annotate display/`.disp`/events but never the raw `.dat`
+stream; decoded matching shall be limited to existing Protocol Metadata (§50.2).
+
+## 166. Liveness
+
+A running Channel shall surface throughput (bytes/sec, msgs/sec), time-since-last-
+data, and a derived idle indicator, bounded and without affecting reception (§91.1).
+
+## 167. Network Live Adjustment
+
+A user shall be able to set SO_RCVBUF and join/leave multicast groups (with
+interface selection) live where the OS permits; re-bind (address/port) shall occur
+via apply-pending restart (§76.1, §13).
+
+## 168. Disk-Space Guard
+
+On low disk a recording shall warn and, if configured, stop and finalize cleanly
+while reception continues; status shall surface current file, bytes written, free
+space, and rotation countdown (§56.2).
+
+---
+
 # Appendix A — Deferred Features
 
 Deferred from Version 1:
@@ -3004,7 +3428,8 @@ Deferred from Version 1:
 - TCP client mode
 - Distributed operation
 - Advanced synchronization recovery
-- File rotation
+- Size-based file rotation (time-based rotation is supported — §59)
+- Pre-trigger / pre-match recording capture (§50.2)
 - Persistent diagnostic log rotation
 - Hard real-time guarantees
 
