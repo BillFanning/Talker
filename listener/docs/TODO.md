@@ -63,8 +63,10 @@ tests yet.
   real `record::` file tasks are not connected. The orchestrator currently starts every
   channel with recording **off** regardless of `RecordingConfig`. Display Recording not
   connected to the display fan-out.
-- [ ] **Retention ↔ pipeline** — pipeline still uses a single-count `DropOldestQueue`;
-  swap in `retention::MessageRetention` (count+byte limits) driven by `RetentionConfig`.
+- [x] **Retention ↔ pipeline** — pipeline retention is `retention::MessageRetention`
+  (count **and** byte limits, §88); the orchestrator derives per-channel limits from
+  `RetentionConfig`. *Still open*: event/warning/error retention limits (§80) need the
+  `diagnostics` module; display history is still a plain count-bounded queue.
 - [ ] **Transport error / loss reporting (§94/§101)** — UDP/TCP/serial `break` on fatal
   read/accept errors with `TODO` markers; no warning/error events, no transport-specific
   loss reporting. Report only *observable* loss (kernel-dropped UDP is not detectable).

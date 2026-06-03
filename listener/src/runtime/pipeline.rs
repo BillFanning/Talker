@@ -21,6 +21,7 @@ use crate::core::{
 };
 use crate::decode::Decoder;
 use crate::extract::MessageExtractor;
+use crate::retention::{ByteSized, MessageRetention, RetentionStore};
 use crate::transport::{ReceivedData, ReceivedPayload};
 
 use super::metadata::MessageNumbering;
@@ -36,7 +37,10 @@ pub struct PipelineCapacities {
     /// reader (§97.1, §99).
     pub ingest: usize,
     pub display: usize,
+    /// Retained-Message **count** limit (§88).
     pub retention: usize,
+    /// Retained-Message total **byte** limit (§88), if any.
+    pub retention_bytes: Option<usize>,
     pub raw_recording: usize,
     pub diagnostics: usize,
     /// Runtime→UI event stream ([`RuntimeEvent`], §137).
@@ -49,6 +53,7 @@ impl Default for PipelineCapacities {
             ingest: 256,
             display: 1024,
             retention: 1024,
+            retention_bytes: None,
             raw_recording: 1024,
             diagnostics: 256,
             events: 256,
@@ -73,6 +78,12 @@ pub struct DecodedMessage {
     pub protocol: Option<ProtocolMetadata>,
 }
 
+impl ByteSized for DecodedMessage {
+    fn byte_len(&self) -> usize {
+        self.message.bytes.len()
+    }
+}
+
 /// One Channel's processing pipeline (§102). Driven synchronously via
 /// [`ChannelPipeline::ingest`]; [`run_channel`] is the async loop around it.
 /// (No `Debug` derive: the boxed `dyn MessageExtractor` is not `Debug`.)
@@ -82,7 +93,7 @@ pub struct ChannelPipeline {
     numbering: MessageNumbering,
     decoder: Option<Box<dyn Decoder + Send>>,
     display: DropOldestQueue<DecodedMessage>,
-    retention: DropOldestQueue<DecodedMessage>,
+    retention: MessageRetention<DecodedMessage>,
     diagnostics: DiagnosticsQueue,
     raw_recorder: Option<RawRecorderSink>,
     events: Option<Sender<RuntimeEvent>>,
@@ -105,7 +116,7 @@ impl ChannelPipeline {
             numbering: MessageNumbering::new(),
             decoder: None,
             display: DropOldestQueue::with_capacity(caps.display),
-            retention: DropOldestQueue::with_capacity(caps.retention),
+            retention: MessageRetention::new(Some(caps.retention), caps.retention_bytes),
             diagnostics: DiagnosticsQueue::with_capacity(caps.diagnostics),
             raw_recorder,
             events: None,
@@ -205,9 +216,9 @@ impl ChannelPipeline {
         // Display: drop oldest on overflow (§99). Per-item loss is coalesced and
         // reported later (§101); we do not emit a diagnostic per dropped item.
         let _ = self.display.push(decoded.clone());
-        // Retention: evict oldest (§89). Message Numbers are never rewritten, so
-        // survivors keep their original numbers.
-        let _ = self.retention.push(decoded);
+        // Retention: bounded by count and bytes (§88), evicting oldest (§89).
+        // Message Numbers are never rewritten, so survivors keep their numbers.
+        self.retention.push(decoded);
         // Event stream (§137): advisory, non-blocking, drop on full.
         if let Some(events) = &self.events {
             let _ = events.try_send(RuntimeEvent::MessageReceived(self.channel_id, number));
@@ -234,7 +245,7 @@ impl ChannelPipeline {
         &self.display
     }
 
-    pub fn retention(&self) -> &DropOldestQueue<DecodedMessage> {
+    pub fn retention(&self) -> &MessageRetention<DecodedMessage> {
         &self.retention
     }
 
@@ -412,6 +423,22 @@ mod tests {
         // Oldest two evicted; survivors keep their original numbers 3,4,5.
         assert_eq!(nums, vec![3, 4, 5]);
         assert_eq!(p.next_message_number(), 6);
+    }
+
+    #[test]
+    fn retention_byte_limit_evicts_oldest() {
+        // §88: a total-byte limit bounds retention independently of count.
+        let cid = ChannelId::new();
+        let caps = PipelineCapacities {
+            retention: 100,
+            retention_bytes: Some(3),
+            ..PipelineCapacities::default()
+        };
+        let mut p = lf_pipeline(cid, caps, false);
+        // Five 1-byte messages; a 3-byte budget keeps the newest three.
+        p.ingest(bytes_chunk(cid, b"1\n2\n3\n4\n5\n"));
+        let nums: Vec<u64> = p.retention().iter().map(|d| d.message.number).collect();
+        assert_eq!(nums, vec![3, 4, 5]);
     }
 
     #[test]

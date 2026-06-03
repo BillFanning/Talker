@@ -247,6 +247,19 @@ impl Listener {
         }
     }
 
+    /// Per-channel pipeline capacities, applying this channel's retention limits
+    /// (§80, §88) on top of the base capacities.
+    fn channel_caps(&self, config: &ChannelConfig) -> PipelineCapacities {
+        PipelineCapacities {
+            retention: config
+                .retention
+                .message_limit
+                .unwrap_or(self.caps.retention),
+            retention_bytes: config.retention.byte_limit,
+            ..self.caps
+        }
+    }
+
     /// Build, open/bind, and wire a Channel's runtime tasks (§8.2).
     async fn spawn_channel(
         &self,
@@ -278,7 +291,7 @@ impl Listener {
                 let handle = start_tcp_listener(
                     bound,
                     move || build_extractor(&extraction),
-                    self.caps,
+                    self.channel_caps(config),
                     false, // recording wiring pending
                     tcp.max_connections,
                     self.events_tx.clone(),
@@ -299,7 +312,7 @@ impl Listener {
             runner,
             build_extractor(&config.extraction),
             build_decoder(&config.decoder),
-            self.caps,
+            self.channel_caps(config),
             false, // recording wiring pending
             self.events_tx.clone(),
         )

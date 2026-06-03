@@ -31,19 +31,30 @@ pub trait RetentionStore<T> {
     }
 }
 
+/// An item whose byte size counts toward a byte-based retention limit (§88).
+pub trait ByteSized {
+    fn byte_len(&self) -> usize;
+}
+
+impl ByteSized for Arc<Message> {
+    fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
 /// Bounded Message history (§86–§89). Stays within an optional message-count
 /// limit and an optional total-byte limit (§88), evicting oldest-first; the most
 /// recent Message is always retained, so a single Message larger than the byte
 /// limit is kept rather than dropping everything.
-pub struct MessageRetention {
+pub struct MessageRetention<T = Arc<Message>> {
     message_limit: Option<usize>,
     byte_limit: Option<usize>,
     backstop: usize,
-    items: VecDeque<Arc<Message>>,
+    items: VecDeque<T>,
     total_bytes: usize,
 }
 
-impl MessageRetention {
+impl<T: ByteSized> MessageRetention<T> {
     /// A store with the given limits (`None` = that limit not enforced) and the
     /// default backstop. Validation (§80) rejects an all-`None` `RetentionConfig`
     /// upstream; the backstop is the defense in depth if one slips through.
@@ -68,7 +79,15 @@ impl MessageRetention {
         self.total_bytes
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Arc<Message>> {
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.items.iter()
     }
 
@@ -84,15 +103,15 @@ impl MessageRetention {
     }
 }
 
-impl RetentionStore<Arc<Message>> for MessageRetention {
-    fn push(&mut self, item: Arc<Message>) {
-        self.total_bytes += item.bytes.len();
+impl<T: ByteSized> RetentionStore<T> for MessageRetention<T> {
+    fn push(&mut self, item: T) {
+        self.total_bytes += item.byte_len();
         self.items.push_back(item);
         // Evict oldest-first until within bounds, but never drop the newest
         // Message (always retain at least one).
         while self.items.len() > 1 && self.over_limits() {
             if let Some(evicted) = self.items.pop_front() {
-                self.total_bytes -= evicted.bytes.len();
+                self.total_bytes -= evicted.byte_len();
             }
         }
     }
@@ -162,7 +181,7 @@ mod tests {
         })
     }
 
-    fn numbers(store: &MessageRetention) -> Vec<u64> {
+    fn numbers(store: &MessageRetention<Arc<Message>>) -> Vec<u64> {
         store.iter().map(|m| m.number).collect()
     }
 
