@@ -366,12 +366,14 @@ impl Listener {
                     .bind()
                     .await
                     .map_err(OrchestratorError::Bind)?;
-                // Each accepted connection gets a fresh extractor from this config.
-                // Per-connection recording/decoding is deferred (§16.2).
+                // Each accepted connection gets a fresh extractor + decoder from
+                // this config (§16.2). Per-connection recording is deferred (§59).
                 let extraction = config.extraction.clone();
+                let decoder = config.decoder.clone();
                 let handle = start_tcp_listener(
                     bound,
                     move || build_extractor(&extraction),
+                    move || build_decoder(&decoder),
                     self.channel_caps(config),
                     tcp.max_connections,
                     self.events_tx.clone(),

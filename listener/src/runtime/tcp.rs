@@ -23,6 +23,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{ChannelId, RuntimeEvent};
+use crate::decode::Decoder;
 use crate::extract::MessageExtractor;
 use crate::transport::tcp::{BoundTcpListenerTransport, TcpConnectionTransport};
 use crate::transport::{ConnectionAcceptorRunner, NewConnection, TransportOutcome};
@@ -58,18 +59,25 @@ impl TcpListenerHandle {
 
 /// Start a TCP listener and supervise its connection channels (§16).
 ///
-/// `make_extractor` builds a fresh extractor per connection (each connection has
-/// independent extraction/numbering state, §16.2). All events — lifecycle and
-/// per-connection `MessageReceived` — flow into `events`.
-pub fn start_tcp_listener<F>(
+/// `make_extractor` and `make_decoder` build a fresh extractor/decoder per
+/// connection, so each accepted connection inherits the listener's configured
+/// extraction and decoding with independent state (§16.2). All events —
+/// lifecycle and per-connection `MessageReceived` — flow into `events`.
+///
+/// Per-connection **recording** is not wired: each connection would need a
+/// distinct destination file, which depends on filename templating (§59,
+/// deferred). Accepted connections are therefore unrecorded for now.
+pub fn start_tcp_listener<F, D>(
     bound: BoundTcpListenerTransport,
     make_extractor: F,
+    make_decoder: D,
     caps: PipelineCapacities,
     max_connections: Option<u32>,
     events: Sender<RuntimeEvent>,
 ) -> TcpListenerHandle
 where
     F: Fn() -> Box<dyn MessageExtractor + Send> + Send + 'static,
+    D: Fn() -> Option<Box<dyn Decoder + Send>> + Send + 'static,
 {
     let listener_id = bound.channel_id();
     let cancel = CancellationToken::new();
@@ -108,10 +116,9 @@ where
                             conn_id,
                             transport,
                             make_extractor(),
-                            // TODO: per-connection decoder + recorders from the
-                            // listener's config (start_tcp_listener would need
-                            // factories). Connections are undecoded/unrecorded.
-                            None,
+                            make_decoder(),
+                            // Per-connection recording is deferred (distinct files
+                            // per connection need §59 filename templates).
                             None,
                             None,
                             1, // one default Display View per connection
@@ -198,6 +205,7 @@ mod tests {
         let handle = start_tcp_listener(
             bound,
             || Box::new(DelimiterExtractor::new(vec![b'\n'], false)),
+            || None::<Box<dyn Decoder + Send>>,
             PipelineCapacities::default(),
             None,
             ev_tx,
@@ -241,6 +249,7 @@ mod tests {
         let handle = start_tcp_listener(
             bound,
             || Box::new(StreamExtractor::new()),
+            || None::<Box<dyn Decoder + Send>>,
             PipelineCapacities::default(),
             Some(1),
             ev_tx,
@@ -272,6 +281,7 @@ mod tests {
         let handle = start_tcp_listener(
             bound,
             || Box::new(DelimiterExtractor::new(vec![b'\n'], false)),
+            || None::<Box<dyn Decoder + Send>>,
             PipelineCapacities::default(),
             None,
             ev_tx,

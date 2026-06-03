@@ -64,8 +64,10 @@ tests yet.
   `start`/`stop`/`set_pending_config`/`apply_pending` (§13) + `shutdown` (§113). Commands
   are async methods, not a background command-loop task; that's fine for v1.
 - [x] **Decoder entrypoint** — `spawn_channel_tasks` takes a decoder; the orchestrator
-  wires it for serial/UDP from `DecoderConfig`. *Still open*: TCP **connection** channels
-  are undecoded (`start_tcp_listener` needs a per-connection decoder factory).
+  wires it for serial/UDP from `DecoderConfig`, and `start_tcp_listener` now takes a
+  per-connection `make_decoder` factory so accepted TCP connections inherit the listener's
+  decoder (§16.2). *Still open*: per-connection **recording** is deferred — distinct files
+  per connection need §59 filename templates (deferred).
 - [x] **Recorder ↔ pipeline (raw + display)** — Raw Recording feeds the real
   `record::Recording` task at the chunk tap; overflow faults it, emits
   `RuntimeEvent::RecordingFaulted` + a diagnostic, reception continues (§56.1). Display
@@ -122,8 +124,10 @@ All unverified end-to-end. Each generally needs the wiring above first.
   suites landed: loopback UDP (datagrams numbered, clean stop, §153–§155), loopback TCP
   (accept → distinct connection id → delimited Message → stop terminates connections,
   §16), and profile behavior (round-trip, load-does-not-start §70/§159, TCP-connection
-  rejected §16.3, unbounded-retention rejected §80). *Still to add*: NMEA-over-TCP-connection,
-  connection recording, display/pause end-to-end, metadata/timing.
+  rejected §16.3, unbounded-retention rejected §80), and a TCP connection inheriting the
+  listener's NMEA decoder (delivers Messages; decode *result* not yet observable — snapshot
+  API is future work). *Still to add*: display/pause end-to-end, metadata/timing — both need
+  the live-readout API.
 
 ## Future work — deferred from Version 1 (spec Appendix A)
 
