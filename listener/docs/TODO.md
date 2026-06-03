@@ -109,6 +109,21 @@ tests yet.
   `RuntimeEvent` stream stays authoritative for liveness. *Still open*: per-connection TCP
   snapshots (the supervisor keeps no per-connection handle) — deferred like per-conn recording.
 
+### v1 scoping decisions (accepted TCP connections)
+
+Two capabilities are **intentionally deferred for v1** — not bugs, not "wire it up"
+gaps. Accepted TCP connections already meet §16.2 inheritance parity (extraction +
+decoder); these are separate, deliberately-scoped omissions:
+
+- **Per-connection recording — deferred, blocked on §59.** Each connection would need
+  its own destination file, which requires filename templating (§59, Appendix A
+  deferred). Not implementable without that, and not to be invented (AGENTS.md §1).
+- **Per-connection snapshots — deferred unless the GUI needs them.** The TCP supervisor
+  keeps no per-connection pipeline handle, so a connection isn't a snapshot target today.
+  Revisit only if the GUI's connection-level live inspection requires it; if so, it's a
+  scoped addition (retain per-connection snapshot senders in the supervisor), not a
+  redesign.
+
 ---
 
 ## Acceptance (§153–§160 — the product-ready bar)
@@ -118,11 +133,16 @@ All unverified end-to-end. Each generally needs the wiring above first.
 - [ ] §153 Channel operation — create from templates, start/stop independently, run many
 - [ ] §154 TCP connections — accept, one channel/client, independent, not persisted
 - [ ] §155 Message processing — Stream/Delimiter/Fixed-Length/sync-marker selectable; UDP datagram → Message
-- [ ] §156 Display — Raw/Rendered/Hex, multi-view, config, pause without affecting reception/recording
-- [ ] §157 Metadata/timing — number, byte count, arrival, optional duration, optional integrity
+- [~] §156 Display — multi-view + pause-without-affecting-reception/numbering/retention proven
+  end-to-end (`pausing_a_display_view_freezes_only_that_view`); pause-without-affecting-*recording*
+  is unit-proven (`display_recording_continues_while_the_view_is_paused`). *Still to add*:
+  Raw/Rendered/Hex rendering selection asserted through a running channel.
+- [x] §157 Metadata/timing — number, byte count, arrival timestamp, reception duration, and NMEA
+  integrity asserted via a live snapshot (`snapshot_exposes_message_metadata_and_nmea_integrity`).
 - [ ] §158 Recording — enable/disable per channel, Raw/Display, optional timestamps, no backfill
 - [ ] §159 Profiles — save/load workspace; load does not start channels, begin recording, or restore runtime state
-- [ ] §160 NMEA0183 — decoder behavior (substrate done; prove through a running channel)
+- [x] §160 NMEA0183 — decoder behavior proven through a running channel: a valid sentence reports
+  integrity Valid + message type, a bad-checksum sentence is retained and annotated Invalid (§37).
 
 ---
 
@@ -142,9 +162,11 @@ All unverified end-to-end. Each generally needs the wiring above first.
   (accept → distinct connection id → delimited Message → stop terminates connections,
   §16), and profile behavior (round-trip, load-does-not-start §70/§159, TCP-connection
   rejected §16.3, unbounded-retention rejected §80), a TCP connection inheriting the
-  listener's NMEA decoder, and a live snapshot exposing a running channel's decoded Messages
-  + per-view display history (decode *result* now observable via the snapshot API). *Still to
-  add*: display/pause end-to-end assertions via snapshots, metadata/timing readout.
+  listener's NMEA decoder, a live snapshot exposing a running channel's decoded Messages
+  + per-view display history, display-view **pause** freezing only that view via snapshots
+  (§156), and Message **metadata/timing + NMEA integrity** via snapshots (§157/§160).
+  *Still to add*: Raw/Rendered/Hex rendering selection through a running channel; recording
+  enable/disable acceptance (§158).
 
 ## Future work — deferred from Version 1 (spec Appendix A)
 
