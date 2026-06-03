@@ -20,6 +20,7 @@ use crate::core::{
     ChannelId, DisplayViewId, Message, MessageBytes, ProtocolMetadata, RecordingState, RuntimeEvent,
 };
 use crate::decode::Decoder;
+use crate::diagnostics::{Diagnostic, DiagnosticLog};
 use crate::display::{DisplayView, RenderedOutput, Renderer};
 use crate::extract::MessageExtractor;
 use crate::record::{Recording, RecordingStopReason};
@@ -27,7 +28,7 @@ use crate::retention::{ByteSized, MessageRetention, RetentionStore};
 use crate::transport::{ReceivedData, ReceivedPayload};
 
 use super::metadata::MessageNumbering;
-use super::queue::{Diagnostic, DiagnosticSeverity, DiagnosticsQueue, DropOldestQueue};
+use super::queue::DropOldestQueue;
 
 /// Bounded capacities for a Channel's fan-out edges (§99, §124). Defaults are
 /// generous; real values come from `RetentionConfig`/`RecordingConfig` later.
@@ -42,7 +43,10 @@ pub struct PipelineCapacities {
     /// Retained-Message total **byte** limit (§88), if any.
     pub retention_bytes: Option<usize>,
     pub raw_recording: usize,
-    pub diagnostics: usize,
+    /// Per-type retained-diagnostic limits (§88): events, warnings, errors.
+    pub event_retention: Option<usize>,
+    pub warning_retention: Option<usize>,
+    pub error_retention: Option<usize>,
     /// Runtime→UI event stream ([`RuntimeEvent`], §137).
     pub events: usize,
 }
@@ -55,7 +59,9 @@ impl Default for PipelineCapacities {
             retention: 1024,
             retention_bytes: None,
             raw_recording: 1024,
-            diagnostics: 256,
+            event_retention: None,
+            warning_retention: None,
+            error_retention: None,
             events: 256,
         }
     }
@@ -145,7 +151,8 @@ pub struct ChannelPipeline {
     /// paused (§11). The first is the default view created by `new`.
     display_views: Vec<PipelineDisplayView>,
     retention: MessageRetention<DecodedMessage>,
-    diagnostics: DiagnosticsQueue,
+    /// Retained diagnostics, count-limited per type (§88).
+    diagnostics: DiagnosticLog,
     /// Raw Recording handle (§53). `None` when recording is disabled or its
     /// enable failed (§55). Faults non-blockingly on overflow (§56.1).
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
@@ -167,7 +174,11 @@ impl ChannelPipeline {
             decoder: None,
             display_views: vec![PipelineDisplayView::new(caps.display)],
             retention: MessageRetention::new(Some(caps.retention), caps.retention_bytes),
-            diagnostics: DiagnosticsQueue::with_capacity(caps.diagnostics),
+            diagnostics: DiagnosticLog::new(
+                caps.event_retention,
+                caps.warning_retention,
+                caps.error_retention,
+            ),
             raw_recorder: None,
             recording_fault_reported: false,
             events: None,
@@ -222,10 +233,10 @@ impl ChannelPipeline {
             }
         }
         if recording_just_faulted {
-            self.diagnostics.push(Diagnostic::new(
-                DiagnosticSeverity::Error,
-                format!("raw recording faulted on channel {}", self.channel_id),
-            ));
+            self.diagnostics.record(Diagnostic::error(format!(
+                "raw recording faulted on channel {}",
+                self.channel_id
+            )));
             if let Some(events) = &self.events {
                 let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
             }
@@ -261,13 +272,10 @@ impl ChannelPipeline {
         let protocol = if let Some(decoder) = &self.decoder {
             let result = decoder.decode(&msg);
             for err in &result.errors {
-                self.diagnostics.push(Diagnostic::new(
-                    DiagnosticSeverity::Warning,
-                    format!(
-                        "decoder: {err} (channel {}, message {number})",
-                        self.channel_id
-                    ),
-                ));
+                self.diagnostics.record(Diagnostic::warning(format!(
+                    "decoder: {err} (channel {}, message {number})",
+                    self.channel_id
+                )));
             }
             result.metadata
         } else {
@@ -379,7 +387,7 @@ impl ChannelPipeline {
         &self.retention
     }
 
-    pub fn diagnostics(&self) -> &DiagnosticsQueue {
+    pub fn diagnostics(&self) -> &DiagnosticLog {
         &self.diagnostics
     }
 
@@ -512,8 +520,26 @@ mod tests {
                 .as_deref(),
             Some("HDT")
         );
-        // The invalid checksum produced exactly one decoder diagnostic.
-        assert_eq!(p.diagnostics().len(), 1);
+        // The invalid checksum produced exactly one decoder warning diagnostic.
+        assert_eq!(p.diagnostics().warnings().count(), 1);
+    }
+
+    #[test]
+    fn diagnostic_warning_retention_limit_is_applied() {
+        // §88: the per-type diagnostic limit bounds retained warnings.
+        use crate::decode::NmeaDecoder;
+        let cid = ChannelId::new();
+        let caps = PipelineCapacities {
+            warning_retention: Some(2),
+            ..PipelineCapacities::default()
+        };
+        let mut p = ChannelPipeline::new(cid, Box::new(StreamExtractor::new()), caps)
+            .with_decoder(Box::new(NmeaDecoder::standard()));
+        // Four non-NMEA datagrams → four decoder warnings, capped at two.
+        for _ in 0..4 {
+            p.ingest(datagram(cid, b"not-nmea"));
+        }
+        assert_eq!(p.diagnostics().warnings().count(), 2);
     }
 
     #[test]
@@ -702,6 +728,8 @@ mod tests {
         assert_eq!(p.raw_recording_state(), Some(RecordingState::Faulted));
         // Reception continued: both messages extracted and retained.
         assert_eq!(p.retention().len(), 2);
+        // The fault was recorded as an error diagnostic (§94).
+        assert_eq!(p.diagnostics().errors().count(), 1);
 
         let mut saw_fault = false;
         while let Ok(event) = ev_rx.try_recv() {

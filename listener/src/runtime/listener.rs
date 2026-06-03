@@ -321,12 +321,13 @@ impl Listener {
     /// Per-channel pipeline capacities, applying this channel's retention limits
     /// (§80, §88) on top of the base capacities.
     fn channel_caps(&self, config: &ChannelConfig) -> PipelineCapacities {
+        let retention = &config.retention;
         PipelineCapacities {
-            retention: config
-                .retention
-                .message_limit
-                .unwrap_or(self.caps.retention),
-            retention_bytes: config.retention.byte_limit,
+            retention: retention.message_limit.unwrap_or(self.caps.retention),
+            retention_bytes: retention.byte_limit,
+            event_retention: retention.event_limit,
+            warning_retention: retention.warning_limit,
+            error_retention: retention.error_limit,
             ..self.caps
         }
     }

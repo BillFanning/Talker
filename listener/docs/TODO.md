@@ -40,9 +40,10 @@ Modules outside the §147 order (§128):
 - [x] `retention/` — `RetentionStore` §143; `MessageRetention` (count + byte limits, §88) and `CountBounded` (events/warnings/errors), backstop (§80). *Not yet wired*: pipeline still uses a single message-count `DropOldestQueue`; swap in `MessageRetention` during the config/orchestrator wiring.
 - [x] `diagnostics/` — owns the diagnostic model (`Diagnostic`/`DiagnosticSeverity`, moved here
   from `runtime::queue` and re-exported; §95 `ErrorCategory`), `DiagnosticLog` (per-type
-  event/warning/error count retention, §88 — completes the §80 limit set), and `init_logging`
-  (tracing, §114). *Not yet wired*: the runtime doesn't yet feed a `DiagnosticLog`; the pipeline
-  still uses the §99 drop-low-priority `DiagnosticsQueue` (these are different bounding edges).
+  event/warning/error count retention, §88), and `init_logging` (tracing, §114). **Wired**:
+  the pipeline retains diagnostics in a `DiagnosticLog`; the orchestrator feeds its per-type
+  limits from `RetentionConfig` (`channel_caps`), completing the §80 retention limit set. The
+  §99 drop-low-priority `DiagnosticsQueue` remains in `queue.rs` as a tested fan-out-edge utility.
 
 ## Scaffolding
 
