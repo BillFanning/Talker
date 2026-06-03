@@ -202,9 +202,9 @@ async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
     // §163: a rotating Raw recording writes a period file named
     // <channel>_<period>.dat into the destination directory, driven through the
     // orchestrator. Boundary-crossing across periods is unit-tested in
-    // record::rotate with crafted timestamps; here we prove the wiring + naming.
+    // record::file_rotation with crafted timestamps; here we prove wiring + naming.
     use listener::config::RecordingConfig;
-    use listener::record::{OverwritePolicy, RecordingMode, RotationPolicy};
+    use listener::record::{FileRotationPolicy, OverwritePolicy, RecordingMode};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -226,7 +226,7 @@ async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
         destination: Some(dir.clone()),
         timestamp_enabled: false,
         overwrite_policy: OverwritePolicy::Overwrite,
-        rotation: RotationPolicy::Hourly,
+        file_rotation: FileRotationPolicy::Hourly,
     };
 
     let mut listener = Listener::with_default_capacities();

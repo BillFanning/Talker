@@ -16,7 +16,7 @@
 //! resumes (§56.1).
 
 pub mod file;
-pub mod rotate;
+pub mod file_rotation;
 
 use std::sync::Arc;
 
@@ -28,13 +28,13 @@ use crate::display::RenderedOutput;
 use crate::transport::ReceivedData;
 
 pub use file::{DisplayFileRecorder, RawFileRecorder};
-pub use rotate::{is_filesystem_safe, RotatingDisplayRecorder, RotatingRawRecorder};
+pub use file_rotation::{is_filesystem_safe, RotatingDisplayRecorder, RotatingRawRecorder};
 
 /// Time-based recording file rotation (§59). `None` writes a single file; the
 /// others write a new file per calendar period, named for the period start (§59).
 /// Size-based rotation and pruning remain deferred (Appendix A).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum RotationPolicy {
+pub enum FileRotationPolicy {
     #[default]
     None,
     Hourly,

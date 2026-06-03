@@ -25,8 +25,8 @@ use crate::config::ChannelConfig;
 use crate::core::{ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
 use crate::display::{DisplayView, RenderedOutput};
 use crate::record::{
-    start_display_recording, start_raw_recording, DisplayFileRecorder, RawFileRecorder, Recording,
-    RecordingMode, RotatingDisplayRecorder, RotatingRawRecorder, RotationPolicy,
+    start_display_recording, start_raw_recording, DisplayFileRecorder, FileRotationPolicy,
+    RawFileRecorder, Recording, RecordingMode, RotatingDisplayRecorder, RotatingRawRecorder,
 };
 use crate::transport::{DataTransportRunner, ReceivedData, TransportNotice};
 
@@ -498,7 +498,7 @@ impl Listener {
         let cap = self.caps.raw_recording;
         // With rotation, `destination` is a directory and files are named per
         // period from the channel name (§59, `.dat`); otherwise a single file.
-        let created = if recording.rotation == RotationPolicy::None {
+        let created = if recording.file_rotation == FileRotationPolicy::None {
             RawFileRecorder::create(destination, policy, ts)
                 .await
                 .map(|r| start_raw_recording(r, cap))
@@ -509,7 +509,7 @@ impl Listener {
                 ".dat",
                 policy,
                 ts,
-                recording.rotation,
+                recording.file_rotation,
             )
             .await
             .map(|r| start_raw_recording(r, cap))
@@ -548,7 +548,7 @@ impl Listener {
         let policy = recording.overwrite_policy;
         let ts = recording.timestamp_enabled;
         let cap = self.caps.raw_recording;
-        let created = if recording.rotation == RotationPolicy::None {
+        let created = if recording.file_rotation == FileRotationPolicy::None {
             DisplayFileRecorder::create(destination, policy, ts)
                 .await
                 .map(|r| start_display_recording(r, cap))
@@ -559,7 +559,7 @@ impl Listener {
                 ".disp",
                 policy,
                 ts,
-                recording.rotation,
+                recording.file_rotation,
             )
             .await
             .map(|r| start_display_recording(r, cap))
@@ -759,7 +759,7 @@ mod tests {
             destination: Some(path.clone()),
             timestamp_enabled: false,
             overwrite_policy: OverwritePolicy::Refuse,
-            rotation: RotationPolicy::None,
+            file_rotation: FileRotationPolicy::None,
         };
         let id = listener.add_channel(config);
 

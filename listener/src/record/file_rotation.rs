@@ -21,16 +21,18 @@ use crate::display::RenderedOutput;
 use crate::transport::ReceivedData;
 
 use super::file::{DisplayFileRecorder, RawFileRecorder};
-use super::{DisplayRecorder, OverwritePolicy, RawRecorder, RecordingStopReason, RotationPolicy};
+use super::{
+    DisplayRecorder, FileRotationPolicy, OverwritePolicy, RawRecorder, RecordingStopReason,
+};
 
 /// The period key for `at` under `policy` — the rotation trigger *and* the
 /// filename time component (§59), in **UTC**. `None` policy has no period.
-pub(crate) fn period_key(policy: RotationPolicy, at: SystemTime) -> Option<String> {
+pub(crate) fn period_key(policy: FileRotationPolicy, at: SystemTime) -> Option<String> {
     let dt: DateTime<Utc> = at.into();
     match policy {
-        RotationPolicy::None => None,
-        RotationPolicy::Hourly => Some(dt.format("%Y-%m-%d_%H").to_string()),
-        RotationPolicy::Daily => Some(dt.format("%Y-%m-%d").to_string()),
+        FileRotationPolicy::None => None,
+        FileRotationPolicy::Hourly => Some(dt.format("%Y-%m-%d_%H").to_string()),
+        FileRotationPolicy::Daily => Some(dt.format("%Y-%m-%d").to_string()),
     }
 }
 
@@ -74,7 +76,7 @@ pub struct RotatingRawRecorder {
     ext: String,
     policy: OverwritePolicy,
     timestamps: bool,
-    rotation: RotationPolicy,
+    rotation: FileRotationPolicy,
     current_key: String,
     inner: RawFileRecorder,
 }
@@ -89,7 +91,7 @@ impl RotatingRawRecorder {
         ext: &str,
         policy: OverwritePolicy,
         timestamps: bool,
-        rotation: RotationPolicy,
+        rotation: FileRotationPolicy,
     ) -> Result<Self, RecordError> {
         tokio::fs::create_dir_all(dir).await?;
         let key = period_key(rotation, SystemTime::now())
@@ -151,7 +153,7 @@ pub struct RotatingDisplayRecorder {
     ext: String,
     policy: OverwritePolicy,
     timestamps: bool,
-    rotation: RotationPolicy,
+    rotation: FileRotationPolicy,
     current_key: String,
     inner: DisplayFileRecorder,
 }
@@ -163,7 +165,7 @@ impl RotatingDisplayRecorder {
         ext: &str,
         policy: OverwritePolicy,
         timestamps: bool,
-        rotation: RotationPolicy,
+        rotation: FileRotationPolicy,
     ) -> Result<Self, RecordError> {
         tokio::fs::create_dir_all(dir).await?;
         let key = period_key(rotation, SystemTime::now())
@@ -255,14 +257,14 @@ mod tests {
     fn period_keys_use_utc_at_the_right_resolution() {
         let at = utc(2026, 6, 3, 8, 30);
         assert_eq!(
-            period_key(RotationPolicy::Hourly, at).as_deref(),
+            period_key(FileRotationPolicy::Hourly, at).as_deref(),
             Some("2026-06-03_08")
         );
         assert_eq!(
-            period_key(RotationPolicy::Daily, at).as_deref(),
+            period_key(FileRotationPolicy::Daily, at).as_deref(),
             Some("2026-06-03")
         );
-        assert_eq!(period_key(RotationPolicy::None, at), None);
+        assert_eq!(period_key(FileRotationPolicy::None, at), None);
     }
 
     #[test]
@@ -298,7 +300,7 @@ mod tests {
             ".dat",
             OverwritePolicy::Overwrite,
             false,
-            RotationPolicy::Hourly,
+            FileRotationPolicy::Hourly,
         )
         .await
         .unwrap();
@@ -335,7 +337,7 @@ mod tests {
             ".disp",
             OverwritePolicy::Overwrite,
             false,
-            RotationPolicy::Daily,
+            FileRotationPolicy::Daily,
         )
         .await
         .unwrap();

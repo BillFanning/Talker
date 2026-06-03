@@ -16,7 +16,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::core::ChannelKind;
-use crate::record::{is_filesystem_safe, RecordingMode, RotationPolicy};
+use crate::record::{is_filesystem_safe, FileRotationPolicy, RecordingMode};
 use crate::transport::udp::UdpMode;
 
 /// The schema version this build understands (§72.1). Listener keeps its own
@@ -157,7 +157,7 @@ pub fn validate_channel(
     // (§59), so it must be filesystem-safe (§71). Non-rotating recordings use a
     // fixed destination path and do not constrain the name.
     if channel.recording.mode != RecordingMode::Disabled
-        && channel.recording.rotation != RotationPolicy::None
+        && channel.recording.file_rotation != FileRotationPolicy::None
         && !is_filesystem_safe(channel.name.as_str())
     {
         errors.push(ChannelConfigError::InvalidChannelName);
@@ -215,7 +215,7 @@ pub enum ChannelConfigError {
     #[error("retention is unbounded: set a limit on the channel or in defaults")]
     UnboundedRetention,
     #[error(
-        "channel name is not filesystem-safe but recording rotation uses it in filenames (§59)"
+        "channel name is not filesystem-safe but recording file rotation uses it in filenames (§59)"
     )]
     InvalidChannelName,
 }
@@ -244,7 +244,7 @@ mod tests {
 
         let mut channel = templates::udp_template();
         channel.recording.mode = RecordingMode::Raw;
-        channel.recording.rotation = RotationPolicy::Hourly;
+        channel.recording.file_rotation = FileRotationPolicy::Hourly;
         channel.recording.destination = Some(std::path::PathBuf::from("."));
         let defaults = DefaultConfig::default();
 
@@ -259,7 +259,7 @@ mod tests {
 
         // No rotation → the name is not constrained (it is not used in filenames).
         channel.name = ChannelName::new("GPS/AIS");
-        channel.recording.rotation = RotationPolicy::None;
+        channel.recording.file_rotation = FileRotationPolicy::None;
         match validate_channel(&channel, &defaults) {
             Ok(()) => {}
             Err(e) => assert!(!e.contains(&ChannelConfigError::InvalidChannelName)),

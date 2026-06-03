@@ -1494,7 +1494,7 @@ rotation and automatic pruning of old files remain deferred — Appendix A.)
 **Rotation period:**
 
 ```rust
-enum RotationPolicy {
+enum FileRotationPolicy {
     None,    // single file (the destination is a file)
     Hourly,
     Daily,
@@ -1839,7 +1839,7 @@ struct RecordingConfig {
     destination: Option<PathBuf>,   // a file when rotation = None; a directory otherwise (§59)
     timestamp_enabled: bool,
     overwrite_policy: OverwritePolicy,
-    rotation: RotationPolicy,       // §59; default None
+    file_rotation: FileRotationPolicy, // §59; default None
     subsample: Subsample,           // §50.1; default None. Non-None makes a data recording
                                     // message-framed (.dat → .ssdat, §53); raw byte output is never subsampled.
                                     // Ignored for Display recording's byte-exactness (it is already rendered).
@@ -1921,7 +1921,7 @@ pub struct DefaultConfig {
 }
 
 // --- v1.2 additions ---
-// (Subsample §50.1, RotationPolicy §59, MatchRule/MatchCondition/MatchAction/
+// (Subsample §50.1, FileRotationPolicy §59, MatchRule/MatchCondition/MatchAction/
 //  DecodedMatch/RecordTarget/RecordControl §50.2, DiskGuard §56.2, and
 //  SerialControlLines §14.3 are defined in their body sections.)
 

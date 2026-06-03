@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::{ChannelKind, ChannelName, ProtocolId, StableConfigId};
 use crate::decode::NmeaValidationMode;
 use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, WrappingMode};
-use crate::record::{OverwritePolicy, RecordingMode, RotationPolicy};
+use crate::record::{FileRotationPolicy, OverwritePolicy, RecordingMode};
 use crate::transport::udp::UdpMode;
 
 /// One configured Channel (§72). Carries only configuration; runtime objects
@@ -192,7 +192,7 @@ pub struct RecordingConfig {
     pub overwrite_policy: OverwritePolicy,
     /// Time-based file rotation (§59); `None` = single file (additive, §72.1).
     #[serde(default)]
-    pub rotation: RotationPolicy,
+    pub file_rotation: FileRotationPolicy,
 }
 
 /// Retention limits (§80). At least one applicable limit must be set — an

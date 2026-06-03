@@ -157,9 +157,9 @@ runtime-surface expansion stays anchored to a product-readiness bar.
 
 - [ ] §161 Serial control lines — live CTS/DSR/DCD/RI display; RTS/DTR set + live-toggle
 - [ ] §162 Auto-reconnect — opt-in `Faulted → Starting` backoff; off by default; TCP connections excluded
-- [x] §163 File rotation — **DONE.** `record::rotate` (`RotatingRawRecorder`/`RotatingDisplayRecorder`)
+- [x] §163 File rotation — **DONE.** `record::file_rotation` (`RotatingRawRecorder`/`RotatingDisplayRecorder`)
   writes `<channel>_<UTC-period><ext>` files per Hourly/Daily period, data-driven from each item's
-  wall-clock, clean file boundaries (no gap/backfill); `RecordingConfig.rotation`; orchestrator builds a
+  wall-clock, clean file boundaries (no gap/backfill); `RecordingConfig.file_rotation`; orchestrator builds a
   rotating recorder when rotation != None (destination = directory); filesystem-safe channel-name
   validation (§71). Tested: period keys/UTC, name safety, raw hour-boundary + display day-boundary
   rotation (unit), config rejection (unit), orchestrator named-file (integration). `.ssdat` (subsampled)
