@@ -18,6 +18,7 @@
 //! - forced (§111, §113): cancel both halves at once without guaranteeing the
 //!   backlog is drained.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, Sender};
@@ -144,6 +145,12 @@ impl MonitoredChannel {
 /// transport outcome and emits `ChannelFaulted` if it ended on a fault (§94,
 /// §101). Used for standalone and orchestrated data channels; the TCP supervisor
 /// does its own per-connection monitoring instead.
+///
+/// `faulted` is the shared per-channel fault flag (listener ADR-006): the
+/// detached monitor cannot mutate the method-based orchestrator's state, so it
+/// flips this flag on a spontaneous fault. The orchestrator reads it to keep
+/// `state()` and command validation honest; observers learn of the fault through
+/// the `ChannelFaulted` event, which is authoritative for presentation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     channel_id: ChannelId,
@@ -155,6 +162,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     display_view_count: usize,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
+    faulted: Arc<AtomicBool>,
 ) -> MonitoredChannel {
     let monitor_events = events.clone();
     let ChannelTasks {
@@ -178,8 +186,10 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
 
     let monitor = tokio::spawn(async move {
         // A spontaneous fault surfaces as ChannelFaulted; cancel/EOF/pipeline-gone
-        // outcomes are normal ends and emit nothing.
+        // outcomes are normal ends and emit nothing. The flag reconciles the
+        // orchestrator's internal state (ADR-006); the event informs observers.
         if let TransportOutcome::Faulted(_) = transport.join().await {
+            faulted.store(true, Ordering::Relaxed);
             let _ = monitor_events.try_send(RuntimeEvent::ChannelFaulted(channel_id));
         }
     });
@@ -199,11 +209,18 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
 pub struct RunningChannel {
     tasks: MonitoredChannel,
     events: mpsc::Receiver<RuntimeEvent>,
+    faulted: Arc<AtomicBool>,
 }
 
 impl RunningChannel {
     pub fn channel_id(&self) -> ChannelId {
         self.tasks.channel_id
+    }
+
+    /// Whether the transport has ended on a spontaneous fault (§94/§101). Set by
+    /// the fault monitor; the `ChannelFaulted` event fires at the same time.
+    pub fn is_faulted(&self) -> bool {
+        self.faulted.load(Ordering::Relaxed)
     }
 
     /// The runtime→UI event stream for this Channel (§137).
@@ -233,6 +250,7 @@ pub fn start_data_channel<R: DataTransportRunner>(
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
 ) -> RunningChannel {
     let (event_tx, event_rx) = mpsc::channel(caps.events);
+    let faulted = Arc::new(AtomicBool::new(false));
     let tasks = spawn_monitored_channel(
         channel_id,
         runner,
@@ -243,10 +261,12 @@ pub fn start_data_channel<R: DataTransportRunner>(
         1,    // a single default Display View
         caps,
         event_tx,
+        faulted.clone(),
     );
     RunningChannel {
         tasks,
         events: event_rx,
+        faulted,
     }
 }
 
@@ -414,6 +434,9 @@ mod tests {
             running.events().recv().await.unwrap(),
             RuntimeEvent::ChannelFaulted(cid)
         );
+        // The same fault flips the shared state flag (ADR-006), so an orchestrator
+        // reading it reconciles to Faulted without waiting for a command.
+        assert!(running.is_faulted());
         let _ = running.stop().await;
     }
 }

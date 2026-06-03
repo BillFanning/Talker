@@ -85,10 +85,13 @@ tests yet.
   (`TransportOutcome::{Cancelled, Completed, Faulted(reason)}`). A spontaneous transport
   fault surfaces `ChannelFaulted`: data channels via a per-channel fault monitor
   (`spawn_monitored_channel`), TCP connections via the supervisor (+ `TcpClientDisconnected`).
-  *Refinements still open*: the orchestrator's internal state stays `Running` after a
-  spontaneous fault until the user calls `stop` (the event fires; state reconciliation is
-  lazy); quantified loss *estimates* (§101 "estimated data loss where practical") are not
-  computed — only observable loss is reportable (kernel-dropped UDP is undetectable).
+  State reconciliation is now eager (ADR-006): the fault monitor flips a shared per-channel
+  `Arc<AtomicBool>` that `Listener::state` and command validation read, so a spontaneously
+  faulted data channel reports `Faulted` immediately (not lazily on the next command). The
+  event remains authoritative for observers. *Refinements still open*: a TCP listener-acceptor
+  fault isn't reconciled through that flag (v1); quantified loss *estimates* (§101 "estimated
+  data loss where practical") are not computed — only observable loss is reportable
+  (kernel-dropped UDP is undetectable).
 - [x] **Multi-view display + pause** — the pipeline holds N Display Views (§48) keyed by
   `DisplayViewId`, each with a shared `DisplayViewHandle` pause flag. Pausing one view
   freezes only its accumulation; reception/recording/numbering/retention and other views

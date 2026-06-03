@@ -94,6 +94,67 @@ reason about. A downstream decoder marks an empty/`$`-less Message as it sees fi
 - This rule is observable behavior and is pinned by unit tests in
   `extract/delimiter.rs`.
 
+## ADR-006 — Runtime observability & fault-state ownership
+
+**Authoritative context:** spec §94/§101 (transport fault reporting), §136–§137
+(`RuntimeCommand` / `RuntimeEvent`), §8/§9 (state machine).
+
+**Context:** A spontaneously-faulting transport (a read/accept error, not a
+commanded stop) is detected by a per-channel **fault monitor** — a detached
+`tokio` task that owns the transport join handle (ADR-001 / `spawn_monitored_channel`).
+The orchestrator (`runtime::Listener`) is **method-based**: it has no background
+event loop, so the monitor cannot mutate its state. Before this decision the
+monitor only emitted `ChannelFaulted`; `Listener`'s stored `ChannelState` stayed
+`Running` until the next command, so `state()` could report `Running` for a
+channel whose transport had already died.
+
+Three models were considered:
+
+1. **Event-only (lazy).** The monitor emits `ChannelFaulted`; the stored state is
+   reconciled only when the next command runs. Simplest, but `state()` lies and
+   command validation can act on a stale state.
+2. **Actor / event-loop owner.** Turn the runtime into a task that consumes its
+   own `RuntimeEvent` stream and owns all state. Clean single-writer model, but a
+   significant architectural commitment for v1.
+3. **Shared per-channel state cell.** The monitor flips a lightweight shared flag
+   that the orchestrator reads when reporting state and validating commands.
+
+**Decision:** Adopt **model 3**, with a clear division of responsibility:
+
+- **`RuntimeEvent` is authoritative for presentation observers.** The CLI/GUI fold
+  the event stream into their own view models; they do **not** read or own
+  transport or pipeline state. Richer GUI state is built by folding events (and,
+  later, requesting on-demand snapshots), not by owning runtime internals.
+- **`Listener` keeps internal channel state only for command validation and
+  lifecycle control** (enforcing the legal §9 transitions).
+- **Spontaneous transport faults reconcile that internal state through a
+  lightweight shared per-channel flag** (`Arc<AtomicBool>`). The fault monitor
+  sets the flag *and* emits `ChannelFaulted`; `Listener::state` and command
+  validation treat a set flag as `Faulted` (an "effective state" overlaid on the
+  stored lifecycle state). A fresh flag is installed at each `start`; `stop`
+  clears it (`Faulted → Stopped`, §8.5). No actor/event-loop rewrite.
+
+We deliberately do **not** adopt model 2 yet. If GUI requirements prove that
+events plus on-demand snapshots are insufficient — e.g. the runtime must *push*
+rich incremental state — revisit with a new ADR; the shared-flag design leaves a
+clean path and does not foreclose it.
+
+**Consequences:**
+- `state()` is accurate immediately after a spontaneous fault, without a
+  background runtime loop.
+- The stored `ChannelState` plus the fault flag together form the *effective*
+  state; everything user-facing (`state`, `start`/`stop` validation, `shutdown`)
+  reads the effective state.
+- Reconciliation covers **data channels** (serial/UDP) via the fault monitor. A
+  TCP **listener-acceptor** fault is not reconciled through this flag in v1 (its
+  supervisor reports per-connection faults as events); revisit if acceptor faults
+  need to surface as listener state.
+- Live readout of *retained* messages / diagnostics / decoded metadata while a
+  channel runs still requires an on-demand snapshot API — separate, upcoming work
+  (the observability surface), not covered here.
+- Pinned by tests: `runtime::channel` (`is_faulted` after a fault) and
+  `runtime::listener` (`state()` reconciles to `Faulted`, then clears on `stop`).
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

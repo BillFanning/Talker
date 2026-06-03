@@ -13,6 +13,7 @@
 //! channels are not yet decoded or recorded.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -51,6 +52,24 @@ struct ManagedChannel {
     /// Pause handles for the running Channel's Display Views (§11, §48); empty
     /// while Stopped.
     display_handles: Vec<DisplayViewHandle>,
+    /// Shared fault flag (ADR-006). The detached fault monitor flips it when the
+    /// transport ends on a spontaneous fault; the orchestrator can't be mutated
+    /// from that task, so it reads the flag to keep `state()` and command
+    /// validation honest. A fresh flag is installed at each `start`.
+    faulted: Arc<AtomicBool>,
+}
+
+impl ManagedChannel {
+    /// The state a caller should see: a tripped fault flag overrides the stored
+    /// lifecycle state, so a spontaneous transport fault reads as `Faulted`
+    /// without waiting for a command to reconcile it (ADR-006).
+    fn effective_state(&self) -> ChannelState {
+        if self.faulted.load(Ordering::Relaxed) {
+            ChannelState::Faulted
+        } else {
+            self.state
+        }
+    }
 }
 
 /// Errors from orchestrating a Channel.
@@ -114,13 +133,14 @@ impl Listener {
                 state: ChannelState::Stopped,
                 handle: None,
                 display_handles: Vec::new(),
+                faulted: Arc::new(AtomicBool::new(false)),
             },
         );
         id
     }
 
     pub fn state(&self, id: ChannelId) -> Option<ChannelState> {
-        self.channels.get(&id).map(|c| c.state)
+        self.channels.get(&id).map(|c| c.effective_state())
     }
 
     pub fn config(&self, id: ChannelId) -> Option<&ChannelConfig> {
@@ -194,17 +214,24 @@ impl Listener {
                 .channels
                 .get(&id)
                 .ok_or(OrchestratorError::UnknownChannel(id))?;
-            if !channel.state.can_transition_to(ChannelState::Starting) {
+            let from = channel.effective_state();
+            if !from.can_transition_to(ChannelState::Starting) {
                 return Err(OrchestratorError::IllegalTransition {
-                    from: channel.state,
+                    from,
                     to: ChannelState::Starting,
                 });
             }
             channel.config.clone()
         };
 
-        self.set_state(id, ChannelState::Starting);
-        match self.spawn_channel(id, &config).await {
+        // Install a fresh fault flag for this run (ADR-006); the monitor flips it
+        // on a spontaneous fault and `state()`/validation read it back.
+        let faulted = Arc::new(AtomicBool::new(false));
+        if let Some(channel) = self.channels.get_mut(&id) {
+            channel.faulted = faulted.clone();
+            channel.state = ChannelState::Starting;
+        }
+        match self.spawn_channel(id, &config, faulted).await {
             Ok(handle) => {
                 let display_handles = match &handle {
                     ChannelHandle::Data(tasks) => tasks.display_handles().to_vec(),
@@ -234,12 +261,14 @@ impl Listener {
             .state(id)
             .ok_or(OrchestratorError::UnknownChannel(id))?;
         match state {
-            ChannelState::Running => {
-                self.set_state(id, ChannelState::Stopping);
-                let handle = self.channels.get_mut(&id).and_then(|c| {
-                    c.display_handles.clear();
-                    c.handle.take()
-                });
+            // Running → graceful drain; Faulted → §8.5 recovery. Both consume the
+            // handle (a spontaneous fault leaves one whose tasks have already
+            // ended; a start-time fault leaves none) and land in Stopped.
+            ChannelState::Running | ChannelState::Faulted => {
+                if state == ChannelState::Running {
+                    self.set_state(id, ChannelState::Stopping);
+                }
+                let handle = self.channels.get_mut(&id).and_then(|c| c.handle.take());
                 match handle {
                     Some(ChannelHandle::Data(tasks)) => {
                         let _ = tasks.stop().await;
@@ -247,16 +276,7 @@ impl Listener {
                     Some(ChannelHandle::TcpListener(listener)) => listener.stop().await,
                     None => {}
                 }
-                self.set_state(id, ChannelState::Stopped);
-                let _ = self.events_tx.try_send(RuntimeEvent::ChannelStopped(id));
-                Ok(())
-            }
-            ChannelState::Faulted => {
-                if let Some(channel) = self.channels.get_mut(&id) {
-                    channel.display_handles.clear();
-                }
-                self.set_state(id, ChannelState::Stopped);
-                let _ = self.events_tx.try_send(RuntimeEvent::ChannelStopped(id));
+                self.finish_stop(id);
                 Ok(())
             }
             other => Err(OrchestratorError::IllegalTransition {
@@ -264,6 +284,18 @@ impl Listener {
                 to: ChannelState::Stopped,
             }),
         }
+    }
+
+    /// Land a Channel in Stopped: clear its Display Views, reset the fault flag
+    /// (so a previously-faulted Channel reads Stopped, not Faulted), and announce
+    /// the stop (§110).
+    fn finish_stop(&mut self, id: ChannelId) {
+        if let Some(channel) = self.channels.get_mut(&id) {
+            channel.display_handles.clear();
+            channel.state = ChannelState::Stopped;
+            channel.faulted.store(false, Ordering::Relaxed);
+        }
+        let _ = self.events_tx.try_send(RuntimeEvent::ChannelStopped(id));
     }
 
     /// Accept a configuration change into pending state without applying it
@@ -305,15 +337,21 @@ impl Listener {
         Ok(())
     }
 
-    /// Stop every Running Channel (§113, application exit).
+    /// Stop every live Channel (§113, application exit). Includes spontaneously
+    /// faulted channels so their tasks and Display Views are cleaned up too.
     pub async fn shutdown(&mut self) {
-        let running: Vec<ChannelId> = self
+        let live: Vec<ChannelId> = self
             .channels
             .iter()
-            .filter(|(_, c)| c.state == ChannelState::Running)
+            .filter(|(_, c)| {
+                matches!(
+                    c.effective_state(),
+                    ChannelState::Running | ChannelState::Faulted
+                )
+            })
             .map(|(id, _)| *id)
             .collect();
-        for id in running {
+        for id in live {
             let _ = self.stop(id).await;
         }
     }
@@ -332,11 +370,13 @@ impl Listener {
         }
     }
 
-    /// Build, open/bind, and wire a Channel's runtime tasks (§8.2).
+    /// Build, open/bind, and wire a Channel's runtime tasks (§8.2). `faulted` is
+    /// the run's shared fault flag (ADR-006), handed to the data-channel monitor.
     async fn spawn_channel(
         &self,
         id: ChannelId,
         config: &ChannelConfig,
+        faulted: Arc<AtomicBool>,
     ) -> Result<ChannelHandle, OrchestratorError> {
         match &config.interface {
             InterfaceConfig::Serial(serial) => {
@@ -347,7 +387,7 @@ impl Listener {
                 let raw = self.build_raw_recorder(id, config).await;
                 let display = self.build_display_recorder(id, config).await;
                 Ok(ChannelHandle::Data(
-                    self.spawn_data(id, opened, config, raw, display),
+                    self.spawn_data(id, opened, config, raw, display, faulted),
                 ))
             }
             InterfaceConfig::Udp(udp) => {
@@ -358,9 +398,11 @@ impl Listener {
                 let raw = self.build_raw_recorder(id, config).await;
                 let display = self.build_display_recorder(id, config).await;
                 Ok(ChannelHandle::Data(
-                    self.spawn_data(id, bound, config, raw, display),
+                    self.spawn_data(id, bound, config, raw, display, faulted),
                 ))
             }
+            // The TCP listener supervises per-connection faults itself; a
+            // listener-acceptor fault isn't reconciled through this flag (v1).
             InterfaceConfig::TcpListener(tcp) => {
                 let bound = build_tcp_listener(id, tcp)?
                     .bind()
@@ -391,6 +433,7 @@ impl Listener {
         config: &ChannelConfig,
         raw_recorder: Option<Recording<Arc<ReceivedData>>>,
         display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
+        faulted: Arc<AtomicBool>,
     ) -> MonitoredChannel {
         spawn_monitored_channel(
             id,
@@ -403,6 +446,7 @@ impl Listener {
             config.display.views.len(),
             self.channel_caps(config),
             self.events_tx.clone(),
+            faulted,
         )
     }
 
@@ -606,6 +650,34 @@ mod tests {
 
         listener.stop(id).await.unwrap();
         assert!(listener.display_views(id).is_empty()); // cleared on stop
+    }
+
+    #[tokio::test]
+    async fn spontaneous_fault_reconciles_state_then_clears_on_stop() {
+        // ADR-006: the detached fault monitor can't mutate the orchestrator, so it
+        // trips the shared flag. We trip it directly here (the exact signal the
+        // monitor leaves) and assert the orchestrator reconciles without a command.
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        listener.start(id).await.unwrap();
+        assert_eq!(listener.state(id), Some(ChannelState::Running));
+
+        listener.channels[&id]
+            .faulted
+            .store(true, Ordering::Relaxed);
+
+        // state() reads Faulted even though the stored lifecycle state is Running.
+        assert_eq!(listener.state(id), Some(ChannelState::Faulted));
+        // Command validation uses the reconciled state: Start is now illegal (§9).
+        assert!(matches!(
+            listener.start(id).await,
+            Err(OrchestratorError::IllegalTransition { .. })
+        ));
+
+        // Stop recovers Faulted → Stopped (§8.5) and clears the flag.
+        listener.stop(id).await.unwrap();
+        assert_eq!(listener.state(id), Some(ChannelState::Stopped));
     }
 
     #[tokio::test]
