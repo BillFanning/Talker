@@ -9,8 +9,10 @@
 //! Commands are exposed as async methods (`start`/`stop`/`apply_pending`),
 //! the vocabulary of [`crate::core::RuntimeCommand`]. Raw recording is wired for
 //! serial/UDP channels from `RecordingConfig`; a recording-enable failure
-//! surfaces a warning without faulting the Channel (§55). TCP **connection**
-//! channels are not yet decoded or recorded.
+//! surfaces a warning without faulting the Channel (§55). Accepted TCP
+//! **connection** channels inherit the listener's extraction and decoder (§16.2);
+//! per-connection recording and snapshots remain deferred (§59 filename
+//! templates; the supervisor keeps no per-connection handle).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};

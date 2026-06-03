@@ -36,8 +36,8 @@ Implementation order per spec §147 (do **not** start with the GUI). Each unit i
 Modules outside the §147 order (§128):
 
 - [x] `decode/` — NMEA0183 decoder (§33–§39/§160), wired as the §107 pipeline stage
-- [x] `config/` — `Profile`/`ChannelConfig` schema (§72–§80), serde/TOML load+save, schema-version refusal (§72.1), per-channel validation (§71), templates (§82–§85). *Not yet wired*: the config→runtime mapping (`ExtractionConfig`→extractor, `*Config`→transport, `DecoderConfig`→decoder) lives in the orchestrator step.
-- [x] `retention/` — `RetentionStore` §143; `MessageRetention` (count + byte limits, §88) and `CountBounded` (events/warnings/errors), backstop (§80). *Not yet wired*: pipeline still uses a single message-count `DropOldestQueue`; swap in `MessageRetention` during the config/orchestrator wiring.
+- [x] `config/` — `Profile`/`ChannelConfig` schema (§72–§80), serde/TOML load+save, schema-version refusal (§72.1), per-channel validation (§71), templates (§82–§85). **Wired**: the config→runtime mapping (`ExtractionConfig`→extractor, `*Config`→transport, `DecoderConfig`→decoder) lives in `runtime::build` and is driven by the orchestrator (see *Wiring* below).
+- [x] `retention/` — `RetentionStore` §143; `MessageRetention` (count + byte limits, §88) and `CountBounded` (events/warnings/errors), backstop (§80). **Wired**: the pipeline's retention is `MessageRetention` (count + byte), fed per-channel from `RetentionConfig`; the plain `DropOldestQueue` now backs only the bounded display history (see *Wiring* below).
 - [x] `diagnostics/` — owns the diagnostic model (`Diagnostic`/`DiagnosticSeverity`, moved here
   from `runtime::queue` and re-exported; §95 `ErrorCategory`), `DiagnosticLog` (per-type
   event/warning/error count retention, §88), and `init_logging` (tracing, §114). **Wired**:
