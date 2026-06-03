@@ -118,7 +118,12 @@ All unverified end-to-end. Each generally needs the wiring above first.
 - [x] Backpressure substrate (§152): display drop-oldest, recorder fault-not-stall, retention eviction preserves numbering, diagnostics drop-low-priority — `runtime/`
 - [x] Graceful vs forced shutdown of a running channel (drain vs abandon; both terminate) — `runtime::channel`
 - [ ] Reader stall reportable as transport-specific loss (§99, §101) — blocked on transport error/loss wiring
-- [ ] Acceptance-level (§150 product areas): channel operation, TCP connections, display/pause, metadata/timing, recording end-to-end, profiles — blocked on the wiring above
+- [~] Acceptance-level integration tests (`listener/tests/`, black-box via public API) — first
+  suites landed: loopback UDP (datagrams numbered, clean stop, §153–§155), loopback TCP
+  (accept → distinct connection id → delimited Message → stop terminates connections,
+  §16), and profile behavior (round-trip, load-does-not-start §70/§159, TCP-connection
+  rejected §16.3, unbounded-retention rejected §80). *Still to add*: NMEA-over-TCP-connection,
+  connection recording, display/pause end-to-end, metadata/timing.
 
 ## Future work — deferred from Version 1 (spec Appendix A)
 

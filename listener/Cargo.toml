@@ -44,3 +44,7 @@ clap = { workspace = true }
 # Diagnostic logging (§114) — tracing facade + env-filtered subscriber
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# Integration tests (listener/tests/) drive the runtime over loopback sockets.
+tokio = { workspace = true }
