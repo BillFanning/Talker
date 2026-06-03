@@ -88,10 +88,12 @@ tests yet.
   State reconciliation is now eager (ADR-006): the fault monitor flips a shared per-channel
   `Arc<AtomicBool>` that `Listener::state` and command validation read, so a spontaneously
   faulted data channel reports `Faulted` immediately (not lazily on the next command). The
-  event remains authoritative for observers. *Refinements still open*: a TCP listener-acceptor
-  fault isn't reconciled through that flag (v1); quantified loss *estimates* (§101 "estimated
-  data loss where practical") are not computed — only observable loss is reportable
-  (kernel-dropped UDP is undetectable).
+  event remains authoritative for observers. The loss-observability boundary is classified in
+  ADR-007: recorder overflow is reported with a truncation point; a sustained serial reader
+  stall raises an unquantified possible-loss `WarningRaised`; kernel-dropped UDP is
+  fundamentally undetectable and is never fabricated. *Refinements still open*: a TCP
+  listener-acceptor fault isn't reconciled through the flag (v1); the rich §101 diagnostic
+  *record* for a reader stall (vs. the event) needs a transport→diagnostics path.
 - [x] **Multi-view display + pause** — the pipeline holds N Display Views (§48) keyed by
   `DisplayViewId`, each with a shared `DisplayViewHandle` pause flag. Pausing one view
   freezes only its accumulation; reception/recording/numbering/retention and other views
@@ -130,7 +132,11 @@ All unverified end-to-end. Each generally needs the wiring above first.
 - [x] NMEA checksum / Standard vs Strict / proprietary / AIS (§151) — `decode/`
 - [x] Backpressure substrate (§152): display drop-oldest, recorder fault-not-stall, retention eviction preserves numbering, diagnostics drop-low-priority — `runtime/`
 - [x] Graceful vs forced shutdown of a running channel (drain vs abandon; both terminate) — `runtime::channel`
-- [ ] Reader stall reportable as transport-specific loss (§99, §101) — blocked on transport error/loss wiring
+- [x] Reader stall reportable as transport-specific loss (§99, §101) — the serial reader
+  watches `blocking_send`; a stall beyond `STALL_WARNING` (250 ms) raises `WarningRaised`
+  once per episode (unquantified — UART overrun isn't countable from userland), and never
+  by dropping data. Boundary classified in ADR-007. *Deferred*: the rich §101 diagnostic
+  *record* in the channel's `DiagnosticLog` (needs a transport→diagnostics path).
 - [~] Acceptance-level integration tests (`listener/tests/`, black-box via public API) — first
   suites landed: loopback UDP (datagrams numbered, clean stop, §153–§155), loopback TCP
   (accept → distinct connection id → delimited Message → stop terminates connections,

@@ -19,14 +19,15 @@
 //! its logic is unit-testable without serial hardware.
 
 use std::io::{self, Read};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::{ChannelId, ChunkTime};
+use crate::core::{ChannelId, ChunkTime, RuntimeEvent};
 
 use super::{
     DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHandle, TransportOutcome,
@@ -39,6 +40,14 @@ const READ_BUFFER: usize = 4096;
 /// Default bounded read timeout. Caps how long a blocking read parks before the
 /// loop re-checks cancellation (§111).
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// How long the reader must be stalled on the Transport→Extractor edge before it
+/// warns of *possible* transport-specific loss (§99, §101; listener ADR-007). A
+/// stall this long means the OS/UART receive buffer has had ample time to overrun.
+/// Heuristic: momentary backpressure that drains quickly is normal and must not
+/// cry loss. The byte count of any overrun is not observable from userland, so the
+/// warning is unquantified (§101 "estimated data loss where practical").
+const STALL_WARNING: Duration = Duration::from_millis(250);
 
 /// An unopened serial transport description (§14, §74). Call
 /// [`open`](Self::open) at Channel Start to acquire the port.
@@ -139,6 +148,7 @@ impl SerialTransport {
         Ok(OpenSerialTransport {
             channel_id: self.channel_id,
             port,
+            loss_reporter: None,
         })
     }
 }
@@ -147,11 +157,23 @@ impl SerialTransport {
 pub struct OpenSerialTransport {
     channel_id: ChannelId,
     port: Box<dyn SerialPort>,
+    /// Optional event sink for transport-specific loss warnings (§101). When set,
+    /// a sustained reader stall emits `WarningRaised` (listener ADR-007).
+    loss_reporter: Option<Sender<RuntimeEvent>>,
 }
 
 impl OpenSerialTransport {
     pub fn channel_id(&self) -> ChannelId {
         self.channel_id
+    }
+
+    /// Attach the runtime event stream so a sustained reader stall — the only
+    /// edge that can backpressure the reader (§97.1) — surfaces a possible-loss
+    /// warning (§101, ADR-007). Optional: without it the reader still stalls
+    /// rather than drops; it just stays silent about it.
+    pub fn with_loss_reporter(mut self, events: Sender<RuntimeEvent>) -> Self {
+        self.loss_reporter = Some(events);
+        self
     }
 }
 
@@ -159,11 +181,19 @@ impl DataTransportRunner for OpenSerialTransport {
     fn run(self, out: Sender<ReceivedData>, cancel: CancellationToken) -> TransportJoinHandle {
         let (done_tx, done_rx) = oneshot::channel();
         let channel_id = self.channel_id;
+        let loss_reporter = self.loss_reporter;
         let reader = SerialReader { port: self.port };
         std::thread::Builder::new()
             .name("serial-rx".to_string())
             .spawn(move || {
-                let outcome = run_blocking_receive_loop(channel_id, reader, out, cancel);
+                let outcome = run_blocking_receive_loop(
+                    channel_id,
+                    reader,
+                    out,
+                    cancel,
+                    STALL_WARNING,
+                    loss_reporter,
+                );
                 // Report the outcome to the async side (never blocks a worker).
                 let _ = done_tx.send(outcome);
             })
@@ -197,13 +227,24 @@ impl BlockingReader for SerialReader {
 
 /// The dedicated-thread receive loop (§97.1). Runs until cancelled, the reader
 /// reports a fatal error, or the extractor channel closes.
+///
+/// On the Transport→Extractor edge — the only one permitted to backpressure the
+/// reader (§99) — the loop *stalls* rather than drops, so it loses nothing in
+/// process. A stall longer than `stall_warning` means the OS/UART buffer has had
+/// time to overrun, so it warns of *possible* transport-specific loss through
+/// `loss_reporter` (§101, ADR-007), once per stall episode. The lost byte count
+/// is not observable from userland, so the warning is unquantified.
 fn run_blocking_receive_loop(
     channel_id: ChannelId,
     mut reader: impl BlockingReader,
     out: Sender<ReceivedData>,
     cancel: CancellationToken,
+    stall_warning: Duration,
+    loss_reporter: Option<Sender<RuntimeEvent>>,
 ) -> TransportOutcome {
     let mut buf = vec![0u8; READ_BUFFER];
+    // One warning per stall episode; reset once the queue accepts again.
+    let mut stall_warned = false;
     loop {
         // Cooperative cancellation, observed between bounded reads (§111).
         if cancel.is_cancelled() {
@@ -218,11 +259,28 @@ fn run_blocking_receive_loop(
                     payload: ReceivedPayload::Bytes(buf[..n].to_vec()),
                     received_at: ChunkTime::now(),
                 };
-                // The one edge that may stall the reader (§97.1, §99): a full
-                // extractor queue backpressures here rather than dropping data.
-                // An `Err` means the pipeline is gone.
-                if out.blocking_send(data).is_err() {
-                    return TransportOutcome::Completed;
+                // Fast path: a non-full queue accepts at once and ends any stall
+                // episode. On Full we stall (blocking_send) rather than drop —
+                // never losing data in process (§97.1, §99). A `Closed` queue (or
+                // a closed-during-stall send) means the pipeline is gone.
+                match out.try_send(data) {
+                    Ok(()) => stall_warned = false,
+                    Err(TrySendError::Closed(_)) => return TransportOutcome::Completed,
+                    Err(TrySendError::Full(data)) => {
+                        let stalled_at = Instant::now();
+                        if out.blocking_send(data).is_err() {
+                            return TransportOutcome::Completed;
+                        }
+                        // A sustained stall risks a UART/driver overrun upstream of
+                        // us — transport-specific loss we flag but cannot quantify
+                        // (§101). Momentary backpressure that drains fast is normal.
+                        if !stall_warned && stalled_at.elapsed() >= stall_warning {
+                            if let Some(events) = &loss_reporter {
+                                let _ = events.try_send(RuntimeEvent::WarningRaised(channel_id));
+                            }
+                            stall_warned = true;
+                        }
+                    }
                 }
             }
             // A read error ends the loop as a fault (§94). A UART/driver overrun
@@ -277,7 +335,8 @@ mod tests {
         let (done_tx, done_rx) = oneshot::channel();
         let loop_cancel = cancel.clone();
         std::thread::spawn(move || {
-            let outcome = run_blocking_receive_loop(cid, reader, tx, loop_cancel);
+            let outcome =
+                run_blocking_receive_loop(cid, reader, tx, loop_cancel, STALL_WARNING, None);
             let _ = done_tx.send(outcome);
         });
 
@@ -309,6 +368,8 @@ mod tests {
                 FailingReader,
                 tx,
                 CancellationToken::new(),
+                STALL_WARNING,
+                None,
             );
             let _ = done_tx.send(outcome);
         });
@@ -326,14 +387,76 @@ mod tests {
         let cid = ChannelId::new();
         let reader = ScriptedReader::new(vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]);
         let loop_cancel = cancel.clone();
-        std::thread::spawn(move || run_blocking_receive_loop(cid, reader, tx, loop_cancel));
+        std::thread::spawn(move || {
+            run_blocking_receive_loop(cid, reader, tx, loop_cancel, STALL_WARNING, None)
+        });
 
         // The reader stalls rather than dropping: all three arrive, in order
         // (§97.1 — the Transport→Extractor edge stalls instead of losing data).
+        // This is the §101 in-process boundary: zero loss inside our queues; any
+        // loss would be a UART overrun upstream, outside what we can count.
         assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");
         assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"2");
         assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"3");
 
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn sustained_stall_warns_of_possible_transport_loss() {
+        // §101 / ADR-007: a reader stall longer than the threshold flags possible
+        // transport-specific loss via WarningRaised — once per episode, and never
+        // by dropping data. A short threshold keeps the test quick.
+        let (tx, mut rx) = mpsc::channel(1);
+        let (loss_tx, mut loss_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let cid = ChannelId::new();
+        // Two chunks: the first fills the cap-1 queue; the second stalls the reader
+        // until we drain, after a delay that exceeds the threshold.
+        let reader = ScriptedReader::new(vec![b"1".to_vec(), b"2".to_vec()]);
+        let loop_cancel = cancel.clone();
+        let threshold = Duration::from_millis(20);
+        std::thread::spawn(move || {
+            run_blocking_receive_loop(cid, reader, tx, loop_cancel, threshold, Some(loss_tx))
+        });
+
+        // Let the reader fill the queue and then stall on the second chunk for
+        // well over the threshold before we start draining.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");
+        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"2");
+
+        // Exactly the stall warning surfaced, naming the channel; no data lost.
+        assert_eq!(
+            loss_rx.recv().await.unwrap(),
+            RuntimeEvent::WarningRaised(cid)
+        );
+
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn momentary_backpressure_does_not_warn() {
+        // A queue that drains promptly is normal backpressure, not loss: no
+        // warning even though the reader briefly stalls (§101 false-positive guard).
+        let (tx, mut rx) = mpsc::channel(1);
+        let (loss_tx, mut loss_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let cid = ChannelId::new();
+        let reader = ScriptedReader::new(vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]);
+        let loop_cancel = cancel.clone();
+        // A high threshold the brisk draining below never crosses.
+        let threshold = Duration::from_secs(10);
+        std::thread::spawn(move || {
+            run_blocking_receive_loop(cid, reader, tx, loop_cancel, threshold, Some(loss_tx))
+        });
+
+        for expected in [b"1", b"2", b"3"] {
+            assert_eq!(rx.recv().await.unwrap().payload.bytes(), expected);
+        }
+        cancel.cancel();
+
+        // No warning was raised for the brief, self-clearing backpressure.
+        assert!(loss_rx.try_recv().is_err());
     }
 }

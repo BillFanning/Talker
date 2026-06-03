@@ -155,6 +155,71 @@ clean path and does not foreclose it.
 - Pinned by tests: `runtime::channel` (`is_faulted` after a fault) and
   `runtime::listener` (`state()` reconciles to `Faulted`, then clears on `stop`).
 
+## ADR-007 — Transport data-loss observability boundary
+
+**Authoritative context:** spec §99 (backpressure matrix), §100 (reception
+priority), §101 (data-loss reporting), §97.1 / ADR-001 (the blocking serial
+reader), §56.1 (recorder fault), §137 (the fixed `RuntimeEvent` set).
+
+**Context:** §101 requires Listener to report discarded data (channel, time,
+overflow type, *estimated loss where practical*) but is explicit that some loss
+"is not reliably observable from userland; Listener reports the loss it can
+detect rather than guaranteeing detection of all loss." We need a precise,
+honest line between what we report and what we cannot — and to avoid both silent
+loss and fabricated loss counts.
+
+**Decision:** Classify transport-relevant loss into three tiers and fix the
+reporting contract for each.
+
+1. **Detected and reported, with a known truncation point — recorder overflow
+   (§56.1).** Under sustained overload Listener preserves reception and *faults*
+   the affected recording rather than stalling the reader or writing a gapped
+   file. The recorder emits `RecordingFaulted(ChannelId)` and records the
+   truncation point; the artifact is contiguous and byte-exact up to a known end.
+   *Status: implemented and tested* (`recording_overflow_faults_emits_event_and_reception_continues`).
+
+2. **Detectable as an event, not quantifiable — a sustained reader stall on the
+   Transport→Extractor edge (§97.1, §99).** This is the only edge permitted to
+   backpressure the reader. In process it *stalls, never drops* — zero loss
+   inside our queues. But a stall long enough lets the OS/UART receive buffer
+   overrun, losing bytes *upstream of us*. We can detect the stall; we cannot
+   count the lost bytes (no portable userland signal for UART/driver overrun).
+   **Contract:** the serial reader watches `blocking_send`; a stall beyond a
+   heuristic threshold (`STALL_WARNING`, 250 ms) raises `WarningRaised(ChannelId)`
+   once per stall episode — an honest "reception stalled; transport-specific loss
+   may have occurred", with **no fabricated byte count**. Momentary backpressure
+   that drains quickly is normal and must not warn.
+   *Status: implemented and tested* (`sustained_stall_warns_of_possible_transport_loss`,
+   `momentary_backpressure_does_not_warn`).
+
+3. **Fundamentally unobservable — pre-receive kernel/NIC loss.** Kernel-dropped
+   UDP datagrams, and any bytes lost in the driver/NIC before our `recv`, leave
+   no reliable userland signal. Listener **does not report** what it cannot
+   detect and **does not fabricate** loss for data it never saw: it numbers and
+   reports exactly what it received (§24). Quantifying this is out of scope for
+   v1; reducing it is an operational concern (socket buffer sizing), not a
+   reporting one.
+
+**Why `WarningRaised` and not a new event:** the `RuntimeEvent` set is fixed by
+spec §137; adding a `ReceptionStalled`/`DataLoss` variant is a spec change and
+needs sign-off. A reader stall is a §93 Warning ("may affect operation but does
+not prevent it"), so `WarningRaised` is the spec-sanctioned signal today. The
+event says *that* a warning occurred on a channel; the descriptive §101 record
+(overflow type, time) belongs in the §95 diagnostics log, which a UI reads.
+
+**Consequences / deferred:**
+- The rich §101 diagnostic *record* for a reader stall (a `Diagnostic` in the
+  channel's `DiagnosticLog`, not just the event) is **deferred**: the transport
+  thread has no path to the pipeline's diagnostics log. Wiring a transport →
+  diagnostics channel is the follow-up; for UART overrun the "estimate" stays
+  *not practical* regardless, so the event-level signal is the substantive part.
+- `WarningRaised` is shared with recording-enable failures (§55). A UI cannot yet
+  distinguish the two from the event alone; the diagnostics log disambiguates
+  once (a) lands. Acceptable for v1.
+- UDP/TCP backpressure does not stall an OS thread (async `send().await`), so
+  there is no serial-style stall warning; sustained UDP backpressure manifests as
+  tier 3 (kernel drops) and is unreportable by design.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

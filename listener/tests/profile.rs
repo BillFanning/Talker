@@ -2,17 +2,21 @@
 //! Black-box — public API only.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use listener::config::{templates, Profile, RetentionConfig};
 use listener::core::{ChannelKind, ChannelState};
 use listener::runtime::Listener;
 
+/// A unique temp path per call. Tests in one binary run concurrently, so the
+/// path must not collide — a wall-clock stamp is unsafe (Windows clock resolution
+/// is coarse enough for two parallel tests to share a nanosecond). A monotonic
+/// counter plus the pid guarantees uniqueness.
 fn temp_profile_path() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("listener-it-profile-{nanos}.toml"))
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("listener-it-profile-{pid}-{n}.toml"))
 }
 
 #[test]

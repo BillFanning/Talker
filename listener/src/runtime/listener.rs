@@ -394,10 +394,14 @@ impl Listener {
     ) -> Result<ChannelHandle, OrchestratorError> {
         match &config.interface {
             InterfaceConfig::Serial(serial) => {
+                // Serial is the one transport whose reader can stall (§97.1); give
+                // it the event stream so a sustained stall warns of possible
+                // transport-specific loss (§101, ADR-007).
                 let opened = build_serial(id, serial)?
                     .open()
                     .await
-                    .map_err(OrchestratorError::SerialOpen)?;
+                    .map_err(OrchestratorError::SerialOpen)?
+                    .with_loss_reporter(self.events_tx.clone());
                 let raw = self.build_raw_recorder(id, config).await;
                 let display = self.build_display_recorder(id, config).await;
                 Ok(ChannelHandle::Data(
