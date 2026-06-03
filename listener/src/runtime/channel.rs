@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::{ChannelId, RuntimeEvent};
 use crate::decode::Decoder;
+use crate::display::{DisplayView, RenderedOutput};
 use crate::extract::MessageExtractor;
 use crate::record::Recording;
 use crate::transport::{DataTransportRunner, ReceivedData, TransportJoinHandle, TransportOutcome};
@@ -54,6 +55,7 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     extractor: Box<dyn MessageExtractor + Send>,
     decoder: Option<Box<dyn Decoder + Send>>,
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
+    display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     display_view_count: usize,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
@@ -72,6 +74,9 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     // `new` created the default Display View; add the rest to reach the count.
     for _ in 1..display_view_count.max(1) {
         pipeline.add_display_view(caps.display);
+    }
+    if let Some((renderer, recording)) = display_recorder {
+        pipeline.set_display_recorder(renderer, recording);
     }
     let display_handles = pipeline.display_view_handles();
 
@@ -146,6 +151,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     extractor: Box<dyn MessageExtractor + Send>,
     decoder: Option<Box<dyn Decoder + Send>>,
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
+    display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     display_view_count: usize,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
@@ -164,6 +170,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         extractor,
         decoder,
         raw_recorder,
+        display_recorder,
         display_view_count,
         caps,
         events,
@@ -232,7 +239,8 @@ pub fn start_data_channel<R: DataTransportRunner>(
         extractor,
         None,
         raw_recorder,
-        1, // a single default Display View
+        None, // no display recording on a standalone channel
+        1,    // a single default Display View
         caps,
         event_tx,
     );

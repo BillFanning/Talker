@@ -20,11 +20,16 @@ use tokio::sync::mpsc;
 use crate::config::schema::InterfaceConfig;
 use crate::config::ChannelConfig;
 use crate::core::{ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
-use crate::record::{start_raw_recording, RawFileRecorder, Recording, RecordingMode};
+use crate::display::{DisplayView, RenderedOutput};
+use crate::record::{
+    start_display_recording, start_raw_recording, DisplayFileRecorder, RawFileRecorder, Recording,
+    RecordingMode,
+};
 use crate::transport::{DataTransportRunner, ReceivedData};
 
 use super::build::{
-    build_decoder, build_extractor, build_serial, build_tcp_listener, build_udp, BuildError,
+    build_decoder, build_display_view, build_extractor, build_serial, build_tcp_listener,
+    build_udp, BuildError,
 };
 use super::channel::{spawn_monitored_channel, MonitoredChannel};
 use super::pipeline::{DisplayViewHandle, PipelineCapacities};
@@ -338,9 +343,10 @@ impl Listener {
                     .open()
                     .await
                     .map_err(OrchestratorError::SerialOpen)?;
-                let recorder = self.build_raw_recorder(id, config).await;
+                let raw = self.build_raw_recorder(id, config).await;
+                let display = self.build_display_recorder(id, config).await;
                 Ok(ChannelHandle::Data(
-                    self.spawn_data(id, opened, config, recorder),
+                    self.spawn_data(id, opened, config, raw, display),
                 ))
             }
             InterfaceConfig::Udp(udp) => {
@@ -348,9 +354,10 @@ impl Listener {
                     .bind()
                     .await
                     .map_err(OrchestratorError::Bind)?;
-                let recorder = self.build_raw_recorder(id, config).await;
+                let raw = self.build_raw_recorder(id, config).await;
+                let display = self.build_display_recorder(id, config).await;
                 Ok(ChannelHandle::Data(
-                    self.spawn_data(id, bound, config, recorder),
+                    self.spawn_data(id, bound, config, raw, display),
                 ))
             }
             InterfaceConfig::TcpListener(tcp) => {
@@ -373,12 +380,14 @@ impl Listener {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_data<R: DataTransportRunner>(
         &self,
         id: ChannelId,
         runner: R,
         config: &ChannelConfig,
         raw_recorder: Option<Recording<Arc<ReceivedData>>>,
+        display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     ) -> MonitoredChannel {
         spawn_monitored_channel(
             id,
@@ -386,6 +395,7 @@ impl Listener {
             build_extractor(&config.extraction),
             build_decoder(&config.decoder),
             raw_recorder,
+            display_recorder,
             // One runtime Display View per configured view (§48); at least one.
             config.display.views.len(),
             self.channel_caps(config),
@@ -419,6 +429,46 @@ impl Listener {
         .await
         {
             Ok(recorder) => Some(start_raw_recording(recorder, self.caps.raw_recording)),
+            Err(_err) => {
+                let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
+                None
+            }
+        }
+    }
+
+    /// Create the Display Recording for a Channel if enabled (§54). v1 records
+    /// the primary (first) Display View; an enable failure surfaces a warning
+    /// without faulting the Channel (§55), like raw recording.
+    async fn build_display_recorder(
+        &self,
+        id: ChannelId,
+        config: &ChannelConfig,
+    ) -> Option<(DisplayView, Recording<RenderedOutput>)> {
+        let recording = &config.recording;
+        if recording.mode != RecordingMode::Display {
+            return None;
+        }
+        let Some(destination) = &recording.destination else {
+            let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
+            return None;
+        };
+        let renderer = config
+            .display
+            .views
+            .first()
+            .map(build_display_view)
+            .unwrap_or_default();
+        match DisplayFileRecorder::create(
+            destination,
+            recording.overwrite_policy,
+            recording.timestamp_enabled,
+        )
+        .await
+        {
+            Ok(recorder) => Some((
+                renderer,
+                start_display_recording(recorder, self.caps.raw_recording),
+            )),
             Err(_err) => {
                 let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
                 None

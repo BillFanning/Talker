@@ -108,9 +108,10 @@ where
                             conn_id,
                             transport,
                             make_extractor(),
-                            // TODO: per-connection decoder + recorder from the
+                            // TODO: per-connection decoder + recorders from the
                             // listener's config (start_tcp_listener would need
                             // factories). Connections are undecoded/unrecorded.
+                            None,
                             None,
                             None,
                             1, // one default Display View per connection

@@ -12,11 +12,13 @@ use std::net::SocketAddr;
 use serialport::{DataBits, FlowControl, Parity, StopBits};
 
 use crate::config::schema::{
-    DataBits as CfgDataBits, DecoderConfig, ExtractionConfig, FlowControl as CfgFlowControl,
-    Parity as CfgParity, SerialConfig, StopBits as CfgStopBits, TcpListenerConfig, UdpConfig,
+    DataBits as CfgDataBits, DecoderConfig, DisplayViewConfig, ExtractionConfig,
+    FlowControl as CfgFlowControl, Parity as CfgParity, SerialConfig, StopBits as CfgStopBits,
+    TcpListenerConfig, UdpConfig,
 };
 use crate::core::{ChannelId, ProtocolId};
 use crate::decode::{Decoder, NmeaDecoder};
+use crate::display::DisplayView;
 use crate::extract::{DelimiterExtractor, FixedLengthExtractor, MessageExtractor, StreamExtractor};
 use crate::transport::serial::SerialTransport;
 use crate::transport::tcp::TcpListenerTransport;
@@ -59,6 +61,21 @@ pub fn build_extractor(config: &ExtractionConfig) -> Box<dyn MessageExtractor + 
                 Box::new(DelimiterExtractor::new(NMEA_DELIMITER.to_vec(), false))
             }
         },
+    }
+}
+
+/// Build a Display View renderer from its config (§47, §78). Visual-only fields
+/// (font, colors) don't affect produced text; the actual wrap width is set by
+/// the UI at render time, so it starts unset here.
+pub fn build_display_view(config: &DisplayViewConfig) -> DisplayView {
+    DisplayView {
+        mode: config.mode,
+        encoding: config.encoding,
+        character_rendering: config.character_rendering,
+        wrapping: config.wrapping,
+        wrap_width: None,
+        hex_separator: " ".to_string(),
+        hex_bytes_per_line: 16,
     }
 }
 

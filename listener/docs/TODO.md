@@ -58,13 +58,15 @@ tests yet.
 - [x] **Decoder entrypoint** — `spawn_channel_tasks` takes a decoder; the orchestrator
   wires it for serial/UDP from `DecoderConfig`. *Still open*: TCP **connection** channels
   are undecoded (`start_tcp_listener` needs a per-connection decoder factory).
-- [x] **Raw recorder ↔ pipeline** — pipeline feeds the real `record::Recording` task at
-  the chunk tap; overflow faults the recording, emits `RuntimeEvent::RecordingFaulted` +
-  a diagnostic, and reception continues (§56.1); `finish` finalizes the file. The
-  orchestrator creates the recorder at Start from `RecordingConfig`, and a recording-enable
-  failure surfaces a `WarningRaised` without faulting the channel (§55). *Still open*:
-  **Display** Recording is not connected to the display fan-out; TCP-connection recording
-  is deferred.
+- [x] **Recorder ↔ pipeline (raw + display)** — Raw Recording feeds the real
+  `record::Recording` task at the chunk tap; overflow faults it, emits
+  `RuntimeEvent::RecordingFaulted` + a diagnostic, reception continues (§56.1). Display
+  Recording renders each Message for the primary view and feeds `DisplayFileRecorder`,
+  running **regardless of pause** (§58); `finish` finalizes both. The orchestrator creates
+  the recorder (`RecordingMode::Raw`→raw, `Display`→display of the primary view) at Start
+  from `RecordingConfig`; an enable failure surfaces `WarningRaised` without faulting the
+  channel (§55). *Still open*: per-view display-recording config (v1 records the primary
+  view); TCP-connection recording is deferred.
 - [x] **Retention ↔ pipeline** — pipeline retention is `retention::MessageRetention`
   (count **and** byte limits, §88); the orchestrator derives per-channel limits from
   `RetentionConfig`. *Still open*: event/warning/error retention limits (§80) need the

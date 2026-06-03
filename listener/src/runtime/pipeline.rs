@@ -20,6 +20,7 @@ use crate::core::{
     ChannelId, DisplayViewId, Message, MessageBytes, ProtocolMetadata, RecordingState, RuntimeEvent,
 };
 use crate::decode::Decoder;
+use crate::display::{DisplayView, RenderedOutput, Renderer};
 use crate::extract::MessageExtractor;
 use crate::record::{Recording, RecordingStopReason};
 use crate::retention::{ByteSized, MessageRetention, RetentionStore};
@@ -107,10 +108,19 @@ impl DisplayViewHandle {
     }
 }
 
-/// One Display View's runtime state: its pause handle and bounded history (§87).
+/// A Display View's optional recorder: its renderer plus the display-recording
+/// handle (§54). Recording runs regardless of pause (§58).
+struct ViewRecorder {
+    renderer: DisplayView,
+    recording: Recording<RenderedOutput>,
+}
+
+/// One Display View's runtime state: pause handle, bounded history (§87), and an
+/// optional Display Recording (§54).
 struct PipelineDisplayView {
     handle: DisplayViewHandle,
     history: DropOldestQueue<DecodedMessage>,
+    recorder: Option<ViewRecorder>,
 }
 
 impl PipelineDisplayView {
@@ -118,6 +128,7 @@ impl PipelineDisplayView {
         Self {
             handle: DisplayViewHandle::new_active(),
             history: DropOldestQueue::with_capacity(capacity),
+            recorder: None,
         }
     }
 }
@@ -267,10 +278,17 @@ impl ChannelPipeline {
             protocol,
         };
 
-        // Display fan-out (§48, §108): each Active view accumulates the Message,
-        // dropping oldest on overflow (§99). A Paused view skips accumulation
-        // without affecting reception/retention/numbering or other views (§50).
+        // Display fan-out (§48, §108). For each view:
+        //  - Display Recording renders + records the Message regardless of pause
+        //    (§58): pausing presentation never pauses recording.
+        //  - Presentation history accumulates only while Active (§50), dropping
+        //    oldest on overflow (§99), without affecting reception/retention/
+        //    numbering or other views.
         for view in &mut self.display_views {
+            if let Some(rec) = view.recorder.as_mut() {
+                let rendered = rec.renderer.render(&decoded.message);
+                rec.recording.try_record(rendered);
+            }
             if !view.handle.is_paused() {
                 let _ = view.history.push(decoded.clone());
             }
@@ -290,6 +308,13 @@ impl ChannelPipeline {
         let _ = self.extractor.finish();
         if let Some(recorder) = self.raw_recorder.take() {
             recorder.finalize(RecordingStopReason::ChannelStopped).await;
+        }
+        for view in &mut self.display_views {
+            if let Some(rec) = view.recorder.take() {
+                rec.recording
+                    .finalize(RecordingStopReason::ChannelStopped)
+                    .await;
+            }
         }
     }
 
@@ -311,6 +336,22 @@ impl ChannelPipeline {
         let handle = view.handle.clone();
         self.display_views.push(view);
         handle
+    }
+
+    /// Attach a Display Recording to the primary (first) Display View (§54),
+    /// rendering each Message with `renderer`. v1 records the primary view;
+    /// per-view display-recording config is deferred (Appendix A).
+    pub fn set_display_recorder(
+        &mut self,
+        renderer: DisplayView,
+        recording: Recording<RenderedOutput>,
+    ) {
+        if let Some(view) = self.display_views.first_mut() {
+            view.recorder = Some(ViewRecorder {
+                renderer,
+                recording,
+            });
+        }
     }
 
     /// Pause/resume handles for every Display View, default first (§48).
@@ -580,6 +621,60 @@ mod tests {
         // Raw recording is byte-exact and pre-extraction (§53): the CRLF and the
         // un-split chunk boundary are both present.
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"$GPGGA,123\r\n");
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn display_recording_captures_rendered_output() {
+        use crate::display::DisplayView;
+        use crate::record::{start_display_recording, DisplayFileRecorder, OverwritePolicy};
+
+        let path = temp_path("display-rec");
+        let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Overwrite, false)
+            .await
+            .unwrap();
+        let cid = ChannelId::new();
+        let mut p = lf_pipeline(cid, PipelineCapacities::default());
+        p.set_display_recorder(
+            DisplayView::default(),
+            start_display_recording(recorder, 16),
+        );
+
+        p.ingest(datagram(cid, b"Hi"));
+        p.finish().await;
+
+        // Raw/Native render of "Hi" → one rendered line in the artifact (§54).
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "Hi\n");
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn display_recording_continues_while_the_view_is_paused() {
+        use crate::display::DisplayView;
+        use crate::record::{start_display_recording, DisplayFileRecorder, OverwritePolicy};
+
+        let path = temp_path("display-paused");
+        let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Overwrite, false)
+            .await
+            .unwrap();
+        let cid = ChannelId::new();
+        let mut p = lf_pipeline(cid, PipelineCapacities::default());
+        let view = p.display_view_handles()[0].clone();
+        p.set_display_recorder(
+            DisplayView::default(),
+            start_display_recording(recorder, 16),
+        );
+
+        // §58: pausing the view's presentation must not pause its recording.
+        view.pause();
+        p.ingest(datagram(cid, b"A"));
+        p.ingest(datagram(cid, b"B"));
+        p.finish().await;
+
+        // Presentation history is frozen...
+        assert_eq!(p.display_view(view.id).unwrap().len(), 0);
+        // ...but both Messages were still recorded.
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "A\nB\n");
         let _ = tokio::fs::remove_file(&path).await;
     }
 
