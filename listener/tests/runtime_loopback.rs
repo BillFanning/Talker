@@ -128,11 +128,67 @@ async fn tcp_listener_accepts_a_client_and_receives_a_message() {
 }
 
 #[tokio::test]
+async fn snapshot_exposes_decoded_messages_of_a_running_channel() {
+    // #4 observability surface: while the channel runs, an on-demand snapshot
+    // reveals the retained Messages *and* their decoder annotations — the decode
+    // readout the event stream alone can't carry (§137, ADR-006).
+    let port = free_udp_port();
+    let mut config = templates::udp_template();
+    if let InterfaceConfig::Udp(udp) = &mut config.interface {
+        udp.bind_address = "127.0.0.1".to_string();
+        udp.port = port;
+    }
+    config.decoder = DecoderConfig::Nmea0183 {
+        validation_mode: NmeaValidationMode::Standard,
+    };
+
+    let mut listener = Listener::with_default_capacities();
+    let mut events = listener.take_events().unwrap();
+    let id = listener.add_channel(config);
+    listener.start(id).await.unwrap();
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // A valid GLL sentence (one datagram → one Message, §15).
+    client
+        .send_to(b"$GPGLL,4916.45,N,12311.12,W*00", ("127.0.0.1", port))
+        .await
+        .unwrap();
+    assert_eq!(next_message(&mut events).await, (id, 1));
+
+    let snapshot = listener
+        .snapshot(id)
+        .await
+        .expect("running channel snapshots");
+    assert_eq!(snapshot.channel_id, id);
+    assert_eq!(snapshot.next_message_number, 2);
+    assert_eq!(snapshot.retained.len(), 1);
+    // The decoder annotation is observable live — this is the readout #2 deferred.
+    let decoded = &snapshot.retained[0];
+    assert_eq!(decoded.message.number, 1);
+    assert_eq!(
+        decoded
+            .protocol
+            .as_ref()
+            .expect("decoder ran")
+            .message_type
+            .as_deref(),
+        Some("GLL")
+    );
+    // Every Display View (the template configures Raw + Hex) accumulated it.
+    assert_eq!(snapshot.display_views.len(), 2);
+    assert!(snapshot.display_views.iter().all(|v| v.messages.len() == 1));
+
+    // A stopped channel has no live pipeline to snapshot.
+    stop(&mut listener, id).await;
+    assert!(listener.snapshot(id).await.is_none());
+}
+
+#[tokio::test]
 async fn tcp_connection_inherits_the_listener_decoder() {
     // §16.2: an accepted connection inherits the listener's decoder. We prove the
-    // decoder is wired into the connection pipeline without breaking it — the
-    // decoded metadata isn't observable via the public API yet (snapshot API is
-    // future work), so we assert the Message still flows end-to-end.
+    // decoder is wired into the connection pipeline without breaking it. Snapshots
+    // exist for data channels, but per-connection snapshots are deferred (the
+    // supervisor keeps no per-connection handle), so we assert the Message flows.
     let port = free_tcp_port();
     let mut config = templates::tcp_listener_template();
     if let InterfaceConfig::TcpListener(tcp) = &mut config.interface {

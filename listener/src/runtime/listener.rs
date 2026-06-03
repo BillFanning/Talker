@@ -34,6 +34,7 @@ use super::build::{
 };
 use super::channel::{spawn_monitored_channel, MonitoredChannel};
 use super::pipeline::{DisplayViewHandle, PipelineCapacities};
+use super::snapshot::ChannelSnapshot;
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
 
 /// A live Channel's running tasks. Held by the orchestrator so it can stop them.
@@ -145,6 +146,19 @@ impl Listener {
 
     pub fn config(&self, id: ChannelId) -> Option<&ChannelConfig> {
         self.channels.get(&id).map(|c| &c.config)
+    }
+
+    /// Request an on-demand snapshot of a running Channel's pipeline state (§137,
+    /// ADR-006): retained Messages with decoder annotations, per-view display
+    /// history, diagnostics, and recording state. Returns `None` when the Channel
+    /// is unknown, not running, or a TCP listener (its connections are snapshot
+    /// targets in their own right; per-connection snapshots are deferred). The
+    /// `RuntimeEvent` stream stays the authoritative liveness signal.
+    pub async fn snapshot(&self, id: ChannelId) -> Option<ChannelSnapshot> {
+        match self.channels.get(&id)?.handle.as_ref()? {
+            ChannelHandle::Data(tasks) => tasks.snapshot().await,
+            ChannelHandle::TcpListener(_) => None,
+        }
     }
 
     pub fn channel_ids(&self) -> Vec<ChannelId> {

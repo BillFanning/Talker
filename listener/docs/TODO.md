@@ -98,6 +98,14 @@ tests yet.
   are unaffected (§11/§50). Wired through the orchestrator: it creates one runtime view per
   `DisplayConfig` view, stores the handles, and exposes `display_views`/`pause_display`/
   `resume_display(channel, view)` (the `RuntimeCommand::PauseDisplay` vocabulary).
+- [x] **On-demand observability surface (§137, ADR-006)** — the *pull* half of
+  observability. `runtime::snapshot` defines `ChannelSnapshot` (retained decoded Messages,
+  per-view display history, diagnostics by severity, recording state); the pipeline serves
+  snapshot requests between reads via a oneshot reply on a bounded request channel, so a
+  live UI reads retained content (incl. decoder annotations) without owning or blocking the
+  pipeline. `Listener::snapshot(id)` / `RunningChannel::snapshot()` expose it; the
+  `RuntimeEvent` stream stays authoritative for liveness. *Still open*: per-connection TCP
+  snapshots (the supervisor keeps no per-connection handle) — deferred like per-conn recording.
 
 ---
 
@@ -127,10 +135,10 @@ All unverified end-to-end. Each generally needs the wiring above first.
   suites landed: loopback UDP (datagrams numbered, clean stop, §153–§155), loopback TCP
   (accept → distinct connection id → delimited Message → stop terminates connections,
   §16), and profile behavior (round-trip, load-does-not-start §70/§159, TCP-connection
-  rejected §16.3, unbounded-retention rejected §80), and a TCP connection inheriting the
-  listener's NMEA decoder (delivers Messages; decode *result* not yet observable — snapshot
-  API is future work). *Still to add*: display/pause end-to-end, metadata/timing — both need
-  the live-readout API.
+  rejected §16.3, unbounded-retention rejected §80), a TCP connection inheriting the
+  listener's NMEA decoder, and a live snapshot exposing a running channel's decoded Messages
+  + per-view display history (decode *result* now observable via the snapshot API). *Still to
+  add*: display/pause end-to-end assertions via snapshots, metadata/timing readout.
 
 ## Future work — deferred from Version 1 (spec Appendix A)
 

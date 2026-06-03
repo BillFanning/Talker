@@ -16,6 +16,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 
+use super::snapshot::{ChannelSnapshot, DiagnosticsSnapshot, DisplayViewSnapshot, SnapshotRequest};
+
 use crate::core::{
     ChannelId, DisplayViewId, Message, MessageBytes, ProtocolMetadata, RecordingState, RuntimeEvent,
 };
@@ -395,6 +397,33 @@ impl ChannelPipeline {
     pub fn raw_recording_state(&self) -> Option<RecordingState> {
         self.raw_recorder.as_ref().map(|r| r.state())
     }
+
+    /// Build an owned, point-in-time snapshot of the observable state (§137,
+    /// ADR-006): retained Messages, per-view display history, diagnostics, and
+    /// recording state. Messages are shared as `Arc`s, so this clones references,
+    /// not payloads.
+    pub fn snapshot(&self) -> ChannelSnapshot {
+        ChannelSnapshot {
+            channel_id: self.channel_id,
+            next_message_number: self.numbering.peek(),
+            retained: self.retention.iter().cloned().collect(),
+            display_views: self
+                .display_views
+                .iter()
+                .map(|v| DisplayViewSnapshot {
+                    id: v.handle.id,
+                    paused: v.handle.is_paused(),
+                    messages: v.history.iter().cloned().collect(),
+                })
+                .collect(),
+            diagnostics: DiagnosticsSnapshot {
+                events: self.diagnostics.events().cloned().collect(),
+                warnings: self.diagnostics.warnings().cloned().collect(),
+                errors: self.diagnostics.errors().cloned().collect(),
+            },
+            raw_recording: self.raw_recorder.as_ref().map(|r| r.state()),
+        }
+    }
 }
 
 /// The async ingest loop for one Channel (§102, §110, §111).
@@ -403,15 +432,28 @@ impl ChannelPipeline {
 /// is dropped, then discards partials (§112) and returns the pipeline so the
 /// caller can finalize/inspect it. Cancellation is cooperative and checked
 /// first (`biased`) so shutdown does not depend on draining the queue (§111).
+///
+/// Between reads it also serves snapshot requests (§137, ADR-006): a requester
+/// sends a oneshot reply on `snapshots` and the loop answers from current state.
+/// Snapshots are checked ahead of reads (they are rare and cheap) so a request
+/// is served promptly; a closed `snapshots` channel simply stops being polled.
 pub async fn run_channel(
     mut ingest: Receiver<ReceivedData>,
+    mut snapshots: Receiver<SnapshotRequest>,
     mut pipeline: ChannelPipeline,
     cancel: CancellationToken,
 ) -> ChannelPipeline {
+    let mut snapshots_open = true;
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
+            reply = snapshots.recv(), if snapshots_open => match reply {
+                Some(tx) => {
+                    let _ = tx.send(pipeline.snapshot());
+                }
+                None => snapshots_open = false, // all requesters gone; keep running
+            },
             maybe = ingest.recv() => match maybe {
                 Some(data) => pipeline.ingest(data),
                 None => break,
@@ -746,9 +788,10 @@ mod tests {
         let cid = ChannelId::new();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let p = lf_pipeline(cid, PipelineCapacities::default());
+        let (_snap_tx, snap_rx) = tokio::sync::mpsc::channel(4);
         tx.send(bytes_chunk(cid, b"X\nY\n")).await.unwrap();
         drop(tx); // loop drains the buffered chunk, then sees the channel close
-        let p = run_channel(rx, p, CancellationToken::new()).await;
+        let p = run_channel(rx, snap_rx, p, CancellationToken::new()).await;
         assert_eq!(p.retention().len(), 2);
     }
 
@@ -757,12 +800,48 @@ mod tests {
         let cid = ChannelId::new();
         let (tx, rx) = tokio::sync::mpsc::channel::<ReceivedData>(8);
         let p = lf_pipeline(cid, PipelineCapacities::default());
+        let (_snap_tx, snap_rx) = tokio::sync::mpsc::channel(4);
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(run_channel(rx, p, cancel.clone()));
+        let handle = tokio::spawn(run_channel(rx, snap_rx, p, cancel.clone()));
         cancel.cancel(); // only cancellation can end the loop — tx is still alive
         let p = handle.await.unwrap();
         drop(tx);
         assert_eq!(p.next_message_number(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_channel_serves_snapshots_while_running() {
+        // §137/ADR-006: a snapshot is built on request from live pipeline state,
+        // without stopping the channel.
+        let cid = ChannelId::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (snap_tx, snap_rx) = tokio::sync::mpsc::channel(4);
+        let p = lf_pipeline(cid, PipelineCapacities::default());
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_channel(rx, snap_rx, p, cancel.clone()));
+
+        tx.send(bytes_chunk(cid, b"one\ntwo\n")).await.unwrap();
+
+        // Request a snapshot; retry until both Messages are visible (the ingest
+        // and the snapshot race in the select loop).
+        let snapshot = loop {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            snap_tx.send(reply_tx).await.unwrap();
+            let snap = reply_rx.await.unwrap();
+            if snap.retained.len() == 2 {
+                break snap;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(snapshot.channel_id, cid);
+        assert_eq!(snapshot.next_message_number, 3);
+        let nums: Vec<u64> = snapshot.retained.iter().map(|d| d.message.number).collect();
+        assert_eq!(nums, vec![1, 2]);
+        assert_eq!(snapshot.display_views.len(), 1);
+        assert_eq!(snapshot.display_views[0].messages.len(), 2);
+
+        cancel.cancel();
+        let _ = handle.await.unwrap();
     }
 
     #[tokio::test]

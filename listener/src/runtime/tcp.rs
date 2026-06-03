@@ -132,6 +132,9 @@ where
                             channel_id: _,
                             pipeline_cancel: _,
                             display_handles: _,
+                            // Per-connection snapshots are deferred (no per-conn
+                            // handle is retained); drop the request sender.
+                            snapshots: _,
                         } = tasks;
 
                         // Detect disconnect: the transport task ends on EOF/cancel/fault.

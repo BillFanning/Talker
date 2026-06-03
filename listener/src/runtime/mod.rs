@@ -13,6 +13,7 @@
 //! - [`build`] — maps validated config to live transports/extractors/decoders.
 //! - [`listener`] — the [`Listener`] orchestrator: registry, §9 state machine,
 //!   start/stop/apply-pending in the [`crate::core::RuntimeCommand`] vocabulary.
+//! - [`snapshot`] — on-demand, pull-side readout of a running Channel's state.
 
 pub mod build;
 pub mod channel;
@@ -20,6 +21,7 @@ pub mod listener;
 pub mod metadata;
 pub mod pipeline;
 pub mod queue;
+pub mod snapshot;
 pub mod tcp;
 
 pub use build::BuildError;
@@ -30,4 +32,5 @@ pub use pipeline::{run_channel, ChannelPipeline, DecodedMessage, PipelineCapacit
 pub use queue::{
     Diagnostic, DiagnosticSeverity, DiagnosticsQueue, DropOldestQueue, FaultOnFullQueue, QueueFull,
 };
+pub use snapshot::{ChannelSnapshot, DiagnosticsSnapshot, DisplayViewSnapshot, SnapshotRequest};
 pub use tcp::{start_tcp_listener, TcpListenerHandle};

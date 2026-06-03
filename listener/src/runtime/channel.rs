@@ -33,6 +33,11 @@ use crate::record::Recording;
 use crate::transport::{DataTransportRunner, ReceivedData, TransportJoinHandle, TransportOutcome};
 
 use super::pipeline::{run_channel, ChannelPipeline, DisplayViewHandle, PipelineCapacities};
+use super::snapshot::{ChannelSnapshot, SnapshotRequest};
+
+/// Bounded request channel for on-demand snapshots (§137, ADR-006). Tiny: a
+/// requester sends a oneshot reply and awaits; the pipeline answers between reads.
+const SNAPSHOT_REQUESTS: usize = 8;
 
 /// The transport + pipeline tasks for one Channel. A plain holder, destructured
 /// by [`spawn_monitored_channel`] and the TCP listener supervisor (which each do
@@ -44,6 +49,8 @@ pub(crate) struct ChannelTasks {
     pub(crate) transport: TransportJoinHandle,
     pub(crate) pipeline_task: JoinHandle<ChannelPipeline>,
     pub(crate) display_handles: Vec<DisplayViewHandle>,
+    /// Sender for snapshot requests served by the pipeline task while it runs.
+    pub(crate) snapshots: Sender<SnapshotRequest>,
 }
 
 /// Wire a bound data-bearing transport to a fresh pipeline and start both tasks,
@@ -83,9 +90,15 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
 
     let transport_cancel = CancellationToken::new();
     let pipeline_cancel = CancellationToken::new();
+    let (snapshots, snapshot_rx) = mpsc::channel(SNAPSHOT_REQUESTS);
 
     let transport = runner.run(ingest_tx, transport_cancel.clone());
-    let pipeline_task = tokio::spawn(run_channel(ingest_rx, pipeline, pipeline_cancel.clone()));
+    let pipeline_task = tokio::spawn(run_channel(
+        ingest_rx,
+        snapshot_rx,
+        pipeline,
+        pipeline_cancel.clone(),
+    ));
 
     ChannelTasks {
         channel_id,
@@ -94,6 +107,7 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
         transport,
         pipeline_task,
         display_handles,
+        snapshots,
     }
 }
 
@@ -108,12 +122,22 @@ pub(crate) struct MonitoredChannel {
     pipeline_task: JoinHandle<ChannelPipeline>,
     monitor: JoinHandle<()>,
     display_handles: Vec<DisplayViewHandle>,
+    snapshots: Sender<SnapshotRequest>,
 }
 
 impl MonitoredChannel {
     /// Pause/resume handles for this Channel's Display Views (§11, §48).
     pub(crate) fn display_handles(&self) -> &[DisplayViewHandle] {
         &self.display_handles
+    }
+
+    /// Request an on-demand snapshot of the running pipeline (§137, ADR-006).
+    /// Returns `None` if the pipeline task has already ended (e.g. after a fault
+    /// or stop) — the event stream remains the authoritative liveness signal.
+    pub(crate) async fn snapshot(&self) -> Option<ChannelSnapshot> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.snapshots.send(reply_tx).await.ok()?;
+        reply_rx.await.ok()
     }
 
     /// Graceful stop (§110): stop reception; the transport's sender drops, the
@@ -172,6 +196,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         transport,
         pipeline_task,
         display_handles,
+        snapshots,
     } = spawn_channel_tasks(
         channel_id,
         runner,
@@ -201,6 +226,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         pipeline_task,
         monitor,
         display_handles,
+        snapshots,
     }
 }
 
@@ -221,6 +247,12 @@ impl RunningChannel {
     /// the fault monitor; the `ChannelFaulted` event fires at the same time.
     pub fn is_faulted(&self) -> bool {
         self.faulted.load(Ordering::Relaxed)
+    }
+
+    /// Request an on-demand snapshot of this Channel's pipeline state (§137,
+    /// ADR-006). `None` once the pipeline has ended.
+    pub async fn snapshot(&self) -> Option<ChannelSnapshot> {
+        self.tasks.snapshot().await
     }
 
     /// The runtime→UI event stream for this Channel (§137).
