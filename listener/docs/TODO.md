@@ -117,9 +117,11 @@ Two capabilities are **intentionally deferred for v1** — not bugs, not "wire i
 gaps. Accepted TCP connections already meet §16.2 inheritance parity (extraction +
 decoder); these are separate, deliberately-scoped omissions:
 
-- **Per-connection recording — deferred, blocked on §59.** Each connection would need
-  its own destination file, which requires filename templating (§59, Appendix A
-  deferred). Not implementable without that, and not to be invented (AGENTS.md §1).
+- **Per-connection recording — deferred.** §59 (v1.2) now defines a generated naming
+  scheme, so the blocker is narrower: there is no naming/ownership rule for runtime
+  TCP **connection** recordings — which identity belongs in the filename (listener id,
+  connection id, remote addr, accept time?) — and connections are never persisted
+  (§16.3). Decide that rule before wiring it; do not invent it (AGENTS.md §1).
 - **Per-connection snapshots — deferred unless the GUI needs them.** The TCP supervisor
   keeps no per-connection pipeline handle, so a connection isn't a snapshot target today.
   Revisit only if the GUI's connection-level live inspection requires it; if so, it's a
@@ -155,7 +157,13 @@ runtime-surface expansion stays anchored to a product-readiness bar.
 
 - [ ] §161 Serial control lines — live CTS/DSR/DCD/RI display; RTS/DTR set + live-toggle
 - [ ] §162 Auto-reconnect — opt-in `Faulted → Starting` backoff; off by default; TCP connections excluded
-- [ ] §163 File rotation — Hourly/Daily files, correct names/extensions, clean boundaries, name validation
+- [x] §163 File rotation — **DONE.** `record::rotate` (`RotatingRawRecorder`/`RotatingDisplayRecorder`)
+  writes `<channel>_<UTC-period><ext>` files per Hourly/Daily period, data-driven from each item's
+  wall-clock, clean file boundaries (no gap/backfill); `RecordingConfig.rotation`; orchestrator builds a
+  rotating recorder when rotation != None (destination = directory); filesystem-safe channel-name
+  validation (§71). Tested: period keys/UTC, name safety, raw hour-boundary + display day-boundary
+  rotation (unit), config rejection (unit), orchestrator named-file (integration). `.ssdat` (subsampled)
+  still pending the subsampling feature.
 - [ ] §164 Subsampling — per-sink count/time; raw never subsampled; numbering unaffected, gaps not renumbered
 - [ ] §165 Match rules & triggers — each condition fires its actions; record-from-match-forward; mark never touches raw
 - [ ] §166 Liveness — throughput + idle surfaced, bounded, no reception impact

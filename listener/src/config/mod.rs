@@ -16,6 +16,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::core::ChannelKind;
+use crate::record::{is_filesystem_safe, RecordingMode, RotationPolicy};
 use crate::transport::udp::UdpMode;
 
 /// The schema version this build understands (§72.1). Listener keeps its own
@@ -152,6 +153,16 @@ pub fn validate_channel(
         _ => {}
     }
 
+    // When recording rotates, the channel name becomes part of generated filenames
+    // (§59), so it must be filesystem-safe (§71). Non-rotating recordings use a
+    // fixed destination path and do not constrain the name.
+    if channel.recording.mode != RecordingMode::Disabled
+        && channel.recording.rotation != RotationPolicy::None
+        && !is_filesystem_safe(channel.name.as_str())
+    {
+        errors.push(ChannelConfigError::InvalidChannelName);
+    }
+
     // Retention must be bounded (§80): use the channel's own limits, or the
     // profile default if the channel sets none.
     let effective = if channel.retention.is_unbounded() {
@@ -203,6 +214,10 @@ pub enum ChannelConfigError {
     ZeroFixedLength,
     #[error("retention is unbounded: set a limit on the channel or in defaults")]
     UnboundedRetention,
+    #[error(
+        "channel name is not filesystem-safe but recording rotation uses it in filenames (§59)"
+    )]
+    InvalidChannelName,
 }
 
 #[cfg(test)]
@@ -221,6 +236,34 @@ mod tests {
         let toml = profile.to_toml().expect("serialize");
         let parsed = Profile::from_toml(&toml).expect("round trip");
         assert_eq!(parsed, profile);
+    }
+
+    #[test]
+    fn rotation_requires_a_filesystem_safe_channel_name() {
+        use crate::core::ChannelName;
+
+        let mut channel = templates::udp_template();
+        channel.recording.mode = RecordingMode::Raw;
+        channel.recording.rotation = RotationPolicy::Hourly;
+        channel.recording.destination = Some(std::path::PathBuf::from("."));
+        let defaults = DefaultConfig::default();
+
+        // Rotation + unsafe name → rejected at config time (§59/§71).
+        channel.name = ChannelName::new("GPS/AIS");
+        let errs = validate_channel(&channel, &defaults).unwrap_err();
+        assert!(errs.contains(&ChannelConfigError::InvalidChannelName));
+
+        // Rotation + safe name → ok.
+        channel.name = ChannelName::new("GPS");
+        assert!(validate_channel(&channel, &defaults).is_ok());
+
+        // No rotation → the name is not constrained (it is not used in filenames).
+        channel.name = ChannelName::new("GPS/AIS");
+        channel.recording.rotation = RotationPolicy::None;
+        match validate_channel(&channel, &defaults) {
+            Ok(()) => {}
+            Err(e) => assert!(!e.contains(&ChannelConfigError::InvalidChannelName)),
+        }
     }
 
     #[test]

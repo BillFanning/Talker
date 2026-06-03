@@ -26,7 +26,7 @@ use crate::core::{ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
 use crate::display::{DisplayView, RenderedOutput};
 use crate::record::{
     start_display_recording, start_raw_recording, DisplayFileRecorder, RawFileRecorder, Recording,
-    RecordingMode,
+    RecordingMode, RotatingDisplayRecorder, RotatingRawRecorder, RotationPolicy,
 };
 use crate::transport::{DataTransportRunner, ReceivedData, TransportNotice};
 
@@ -493,14 +493,29 @@ impl Listener {
             let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
             return None;
         };
-        match RawFileRecorder::create(
-            destination,
-            recording.overwrite_policy,
-            recording.timestamp_enabled,
-        )
-        .await
-        {
-            Ok(recorder) => Some(start_raw_recording(recorder, self.caps.raw_recording)),
+        let policy = recording.overwrite_policy;
+        let ts = recording.timestamp_enabled;
+        let cap = self.caps.raw_recording;
+        // With rotation, `destination` is a directory and files are named per
+        // period from the channel name (§59, `.dat`); otherwise a single file.
+        let created = if recording.rotation == RotationPolicy::None {
+            RawFileRecorder::create(destination, policy, ts)
+                .await
+                .map(|r| start_raw_recording(r, cap))
+        } else {
+            RotatingRawRecorder::create(
+                destination,
+                config.name.as_str(),
+                ".dat",
+                policy,
+                ts,
+                recording.rotation,
+            )
+            .await
+            .map(|r| start_raw_recording(r, cap))
+        };
+        match created {
+            Ok(recording) => Some(recording),
             Err(_err) => {
                 let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
                 None
@@ -530,17 +545,27 @@ impl Listener {
             .first()
             .map(build_display_view)
             .unwrap_or_default();
-        match DisplayFileRecorder::create(
-            destination,
-            recording.overwrite_policy,
-            recording.timestamp_enabled,
-        )
-        .await
-        {
-            Ok(recorder) => Some((
-                renderer,
-                start_display_recording(recorder, self.caps.raw_recording),
-            )),
+        let policy = recording.overwrite_policy;
+        let ts = recording.timestamp_enabled;
+        let cap = self.caps.raw_recording;
+        let created = if recording.rotation == RotationPolicy::None {
+            DisplayFileRecorder::create(destination, policy, ts)
+                .await
+                .map(|r| start_display_recording(r, cap))
+        } else {
+            RotatingDisplayRecorder::create(
+                destination,
+                config.name.as_str(),
+                ".disp",
+                policy,
+                ts,
+                recording.rotation,
+            )
+            .await
+            .map(|r| start_display_recording(r, cap))
+        };
+        match created {
+            Ok(recording) => Some((renderer, recording)),
             Err(_err) => {
                 let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
                 None
@@ -734,6 +759,7 @@ mod tests {
             destination: Some(path.clone()),
             timestamp_enabled: false,
             overwrite_policy: OverwritePolicy::Refuse,
+            rotation: RotationPolicy::None,
         };
         let id = listener.add_channel(config);
 

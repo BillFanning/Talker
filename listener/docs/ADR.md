@@ -219,8 +219,10 @@ diagnostics/event vocabulary); the **pipeline** — the channel's `DiagnosticLog
 owner — decides how it is recorded and reported. `run_channel` drains a bounded
 `Receiver<TransportNotice>` in its `select!` (alongside ingest and snapshot
 requests) and calls `record_notice`, which writes a Warning `Diagnostic` (naming
-the channel and stall duration) **and** emits `WarningRaised` — keeping the §95
-record and §137 event paired in one owner. The notice channel is created by the
+the channel and stall duration) **and** emits the spec-appropriate §137 event —
+`ReceptionStalled` under spec v1.2 (the shipped code still emits `WarningRaised`
+pending the v1.2 vocabulary flip, see above) — keeping the §95 record and the §137
+event paired in one owner. The notice channel is created by the
 orchestrator; only the serial transport is given the sender (`with_notice_sender`),
 because only serial can stall the reader (§97.1). The §95 record is now visible in
 a live `ChannelSnapshot.diagnostics`, which is what a GUI reads.

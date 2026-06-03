@@ -198,6 +198,65 @@ async fn snapshot_exposes_decoded_messages_of_a_running_channel() {
 }
 
 #[tokio::test]
+async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
+    // §163: a rotating Raw recording writes a period file named
+    // <channel>_<period>.dat into the destination directory, driven through the
+    // orchestrator. Boundary-crossing across periods is unit-tested in
+    // record::rotate with crafted timestamps; here we prove the wiring + naming.
+    use listener::config::RecordingConfig;
+    use listener::record::{OverwritePolicy, RecordingMode, RotationPolicy};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "listener-rot-it-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let port = free_udp_port();
+    let mut config = templates::udp_template();
+    config.name = listener::core::ChannelName::new("gpsfeed");
+    if let InterfaceConfig::Udp(udp) = &mut config.interface {
+        udp.bind_address = "127.0.0.1".to_string();
+        udp.port = port;
+    }
+    config.recording = RecordingConfig {
+        mode: RecordingMode::Raw,
+        destination: Some(dir.clone()),
+        timestamp_enabled: false,
+        overwrite_policy: OverwritePolicy::Overwrite,
+        rotation: RotationPolicy::Hourly,
+    };
+
+    let mut listener = Listener::with_default_capacities();
+    let mut events = listener.take_events().unwrap();
+    let id = listener.add_channel(config);
+    listener.start(id).await.unwrap();
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .send_to(b"$GPGGA,test", ("127.0.0.1", port))
+        .await
+        .unwrap();
+    assert_eq!(next_message(&mut events).await, (id, 1));
+
+    stop(&mut listener, id).await; // finalizes + flushes the recording
+
+    // Exactly one rotated file, named gpsfeed_<period>.dat, holding the datagram.
+    let mut dats: Vec<_> = std::fs::read_dir(&dir)
+        .expect("rotation directory exists")
+        .filter_map(|e| e.ok().map(|e| e.file_name().into_string().unwrap()))
+        .filter(|n| n.starts_with("gpsfeed_") && n.ends_with(".dat"))
+        .collect();
+    dats.sort();
+    assert_eq!(dats.len(), 1, "one period file, got {dats:?}");
+    assert_eq!(std::fs::read(dir.join(&dats[0])).unwrap(), b"$GPGGA,test");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn snapshot_exposes_message_metadata_and_nmea_integrity() {
     // §157/§160 acceptance: a live snapshot carries per-Message metadata (number,
     // byte count, arrival, reception duration) and NMEA integrity — and a

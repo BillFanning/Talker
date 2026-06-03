@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::{ChannelKind, ChannelName, ProtocolId, StableConfigId};
 use crate::decode::NmeaValidationMode;
 use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, WrappingMode};
-use crate::record::{OverwritePolicy, RecordingMode};
+use crate::record::{OverwritePolicy, RecordingMode, RotationPolicy};
 use crate::transport::udp::UdpMode;
 
 /// One configured Channel (§72). Carries only configuration; runtime objects
@@ -182,12 +182,17 @@ pub struct DisplayViewConfig {
 pub struct RecordingConfig {
     #[serde(default)]
     pub mode: RecordingMode,
+    /// A single file when `rotation` is `None`; the output **directory** otherwise
+    /// (§59), into which `<channel>_<period><ext>` files are written.
     #[serde(default)]
     pub destination: Option<PathBuf>,
     #[serde(default)]
     pub timestamp_enabled: bool,
     #[serde(default)]
     pub overwrite_policy: OverwritePolicy,
+    /// Time-based file rotation (§59); `None` = single file (additive, §72.1).
+    #[serde(default)]
+    pub rotation: RotationPolicy,
 }
 
 /// Retention limits (§80). At least one applicable limit must be set — an
