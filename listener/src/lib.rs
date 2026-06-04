@@ -13,8 +13,14 @@ pub mod transport;
 
 use anyhow::Result;
 
-/// Binary entry point: run the CLI (§3). The GUI front-end is a separate path
-/// (not yet implemented).
+/// Binary entry point (§3): parse arguments, then dispatch to the graphical
+/// interface (`--gui`) or the headless CLI runner. The branch happens before the
+/// async runtime is built, since the GUI owns its own runtime (ADR-008).
 pub fn run() -> Result<()> {
-    cli::run()
+    let cli = cli::parse();
+    if cli.gui {
+        gui::run()
+    } else {
+        cli::run(cli)
+    }
 }

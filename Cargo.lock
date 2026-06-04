@@ -1919,6 +1919,8 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "eframe",
+ "egui",
  "fs2",
  "nmea0183",
  "serde",

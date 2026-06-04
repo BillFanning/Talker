@@ -50,6 +50,12 @@ toml = { workspace = true }
 # CLI argument parsing (thin presentation layer, §3)
 clap = { workspace = true }
 
+# GUI presentation layer (§3). eframe/egui share a minor version; the GUI thread
+# is a thin layer that exchanges commands/updates with the async runtime over
+# channels and never blocks or does I/O (AGENTS §5, listener ADR-008).
+eframe = { workspace = true }
+egui = { workspace = true }
+
 # Diagnostic logging (§114) — tracing facade + env-filtered subscriber
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

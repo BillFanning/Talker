@@ -42,11 +42,21 @@ pub struct Cli {
     /// Decode received Messages as NMEA0183 (for the quick-start channels).
     #[arg(long)]
     nmea: bool,
+
+    /// Launch the graphical interface instead of the headless CLI runner.
+    #[arg(short = 'g', long)]
+    pub gui: bool,
 }
 
-/// CLI entry point: parse args, build a Tokio runtime, run the event loop.
-pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+/// Parse the process arguments into a [`Cli`]. Kept separate from [`run`] so the
+/// entry point can branch to the GUI before building the async runtime.
+pub fn parse() -> Cli {
+    Cli::parse()
+}
+
+/// Headless CLI entry point: build a Tokio runtime and run the event loop over the
+/// already-parsed arguments (§3). The GUI path is dispatched in [`crate::run`].
+pub fn run(cli: Cli) -> Result<()> {
     crate::diagnostics::init_logging(); // §114; non-fatal if already installed (§117)
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     runtime.block_on(run_cli(cli))
@@ -182,6 +192,7 @@ mod tests {
             serial: None,
             baud: 9600,
             nmea: false,
+            gui: false,
         }
     }
 

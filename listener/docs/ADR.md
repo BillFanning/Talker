@@ -250,6 +250,70 @@ dropped-notice counter can be added later only if the drop rate proves to matter
 - `TransportNotice` is `#[non_exhaustive]`: future non-terminal transport
   conditions (e.g. a recoverable read hiccup) extend it without a breaking change.
 
+## ADR-008 — GUI↔runtime bridge: a background driver task owns the `Listener`
+
+**Status:** Accepted. **Context:** spec §3 (thin presentation layers), §136/§137
+(command/event vocabulary), §10 (observable state); AGENTS §5 ("UI threads never
+perform I/O and never block"); ADR-001 (Tokio hybrid) and ADR-006 (events are the
+authoritative push surface, snapshots the pull surface).
+
+**Problem.** egui/eframe is a *synchronous, main-thread, immediate-mode* loop
+(`eframe::run_native` owns the OS event loop and calls `App::update` per frame). The
+`Listener` orchestrator is *async* (`async fn start/stop/snapshot/reconnect_tick/…`).
+Calling those from inside `update` via `Runtime::block_on` would block the UI thread
+on every interaction — exactly what AGENTS §5 forbids. So the GUI cannot own the
+`Listener` directly.
+
+**Decision.** Put a **background "driver" task** between the egui App and the
+`Listener`, mirroring talker's UI↔talker-thread command/status split (AGENTS §5)
+adapted to listener's Tokio model:
+
+- A dedicated Tokio runtime (its own thread) **owns the `Listener`**. It runs a loop
+  that: drains a **command channel** (GUI → driver) and calls the matching `Listener`
+  method; forwards the `Listener`'s `RuntimeEvent` stream to the GUI; and on a timer
+  (a few Hz) polls `snapshot(id)` for each running Channel and pushes the result to
+  the GUI. It also drives `reconnect_tick` (the loop the CLI already runs).
+- Two message types cross the boundary:
+  - `UiCommand` (GUI → driver): `Start/Stop/ApplyPending/AddChannel/EnableRecording/
+    PauseDisplay/ResumeDisplay/SetRts/SetDtr/SetMatchRuleEnabled/MarkNow/Shutdown`.
+    This is the path that finally needs a command channel **into the running
+    pipeline** for the dynamic §165/§161 actions (live rule-toggle, MarkNow,
+    mid-run recording) — see the deferred items; building it is part of this work.
+  - `UiUpdate` (driver → GUI): `Event(RuntimeEvent)` and
+    `Snapshot(ChannelId, ChannelSnapshot)`.
+- The driver holds a clone of `egui::Context` and calls `request_repaint()` when it
+  pushes an update, so a streaming source wakes the UI without the App busy-polling.
+- The egui App is **pure presentation**: it folds `UiUpdate`s into a testable
+  per-Channel view-model (`AppState::apply`), lays out widgets reading that model,
+  and emits `UiCommand`s on interaction. No `Listener`, no I/O, no `block_on`.
+
+**Why not the alternatives.**
+- *`block_on` in `update`* — violates AGENTS §5 (UI blocks on orchestration and on
+  every async snapshot); also fights egui's frame budget.
+- *GUI owns the `Listener` directly* — impossible cleanly: the methods are `async`
+  and take `&mut self`; the immediate-mode loop has nowhere to `.await`.
+- *Snapshot-on-request from the UI thread* — would still block or require an async
+  round-trip per frame; the driver's timer-push keeps the UI reading owned, already
+  -current view-models (ADR-006's pull surface, fetched off the UI thread).
+
+**Consequences.**
+- The business logic (command handling, view-model fold) lives in testable structs;
+  the `gui/` egui code stays thin (AGENTS §5) and is exercised only by eye.
+- Channels carry **owned** snapshots/events, so the UI never shares mutable pipeline
+  state and a slow UI can never stall reception (the driver's pushes are advisory,
+  `try_send`/drop-newest like the other observer edges, §99).
+- This bridge is also where the `RuntimeCommand` enum finally gets aligned with §136
+  and dispatched for real (today it is vestigial — commands are direct `Listener`
+  methods); and where the missing **command channel into `run_channel`** is built,
+  unblocking the deferred §165 live actions.
+- GUI-only state (window geometry, last layout) uses eframe's built-in persistence,
+  never the profile schema (mirrors the talker rule).
+
+**Build order (small, reversible first):** (1) deps + `--gui` dispatch + a minimal
+window [this step]; (2) the driver + `UiCommand`/`UiUpdate` + a pure `AppState`
+reducer, unit-tested, no egui; (3) a one-Channel vertical slice (list + start/stop +
+a live snapshot pane); (4) breadth by mapping snapshot fields to panes.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_
