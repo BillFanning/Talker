@@ -11,6 +11,14 @@ rust-version.workspace = true
 name = "listener"
 path = "src/main.rs"
 
+# Flash-free GUI launcher: a Windows "windows" subsystem app (no console allocated
+# on double-click). The `listener` binary above stays a console app for terminal
+# CLI/headless use; this one is just the desktop GUI entry point. See
+# src/bin/listener-gui.rs.
+[[bin]]
+name = "listener-gui"
+path = "src/bin/listener-gui.rs"
+
 [dependencies]
 # Workspace crate — listener and talker are equal consumers of nmea0183.
 nmea0183 = { path = "../nmea0183" }
@@ -59,6 +67,12 @@ egui = { workspace = true }
 # Diagnostic logging (§114) — tracing facade + env-filtered subscriber
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# Windows console handling for the GUI (§3): the binary stays a console-subsystem
+# app so the headless CLI works when run from a terminal, and the GUI path detaches
+# the console (FreeConsole) so a double-click doesn't leave an empty console window.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 # Integration tests (listener/tests/) drive the runtime over loopback sockets.

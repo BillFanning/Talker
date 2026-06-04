@@ -18,6 +18,12 @@ use anyhow::Result;
 /// is given (or `--cli`); a bare invocation (no source, no flag) opens the GUI, so
 /// a double-clicked executable shows a window. The branch happens before the async
 /// runtime is built, since the GUI owns its own runtime (ADR-008).
+///
+/// **Shared funnel (two-binary invariant — see `src/main.rs`).** The `listener.exe`
+/// launcher calls this; the flash-free `listener-gui.exe` calls [`gui::run`]
+/// directly. Process-wide startup that *both* binaries need belongs HERE (or in
+/// [`gui::run`] for GUI-only startup), never inline in a `main`, so the two thin
+/// launchers cannot drift.
 pub fn run() -> Result<()> {
     let cli = cli::parse();
     if cli.wants_gui() {
