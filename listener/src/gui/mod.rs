@@ -7,6 +7,13 @@
 //! real panes land in the next steps (ADR-008 build order). Per AGENTS §5 the egui
 //! code here stays a thin presentation layer: it never owns the runtime, never does
 //! I/O, and never blocks.
+//!
+//! The egui-free, unit-tested pieces live in submodules: [`bridge`] (the driver +
+//! `UiCommand`/`UiUpdate`) and [`state`] (the view-model reducer). The App wires
+//! them together in a later step (ADR-008 build order).
+
+pub mod bridge;
+pub mod state;
 
 use anyhow::anyhow;
 
