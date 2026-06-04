@@ -15,7 +15,7 @@
 
 use tokio::sync::oneshot;
 
-use crate::core::{ChannelId, DisplayViewId, RecordingState};
+use crate::core::{ChannelId, DisplayViewId, MatchRuleId, RecordingState};
 use crate::diagnostics::Diagnostic;
 
 use super::activity::ChannelActivity;
@@ -46,6 +46,21 @@ pub struct ChannelSnapshot {
     pub raw_recording: Option<RecordingState>,
     /// Liveness facts: rolling throughput + last-data time (§91.1, §166).
     pub activity: ChannelActivity,
+    /// Recent Match Rule firings, oldest → newest, bounded (§50.2, §165). A GUI
+    /// cross-references these against retained Messages to highlight/annotate.
+    pub matches: Vec<TriggeredMatch>,
+}
+
+/// A single Match Rule firing (§50.2). Records which rule fired and, for a
+/// per-Message condition, the Message Number it fired on (`None` for an `Idle`
+/// firing, which is not tied to a Message). This is the observable record of
+/// `Highlight`/`Mark` (whose visual styling is applied by the UI) and of any
+/// rule's trigger; `Notify` also lands in diagnostics and every firing emits a
+/// `MatchTriggered` event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TriggeredMatch {
+    pub rule_id: MatchRuleId,
+    pub message_number: Option<u64>,
 }
 
 /// One Display View's snapshot: its identity, pause state, and accumulated

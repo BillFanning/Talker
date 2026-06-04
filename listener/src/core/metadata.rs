@@ -24,7 +24,7 @@ pub enum IntegrityScope {
 }
 
 /// Result of validating an integrity field (§28).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IntegrityStatus {
     NotPresent,
     Valid,

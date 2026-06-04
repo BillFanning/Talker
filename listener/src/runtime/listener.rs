@@ -38,8 +38,10 @@ use super::build::{
     build_decoder, build_display_view, build_extractor, build_serial, build_tcp_listener,
     build_udp, BuildError,
 };
-use super::channel::{spawn_monitored_channel, DataRecorder, MonitoredChannel, TRANSPORT_NOTICES};
-use super::pipeline::{DisplayViewHandle, PipelineCapacities};
+use super::channel::{
+    spawn_monitored_channel, DataRecorder, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES,
+};
+use super::pipeline::{DisplayViewHandle, PipelineCapacities, RawRecordArming};
 use super::snapshot::ChannelSnapshot;
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
 
@@ -677,11 +679,38 @@ impl Listener {
                 .recording
                 .disk_guard
                 .zip(config.recording.destination.clone()),
+            // Match Rules (§50.2, §165) plus arming for any match-triggered `Record`
+            // (lazy-create from the configured destination — nothing until a match).
+            MatchSetup {
+                rules: config.match_rules.clone(),
+                arming: self.record_arming(config),
+            },
             self.channel_caps(config),
             self.events_tx.clone(),
             faulted,
             notices_rx,
         )
+    }
+
+    /// Arming for a match-triggered `Record` action (§50.2): the bits needed to
+    /// lazily build the Channel's Raw/`.ssdat` recording on a `Begin`, present only
+    /// when a recording destination is configured. Mirrors `build_raw_recorder`'s
+    /// destination/overwrite/timestamp/rotation/subsample choices so a rule-armed
+    /// recording matches what static recording would have produced.
+    fn record_arming(&self, config: &ChannelConfig) -> Option<RawRecordArming> {
+        config
+            .recording
+            .destination
+            .clone()
+            .map(|destination| RawRecordArming {
+                destination,
+                channel_name: config.name.as_str().to_string(),
+                overwrite: config.recording.overwrite_policy,
+                timestamps: config.recording.timestamp_enabled,
+                file_rotation: config.recording.file_rotation,
+                subsample: config.recording.subsample,
+                capacity: self.caps.raw_recording,
+            })
     }
 
     /// Create the Raw Recording handle for a Channel if enabled (§53). Per §55,

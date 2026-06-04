@@ -15,23 +15,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::matchrule::{FiredRule, MatchRuleSet};
+use super::snapshot::TriggeredMatch;
+
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 
 use super::activity::ActivityMeter;
 use super::snapshot::{ChannelSnapshot, DiagnosticsSnapshot, DisplayViewSnapshot, SnapshotRequest};
 use super::subsample::Subsampler;
-use crate::config::{DiskGuard, DiskThreshold, LowDiskAction, Subsample};
+use crate::config::{
+    DiskGuard, DiskThreshold, LowDiskAction, MatchAction, MatchRule, RecordControl, RecordTarget,
+    Subsample,
+};
 
 use crate::core::{
-    ChannelId, ChunkTime, DisplayViewId, Message, MessageBytes, ProtocolMetadata, RecordingState,
-    RuntimeEvent,
+    ChannelId, ChunkTime, DisplayViewId, MatchRuleId, Message, MessageBytes, ProtocolMetadata,
+    RecordingState, RuntimeEvent,
 };
 use crate::decode::Decoder;
 use crate::diagnostics::{Diagnostic, DiagnosticLog};
 use crate::display::{DisplayView, RenderedOutput, Renderer};
 use crate::extract::MessageExtractor;
-use crate::record::{Recording, RecordingStopReason};
+use crate::record::{
+    start_raw_recording, FileRotationPolicy, OverwritePolicy, RawFileRecorder, Recording,
+    RecordingStopReason, RotatingRawRecorder,
+};
 use crate::retention::{ByteSized, MessageRetention, RetentionStore};
 use crate::transport::{ReceivedData, ReceivedPayload, TransportNotice};
 
@@ -191,7 +200,44 @@ pub struct ChannelPipeline {
     /// Per-Channel liveness facts (§91.1): rolling throughput + last-data time.
     activity: ActivityMeter,
     events: Option<Sender<RuntimeEvent>>,
+    /// Compiled Match Rules (§50.2, §165); empty when none are configured.
+    match_rules: MatchRuleSet,
+    /// Bounded log of recent rule firings, surfaced in the snapshot (§165).
+    recent_matches: DropOldestQueue<TriggeredMatch>,
+    /// `Record` actions queued by rule evaluation, applied asynchronously by
+    /// [`apply_pending_records`](Self::apply_pending_records) (file I/O is async).
+    pending_record_controls: Vec<PendingRecord>,
+    /// What a match-armed `Record` recording needs to be built on demand (§50.2,
+    /// lazy-create: nothing on disk until a `Begin` fires). `None` = no arming.
+    record_arming: Option<RawRecordArming>,
+    /// Anchor for the `Idle` condition before any data has arrived (§50.2): idle is
+    /// measured from the last data, or from this instant when none has arrived yet.
+    created_at: Instant,
 }
+
+/// A `Record` action queued for asynchronous application (§50.2).
+struct PendingRecord {
+    target: RecordTarget,
+    control: RecordControl,
+}
+
+/// Everything needed to lazily build a match-armed Raw/`.ssdat` recording the
+/// first time a `Record { Begin }` fires (§50.2, §165). Mirrors the orchestrator's
+/// raw-recorder construction so a match-triggered recording uses the Channel's
+/// configured destination, overwrite policy, timestamps, rotation, and subsample.
+#[derive(Clone, Debug)]
+pub struct RawRecordArming {
+    pub destination: PathBuf,
+    pub channel_name: String,
+    pub overwrite: OverwritePolicy,
+    pub timestamps: bool,
+    pub file_rotation: FileRotationPolicy,
+    pub subsample: Subsample,
+    pub capacity: usize,
+}
+
+/// Bound on the retained recent-match log (§165) — generous but constant (§124).
+const RECENT_MATCHES_CAP: usize = 256;
 
 impl ChannelPipeline {
     pub fn new(
@@ -218,7 +264,26 @@ impl ChannelPipeline {
             disk_low_reported: false,
             activity: ActivityMeter::new(),
             events: None,
+            match_rules: MatchRuleSet::compile(&[]),
+            recent_matches: DropOldestQueue::with_capacity(RECENT_MATCHES_CAP),
+            pending_record_controls: Vec::new(),
+            record_arming: None,
+            created_at: Instant::now(),
         }
+    }
+
+    /// Attach compiled Match Rules (§50.2, §165). Evaluated per-Message after
+    /// decoding and via an idle timer; actions are presentation/control only.
+    pub fn with_match_rules(mut self, rules: &[MatchRule]) -> Self {
+        self.match_rules = MatchRuleSet::compile(rules);
+        self
+    }
+
+    /// Arm a match-triggered Raw recording (§50.2): the recorder is created only
+    /// when a `Record { Begin }` action fires, so nothing is written before a match.
+    pub fn with_record_arming(mut self, arming: RawRecordArming) -> Self {
+        self.record_arming = Some(arming);
+        self
     }
 
     /// Attach a Raw Recording handle (§53). The orchestrator creates it at Start
@@ -281,6 +346,9 @@ impl ChannelPipeline {
         // Liveness (§91.1): count received bytes at the chunk's arrival time.
         self.activity
             .record_chunk(data.received_at.monotonic, data.payload.bytes().len());
+        // Data arrived: re-arm any `Idle` Match Rule so it can fire again on the
+        // next quiet episode (§50.2). Cheap no-op when there are no idle rules.
+        self.match_rules.note_activity();
 
         // 1. Raw recorder tap (pre-extraction, §53). Non-blocking: a full
         // recorder queue faults the recording rather than stalling reception
@@ -352,6 +420,18 @@ impl ChannelPipeline {
             protocol,
         };
 
+        // Match Rules (§50.2, §165): evaluate the per-Message conditions after
+        // decoding and before fan-out, then apply each fired rule's actions
+        // (presentation/control only — never touching the Message or its bytes).
+        if !self.match_rules.is_empty() {
+            let fired = self
+                .match_rules
+                .evaluate_message(&decoded.message.bytes, decoded.protocol.as_ref());
+            if !fired.is_empty() {
+                self.apply_fired_rules(fired, Some(number));
+            }
+        }
+
         // Display fan-out (§48, §108). For each view:
         //  - Display Recording renders + records the Message regardless of pause
         //    (§58): pausing presentation never pauses recording.
@@ -410,6 +490,187 @@ impl ChannelPipeline {
         // Event stream (§137): advisory, non-blocking, drop on full.
         if let Some(events) = &self.events {
             let _ = events.try_send(RuntimeEvent::MessageReceived(self.channel_id, number));
+        }
+    }
+
+    /// Apply the actions of every rule that fired (§50.2). Synchronous actions —
+    /// `Notify`, `Mark`, `PauseDisplay`, `Highlight` — take effect immediately;
+    /// `Record` actions are queued for asynchronous application (file I/O). Every
+    /// firing is observable: it is logged for the snapshot and emits a
+    /// `MatchTriggered` event (§137). `message_number` is `None` for an idle firing.
+    fn apply_fired_rules(&mut self, fired: Vec<FiredRule>, message_number: Option<u64>) {
+        for rule in fired {
+            self.recent_matches.push(TriggeredMatch {
+                rule_id: rule.id,
+                message_number,
+            });
+            if let Some(events) = &self.events {
+                let _ = events.try_send(RuntimeEvent::MatchTriggered(self.channel_id, rule.id));
+            }
+            for action in &rule.actions {
+                match action {
+                    MatchAction::Notify { severity } => {
+                        let where_ = message_number
+                            .map(|n| format!(" (message {n})"))
+                            .unwrap_or_default();
+                        self.diagnostics.record(Diagnostic::new(
+                            *severity,
+                            format!("match rule fired on channel {}{where_}", self.channel_id),
+                        ));
+                    }
+                    MatchAction::Mark => self.write_mark(rule.id, message_number),
+                    MatchAction::PauseDisplay { view } => self.pause_views(*view),
+                    // Highlight is presentation-only; the firing is recorded above
+                    // (`recent_matches`) and the UI applies the style. Nothing to do
+                    // headless, and it never touches the Message (§50.2).
+                    MatchAction::Highlight { .. } => {}
+                    MatchAction::Record { target, control } => {
+                        self.pending_record_controls.push(PendingRecord {
+                            target: *target,
+                            control: *control,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// `Mark` action (§50.2): drop a correlation marker into every Display View's
+    /// Display Recording (`.disp`) — **never** the raw `.dat` stream, which stays
+    /// byte-exact (§5.6/§49). The `MatchTriggered` event and `recent_matches` log
+    /// (written by the caller) are the marker's display/event surfaces.
+    fn write_mark(&mut self, rule_id: MatchRuleId, message_number: Option<u64>) {
+        let suffix = message_number
+            .map(|n| format!(" msg={n}"))
+            .unwrap_or_default();
+        let text = format!("\u{2039}MARK rule={rule_id}{suffix}\u{203a}");
+        let channel_id = self.channel_id;
+        for view in &mut self.display_views {
+            if let Some(rec) = view.recorder.as_mut() {
+                rec.recording.try_record(RenderedOutput {
+                    channel_id,
+                    message_number,
+                    text: text.clone(),
+                    timestamp: None,
+                });
+            }
+        }
+    }
+
+    /// `PauseDisplay` action (§50.2, §50): freeze one Display View by index, or all
+    /// views when `None`. Reception and recording continue (§58).
+    fn pause_views(&mut self, view: Option<usize>) {
+        match view {
+            Some(idx) => {
+                if let Some(v) = self.display_views.get(idx) {
+                    v.handle.pause();
+                }
+            }
+            None => {
+                for v in &self.display_views {
+                    v.handle.pause();
+                }
+            }
+        }
+    }
+
+    /// Idle Match Rules (§50.2): fire any whose quiet-time has reached its timeout.
+    /// `now` anchors "time since last data" (or since channel start before any data
+    /// arrives). A no-op when no idle rule is configured.
+    pub fn evaluate_idle_rules(&mut self, now: Instant) {
+        if !self.match_rules.has_idle_rule() {
+            return;
+        }
+        let last = self
+            .activity
+            .snapshot(now)
+            .last_data_at
+            .unwrap_or(self.created_at);
+        let idle_for = now.saturating_duration_since(last);
+        let fired = self.match_rules.evaluate_idle(idle_for);
+        if !fired.is_empty() {
+            self.apply_fired_rules(fired, None);
+        }
+    }
+
+    /// Apply queued `Record` actions (§50.2). Called from the async ingest loop,
+    /// since recorder creation/finalization is async. Raw/`Both` targets are
+    /// honoured by the byte-exact (or `.ssdat`) recorder; the display portion of
+    /// `Display`/`Both` is deferred (it needs per-view display-recorder arming).
+    pub async fn apply_pending_records(&mut self) {
+        if self.pending_record_controls.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_record_controls);
+        for req in pending {
+            let raw_targeted = matches!(req.target, RecordTarget::Raw | RecordTarget::Both);
+            if !raw_targeted {
+                continue; // Display-only target: deferred (no raw recorder to drive)
+            }
+            match req.control {
+                RecordControl::Begin => self.begin_armed_recording().await,
+                RecordControl::Stop => self.stop_armed_recording().await,
+            }
+        }
+    }
+
+    /// Lazily create the match-armed Raw/`.ssdat` recording on the first `Begin`
+    /// (§50.2): nothing is on disk until now. A no-op if a recording is already
+    /// active or no arming is configured; an open failure warns without faulting
+    /// the Channel (§55).
+    async fn begin_armed_recording(&mut self) {
+        if self.raw_recorder.is_some() || self.message_recorder.is_some() {
+            return; // already recording — `Begin` is idempotent
+        }
+        let Some(arm) = self.record_arming.clone() else {
+            return; // no destination armed — cannot record
+        };
+        let subsampled = arm.subsample != Subsample::None;
+        let ext = if subsampled { ".ssdat" } else { ".dat" };
+        let created = if arm.file_rotation == FileRotationPolicy::None {
+            RawFileRecorder::create(&arm.destination, arm.overwrite, arm.timestamps)
+                .await
+                .map(|r| start_raw_recording(r, arm.capacity))
+        } else {
+            RotatingRawRecorder::create(
+                &arm.destination,
+                &arm.channel_name,
+                ext,
+                arm.overwrite,
+                arm.timestamps,
+                arm.file_rotation,
+            )
+            .await
+            .map(|r| start_raw_recording(r, arm.capacity))
+        };
+        match created {
+            Ok(rec) if subsampled => {
+                self.message_recorder = Some(MessageRecorder {
+                    recording: rec,
+                    subsampler: Subsampler::new(arm.subsample),
+                    fault_reported: false,
+                });
+            }
+            Ok(rec) => {
+                self.raw_recorder = Some(rec);
+                self.recording_fault_reported = false;
+            }
+            Err(_err) => {
+                if let Some(events) = &self.events {
+                    let _ = events.try_send(RuntimeEvent::WarningRaised(self.channel_id));
+                }
+            }
+        }
+    }
+
+    /// Stop and finalize the match-armed recording on a `Record { Stop }` (§50.2,
+    /// §56): a clean finalize, reception continues. A no-op if none is active.
+    async fn stop_armed_recording(&mut self) {
+        if let Some(recorder) = self.raw_recorder.take() {
+            recorder.finalize(RecordingStopReason::Disabled).await;
+        }
+        if let Some(mr) = self.message_recorder.take() {
+            mr.recording.finalize(RecordingStopReason::Disabled).await;
         }
     }
 
@@ -621,6 +882,7 @@ impl ChannelPipeline {
             },
             raw_recording: self.raw_recording_state(),
             activity: self.activity.snapshot(Instant::now()),
+            matches: self.recent_matches.iter().copied().collect(),
         }
     }
 }
@@ -661,6 +923,10 @@ pub async fn run_channel(
     // guard is configured (the check returns immediately).
     let mut disk_check = tokio::time::interval(Duration::from_secs(5));
     disk_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Idle Match Rule timer (§50.2): a sub-second tick so an `Idle` condition fires
+    // promptly once the stream goes quiet. Cheap no-op when no idle rule exists.
+    let mut idle_check = tokio::time::interval(Duration::from_millis(250));
+    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             biased;
@@ -676,8 +942,16 @@ pub async fn run_channel(
                 None => notices_open = false, // transport gone; keep running
             },
             _ = disk_check.tick() => pipeline.check_disk_guard().await,
+            _ = idle_check.tick() => {
+                pipeline.evaluate_idle_rules(Instant::now());
+                pipeline.apply_pending_records().await;
+            }
             maybe = ingest.recv() => match maybe {
-                Some(data) => pipeline.ingest(data),
+                Some(data) => {
+                    pipeline.ingest(data);
+                    // A per-Message `Record` action may have been queued (§50.2).
+                    pipeline.apply_pending_records().await;
+                }
                 None => break,
             },
         }
@@ -689,6 +963,7 @@ pub async fn run_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MatchCondition;
     use crate::core::ChunkTime;
     use crate::extract::{DelimiterExtractor, StreamExtractor};
 
@@ -1171,6 +1446,209 @@ mod tests {
         assert!(ev_rx.try_recv().is_err());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Match Rules & Triggers (§50.2, §165) ---
+
+    fn byte_rule(name: &str, pattern: &[u8], actions: Vec<MatchAction>) -> MatchRule {
+        MatchRule {
+            name: name.to_string(),
+            condition: MatchCondition::BytePattern {
+                pattern: pattern.to_vec(),
+            },
+            actions,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn notify_rule_records_a_diagnostic_logs_the_firing_and_emits_an_event() {
+        use crate::diagnostics::DiagnosticSeverity;
+        let cid = ChannelId::new();
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(8);
+        let rule = byte_rule(
+            "alarm",
+            b"ALARM",
+            vec![MatchAction::Notify {
+                severity: DiagnosticSeverity::Warning,
+            }],
+        );
+        let mut p = lf_pipeline(cid, PipelineCapacities::default())
+            .with_event_sender(ev_tx)
+            .with_match_rules(&[rule]);
+
+        // A non-matching Message fires nothing.
+        p.ingest(bytes_chunk(cid, b"normal\n"));
+        assert_eq!(p.snapshot().matches.len(), 0);
+
+        // A matching Message: diagnostic recorded, firing logged, event emitted.
+        p.ingest(bytes_chunk(cid, b"ALARM\n"));
+        assert_eq!(p.diagnostics().warnings().count(), 1);
+        let snap = p.snapshot();
+        assert_eq!(snap.matches.len(), 1);
+        assert_eq!(snap.matches[0].message_number, Some(2));
+
+        // The MessageReceived (#1, #2) and a MatchTriggered are on the stream.
+        let mut saw_match = false;
+        while let Ok(ev) = ev_rx.try_recv() {
+            if let RuntimeEvent::MatchTriggered(c, r) = ev {
+                assert_eq!(c, cid);
+                assert_eq!(r, snap.matches[0].rule_id);
+                saw_match = true;
+            }
+        }
+        assert!(saw_match, "a MatchTriggered event should have been emitted");
+    }
+
+    #[test]
+    fn pause_display_rule_freezes_the_targeted_view() {
+        let cid = ChannelId::new();
+        let rule = byte_rule(
+            "freeze",
+            b"STOP",
+            vec![MatchAction::PauseDisplay { view: Some(0) }],
+        );
+        let mut p = lf_pipeline(cid, PipelineCapacities::default()).with_match_rules(&[rule]);
+        assert!(!p.snapshot().display_views[0].paused);
+
+        p.ingest(bytes_chunk(cid, b"STOP\n"));
+        assert!(
+            p.snapshot().display_views[0].paused,
+            "the matching Message should pause the view (§50.2)"
+        );
+    }
+
+    #[test]
+    fn idle_rule_fires_once_then_rearms_after_data() {
+        let cid = ChannelId::new();
+        let rule = MatchRule {
+            name: "quiet".to_string(),
+            condition: MatchCondition::Idle { timeout_ms: 0 },
+            actions: vec![MatchAction::Mark],
+            enabled: true,
+        };
+        let mut p = lf_pipeline(cid, PipelineCapacities::default()).with_match_rules(&[rule]);
+
+        // Quiet since start (timeout 0): fires once, then latches.
+        p.evaluate_idle_rules(Instant::now());
+        assert_eq!(p.snapshot().matches.len(), 1);
+        p.evaluate_idle_rules(Instant::now());
+        assert_eq!(p.snapshot().matches.len(), 1, "idle latches — fires once");
+
+        // Data arrives (re-arms), then quiet again: it can fire a second time.
+        p.ingest(bytes_chunk(cid, b"x\n"));
+        p.evaluate_idle_rules(Instant::now());
+        assert_eq!(p.snapshot().matches.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn record_action_begins_and_stops_from_the_match_forward() {
+        let path = temp_path("match-record");
+        let cid = ChannelId::new();
+        let arming = RawRecordArming {
+            destination: path.clone(),
+            channel_name: "t".to_string(),
+            overwrite: OverwritePolicy::Overwrite,
+            timestamps: false,
+            file_rotation: FileRotationPolicy::None,
+            subsample: Subsample::None,
+            capacity: 16,
+        };
+        let begin = byte_rule(
+            "go",
+            b"GO",
+            vec![MatchAction::Record {
+                target: RecordTarget::Raw,
+                control: RecordControl::Begin,
+            }],
+        );
+        let stop = byte_rule(
+            "stop",
+            b"STOP",
+            vec![MatchAction::Record {
+                target: RecordTarget::Raw,
+                control: RecordControl::Stop,
+            }],
+        );
+        let mut p = lf_pipeline(cid, PipelineCapacities::default())
+            .with_match_rules(&[begin, stop])
+            .with_record_arming(arming);
+
+        // Lazy-create: nothing on disk before any match (§50.2 — no pre-match data).
+        assert!(!path.exists());
+
+        // Pre-match data is not recorded and creates no file.
+        p.ingest(bytes_chunk(cid, b"before\n"));
+        p.apply_pending_records().await;
+        assert!(!path.exists());
+
+        // The match itself arms recording; its own chunk was tapped before the
+        // recorder existed, so capture starts from the next chunk forward.
+        p.ingest(bytes_chunk(cid, b"GO\n"));
+        p.apply_pending_records().await;
+        p.ingest(bytes_chunk(cid, b"DATA\n"));
+        p.apply_pending_records().await;
+
+        // The stop match finalizes; data after it is not recorded.
+        p.ingest(bytes_chunk(cid, b"STOP\n"));
+        p.apply_pending_records().await;
+        p.ingest(bytes_chunk(cid, b"after\n"));
+        p.apply_pending_records().await;
+        p.finish().await;
+
+        let contents = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
+        assert!(contents.contains("DATA"), "data after Begin is captured");
+        assert!(!contents.contains("before"), "no pre-match backfill (§158)");
+        assert!(
+            !contents.contains("GO"),
+            "the arming Message itself is not retro-captured"
+        );
+        assert!(
+            !contents.contains("after"),
+            "nothing after Stop is captured"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn mark_action_annotates_the_display_recording_not_the_raw_stream() {
+        use crate::display::DisplayView;
+        use crate::record::{
+            start_display_recording, start_raw_recording, DisplayFileRecorder, RawFileRecorder,
+        };
+
+        let disp_path = temp_path("mark-disp");
+        let raw_path = temp_path("mark-raw");
+        let cid = ChannelId::new();
+
+        let disp = DisplayFileRecorder::create(&disp_path, OverwritePolicy::Overwrite, false)
+            .await
+            .unwrap();
+        let raw = RawFileRecorder::create(&raw_path, OverwritePolicy::Overwrite, false)
+            .await
+            .unwrap();
+
+        let rule = byte_rule("mark", b"HIT", vec![MatchAction::Mark]);
+        let mut p = lf_pipeline(cid, PipelineCapacities::default())
+            .with_raw_recorder(start_raw_recording(raw, 16))
+            .with_match_rules(&[rule]);
+        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 16));
+
+        p.ingest(bytes_chunk(cid, b"HIT\n"));
+        p.finish().await;
+
+        // The marker lands in the Display Recording (.disp)…
+        let disp_text = tokio::fs::read_to_string(&disp_path).await.unwrap();
+        assert!(
+            disp_text.contains("MARK"),
+            "mark annotates the .disp stream"
+        );
+        // …but the raw .dat stays byte-exact — no marker bytes injected (§5.6/§49).
+        let raw_bytes = tokio::fs::read(&raw_path).await.unwrap();
+        assert_eq!(raw_bytes, b"HIT\n", "raw .dat is untouched by Mark");
+
+        let _ = tokio::fs::remove_file(&disp_path).await;
+        let _ = tokio::fs::remove_file(&raw_path).await;
     }
 
     #[tokio::test]

@@ -163,6 +163,7 @@ fn format_event(event: &RuntimeEvent) -> String {
         RuntimeEvent::RecordingStoppedLowDisk(id) => {
             format!("[{id}] recording stopped (low disk)")
         }
+        RuntimeEvent::MatchTriggered(id, rule) => format!("[{id}] match rule {rule} fired"),
     }
 }
 

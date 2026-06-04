@@ -14,7 +14,9 @@ pub use crate::core::ErrorCategory;
 
 /// Severity of a diagnostic, ordered low → high priority (§92–§95). On the §99
 /// diagnostics queue the **oldest lowest-priority** entry is dropped first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum DiagnosticSeverity {
     /// Something happened (§92: channel started, client connected, …).
     Event,

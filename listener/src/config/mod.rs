@@ -173,6 +173,18 @@ pub fn validate_channel(
         errors.push(ChannelConfigError::InvalidSubsample);
     }
 
+    // Match Rules (§50.2, §165). A `BytePattern` with an empty pattern would match
+    // every Message (an empty needle is always found) — reject it like an empty
+    // delimiter. Decoded-field rules without a decoder are a non-fatal *warning*
+    // (see `channel_warnings`): the rule simply never matches, it is not invalid.
+    for rule in &channel.match_rules {
+        if let MatchCondition::BytePattern { pattern } = &rule.condition {
+            if pattern.is_empty() {
+                errors.push(ChannelConfigError::EmptyMatchPattern);
+            }
+        }
+    }
+
     // Retention must be bounded (§80): use the channel's own limits, or the
     // profile default if the channel sets none.
     let effective = if channel.retention.is_unbounded() {
@@ -192,6 +204,28 @@ pub fn validate_channel(
     } else {
         Err(errors)
     }
+}
+
+/// Non-fatal configuration warnings (§71): the channel is still valid and will
+/// run, but something is likely a mistake. Surfaced to the user (e.g. printed at
+/// profile load) without skipping the channel.
+pub fn channel_warnings(channel: &ChannelConfig) -> Vec<ChannelConfigWarning> {
+    let mut warnings = Vec::new();
+
+    // A decoded-field Match Rule needs a decoder to have anything to match (§50.2):
+    // with `DecoderConfig::None` the rule can never fire. Warn rather than reject.
+    let has_decoder = !matches!(channel.decoder, DecoderConfig::None);
+    if !has_decoder {
+        for rule in &channel.match_rules {
+            if matches!(rule.condition, MatchCondition::DecodedField { .. }) {
+                warnings.push(ChannelConfigWarning::DecodedMatchWithoutDecoder {
+                    rule: rule.name.clone(),
+                });
+            }
+        }
+    }
+
+    warnings
 }
 
 /// Errors from loading or saving a profile (§72.1).
@@ -230,6 +264,19 @@ pub enum ChannelConfigError {
     InvalidChannelName,
     #[error("count-based subsampling requires n >= 1 (§50.1)")]
     InvalidSubsample,
+    #[error("a match rule's byte pattern is empty (it would match every message, §50.2)")]
+    EmptyMatchPattern,
+}
+
+/// A non-fatal configuration warning (§71): the channel runs, but this is likely
+/// not what the user intended.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChannelConfigWarning {
+    #[error(
+        "match rule \"{rule}\" tests a decoded field but the channel has no decoder; \
+         it will never match (§50.2)"
+    )]
+    DecodedMatchWithoutDecoder { rule: String },
 }
 
 #[cfg(test)]
@@ -290,6 +337,100 @@ mod tests {
 
         channel.display.views[0].subsample = Subsample::EveryNth { n: 5 };
         assert!(validate_channel(&channel, &defaults).is_ok());
+    }
+
+    #[test]
+    fn empty_byte_pattern_match_rule_is_rejected() {
+        let mut channel = templates::udp_template();
+        channel.match_rules = vec![MatchRule {
+            name: "everything".to_string(),
+            condition: MatchCondition::BytePattern { pattern: vec![] },
+            actions: vec![MatchAction::Mark],
+            enabled: true,
+        }];
+        let errs = validate_channel(&channel, &DefaultConfig::default()).unwrap_err();
+        assert!(errs.contains(&ChannelConfigError::EmptyMatchPattern));
+
+        // A non-empty pattern validates.
+        channel.match_rules[0].condition = MatchCondition::BytePattern {
+            pattern: b"GGA".to_vec(),
+        };
+        assert!(validate_channel(&channel, &DefaultConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn decoded_field_rule_without_a_decoder_warns_but_stays_valid() {
+        let mut channel = templates::udp_template(); // DecoderConfig::None
+        channel.match_rules = vec![MatchRule {
+            name: "bad checksums".to_string(),
+            condition: MatchCondition::DecodedField {
+                field: DecodedMatch::Integrity {
+                    status: crate::core::IntegrityStatus::Invalid,
+                },
+            },
+            actions: vec![MatchAction::Notify {
+                severity: crate::diagnostics::DiagnosticSeverity::Warning,
+            }],
+            enabled: true,
+        }];
+
+        // Non-fatal: the channel is still valid (it runs; the rule just never fires).
+        assert!(validate_channel(&channel, &DefaultConfig::default()).is_ok());
+        let warnings = channel_warnings(&channel);
+        assert_eq!(
+            warnings,
+            vec![ChannelConfigWarning::DecodedMatchWithoutDecoder {
+                rule: "bad checksums".to_string()
+            }]
+        );
+
+        // With a decoder configured, there is no warning.
+        channel.decoder = DecoderConfig::Nmea0183 {
+            validation_mode: crate::decode::NmeaValidationMode::Standard,
+        };
+        assert!(channel_warnings(&channel).is_empty());
+    }
+
+    #[test]
+    fn match_rules_round_trip_through_toml() {
+        let mut profile = Profile::new("rules");
+        let mut channel = templates::nmea_serial_template();
+        channel.match_rules = vec![
+            MatchRule {
+                name: "GGA highlight".to_string(),
+                condition: MatchCondition::DecodedField {
+                    field: DecodedMatch::MessageType {
+                        value: "GGA".to_string(),
+                    },
+                },
+                actions: vec![MatchAction::Highlight {
+                    style: HighlightStyle {
+                        background: Some("yellow".to_string()),
+                        ..HighlightStyle::default()
+                    },
+                }],
+                enabled: true,
+            },
+            MatchRule {
+                name: "go quiet".to_string(),
+                condition: MatchCondition::Idle { timeout_ms: 5_000 },
+                actions: vec![
+                    MatchAction::Notify {
+                        severity: crate::diagnostics::DiagnosticSeverity::Warning,
+                    },
+                    MatchAction::Record {
+                        target: RecordTarget::Both,
+                        control: RecordControl::Begin,
+                    },
+                    MatchAction::PauseDisplay { view: Some(0) },
+                ],
+                enabled: false,
+            },
+        ];
+        profile.channels = vec![channel];
+        let toml = profile.to_toml().expect("serialize");
+        let parsed = Profile::from_toml(&toml).expect("round trip");
+        assert_eq!(parsed, profile);
     }
 
     #[test]

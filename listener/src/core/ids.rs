@@ -70,6 +70,32 @@ impl Default for DisplayViewId {
     }
 }
 
+/// Runtime identity of one Match Rule on a Channel (§50.2). Minted when a
+/// Channel's rules are compiled at Start, so events (`MatchTriggered`) and
+/// commands (`SetMatchRuleEnabled`) can name a specific rule. Runtime-only —
+/// configuration identifies a rule by its `name` (§50.2); this id is never
+/// persisted (§69).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MatchRuleId(Uuid);
+
+impl MatchRuleId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for MatchRuleId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for MatchRuleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Stable identity for a configured Channel, persisted in a profile so a saved
 /// workspace round-trips to the same logical channel (§72, §80.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

@@ -5,7 +5,7 @@
 //! and observes events; it never owns transport, recording, or pipeline state
 //! (§3).
 
-use super::ids::{ChannelId, DisplayViewId};
+use super::ids::{ChannelId, DisplayViewId, MatchRuleId};
 
 /// A command directed at the runtime (§136).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,4 +50,7 @@ pub enum RuntimeEvent {
     /// A recording was stopped and finalized because of low disk (§168); reception
     /// continues.
     RecordingStoppedLowDisk(ChannelId),
+    /// A Match Rule fired on a Channel (§50.2, §165). Carries the runtime id of the
+    /// rule that matched; `Notify`/`Mark` actions are observable here.
+    MatchTriggered(ChannelId, MatchRuleId),
 }

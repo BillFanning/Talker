@@ -29,7 +29,7 @@ use crate::extract::MessageExtractor;
 use crate::transport::tcp::{BoundTcpListenerTransport, TcpConnectionTransport};
 use crate::transport::{ConnectionAcceptorRunner, NewConnection, TransportOutcome};
 
-use super::channel::{spawn_channel_tasks, ChannelTasks, TRANSPORT_NOTICES};
+use super::channel::{spawn_channel_tasks, ChannelTasks, MatchSetup, TRANSPORT_NOTICES};
 use super::pipeline::PipelineCapacities;
 
 /// Per-connection state retained by the supervisor for shutdown and disconnect
@@ -129,6 +129,10 @@ where
                             // display subsampling inheritance is deferred (§50.1).
                             vec![Subsample::None],
                             None, // per-connection recording (and its guard) deferred
+                            // Per-connection Match Rules are deferred (§50.2): rules
+                            // are per-listener config; wiring them per accepted
+                            // connection follows the per-connection recording work.
+                            MatchSetup::none(),
                             caps,
                             events.clone(),
                             notice_rx,

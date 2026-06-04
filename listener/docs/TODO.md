@@ -133,8 +133,8 @@ decoder); these are separate, deliberately-scoped omissions:
 ## Acceptance (§153–§160 — the product-ready bar)
 
 Not all acceptance criteria are proven end-to-end yet (some are checked or partial
-below; the v1.2 addendum §161–§168 is mostly implemented now — only §165 remains,
-with §167 UDP-only). Each generally needs the wiring above first.
+below; the v1.2 addendum §161–§168 is fully implemented now, with §167 UDP-only).
+Each generally needs the wiring above first.
 
 - [ ] §153 Channel operation — create from templates, start/stop independently, run many
 - [ ] §154 TCP connections — accept, one channel/client, independent, not persisted
@@ -150,7 +150,7 @@ with §167 UDP-only). Each generally needs the wiring above first.
 - [x] §160 NMEA0183 — decoder behavior proven through a running channel: a valid sentence reports
   integrity Valid + message type, a bad-checksum sentence is retained and annotated Invalid (§37).
 
-### v1.2 acceptance addendum (spec §161–§168) — only §165 remains (§167 UDP-only)
+### v1.2 acceptance addendum (spec §161–§168) — all implemented (§167 UDP-only); GUI next
 
 Per the v1.2 review: build acceptance/tests **before** implementing each, so the
 runtime-surface expansion stays anchored to a product-readiness bar.
@@ -190,7 +190,25 @@ runtime-surface expansion stays anchored to a product-readiness bar.
   config rejection (unit), orchestrator gapped-view + .ssdat decimated-bytes (integration). *Optional
   extras deferred* (beyond the §164 bar): display-recording (`.disp`) subsampling; per-connection TCP
   display-subsample inheritance.
-- [ ] §165 Match rules & triggers — each condition fires its actions; record-from-match-forward; mark never touches raw
+- [x] §165 Match rules & triggers — **DONE.** Config: `MatchRule {name, condition, actions, enabled}` on
+  `ChannelConfig.match_rules`; `MatchCondition` (BytePattern / DecodedField(`DecodedMatch`: MessageType/
+  TalkerId/Integrity) / Idle{timeout_ms} / MessageSize{min,max}); `MatchAction` (Highlight{HighlightStyle} /
+  Record{RecordTarget,RecordControl} / Mark / Notify{DiagnosticSeverity} / PauseDisplay{view: Option<usize>}).
+  Validation: empty BytePattern rejected (fatal); decoded-field-without-decoder is a non-fatal
+  `ChannelConfigWarning` via `channel_warnings`. Runtime: `MatchRuleId` (minted), `RuntimeEvent::MatchTriggered`
+  (+CLI). `runtime::matchrule::MatchRuleSet` is a pure evaluator (`evaluate_message` byte/decoded/size;
+  timer `evaluate_idle` fires once per quiet episode, `note_activity` re-arms; `set_enabled`). Pipeline wires
+  it: per-Message eval in `dispatch` (after decode, before fan-out) + a 250ms idle tick in `run_channel`;
+  applies actions — Notify→diagnostic+event, Mark→`.disp` marker + event (never raw `.dat`), PauseDisplay→
+  flip view pause, Highlight→logged for the UI, Record→**lazy-create** the configured recorder on Begin
+  (nothing on disk until the match; the arming Message isn't retro-captured — "from the match forward, no
+  backfill"), Stop→finalize. Firings surface in `ChannelSnapshot.matches` (`TriggeredMatch`). Tested: evaluator
+  (10 unit), config validate/warn/round-trip (3), pipeline notify/pause/idle/record-lazy-create/mark-not-raw
+  (5), orchestrator end-to-end UDP rule fires + snapshot + diagnostic (1 integration). *Deferred*: the display
+  portion of Record `Display`/`Both` (needs per-view display-recorder arming); live `SetMatchRuleEnabled`/
+  `MarkNow` command plumbing into the running pipeline (no command channel yet — GUI work); per-connection TCP
+  rules (like per-connection recording); compound AND/OR/sequence conditions + pre-trigger capture (Appendix A);
+  Highlight visual styling (GUI-side).
 - [x] §166 Liveness — **DONE.** `runtime::activity::ActivityMeter` (bounded 5×1s ring) tracks
   `last_data_at` + rolling bytes/sec & msgs/sec; the pipeline records per chunk (ingest) and per
   Message (dispatch); surfaced in `ChannelSnapshot.activity` (`ChannelActivity`). Fact source only —

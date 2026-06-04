@@ -79,6 +79,21 @@ async fn stop(listener: &mut Listener, id: ChannelId) {
         .expect("stop failed");
 }
 
+/// Await the next `MatchTriggered` event, with a timeout.
+async fn next_match(events: &mut Receiver<RuntimeEvent>) -> ChannelId {
+    let wait = async {
+        loop {
+            match events.recv().await.expect("event stream closed") {
+                RuntimeEvent::MatchTriggered(id, _rule) => return id,
+                _ => continue,
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("timed out waiting for a match")
+}
+
 #[tokio::test]
 async fn udp_channel_receives_datagrams_and_stops_cleanly() {
     let port = free_udp_port();
@@ -104,6 +119,58 @@ async fn udp_channel_receives_datagrams_and_stops_cleanly() {
 
     stop(&mut listener, id).await;
     assert_eq!(listener.state(id), Some(ChannelState::Stopped));
+}
+
+#[tokio::test]
+async fn udp_channel_match_rule_fires_an_action_and_is_observable() {
+    use listener::config::{MatchAction, MatchCondition, MatchRule};
+    use listener::diagnostics::DiagnosticSeverity;
+
+    let port = free_udp_port();
+    let mut config = templates::udp_template();
+    if let InterfaceConfig::Udp(udp) = &mut config.interface {
+        udp.bind_address = "127.0.0.1".to_string();
+        udp.port = port;
+    }
+    // A byte-pattern rule that raises a Notify when "ALARM" appears (§50.2, §165).
+    config.match_rules = vec![MatchRule {
+        name: "alarm".to_string(),
+        condition: MatchCondition::BytePattern {
+            pattern: b"ALARM".to_vec(),
+        },
+        actions: vec![MatchAction::Notify {
+            severity: DiagnosticSeverity::Warning,
+        }],
+        enabled: true,
+    }];
+
+    let mut listener = Listener::with_default_capacities();
+    let mut events = listener.take_events().unwrap();
+    let id = listener.add_channel(config);
+    listener.start(id).await.unwrap();
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // A non-matching datagram: a Message, but no rule fires.
+    client.send_to(b"quiet", ("127.0.0.1", port)).await.unwrap();
+    assert_eq!(next_message(&mut events).await, (id, 1));
+    // A matching datagram: the rule fires (push half — MatchTriggered event).
+    client
+        .send_to(b"ALARM now", ("127.0.0.1", port))
+        .await
+        .unwrap();
+    assert_eq!(next_match(&mut events).await, id);
+
+    // Pull half: the firing is in the snapshot, on message #2, and Notify left a
+    // warning diagnostic — reception is unaffected.
+    let snap = listener
+        .snapshot(id)
+        .await
+        .expect("a running channel snapshot");
+    assert_eq!(snap.matches.len(), 1);
+    assert_eq!(snap.matches[0].message_number, Some(2));
+    assert_eq!(snap.diagnostics.warnings.len(), 1);
+
+    stop(&mut listener, id).await;
 }
 
 #[tokio::test]

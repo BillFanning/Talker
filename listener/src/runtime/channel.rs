@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use std::path::PathBuf;
 
-use crate::config::{DiskGuard, Subsample};
+use crate::config::{DiskGuard, MatchRule, Subsample};
 use crate::core::{ChannelId, RuntimeEvent};
 use crate::decode::Decoder;
 use crate::display::{DisplayView, RenderedOutput};
@@ -37,8 +37,28 @@ use crate::transport::{
     DataTransportRunner, ReceivedData, TransportJoinHandle, TransportNotice, TransportOutcome,
 };
 
-use super::pipeline::{run_channel, ChannelPipeline, DisplayViewHandle, PipelineCapacities};
+use super::pipeline::{
+    run_channel, ChannelPipeline, DisplayViewHandle, PipelineCapacities, RawRecordArming,
+};
 use super::snapshot::{ChannelSnapshot, SnapshotRequest};
+
+/// Match Rule wiring for a Channel (§50.2, §165): the compiled-from rules plus the
+/// optional arming a `Record` action needs to lazily create a recording. Bundled
+/// so the long `spawn_*` signatures gain one parameter, not two.
+pub(crate) struct MatchSetup {
+    pub(crate) rules: Vec<MatchRule>,
+    pub(crate) arming: Option<RawRecordArming>,
+}
+
+impl MatchSetup {
+    /// No Match Rules (standalone and per-connection channels for now).
+    pub(crate) fn none() -> Self {
+        Self {
+            rules: Vec::new(),
+            arming: None,
+        }
+    }
+}
 
 /// Bounded request channel for on-demand snapshots (§137, ADR-006). Tiny: a
 /// requester sends a oneshot reply and awaits; the pipeline answers between reads.
@@ -92,6 +112,7 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     view_subsamples: Vec<Subsample>,
     disk_guard: Option<(DiskGuard, PathBuf)>,
+    match_setup: MatchSetup,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
     notices_rx: Receiver<TransportNotice>,
@@ -103,6 +124,12 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     let mut pipeline = ChannelPipeline::new(channel_id, extractor, caps).with_event_sender(events);
     if let Some(decoder) = decoder {
         pipeline = pipeline.with_decoder(decoder);
+    }
+    // Match Rules (§50.2, §165): compile the rules and arm any match-triggered
+    // recording before the pipeline starts processing.
+    pipeline = pipeline.with_match_rules(&match_setup.rules);
+    if let Some(arming) = match_setup.arming {
+        pipeline = pipeline.with_record_arming(arming);
     }
     match data_recorder {
         Some(DataRecorder::Raw(r)) => pipeline = pipeline.with_raw_recorder(r),
@@ -221,6 +248,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     view_subsamples: Vec<Subsample>,
     disk_guard: Option<(DiskGuard, PathBuf)>,
+    match_setup: MatchSetup,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
     faulted: Arc<AtomicBool>,
@@ -244,6 +272,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         display_recorder,
         view_subsamples,
         disk_guard,
+        match_setup,
         caps,
         events,
         notices_rx,
@@ -335,6 +364,7 @@ pub fn start_data_channel<R: DataTransportRunner>(
         None,                  // no display recording on a standalone channel
         vec![Subsample::None], // a single default Display View, no subsampling
         None,                  // no disk guard on a standalone channel
+        MatchSetup::none(),    // no Match Rules on a standalone channel
         caps,
         event_tx,
         faulted.clone(),

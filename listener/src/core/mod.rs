@@ -14,7 +14,7 @@ pub mod state;
 
 pub use command::{RuntimeCommand, RuntimeEvent};
 pub use error::{DecodeError, ErrorCategory, RecordError};
-pub use ids::{ChannelId, ChannelName, DisplayViewId, StableConfigId};
+pub use ids::{ChannelId, ChannelName, DisplayViewId, MatchRuleId, StableConfigId};
 pub use message::{ChunkTime, Message, MessageBytes, MessageMetadata, MessageTimestamp};
 pub use metadata::{
     IntegrityMetadata, IntegrityScope, IntegrityStatus, ProtocolId, ProtocolMetadata,

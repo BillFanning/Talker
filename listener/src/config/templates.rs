@@ -64,6 +64,7 @@ pub fn serial_template() -> ChannelConfig {
         recording: RecordingConfig::default(),
         retention: default_retention(),
         reconnect: ReconnectPolicy::default(),
+        match_rules: Vec::new(),
     }
 }
 
@@ -95,6 +96,7 @@ pub fn nmea_serial_template() -> ChannelConfig {
         recording: RecordingConfig::default(),
         retention: default_retention(),
         reconnect: ReconnectPolicy::default(),
+        match_rules: Vec::new(),
     }
 }
 
@@ -118,6 +120,7 @@ pub fn udp_template() -> ChannelConfig {
         recording: RecordingConfig::default(),
         retention: default_retention(),
         reconnect: ReconnectPolicy::default(),
+        match_rules: Vec::new(),
     }
 }
 
@@ -140,5 +143,6 @@ pub fn tcp_listener_template() -> ChannelConfig {
         recording: RecordingConfig::default(),
         retention: default_retention(),
         reconnect: ReconnectPolicy::default(),
+        match_rules: Vec::new(),
     }
 }

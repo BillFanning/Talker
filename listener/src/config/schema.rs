@@ -10,8 +10,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::{ChannelKind, ChannelName, ProtocolId, StableConfigId};
+use crate::core::{ChannelKind, ChannelName, IntegrityStatus, ProtocolId, StableConfigId};
 use crate::decode::NmeaValidationMode;
+use crate::diagnostics::DiagnosticSeverity;
 use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, WrappingMode};
 use crate::record::{FileRotationPolicy, OverwritePolicy, RecordingMode};
 use crate::transport::udp::UdpMode;
@@ -38,6 +39,10 @@ pub struct ChannelConfig {
     /// Opt-in auto-reconnect after a fault (§9.1, §162); default disabled.
     #[serde(default)]
     pub reconnect: ReconnectPolicy,
+    /// Per-Channel Match Rules (§50.2, §165); default empty. Presentation/control
+    /// only — a rule never modifies Messages, bytes, recordings, or metadata.
+    #[serde(default)]
+    pub match_rules: Vec<MatchRule>,
 }
 
 /// Opt-in auto-reconnect policy (§9.1, §162). When `enabled`, a Channel that
@@ -67,6 +72,11 @@ fn default_max_backoff_ms() -> u64 {
 }
 fn default_backoff_multiplier() -> f64 {
     2.0
+}
+/// Serde default for opt-out booleans (e.g. a Match Rule is enabled unless the
+/// profile says otherwise, §50.2).
+fn default_true() -> bool {
+    true
 }
 
 impl Default for ReconnectPolicy {
@@ -302,6 +312,114 @@ pub enum LowDiskAction {
     Warn,
     /// Finalize and stop the recording cleanly; reception continues (§96).
     StopRecording,
+}
+
+/// A per-Channel Match Rule (§50.2, §165): a predicate over received data that
+/// fires one or more presentation/control Actions on a match. Rules are
+/// **presentation/control only** — they never modify Messages, bytes, recordings,
+/// or metadata (§40, §103, §116). Persisted in profiles; identified at runtime by
+/// a minted [`MatchRuleId`](crate::core::MatchRuleId), in config by `name`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MatchRule {
+    pub name: String,
+    pub condition: MatchCondition,
+    #[serde(default)]
+    pub actions: Vec<MatchAction>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// What a Match Rule tests (§50.2). One condition per rule in v1 — compound
+/// AND/OR/sequence logic is deferred (Appendix A). Internally tagged so every
+/// variant is a uniform TOML table.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum MatchCondition {
+    /// A byte pattern occurring within a single Message's bytes (§50.2). v1 scans
+    /// one Message; cross-chunk stream scanning is deferred.
+    BytePattern { pattern: Vec<u8> },
+    /// A field of the decoder's Protocol Metadata (§134/§135). Requires a
+    /// configured decoder, else the rule never matches and validation warns (§71).
+    DecodedField { field: DecodedMatch },
+    /// No data received for `timeout_ms` (timer-based, via the activity monitor
+    /// §91.1): fires once when quiet and re-arms when data resumes. (The spec
+    /// shows a `Duration`; config carries milliseconds, like `ReconnectPolicy`.)
+    Idle { timeout_ms: u64 },
+    /// A Message whose byte count falls **outside** `[min, max]` (either bound
+    /// optional; an unset bound is not enforced on that side).
+    MessageSize {
+        #[serde(default)]
+        min: Option<usize>,
+        #[serde(default)]
+        max: Option<usize>,
+    },
+}
+
+/// A decoded-metadata predicate (§50.2). Limited to Protocol Metadata a decoder
+/// already produced (§134/§135) — message type, talker id, integrity status —
+/// **not** arbitrary protocol field extraction (deferred, Appendix A).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "field")]
+pub enum DecodedMatch {
+    /// e.g. `"GLL"` — matches `ProtocolMetadata.message_type`.
+    MessageType { value: String },
+    /// e.g. `"GP"` — matches the `talker_id` attribute.
+    TalkerId { value: String },
+    /// e.g. `Invalid` (bad checksum) — matches any integrity field's status.
+    Integrity { status: IntegrityStatus },
+}
+
+/// What a matched rule does (§50.2). Presentation/control only.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum MatchAction {
+    /// Style the matched item in the display (presentation only).
+    Highlight { style: HighlightStyle },
+    /// Begin or stop recording **from the match forward** — no pre-match backfill
+    /// (§158). Requires the Channel to have a recording destination configured.
+    Record {
+        target: RecordTarget,
+        control: RecordControl,
+    },
+    /// Drop a correlation marker into the display, the Display Recording (`.disp`),
+    /// and a tagged event (§137) — **never** into the raw `.dat` stream (§5.6/§49).
+    Mark,
+    /// Raise a diagnostic event/warning of the given severity (§92–§94).
+    Notify { severity: DiagnosticSeverity },
+    /// Freeze a Display View by index (into `display.views`), or all views when
+    /// `None` (§50). Reception and recording continue. (The spec models the target
+    /// as a runtime `DisplayViewId`; config uses a stable view index.)
+    PauseDisplay {
+        #[serde(default)]
+        view: Option<usize>,
+    },
+}
+
+/// Which recording(s) a `Record` action controls (§50.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordTarget {
+    Raw,
+    Display,
+    Both,
+}
+
+/// Whether a `Record` action begins or stops recording (§50.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordControl {
+    Begin,
+    Stop,
+}
+
+/// How a `Highlight` action styles a matched item (§50.2). All fields optional;
+/// colors are presentation-layer strings interpreted by the UI.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HighlightStyle {
+    #[serde(default)]
+    pub foreground: Option<String>,
+    #[serde(default)]
+    pub background: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// Retention limits (§80). At least one applicable limit must be set — an
