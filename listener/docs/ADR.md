@@ -189,7 +189,7 @@ reporting contract for each.
    `TransportNotice::ReceptionStalled { channel_id, stalled_for }` once per stall
    episode — self-describing, carrying the observed stall **duration** (the honest
    §101 proxy) and **no fabricated byte count**. The pipeline records it as a
-   Warning `Diagnostic` and emits `WarningRaised` (see the seam below). Momentary
+   Warning `Diagnostic` and emits `ReceptionStalled` (see the seam below). Momentary
    backpressure that drains quickly is normal and must not notify.
    *Status: implemented and tested* (`sustained_stall_sends_a_reception_stalled_notice`,
    `momentary_backpressure_sends_no_notice`, `run_channel_records_a_transport_notice_as_a_diagnostic`).
@@ -209,9 +209,8 @@ needing sign-off. **Spec v1.2 added a dedicated `ReceptionStalled(ChannelId,
 Duration)` event** (§137) and marked the enum `#[non_exhaustive]`, so the overload
 is retired: the stall now emits `ReceptionStalled` carrying the duration. The
 retained §95 `Diagnostic` remains the **rich detail surface** (channel, time,
-human text); the event is the lightweight signal. (Implementation note: the shipped
-seam still emits `WarningRaised`; flipping it to `ReceptionStalled` is the small
-follow-up that lands with the §136/§137 v1.2 vocabulary.)
+human text); the event is the lightweight signal. *Implemented:* the seam emits
+`ReceptionStalled`, and both `RuntimeEvent`/`RuntimeCommand` are `#[non_exhaustive]`.
 
 **The transport→diagnostics seam (implements tier 2's record).** A transport states
 *what happened* via a `TransportNotice` (in `transport/`, with no dependency on the
@@ -220,9 +219,8 @@ owner — decides how it is recorded and reported. `run_channel` drains a bounde
 `Receiver<TransportNotice>` in its `select!` (alongside ingest and snapshot
 requests) and calls `record_notice`, which writes a Warning `Diagnostic` (naming
 the channel and stall duration) **and** emits the spec-appropriate §137 event —
-`ReceptionStalled` under spec v1.2 (the shipped code still emits `WarningRaised`
-pending the v1.2 vocabulary flip, see above) — keeping the §95 record and the §137
-event paired in one owner. The notice channel is created by the
+`ReceptionStalled` (carrying the duration) under spec v1.2 — keeping the §95 record
+and the §137 event paired in one owner. The notice channel is created by the
 orchestrator; only the serial transport is given the sender (`with_notice_sender`),
 because only serial can stall the reader (§97.1). The §95 record is now visible in
 a live `ChannelSnapshot.diagnostics`, which is what a GUI reads.

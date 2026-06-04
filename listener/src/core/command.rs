@@ -5,10 +5,17 @@
 //! and observes events; it never owns transport, recording, or pipeline state
 //! (§3).
 
+use std::time::Duration;
+
 use super::ids::{ChannelId, DisplayViewId, MatchRuleId};
 
 /// A command directed at the runtime (§136).
+///
+/// `#[non_exhaustive]`: the v1.2 command surface is still growing (live serial
+/// control, network adjustment, and match-rule commands land as the GUI's command
+/// channel is built), so consumers must keep a wildcard arm.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuntimeCommand {
     StartChannel(ChannelId),
     StopChannel(ChannelId),
@@ -24,7 +31,12 @@ pub enum RuntimeCommand {
 
 /// Something the runtime reports happened (§137). `MessageReceived` carries the
 /// Channel-local Message Number (§24).
+///
+/// `#[non_exhaustive]`: the event vocabulary grows across versions, so observers
+/// (notably the GUI's event-folding loop) must keep a wildcard arm and stay
+/// forward-compatible.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuntimeEvent {
     ChannelStarted(ChannelId),
     ChannelStopped(ChannelId),
@@ -34,6 +46,11 @@ pub enum RuntimeEvent {
     WarningRaised(ChannelId),
     TcpClientConnected(ChannelId),
     TcpClientDisconnected(ChannelId),
+    /// A sustained reader stall on a Channel's Transport→Extractor edge (§101,
+    /// ADR-007): possible transport-specific loss. Carries how long the reader was
+    /// stalled. Dedicated variant (v1.2 §137) — replaces the earlier reuse of
+    /// `WarningRaised` so observers can distinguish a stall from any other warning.
+    ReceptionStalled(ChannelId, Duration),
     /// A serial Channel's control/status lines changed (§14.3, §161); read the
     /// current state from the snapshot/query. Part of the v1.2 §137 vocabulary.
     ControlLinesChanged(ChannelId),

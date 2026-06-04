@@ -151,6 +151,9 @@ fn format_event(event: &RuntimeEvent) -> String {
         RuntimeEvent::MessageReceived(id, number) => format!("[{id}] message #{number}"),
         RuntimeEvent::RecordingFaulted(id) => format!("[{id}] recording faulted"),
         RuntimeEvent::WarningRaised(id) => format!("[{id}] warning raised"),
+        RuntimeEvent::ReceptionStalled(id, dur) => {
+            format!("[{id}] reception stalled {} ms", dur.as_millis())
+        }
         RuntimeEvent::TcpClientConnected(id) => format!("[{id}] TCP client connected"),
         RuntimeEvent::TcpClientDisconnected(id) => format!("[{id}] TCP client disconnected"),
         RuntimeEvent::ControlLinesChanged(id) => format!("[{id}] control lines changed"),

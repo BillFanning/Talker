@@ -133,8 +133,9 @@ decoder); these are separate, deliberately-scoped omissions:
 ## Acceptance (§153–§160 — the product-ready bar)
 
 Not all acceptance criteria are proven end-to-end yet (some are checked or partial
-below; the v1.2 addendum §161–§168 is fully implemented now, with §167 UDP-only).
-Each generally needs the wiring above first.
+below; the v1.2 addendum §161–§168 is implemented except §165 (Record Display/Both
++ live rule-toggle/MarkNow) and §167 (UDP-only), both partial). Each generally needs
+the wiring above first.
 
 - [ ] §153 Channel operation — create from templates, start/stop independently, run many
 - [ ] §154 TCP connections — accept, one channel/client, independent, not persisted
@@ -150,7 +151,7 @@ Each generally needs the wiring above first.
 - [x] §160 NMEA0183 — decoder behavior proven through a running channel: a valid sentence reports
   integrity Valid + message type, a bad-checksum sentence is retained and annotated Invalid (§37).
 
-### v1.2 acceptance addendum (spec §161–§168) — all implemented (§167 UDP-only); GUI next
+### v1.2 acceptance addendum (spec §161–§168) — §161-164/166/168 done; §165 & §167 partial; GUI next
 
 Per the v1.2 review: build acceptance/tests **before** implementing each, so the
 runtime-surface expansion stays anchored to a product-readiness bar.
@@ -190,7 +191,8 @@ runtime-surface expansion stays anchored to a product-readiness bar.
   config rejection (unit), orchestrator gapped-view + .ssdat decimated-bytes (integration). *Optional
   extras deferred* (beyond the §164 bar): display-recording (`.disp`) subsampling; per-connection TCP
   display-subsample inheritance.
-- [x] §165 Match rules & triggers — **DONE.** Config: `MatchRule {name, condition, actions, enabled}` on
+- [~] §165 Match rules & triggers — **PARTIAL** (core conditions + actions wired & tested; three pieces
+  deferred, see end). Config: `MatchRule {name, condition, actions, enabled}` on
   `ChannelConfig.match_rules`; `MatchCondition` (BytePattern / DecodedField(`DecodedMatch`: MessageType/
   TalkerId/Integrity) / Idle{timeout_ms} / MessageSize{min,max}); `MatchAction` (Highlight{HighlightStyle} /
   Record{RecordTarget,RecordControl} / Mark / Notify{DiagnosticSeverity} / PauseDisplay{view: Option<usize>}).
@@ -204,11 +206,13 @@ runtime-surface expansion stays anchored to a product-readiness bar.
   (nothing on disk until the match; the arming Message isn't retro-captured — "from the match forward, no
   backfill"), Stop→finalize. Firings surface in `ChannelSnapshot.matches` (`TriggeredMatch`). Tested: evaluator
   (10 unit), config validate/warn/round-trip (3), pipeline notify/pause/idle/record-lazy-create/mark-not-raw
-  (5), orchestrator end-to-end UDP rule fires + snapshot + diagnostic (1 integration). *Deferred*: the display
-  portion of Record `Display`/`Both` (needs per-view display-recorder arming); live `SetMatchRuleEnabled`/
-  `MarkNow` command plumbing into the running pipeline (no command channel yet — GUI work); per-connection TCP
-  rules (like per-connection recording); compound AND/OR/sequence conditions + pre-trigger capture (Appendix A);
-  Highlight visual styling (GUI-side).
+  (5), orchestrator end-to-end UDP rule fires + snapshot + diagnostic (1 integration). **Why PARTIAL (3
+  pieces, two share one blocker):** (a) the display portion of Record `Display`/`Both` (needs per-view
+  display-recorder arming); (b) live `SetMatchRuleEnabled` + (c) `MarkNow` — both blocked on the **missing
+  command channel into the running pipeline** (`run_channel` has no inbound command seam; pause/resume work
+  via shared handles, but rule-toggle/mark need a real channel — this is GUI-era plumbing). Also deferred
+  (Appendix A / GUI, not counted against §165): per-connection TCP rules; compound AND/OR/sequence conditions
+  + pre-trigger capture; Highlight visual styling (GUI-side).
 - [x] §166 Liveness — **DONE.** `runtime::activity::ActivityMeter` (bounded 5×1s ring) tracks
   `last_data_at` + rolling bytes/sec & msgs/sec; the pipeline records per chunk (ingest) and per
   Message (dispatch); surfaced in `ChannelSnapshot.activity` (`ChannelActivity`). Fact source only —
@@ -232,6 +236,26 @@ runtime-surface expansion stays anchored to a product-readiness bar.
   Tested: `disk_is_low` byte/percent/zero-total (unit), pipeline stop-once + both events + idempotence
   with a real recorder and `min_free = u64::MAX` (unit/async). *Deferred*: the periodic poll is fixed at
   5s (not yet configurable).
+
+### v1.2 display-config (spec §41/§45/§49/§78/§133, §1928–§1937) — NOT in the §161–§168 addendum, untracked until now
+
+The v1.2 spec amended `DisplayViewConfig` but the code never caught up — this was missing
+from the acceptance addendum, so flag it here so it isn't silently skipped before the GUI
+(the GUI renders exactly these per-view knobs, so it will surface the gap hard).
+
+- [ ] Retire `metadata_visible` → `MessageAnnotations { message_number: bool, timestamp: bool }`
+  (spec §49/§1936 says it *replaces* `metadata_visible`). Schema change + render plumbing +
+  profile round-trip; no migration code (additive `#[serde(default)]`, schema v1 series).
+- [ ] Per-view **display source** `DisplaySource { Stream, Messages }` (§41/§1928) — one view can
+  show the raw stream while another shows completed Messages.
+- [ ] Per-view **hex grouping** `HexGrouping { bytes_per_group, groups_per_line }` (§45/§1931;
+  `groups_per_line = 0` = fit to width). The renderer (`display::render::render_hex`) already
+  takes grouping params — this is the config field + wiring, not new render logic.
+- [ ] Per-view **timestamp display** `TimestampDisplay { source, resolution }` (§133/§1934).
+- [ ] Validation + template defaults for the above; extend the config round-trip test.
+- *Note:* spec types are defined in their body sections (§1928–§1937) but not in `config::schema`;
+  current `DisplayViewConfig` still carries `metadata_visible` ([schema.rs] §245 region). Real
+  feature work, not contract polish — give it its own commit when picked up.
 
 ---
 

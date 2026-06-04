@@ -163,13 +163,16 @@ pub fn validate_channel(
         errors.push(ChannelConfigError::InvalidChannelName);
     }
 
-    // A count-based subsample must pass at least one of every N (§50.1).
-    if channel
+    // A count-based subsample must pass at least one of every N (§50.1) — on any
+    // sink: a Display View's history or the message-framed (`.ssdat`) recording.
+    let display_subsample_invalid = channel
         .display
         .views
         .iter()
-        .any(|v| matches!(v.subsample, Subsample::EveryNth { n: 0 }))
-    {
+        .any(|v| matches!(v.subsample, Subsample::EveryNth { n: 0 }));
+    let recording_subsample_invalid =
+        matches!(channel.recording.subsample, Subsample::EveryNth { n: 0 });
+    if display_subsample_invalid || recording_subsample_invalid {
         errors.push(ChannelConfigError::InvalidSubsample);
     }
 
@@ -330,12 +333,22 @@ mod tests {
         let mut channel = templates::udp_template();
         let defaults = DefaultConfig::default();
 
+        // A Display View sink with n = 0 is rejected.
         channel.display.views[0].subsample = Subsample::EveryNth { n: 0 };
         assert!(validate_channel(&channel, &defaults)
             .unwrap_err()
             .contains(&ChannelConfigError::InvalidSubsample));
 
         channel.display.views[0].subsample = Subsample::EveryNth { n: 5 };
+        assert!(validate_channel(&channel, &defaults).is_ok());
+
+        // The recording (`.ssdat`) sink is validated too (§50.1) — not just views.
+        channel.recording.subsample = Subsample::EveryNth { n: 0 };
+        assert!(validate_channel(&channel, &defaults)
+            .unwrap_err()
+            .contains(&ChannelConfigError::InvalidSubsample));
+
+        channel.recording.subsample = Subsample::EveryNth { n: 3 };
         assert!(validate_channel(&channel, &defaults).is_ok());
     }
 

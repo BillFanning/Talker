@@ -690,8 +690,11 @@ impl ChannelPipeline {
                     stalled_for.as_millis(),
                 )));
                 // The matching event (§137); advisory, non-blocking like the rest.
+                // Dedicated `ReceptionStalled` (v1.2) so observers can tell a stall
+                // apart from any other warning (ADR-007).
                 if let Some(events) = &self.events {
-                    let _ = events.try_send(RuntimeEvent::WarningRaised(channel_id));
+                    let _ =
+                        events.try_send(RuntimeEvent::ReceptionStalled(channel_id, stalled_for));
                 }
             }
         }
@@ -1365,10 +1368,11 @@ mod tests {
             .await
             .unwrap();
 
-        // The matching event surfaces (waiting on it also means record_notice ran).
+        // The matching event surfaces (waiting on it also means record_notice ran):
+        // a dedicated ReceptionStalled carrying the stall duration (§137, v1.2).
         assert_eq!(
             ev_rx.recv().await.unwrap(),
-            RuntimeEvent::WarningRaised(cid)
+            RuntimeEvent::ReceptionStalled(cid, std::time::Duration::from_millis(500))
         );
 
         // A live snapshot shows the retained warning naming the stall duration.
