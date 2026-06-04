@@ -43,9 +43,42 @@ pub struct Cli {
     #[arg(long)]
     nmea: bool,
 
-    /// Launch the graphical interface instead of the headless CLI runner.
+    /// Launch the graphical interface. Also the default for a bare invocation
+    /// (no source given) — e.g. double-clicking the executable.
     #[arg(short = 'g', long)]
     pub gui: bool,
+
+    /// Force the headless CLI runner, overriding the bare-invocation GUI default.
+    /// (A source flag already implies headless; this is for the no-source case.)
+    #[arg(long, conflicts_with = "gui")]
+    pub cli: bool,
+}
+
+impl Cli {
+    /// Whether any data source was requested on the command line.
+    fn has_source(&self) -> bool {
+        self.profile.is_some() || self.udp.is_some() || self.tcp.is_some() || self.serial.is_some()
+    }
+
+    /// Whether to launch the GUI (§3). Explicit `--gui` always wins; explicit
+    /// `--cli` or any source flag selects headless; a bare invocation (no source,
+    /// no flag) defaults to the GUI so a double-clicked executable opens a window.
+    pub fn wants_gui(&self) -> bool {
+        if self.gui {
+            true
+        } else if self.cli {
+            false
+        } else {
+            !self.has_source()
+        }
+    }
+
+    /// A bare launch — no UI flag and no source. The double-click case, where a GUI
+    /// failure (e.g. a headless box with no display) should hint at headless mode
+    /// rather than surface a cryptic windowing error.
+    pub fn is_bare_launch(&self) -> bool {
+        !self.gui && !self.cli && !self.has_source()
+    }
 }
 
 /// Parse the process arguments into a [`Cli`]. Kept separate from [`run`] so the
@@ -193,7 +226,52 @@ mod tests {
             baud: 9600,
             nmea: false,
             gui: false,
+            cli: false,
         }
+    }
+
+    #[test]
+    fn bare_invocation_defaults_to_the_gui() {
+        let cli = base_cli(); // no source, no flag
+        assert!(cli.wants_gui());
+        assert!(cli.is_bare_launch());
+    }
+
+    #[test]
+    fn a_source_flag_selects_headless() {
+        let cli = Cli {
+            udp: Some(9000),
+            ..base_cli()
+        };
+        assert!(!cli.wants_gui());
+        assert!(!cli.is_bare_launch());
+    }
+
+    #[test]
+    fn explicit_flags_override_the_default() {
+        // --gui with no source → GUI (and not a "bare" launch needing the hint).
+        let gui = Cli {
+            gui: true,
+            ..base_cli()
+        };
+        assert!(gui.wants_gui());
+        assert!(!gui.is_bare_launch());
+
+        // --cli with no source → headless (the user asked for it).
+        let headless = Cli {
+            cli: true,
+            ..base_cli()
+        };
+        assert!(!headless.wants_gui());
+        assert!(!headless.is_bare_launch());
+
+        // --gui still wins even with a source present.
+        let gui_with_source = Cli {
+            gui: true,
+            udp: Some(9000),
+            ..base_cli()
+        };
+        assert!(gui_with_source.wants_gui());
     }
 
     #[test]

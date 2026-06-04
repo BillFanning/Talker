@@ -14,12 +14,23 @@ pub mod transport;
 use anyhow::Result;
 
 /// Binary entry point (§3): parse arguments, then dispatch to the graphical
-/// interface (`--gui`) or the headless CLI runner. The branch happens before the
-/// async runtime is built, since the GUI owns its own runtime (ADR-008).
+/// interface or the headless CLI runner. Headless is the default whenever a source
+/// is given (or `--cli`); a bare invocation (no source, no flag) opens the GUI, so
+/// a double-clicked executable shows a window. The branch happens before the async
+/// runtime is built, since the GUI owns its own runtime (ADR-008).
 pub fn run() -> Result<()> {
     let cli = cli::parse();
-    if cli.gui {
-        gui::run()
+    if cli.wants_gui() {
+        match gui::run() {
+            Ok(()) => Ok(()),
+            // A bare launch on a headless box can't open a window — guide toward
+            // headless mode instead of surfacing a cryptic windowing error.
+            Err(e) if cli.is_bare_launch() => Err(anyhow::anyhow!(
+                "could not open the graphical interface ({e}); for headless use pass \
+                 a source (--udp/--tcp/--serial/--profile), or run with --cli"
+            )),
+            Err(e) => Err(e),
+        }
     } else {
         cli::run(cli)
     }
