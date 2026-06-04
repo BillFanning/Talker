@@ -34,6 +34,9 @@ serialport = { workspace = true }
 # Calendar time for time-based recording-file rotation (§59) — UTC period keys
 chrono = { workspace = true }
 
+# Raw socket options: SO_RCVBUF to mitigate kernel UDP drops (§167, §101)
+socket2 = { workspace = true }
+
 # async methods in the recorder traits (§142)
 async-trait = { workspace = true }
 

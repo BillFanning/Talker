@@ -20,6 +20,9 @@ rust-version = "1.95"
 # ── Serial port ───────────────────────────────────────────────────────────────
 serialport = "4"
 
+# ── Raw socket options (SO_RCVBUF, §167) ──────────────────────────────────────
+socket2 = "0.5"
+
 # ── GUI ───────────────────────────────────────────────────────────────────────
 # eframe and egui MUST share the same minor version.
 eframe = { version = "0.34", default-features = false, features = [

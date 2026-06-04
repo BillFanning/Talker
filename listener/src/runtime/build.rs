@@ -38,6 +38,8 @@ pub enum BuildError {
     InvalidSocketAddr { address: String, port: u16 },
     #[error("invalid multicast group address {0:?}")]
     InvalidMulticastGroup(String),
+    #[error("invalid multicast interface address {0:?}")]
+    InvalidMulticastInterface(String),
 }
 
 /// Build the extractor for a Channel (§20). `Protocol { Nmea0183 }` is realized
@@ -160,6 +162,15 @@ pub fn build_udp(channel_id: ChannelId, config: &UdpConfig) -> Result<UdpTranspo
             .map_err(|_| BuildError::InvalidMulticastGroup(group.clone()))?;
         transport = transport.with_multicast_group(ip);
     }
+    if let Some(iface) = &config.multicast_interface {
+        let ip = iface
+            .parse()
+            .map_err(|_| BuildError::InvalidMulticastInterface(iface.clone()))?;
+        transport = transport.with_multicast_interface(ip);
+    }
+    if let Some(bytes) = config.recv_buffer_bytes {
+        transport = transport.with_recv_buffer(bytes);
+    }
     Ok(transport)
 }
 
@@ -229,6 +240,8 @@ mod tests {
             port: 9000,
             mode: crate::transport::udp::UdpMode::Unicast,
             multicast_group: None,
+            multicast_interface: None,
+            recv_buffer_bytes: None,
         };
         assert!(build_udp(ChannelId::new(), &good).is_ok());
 
@@ -237,6 +250,8 @@ mod tests {
             port: 9000,
             mode: crate::transport::udp::UdpMode::Unicast,
             multicast_group: None,
+            multicast_interface: None,
+            recv_buffer_bytes: None,
         };
         assert!(matches!(
             build_udp(ChannelId::new(), &bad),

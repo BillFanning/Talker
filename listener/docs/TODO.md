@@ -189,7 +189,13 @@ runtime-surface expansion stays anchored to a product-readiness bar.
   Message (dispatch); surfaced in `ChannelSnapshot.activity` (`ChannelActivity`). Fact source only —
   consumers derive "idle" against their own threshold (unblocks MR&T `Idle`, §50.2). Tested: meter
   window/decay/zero (unit), orchestrator snapshot shows throughput + last-data (integration).
-- [ ] §167 Network live adjustment — SO_RCVBUF, multicast join/leave + interface; re-bind via apply-pending
+- [~] §167 Network live adjustment — **UDP core DONE.** `UdpConfig.recv_buffer_bytes` (SO_RCVBUF, set
+  before bind via `socket2` — the kernel-UDP-drop lever, §101) + `multicast_interface` (NIC selection for
+  the group join); `build_udp` wires both; changes take effect via the §13 apply-pending restart. Added
+  `socket2` dep. Tested: `recv_buffer_size_is_applied_at_bind` (unit) + existing UDP bind/recv still pass.
+  *Deferred*: `TcpListenerConfig.recv_buffer_bytes` (field added, not yet applied to the listener socket);
+  truly-live no-restart commands (`SetReceiveBuffer`/`JoinMulticast`/`LeaveMulticast` into the running UDP
+  task) — spec §76.1 marks live RCVBUF best-effort, so apply-pending restart covers it for v1.
 - [ ] §168 Disk-space guard — warn/stop on low disk, clean finalize, reception continues
 
 ---

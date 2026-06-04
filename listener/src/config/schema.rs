@@ -110,6 +110,15 @@ pub struct UdpConfig {
     pub mode: UdpMode,
     #[serde(default)]
     pub multicast_group: Option<String>,
+    /// Multicast join interface — a local IPv4 address selecting the NIC on a
+    /// multi-homed host (§75/§167). `None` = the OS default interface.
+    #[serde(default)]
+    pub multicast_interface: Option<String>,
+    /// SO_RCVBUF in bytes (§167): the primary lever against kernel-dropped UDP
+    /// (§101). `None` = OS default. Applied at bind; a change takes effect via the
+    /// §13 apply-pending restart.
+    #[serde(default)]
+    pub recv_buffer_bytes: Option<usize>,
 }
 
 /// TCP listener interface configuration (§76).
@@ -119,6 +128,9 @@ pub struct TcpListenerConfig {
     pub port: u16,
     #[serde(default)]
     pub max_connections: Option<u32>,
+    /// SO_RCVBUF in bytes for accepted connections (§167); `None` = OS default.
+    #[serde(default)]
+    pub recv_buffer_bytes: Option<usize>,
 }
 
 /// Message-extraction configuration (§20). For a TCP Listener these settings

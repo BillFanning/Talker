@@ -43,6 +43,8 @@ pub struct UdpTransport {
     bind_addr: SocketAddr,
     mode: UdpMode,
     multicast_group: Option<IpAddr>,
+    multicast_interface: Option<Ipv4Addr>,
+    recv_buffer: Option<usize>,
 }
 
 impl UdpTransport {
@@ -52,6 +54,8 @@ impl UdpTransport {
             bind_addr,
             mode,
             multicast_group: None,
+            multicast_interface: None,
+            recv_buffer: None,
         }
     }
 
@@ -61,10 +65,25 @@ impl UdpTransport {
         self
     }
 
+    /// Select the local IPv4 interface to join the multicast group on (§167), for
+    /// multi-homed hosts. Without it, the OS default interface is used.
+    pub fn with_multicast_interface(mut self, interface: Ipv4Addr) -> Self {
+        self.multicast_interface = Some(interface);
+        self
+    }
+
+    /// Set SO_RCVBUF in bytes (§167) — the lever against kernel-dropped UDP (§101).
+    pub fn with_recv_buffer(mut self, bytes: usize) -> Self {
+        self.recv_buffer = Some(bytes);
+        self
+    }
+
     /// Bind the socket and apply mode-specific setup (§8.2). Fallible so the
     /// runtime can take Starting → Faulted on failure (§9, §71).
     pub async fn bind(self) -> io::Result<BoundUdpTransport> {
-        let socket = UdpSocket::bind(self.bind_addr).await?;
+        let std_socket = build_udp_socket(self.bind_addr, self.recv_buffer)?;
+        std_socket.set_nonblocking(true)?;
+        let socket = UdpSocket::from_std(std_socket)?;
         match self.mode {
             UdpMode::Unicast => {}
             UdpMode::Broadcast => socket.set_broadcast(true)?,
@@ -76,7 +95,10 @@ impl UdpTransport {
                     )
                 })?;
                 match group {
-                    IpAddr::V4(group) => socket.join_multicast_v4(group, Ipv4Addr::UNSPECIFIED)?,
+                    IpAddr::V4(group) => {
+                        let iface = self.multicast_interface.unwrap_or(Ipv4Addr::UNSPECIFIED);
+                        socket.join_multicast_v4(group, iface)?;
+                    }
                     IpAddr::V6(group) => socket.join_multicast_v6(&group, 0)?,
                 }
             }
@@ -86,6 +108,27 @@ impl UdpTransport {
             socket,
         })
     }
+}
+
+/// Build and bind a std UDP socket, optionally setting SO_RCVBUF *before* bind
+/// (§167) — the point most platforms honor. Built via `socket2` so the option can
+/// be set on the raw socket before it is handed to Tokio.
+fn build_udp_socket(
+    addr: SocketAddr,
+    recv_buffer: Option<usize>,
+) -> io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    if let Some(bytes) = recv_buffer {
+        socket.set_recv_buffer_size(bytes)?;
+    }
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
 }
 
 /// A bound UDP socket ready to receive. Implements [`DataTransportRunner`].
@@ -146,6 +189,20 @@ impl DataTransportRunner for BoundUdpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recv_buffer_size_is_applied_at_bind() {
+        // §167: SO_RCVBUF is set before bind. The OS may round up (Linux commonly
+        // doubles), so the effective size is at least what we requested.
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let requested = 512 * 1024;
+        let socket = build_udp_socket(addr, Some(requested)).unwrap();
+        let actual = socket2::SockRef::from(&socket).recv_buffer_size().unwrap();
+        assert!(
+            actual >= requested,
+            "recv buffer {actual} should be >= requested {requested}"
+        );
+    }
 
     #[tokio::test]
     async fn unicast_receives_each_datagram_as_a_message() {
