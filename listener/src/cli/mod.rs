@@ -149,6 +149,7 @@ fn format_event(event: &RuntimeEvent) -> String {
         RuntimeEvent::WarningRaised(id) => format!("[{id}] warning raised"),
         RuntimeEvent::TcpClientConnected(id) => format!("[{id}] TCP client connected"),
         RuntimeEvent::TcpClientDisconnected(id) => format!("[{id}] TCP client disconnected"),
+        RuntimeEvent::ControlLinesChanged(id) => format!("[{id}] control lines changed"),
     }
 }
 

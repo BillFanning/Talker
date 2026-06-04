@@ -155,7 +155,14 @@ wiring above first.
 Per the v1.2 review: build acceptance/tests **before** implementing each, so the
 runtime-surface expansion stays anchored to a product-readiness bar.
 
-- [ ] §161 Serial control lines — live CTS/DSR/DCD/RI display; RTS/DTR set + live-toggle
+- [x] §161 Serial control lines — **DONE.** `transport::SerialControlLines` {rts,dtr,cts,dsr,dcd,ri};
+  the serial receive loop services live RTS/DTR commands and polls input lines between bounded reads
+  (never interferes with reception) via the extended `BlockingReader` seam + `SerialControlHooks`
+  (command inbox + shared state cell + events). Orchestrator: a serial channel gets a control handle;
+  `Listener::set_rts`/`set_dtr` (commands) + `serial_control_lines(id)` (pull) + `ControlLinesChanged`
+  event (push, added to `RuntimeEvent`). Tested: loop applies a command + reports an input change (unit
+  via a fake `ControlReader`); non-serial channel reports control unavailable (orchestrator unit). The
+  full orchestrator serial path needs real hardware (loopback can't); only the loop logic is unit-tested.
 - [ ] §162 Auto-reconnect — opt-in `Faulted → Starting` backoff; off by default; TCP connections excluded
 - [x] §163 File rotation — **DONE.** `record::file_rotation` (`RotatingRawRecorder`/`RotatingDisplayRecorder`)
   writes `<channel>_<UTC-period><ext>` files per Hourly/Daily period, data-driven from each item's

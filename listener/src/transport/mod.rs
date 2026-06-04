@@ -27,7 +27,10 @@ pub mod serial;
 pub mod tcp;
 pub mod udp;
 
-pub use serial::{OpenSerialTransport, SerialTransport};
+pub use serial::{
+    OpenSerialTransport, SerialControlCommand, SerialControlHooks, SerialControlLines,
+    SerialTransport,
+};
 pub use tcp::{BoundTcpListenerTransport, TcpConnectionTransport, TcpListenerTransport};
 pub use udp::{BoundUdpTransport, UdpMode, UdpTransport};
 

@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
@@ -28,7 +28,10 @@ use crate::record::{
     start_display_recording, start_raw_recording, DisplayFileRecorder, FileRotationPolicy,
     RawFileRecorder, Recording, RecordingMode, RotatingDisplayRecorder, RotatingRawRecorder,
 };
-use crate::transport::{DataTransportRunner, TransportNotice};
+use crate::transport::{
+    DataTransportRunner, SerialControlCommand, SerialControlHooks, SerialControlLines,
+    TransportNotice,
+};
 
 use super::build::{
     build_decoder, build_display_view, build_extractor, build_serial, build_tcp_listener,
@@ -49,10 +52,22 @@ fn view_subsamples(config: &ChannelConfig) -> Vec<Subsample> {
     }
 }
 
+/// Bounded inbox for live serial control-line commands (§161). Tiny: commands are
+/// occasional operator actions.
+const SERIAL_CONTROL_COMMANDS: usize = 8;
+
 /// A live Channel's running tasks. Held by the orchestrator so it can stop them.
 enum ChannelHandle {
     Data(MonitoredChannel),
     TcpListener(TcpListenerHandle),
+}
+
+/// Live serial control-line handle held by the orchestrator (§161): the command
+/// inbox to the running serial reader, and the shared cell the reader updates with
+/// the current line state.
+struct SerialControl {
+    commands: mpsc::Sender<SerialControlCommand>,
+    state: Arc<Mutex<SerialControlLines>>,
 }
 
 /// Registry entry: the configuration, any accepted-but-unapplied change (§13),
@@ -70,6 +85,9 @@ struct ManagedChannel {
     /// from that task, so it reads the flag to keep `state()` and command
     /// validation honest. A fresh flag is installed at each `start`.
     faulted: Arc<AtomicBool>,
+    /// Live serial control-line handle (§161); `Some` only while a serial Channel
+    /// is running.
+    serial_control: Option<SerialControl>,
 }
 
 impl ManagedChannel {
@@ -103,6 +121,8 @@ pub enum OrchestratorError {
     SerialOpen(#[source] serialport::Error),
     #[error("failed to bind interface: {0}")]
     Bind(#[source] std::io::Error),
+    #[error("serial control is not available for channel {0} (not a running serial channel)")]
+    SerialControlUnavailable(ChannelId),
 }
 
 /// The runtime orchestrator (§97.1). Owns channels; drives their lifecycle.
@@ -147,6 +167,7 @@ impl Listener {
                 handle: None,
                 display_handles: Vec::new(),
                 faulted: Arc::new(AtomicBool::new(false)),
+                serial_control: None,
             },
         );
         id
@@ -175,6 +196,43 @@ impl Listener {
 
     pub fn channel_ids(&self) -> Vec<ChannelId> {
         self.channels.keys().copied().collect()
+    }
+
+    /// Drive the RTS output line of a running serial Channel (§161).
+    pub async fn set_rts(&self, id: ChannelId, on: bool) -> Result<(), OrchestratorError> {
+        self.serial_command(id, SerialControlCommand::SetRts(on))
+            .await
+    }
+
+    /// Drive the DTR output line of a running serial Channel (§161).
+    pub async fn set_dtr(&self, id: ChannelId, on: bool) -> Result<(), OrchestratorError> {
+        self.serial_command(id, SerialControlCommand::SetDtr(on))
+            .await
+    }
+
+    async fn serial_command(
+        &self,
+        id: ChannelId,
+        command: SerialControlCommand,
+    ) -> Result<(), OrchestratorError> {
+        let control = self
+            .channels
+            .get(&id)
+            .and_then(|c| c.serial_control.as_ref())
+            .ok_or(OrchestratorError::SerialControlUnavailable(id))?;
+        control
+            .commands
+            .send(command)
+            .await
+            .map_err(|_| OrchestratorError::SerialControlUnavailable(id))
+    }
+
+    /// The current serial control-line state of a running serial Channel (§161, the
+    /// pull side of `ControlLinesChanged`); `None` if it is not a running serial
+    /// Channel.
+    pub fn serial_control_lines(&self, id: ChannelId) -> Option<SerialControlLines> {
+        let control = self.channels.get(&id)?.serial_control.as_ref()?;
+        control.state.lock().ok().map(|guard| *guard)
     }
 
     pub fn has_pending(&self, id: ChannelId) -> bool {
@@ -258,7 +316,7 @@ impl Listener {
             channel.state = ChannelState::Starting;
         }
         match self.spawn_channel(id, &config, faulted).await {
-            Ok(handle) => {
+            Ok((handle, serial_control)) => {
                 let display_handles = match &handle {
                     ChannelHandle::Data(tasks) => tasks.display_handles().to_vec(),
                     // A TCP listener has no display itself; its connections do.
@@ -267,6 +325,7 @@ impl Listener {
                 if let Some(channel) = self.channels.get_mut(&id) {
                     channel.handle = Some(handle);
                     channel.display_handles = display_handles;
+                    channel.serial_control = serial_control;
                     channel.state = ChannelState::Running;
                 }
                 let _ = self.events_tx.try_send(RuntimeEvent::ChannelStarted(id));
@@ -318,6 +377,7 @@ impl Listener {
     fn finish_stop(&mut self, id: ChannelId) {
         if let Some(channel) = self.channels.get_mut(&id) {
             channel.display_handles.clear();
+            channel.serial_control = None;
             channel.state = ChannelState::Stopped;
             channel.faulted.store(false, Ordering::Relaxed);
         }
@@ -403,23 +463,40 @@ impl Listener {
         id: ChannelId,
         config: &ChannelConfig,
         faulted: Arc<AtomicBool>,
-    ) -> Result<ChannelHandle, OrchestratorError> {
+    ) -> Result<(ChannelHandle, Option<SerialControl>), OrchestratorError> {
         match &config.interface {
             InterfaceConfig::Serial(serial) => {
                 // Serial is the one transport whose reader can stall (§97.1); give
                 // it a notice sender so a sustained stall becomes a retained
                 // diagnostic + warning in the pipeline (§101, ADR-007).
                 let (notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
+                // Live control lines (§161): a command inbox to the reader and a
+                // shared cell it updates; ControlLinesChanged flows on the events.
+                let (cmd_tx, cmd_rx) = mpsc::channel(SERIAL_CONTROL_COMMANDS);
+                let state = Arc::new(Mutex::new(SerialControlLines::default()));
+                let hooks = SerialControlHooks {
+                    commands: cmd_rx,
+                    state: state.clone(),
+                    events: self.events_tx.clone(),
+                };
                 let opened = build_serial(id, serial)?
                     .open()
                     .await
                     .map_err(OrchestratorError::SerialOpen)?
-                    .with_notice_sender(notice_tx);
+                    .with_notice_sender(notice_tx)
+                    .with_control(hooks);
                 let raw = self.build_raw_recorder(id, config).await;
                 let display = self.build_display_recorder(id, config).await;
-                Ok(ChannelHandle::Data(self.spawn_data(
-                    id, opened, config, raw, display, faulted, notice_rx,
-                )))
+                let handle = ChannelHandle::Data(
+                    self.spawn_data(id, opened, config, raw, display, faulted, notice_rx),
+                );
+                Ok((
+                    handle,
+                    Some(SerialControl {
+                        commands: cmd_tx,
+                        state,
+                    }),
+                ))
             }
             InterfaceConfig::Udp(udp) => {
                 let bound = build_udp(id, udp)?
@@ -430,9 +507,10 @@ impl Listener {
                 let display = self.build_display_recorder(id, config).await;
                 // UDP is async and never stalls the reader; no notices to send.
                 let (_notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
-                Ok(ChannelHandle::Data(self.spawn_data(
-                    id, bound, config, raw, display, faulted, notice_rx,
-                )))
+                let handle = ChannelHandle::Data(
+                    self.spawn_data(id, bound, config, raw, display, faulted, notice_rx),
+                );
+                Ok((handle, None))
             }
             // The TCP listener supervises per-connection faults itself; a
             // listener-acceptor fault isn't reconciled through this flag (v1).
@@ -453,7 +531,7 @@ impl Listener {
                     tcp.max_connections,
                     self.events_tx.clone(),
                 );
-                Ok(ChannelHandle::TcpListener(handle))
+                Ok((ChannelHandle::TcpListener(handle), None))
             }
         }
     }
@@ -744,6 +822,24 @@ mod tests {
         // Stop recovers Faulted → Stopped (§8.5) and clears the flag.
         listener.stop(id).await.unwrap();
         assert_eq!(listener.state(id), Some(ChannelState::Stopped));
+    }
+
+    #[tokio::test]
+    async fn serial_control_is_unavailable_on_non_serial_channels() {
+        // §161: control-line commands/queries only apply to running serial
+        // Channels; a UDP channel reports it has no serial control.
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        listener.start(id).await.unwrap();
+
+        assert!(matches!(
+            listener.set_rts(id, true).await,
+            Err(OrchestratorError::SerialControlUnavailable(_))
+        ));
+        assert!(listener.serial_control_lines(id).is_none());
+
+        listener.stop(id).await.unwrap();
     }
 
     #[tokio::test]

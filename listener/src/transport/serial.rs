@@ -19,20 +19,52 @@
 //! its logic is unit-testable without serial hardware.
 
 use std::io::{self, Read};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::{ChannelId, ChunkTime};
+use crate::core::{ChannelId, ChunkTime, RuntimeEvent};
 
 use super::{
     DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHandle, TransportNotice,
     TransportOutcome,
 };
+
+/// Live serial control/status line state (§14.3, §161). Outputs (RTS, DTR) are
+/// driven by Listener; inputs (CTS, DSR, DCD, RI) are driven by the device. Output
+/// states reflect what Listener has set this session (serial outputs are not
+/// read-back), inputs reflect the last poll.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SerialControlLines {
+    pub rts: bool,
+    pub dtr: bool,
+    pub cts: bool,
+    pub dsr: bool,
+    pub dcd: bool,
+    pub ri: bool,
+}
+
+/// A live control-line command to a running serial Channel (§161).
+#[derive(Clone, Copy, Debug)]
+pub enum SerialControlCommand {
+    SetRts(bool),
+    SetDtr(bool),
+}
+
+/// The runtime's hooks into a running serial reader's control lines (§161): a
+/// command inbox, a shared state cell the reader updates, and the event stream for
+/// `ControlLinesChanged` signals. The reader polls inputs and applies commands
+/// between bounded reads, so this never interferes with reception (§100).
+pub struct SerialControlHooks {
+    pub commands: Receiver<SerialControlCommand>,
+    pub state: Arc<Mutex<SerialControlLines>>,
+    pub events: Sender<RuntimeEvent>,
+}
 
 /// Read buffer size for one blocking read (a serial chunk; framing is the
 /// extractor's job, §105).
@@ -150,6 +182,7 @@ impl SerialTransport {
             channel_id: self.channel_id,
             port,
             notices: None,
+            control: None,
         })
     }
 }
@@ -162,6 +195,9 @@ pub struct OpenSerialTransport {
     /// reader stall sends `ReceptionStalled`; the pipeline turns it into a
     /// retained diagnostic + `WarningRaised` (listener ADR-007).
     notices: Option<Sender<TransportNotice>>,
+    /// Optional live control-line hooks (§161): command inbox + state cell + event
+    /// sink. When set, the reader services RTS/DTR commands and polls input lines.
+    control: Option<SerialControlHooks>,
 }
 
 impl OpenSerialTransport {
@@ -178,6 +214,14 @@ impl OpenSerialTransport {
         self.notices = Some(notices);
         self
     }
+
+    /// Attach live control-line hooks (§161): the reader applies RTS/DTR commands
+    /// and polls CTS/DSR/DCD/RI between reads, updating the shared state cell and
+    /// signalling `ControlLinesChanged`.
+    pub fn with_control(mut self, control: SerialControlHooks) -> Self {
+        self.control = Some(control);
+        self
+    }
 }
 
 impl DataTransportRunner for OpenSerialTransport {
@@ -185,6 +229,7 @@ impl DataTransportRunner for OpenSerialTransport {
         let (done_tx, done_rx) = oneshot::channel();
         let channel_id = self.channel_id;
         let notices = self.notices;
+        let control = self.control;
         let reader = SerialReader { port: self.port };
         std::thread::Builder::new()
             .name("serial-rx".to_string())
@@ -196,6 +241,7 @@ impl DataTransportRunner for OpenSerialTransport {
                     cancel,
                     STALL_WARNING,
                     notices,
+                    control,
                 );
                 // Report the outcome to the async side (never blocks a worker).
                 let _ = done_tx.send(outcome);
@@ -210,6 +256,18 @@ impl DataTransportRunner for OpenSerialTransport {
 /// poll cancellation (§111). This seam keeps the loop testable without hardware.
 trait BlockingReader: Send {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+    /// Read the input/status lines `(CTS, DSR, DCD, RI)` (§14.3). Default: unknown.
+    fn read_inputs(&mut self) -> io::Result<(bool, bool, bool, bool)> {
+        Ok((false, false, false, false))
+    }
+    /// Drive the RTS output line (§14.3). Default: no-op.
+    fn set_rts(&mut self, _on: bool) -> io::Result<()> {
+        Ok(())
+    }
+    /// Drive the DTR output line (§14.3). Default: no-op.
+    fn set_dtr(&mut self, _on: bool) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// [`BlockingReader`] backed by a real serial port. Maps the port's `TimedOut`
@@ -225,6 +283,27 @@ impl BlockingReader for SerialReader {
             Err(e) if e.kind() == io::ErrorKind::TimedOut => Ok(0),
             Err(e) => Err(e),
         }
+    }
+
+    fn read_inputs(&mut self) -> io::Result<(bool, bool, bool, bool)> {
+        Ok((
+            self.port.read_clear_to_send().map_err(io::Error::other)?,
+            self.port.read_data_set_ready().map_err(io::Error::other)?,
+            self.port.read_carrier_detect().map_err(io::Error::other)?,
+            self.port.read_ring_indicator().map_err(io::Error::other)?,
+        ))
+    }
+
+    fn set_rts(&mut self, on: bool) -> io::Result<()> {
+        self.port
+            .write_request_to_send(on)
+            .map_err(io::Error::other)
+    }
+
+    fn set_dtr(&mut self, on: bool) -> io::Result<()> {
+        self.port
+            .write_data_terminal_ready(on)
+            .map_err(io::Error::other)
     }
 }
 
@@ -244,14 +323,22 @@ fn run_blocking_receive_loop(
     cancel: CancellationToken,
     stall_warning: Duration,
     notices: Option<Sender<TransportNotice>>,
+    mut control: Option<SerialControlHooks>,
 ) -> TransportOutcome {
     let mut buf = vec![0u8; READ_BUFFER];
     // One warning per stall episode; reset once the queue accepts again.
     let mut stall_warned = false;
+    // Live control-line state (§161), tracked across the session.
+    let mut lines = SerialControlLines::default();
     loop {
         // Cooperative cancellation, observed between bounded reads (§111).
         if cancel.is_cancelled() {
             return TransportOutcome::Cancelled;
+        }
+        // Live control lines (§161): apply pending RTS/DTR commands and poll the
+        // input lines between reads, so this never interferes with reception (§100).
+        if let Some(ctl) = control.as_mut() {
+            service_control_lines(&mut reader, ctl, &mut lines, channel_id);
         }
         match reader.read(&mut buf) {
             // Timeout / no data: loop back to re-check cancellation.
@@ -299,6 +386,43 @@ fn run_blocking_receive_loop(
     }
 }
 
+/// Apply any pending RTS/DTR commands and poll the input lines (§161). On any
+/// change, update the shared state cell and signal `ControlLinesChanged` (§137) —
+/// the cell is the truth, the event is the lightweight signal (ADR-006). A
+/// control-line I/O error is ignored (it does not fault the Channel, §96).
+fn service_control_lines(
+    reader: &mut impl BlockingReader,
+    ctl: &mut SerialControlHooks,
+    lines: &mut SerialControlLines,
+    channel_id: ChannelId,
+) {
+    let mut changed = false;
+    while let Ok(cmd) = ctl.commands.try_recv() {
+        let applied = match cmd {
+            SerialControlCommand::SetRts(on) => reader.set_rts(on).map(|()| lines.rts = on),
+            SerialControlCommand::SetDtr(on) => reader.set_dtr(on).map(|()| lines.dtr = on),
+        };
+        changed |= applied.is_ok();
+    }
+    if let Ok((cts, dsr, dcd, ri)) = reader.read_inputs() {
+        if (cts, dsr, dcd, ri) != (lines.cts, lines.dsr, lines.dcd, lines.ri) {
+            lines.cts = cts;
+            lines.dsr = dsr;
+            lines.dcd = dcd;
+            lines.ri = ri;
+            changed = true;
+        }
+    }
+    if changed {
+        if let Ok(mut guard) = ctl.state.lock() {
+            *guard = *lines;
+        }
+        let _ = ctl
+            .events
+            .try_send(RuntimeEvent::ControlLinesChanged(channel_id));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +459,92 @@ mod tests {
         }
     }
 
+    /// A test reader for control-line behavior: never yields data, exposes mutable
+    /// input lines, and records the RTS/DTR it was asked to drive.
+    #[derive(Clone, Default)]
+    struct ControlReader {
+        inputs: Arc<Mutex<(bool, bool, bool, bool)>>, // cts, dsr, dcd, ri
+        outputs: Arc<Mutex<(bool, bool)>>,            // rts, dtr
+    }
+
+    impl BlockingReader for ControlReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(1));
+            Ok(0)
+        }
+        fn read_inputs(&mut self) -> io::Result<(bool, bool, bool, bool)> {
+            Ok(*self.inputs.lock().unwrap())
+        }
+        fn set_rts(&mut self, on: bool) -> io::Result<()> {
+            self.outputs.lock().unwrap().0 = on;
+            Ok(())
+        }
+        fn set_dtr(&mut self, on: bool) -> io::Result<()> {
+            self.outputs.lock().unwrap().1 = on;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn control_lines_apply_commands_and_report_input_changes() {
+        // §161: the reader drives RTS/DTR on command and reports input-line changes
+        // via the shared cell + a ControlLinesChanged event.
+        let reader = ControlReader::default();
+        let inputs = reader.inputs.clone();
+        let outputs = reader.outputs.clone();
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = mpsc::channel(8);
+        let state = Arc::new(Mutex::new(SerialControlLines::default()));
+        let cancel = CancellationToken::new();
+        let cid = ChannelId::new();
+        let (tx, _rx) = mpsc::channel(8);
+
+        let hooks = SerialControlHooks {
+            commands: cmd_rx,
+            state: state.clone(),
+            events: ev_tx,
+        };
+        let loop_cancel = cancel.clone();
+        std::thread::spawn(move || {
+            run_blocking_receive_loop(
+                cid,
+                reader,
+                tx,
+                loop_cancel,
+                STALL_WARNING,
+                None,
+                Some(hooks),
+            )
+        });
+
+        // Drive RTS high: the output line is set, and the cell + event reflect it.
+        cmd_tx
+            .send(SerialControlCommand::SetRts(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            ev_rx.recv().await.unwrap(),
+            RuntimeEvent::ControlLinesChanged(cid)
+        );
+        assert!(state.lock().unwrap().rts);
+        assert!(outputs.lock().unwrap().0);
+
+        // A device asserts CTS: the next poll detects it and reports the change.
+        inputs.lock().unwrap().0 = true;
+        loop {
+            assert_eq!(
+                ev_rx.recv().await.unwrap(),
+                RuntimeEvent::ControlLinesChanged(cid)
+            );
+            if state.lock().unwrap().cts {
+                break;
+            }
+        }
+
+        cancel.cancel();
+    }
+
     #[tokio::test]
     async fn receive_loop_emits_chunks_then_stops_on_cancellation() {
         let (tx, mut rx) = mpsc::channel(8);
@@ -345,7 +555,7 @@ mod tests {
         let loop_cancel = cancel.clone();
         std::thread::spawn(move || {
             let outcome =
-                run_blocking_receive_loop(cid, reader, tx, loop_cancel, STALL_WARNING, None);
+                run_blocking_receive_loop(cid, reader, tx, loop_cancel, STALL_WARNING, None, None);
             let _ = done_tx.send(outcome);
         });
 
@@ -379,6 +589,7 @@ mod tests {
                 CancellationToken::new(),
                 STALL_WARNING,
                 None,
+                None,
             );
             let _ = done_tx.send(outcome);
         });
@@ -397,7 +608,7 @@ mod tests {
         let reader = ScriptedReader::new(vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]);
         let loop_cancel = cancel.clone();
         std::thread::spawn(move || {
-            run_blocking_receive_loop(cid, reader, tx, loop_cancel, STALL_WARNING, None)
+            run_blocking_receive_loop(cid, reader, tx, loop_cancel, STALL_WARNING, None, None)
         });
 
         // The reader stalls rather than dropping: all three arrive, in order
@@ -426,7 +637,15 @@ mod tests {
         let loop_cancel = cancel.clone();
         let threshold = Duration::from_millis(20);
         std::thread::spawn(move || {
-            run_blocking_receive_loop(cid, reader, tx, loop_cancel, threshold, Some(notice_tx))
+            run_blocking_receive_loop(
+                cid,
+                reader,
+                tx,
+                loop_cancel,
+                threshold,
+                Some(notice_tx),
+                None,
+            )
         });
 
         // Let the reader fill the queue and then stall on the second chunk for
@@ -463,7 +682,15 @@ mod tests {
         // A high threshold the brisk draining below never crosses.
         let threshold = Duration::from_secs(10);
         std::thread::spawn(move || {
-            run_blocking_receive_loop(cid, reader, tx, loop_cancel, threshold, Some(notice_tx))
+            run_blocking_receive_loop(
+                cid,
+                reader,
+                tx,
+                loop_cancel,
+                threshold,
+                Some(notice_tx),
+                None,
+            )
         });
 
         for expected in [b"1", b"2", b"3"] {

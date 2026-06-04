@@ -34,4 +34,7 @@ pub enum RuntimeEvent {
     WarningRaised(ChannelId),
     TcpClientConnected(ChannelId),
     TcpClientDisconnected(ChannelId),
+    /// A serial Channel's control/status lines changed (§14.3, §161); read the
+    /// current state from the snapshot/query. Part of the v1.2 §137 vocabulary.
+    ControlLinesChanged(ChannelId),
 }
