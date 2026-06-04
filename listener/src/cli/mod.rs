@@ -77,9 +77,13 @@ async fn run_cli(cli: Cli) -> Result<()> {
     }
 
     println!("listening on {started} channel(s) — press Ctrl-C to stop");
+    // Drive auto-reconnect (§162): the orchestrator has no background loop, so the
+    // app ticks it. Channels without reconnect enabled are unaffected.
+    let mut reconnect = tokio::time::interval(std::time::Duration::from_millis(500));
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            _ = reconnect.tick() => listener.reconnect_tick().await,
             maybe = events.recv() => match maybe {
                 Some(event) => println!("{}", format_event(&event)),
                 None => break,
@@ -150,6 +154,11 @@ fn format_event(event: &RuntimeEvent) -> String {
         RuntimeEvent::TcpClientConnected(id) => format!("[{id}] TCP client connected"),
         RuntimeEvent::TcpClientDisconnected(id) => format!("[{id}] TCP client disconnected"),
         RuntimeEvent::ControlLinesChanged(id) => format!("[{id}] control lines changed"),
+        RuntimeEvent::ChannelReconnecting(id, attempt) => {
+            format!("[{id}] reconnecting (attempt {attempt})")
+        }
+        RuntimeEvent::ChannelReconnected(id) => format!("[{id}] reconnected"),
+        RuntimeEvent::ChannelReconnectGaveUp(id) => format!("[{id}] reconnect gave up"),
     }
 }
 

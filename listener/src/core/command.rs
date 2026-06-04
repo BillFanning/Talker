@@ -37,4 +37,11 @@ pub enum RuntimeEvent {
     /// A serial Channel's control/status lines changed (§14.3, §161); read the
     /// current state from the snapshot/query. Part of the v1.2 §137 vocabulary.
     ControlLinesChanged(ChannelId),
+    /// Auto-reconnect (§9.1, §162) is attempting to re-Start a faulted Channel;
+    /// carries the 1-based attempt number.
+    ChannelReconnecting(ChannelId, u32),
+    /// Auto-reconnect succeeded — the Channel is Running again.
+    ChannelReconnected(ChannelId),
+    /// Auto-reconnect gave up after `max_attempts`; the Channel stays Faulted.
+    ChannelReconnectGaveUp(ChannelId),
 }

@@ -35,6 +35,50 @@ pub struct ChannelConfig {
     pub recording: RecordingConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// Opt-in auto-reconnect after a fault (§9.1, §162); default disabled.
+    #[serde(default)]
+    pub reconnect: ReconnectPolicy,
+}
+
+/// Opt-in auto-reconnect policy (§9.1, §162). When `enabled`, a Channel that
+/// faults while it was meant to be Running is automatically re-Started with
+/// exponential backoff. Applies to Serial/UDP/TCP-Listener Channels, never TCP
+/// Connection Channels (the listener does not dial out).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReconnectPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_initial_backoff_ms")]
+    pub initial_backoff_ms: u64,
+    #[serde(default = "default_max_backoff_ms")]
+    pub max_backoff_ms: u64,
+    #[serde(default = "default_backoff_multiplier")]
+    pub multiplier: f64,
+    /// `None` = retry indefinitely.
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+}
+
+fn default_initial_backoff_ms() -> u64 {
+    1_000
+}
+fn default_max_backoff_ms() -> u64 {
+    30_000
+}
+fn default_backoff_multiplier() -> f64 {
+    2.0
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            initial_backoff_ms: default_initial_backoff_ms(),
+            max_backoff_ms: default_max_backoff_ms(),
+            multiplier: default_backoff_multiplier(),
+            max_attempts: None,
+        }
+    }
 }
 
 /// Interface configuration (§73). There is no persisted `TcpConnectionConfig` —

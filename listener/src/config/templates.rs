@@ -63,6 +63,7 @@ pub fn serial_template() -> ChannelConfig {
         display: raw_and_hex(),
         recording: RecordingConfig::default(),
         retention: default_retention(),
+        reconnect: ReconnectPolicy::default(),
     }
 }
 
@@ -93,6 +94,7 @@ pub fn nmea_serial_template() -> ChannelConfig {
         display: raw_with_metadata(),
         recording: RecordingConfig::default(),
         retention: default_retention(),
+        reconnect: ReconnectPolicy::default(),
     }
 }
 
@@ -115,6 +117,7 @@ pub fn udp_template() -> ChannelConfig {
         display: raw_and_hex(),
         recording: RecordingConfig::default(),
         retention: default_retention(),
+        reconnect: ReconnectPolicy::default(),
     }
 }
 
@@ -136,5 +139,6 @@ pub fn tcp_listener_template() -> ChannelConfig {
         display: raw_and_hex(),
         recording: RecordingConfig::default(),
         retention: default_retention(),
+        reconnect: ReconnectPolicy::default(),
     }
 }

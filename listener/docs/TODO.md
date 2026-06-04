@@ -163,7 +163,14 @@ runtime-surface expansion stays anchored to a product-readiness bar.
   event (push, added to `RuntimeEvent`). Tested: loop applies a command + reports an input change (unit
   via a fake `ControlReader`); non-serial channel reports control unavailable (orchestrator unit). The
   full orchestrator serial path needs real hardware (loopback can't); only the loop logic is unit-tested.
-- [ ] §162 Auto-reconnect — opt-in `Faulted → Starting` backoff; off by default; TCP connections excluded
+- [x] §162 Auto-reconnect — **DONE.** `config::ReconnectPolicy` {enabled(default false), initial/max
+  backoff ms, multiplier, max_attempts}; `ChannelConfig.reconnect`. The orchestrator has no background
+  loop (ADR-006), so the app drives `Listener::reconnect_tick()`: it arms a backoff timer on first
+  observing an effective-Faulted reconnect-enabled channel, then once due does a Stop+Start (reusing the
+  tested lifecycle), backing off exponentially on failure and giving up after `max_attempts`. Events
+  `ChannelReconnecting(id, attempt)` / `ChannelReconnected` / `ChannelReconnectGaveUp` (added to
+  `RuntimeEvent` + CLI). CLI ticks reconnect every 500ms. TCP **connection** channels excluded (not in the
+  registry; the listener doesn't dial out). Tested: success path + give-up-after-max (orchestrator unit).
 - [x] §163 File rotation — **DONE.** `record::file_rotation` (`RotatingRawRecorder`/`RotatingDisplayRecorder`)
   writes `<channel>_<UTC-period><ext>` files per Hourly/Daily period, data-driven from each item's
   wall-clock, clean file boundaries (no gap/backfill); `RecordingConfig.file_rotation`; orchestrator builds a
