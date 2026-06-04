@@ -23,7 +23,8 @@ use super::subsample::Subsampler;
 use crate::config::Subsample;
 
 use crate::core::{
-    ChannelId, DisplayViewId, Message, MessageBytes, ProtocolMetadata, RecordingState, RuntimeEvent,
+    ChannelId, ChunkTime, DisplayViewId, Message, MessageBytes, ProtocolMetadata, RecordingState,
+    RuntimeEvent,
 };
 use crate::decode::Decoder;
 use crate::diagnostics::{Diagnostic, DiagnosticLog};
@@ -127,6 +128,17 @@ struct ViewRecorder {
     recording: Recording<RenderedOutput>,
 }
 
+/// A subsampled, message-framed data recording (`.ssdat`, §50.1/§53): each passed
+/// Message's bytes are written, decimated by `subsampler`. It reuses the raw
+/// recording task by feeding it a synthetic per-Message chunk, so no new recorder
+/// type is needed — but it taps the *post-extraction* Message fan-out, not the raw
+/// chunk stream (raw `.dat` byte data is never subsampled).
+struct MessageRecorder {
+    recording: Recording<Arc<ReceivedData>>,
+    subsampler: Subsampler,
+    fault_reported: bool,
+}
+
 /// One Display View's runtime state: pause handle, bounded history (§87), an
 /// optional Display Recording (§54), and an optional subsampler for its history
 /// (§50.1).
@@ -167,6 +179,9 @@ pub struct ChannelPipeline {
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     /// Whether the raw recorder's fault has already been reported.
     recording_fault_reported: bool,
+    /// Subsampled message-framed data recording (`.ssdat`, §50.1); mutually
+    /// exclusive with `raw_recorder` (a Raw recording is one or the other).
+    message_recorder: Option<MessageRecorder>,
     /// Per-Channel liveness facts (§91.1): rolling throughput + last-data time.
     activity: ActivityMeter,
     events: Option<Sender<RuntimeEvent>>,
@@ -192,6 +207,7 @@ impl ChannelPipeline {
             ),
             raw_recorder: None,
             recording_fault_reported: false,
+            message_recorder: None,
             activity: ActivityMeter::new(),
             events: None,
         }
@@ -202,6 +218,21 @@ impl ChannelPipeline {
     /// finalizes it.
     pub fn with_raw_recorder(mut self, recorder: Recording<Arc<ReceivedData>>) -> Self {
         self.raw_recorder = Some(recorder);
+        self
+    }
+
+    /// Attach a subsampled message-framed data recording (`.ssdat`, §50.1): each
+    /// passed Message's bytes are recorded, decimated by `subsample`.
+    pub fn with_message_recorder(
+        mut self,
+        recorder: Recording<Arc<ReceivedData>>,
+        subsample: Subsample,
+    ) -> Self {
+        self.message_recorder = Some(MessageRecorder {
+            recording: recorder,
+            subsampler: Subsampler::new(subsample),
+            fault_reported: false,
+        });
         self
     }
 
@@ -323,9 +354,43 @@ impl ChannelPipeline {
                 let _ = view.history.push(decoded.clone());
             }
         }
+        // Keep the Message (an `Arc`) for the data recorder before retention takes
+        // ownership of `decoded`.
+        let message = Arc::clone(&decoded.message);
         // Retention: bounded by count and bytes (§88), evicting oldest (§89).
         // Message Numbers are never rewritten, so survivors keep their numbers.
         self.retention.push(decoded);
+        // Subsampled data recording (`.ssdat`, §50.1/§53): write passed Messages'
+        // bytes, decimated, by feeding the raw recording task a synthetic
+        // per-Message chunk. Non-blocking and fault-on-overflow like raw (§56.1).
+        let mut message_recording_faulted = false;
+        if let Some(mr) = self.message_recorder.as_mut() {
+            if mr.recording.state() == RecordingState::Enabled && mr.subsampler.should_pass(at) {
+                let chunk = Arc::new(ReceivedData {
+                    channel_id: self.channel_id,
+                    payload: ReceivedPayload::Bytes(message.bytes.to_vec()),
+                    received_at: ChunkTime {
+                        monotonic: message.metadata.arrival_timestamp.monotonic,
+                        wall_clock: message.metadata.arrival_timestamp.wall_clock,
+                    },
+                });
+                mr.recording.try_record(chunk);
+                if mr.recording.state() == RecordingState::Faulted && !mr.fault_reported {
+                    mr.fault_reported = true;
+                    message_recording_faulted = true;
+                }
+            }
+        }
+        if message_recording_faulted {
+            self.diagnostics.record(Diagnostic::error(format!(
+                "subsampled data recording faulted on channel {}",
+                self.channel_id
+            )));
+            if let Some(events) = &self.events {
+                let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+            }
+        }
+
         // Event stream (§137): advisory, non-blocking, drop on full.
         if let Some(events) = &self.events {
             let _ = events.try_send(RuntimeEvent::MessageReceived(self.channel_id, number));
@@ -361,6 +426,11 @@ impl ChannelPipeline {
         let _ = self.extractor.finish();
         if let Some(recorder) = self.raw_recorder.take() {
             recorder.finalize(RecordingStopReason::ChannelStopped).await;
+        }
+        if let Some(mr) = self.message_recorder.take() {
+            mr.recording
+                .finalize(RecordingStopReason::ChannelStopped)
+                .await;
         }
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.take() {
@@ -444,9 +514,13 @@ impl ChannelPipeline {
         &self.diagnostics
     }
 
-    /// Current raw-recording state, or `None` if raw recording is not attached.
+    /// Current data-recording state — raw `.dat` or subsampled `.ssdat` (the two
+    /// are mutually exclusive) — or `None` if neither is attached.
     pub fn raw_recording_state(&self) -> Option<RecordingState> {
-        self.raw_recorder.as_ref().map(|r| r.state())
+        self.raw_recorder
+            .as_ref()
+            .map(|r| r.state())
+            .or_else(|| self.message_recorder.as_ref().map(|m| m.recording.state()))
     }
 
     /// Build an owned, point-in-time snapshot of the observable state (§137,
@@ -472,7 +546,7 @@ impl ChannelPipeline {
                 warnings: self.diagnostics.warnings().cloned().collect(),
                 errors: self.diagnostics.errors().cloned().collect(),
             },
-            raw_recording: self.raw_recorder.as_ref().map(|r| r.state()),
+            raw_recording: self.raw_recording_state(),
             activity: self.activity.snapshot(Instant::now()),
         }
     }

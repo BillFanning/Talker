@@ -210,6 +210,11 @@ pub struct RecordingConfig {
     /// Time-based file rotation (§59); `None` = single file (additive, §72.1).
     #[serde(default)]
     pub file_rotation: FileRotationPolicy,
+    /// Subsampling (§50.1). For a `Raw` recording a non-`None` policy makes it a
+    /// message-framed, decimated **`.ssdat`** data file rather than a byte-exact
+    /// `.dat` (raw byte data is never subsampled, §53). Default `None`.
+    #[serde(default)]
+    pub subsample: Subsample,
 }
 
 /// Retention limits (§80). At least one applicable limit must be set — an

@@ -203,7 +203,7 @@ async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
     // <channel>_<period>.dat into the destination directory, driven through the
     // orchestrator. Boundary-crossing across periods is unit-tested in
     // record::file_rotation with crafted timestamps; here we prove wiring + naming.
-    use listener::config::RecordingConfig;
+    use listener::config::{RecordingConfig, Subsample};
     use listener::record::{FileRotationPolicy, OverwritePolicy, RecordingMode};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -227,6 +227,7 @@ async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
         timestamp_enabled: false,
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::Hourly,
+        subsample: Subsample::None,
     };
 
     let mut listener = Listener::with_default_capacities();
@@ -302,6 +303,55 @@ async fn subsampling_thins_a_view_without_renumbering_or_affecting_others() {
     assert_eq!(retained, vec![1, 2, 3, 4]);
 
     stop(&mut listener, id).await;
+}
+
+#[tokio::test]
+async fn subsampled_data_recording_writes_decimated_message_bytes() {
+    // §164/§53: a Raw recording with subsampling becomes a message-framed .ssdat
+    // holding only the passed Messages' bytes (decimated), not byte-exact .dat.
+    use listener::config::{RecordingConfig, Subsample};
+    use listener::record::{FileRotationPolicy, OverwritePolicy, RecordingMode};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "listener-ssdat-{}-{}.ssdat",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let port = free_udp_port();
+    let mut config = templates::udp_template();
+    if let InterfaceConfig::Udp(udp) = &mut config.interface {
+        udp.bind_address = "127.0.0.1".to_string();
+        udp.port = port;
+    }
+    config.recording = RecordingConfig {
+        mode: RecordingMode::Raw,
+        destination: Some(path.clone()),
+        timestamp_enabled: false,
+        overwrite_policy: OverwritePolicy::Overwrite,
+        file_rotation: FileRotationPolicy::None,
+        subsample: Subsample::EveryNth { n: 2 },
+    };
+
+    let mut listener = Listener::with_default_capacities();
+    let mut events = listener.take_events().unwrap();
+    let id = listener.add_channel(config);
+    listener.start(id).await.unwrap();
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for (n, payload) in [b"A", b"B", b"C", b"D"].into_iter().enumerate() {
+        client.send_to(payload, ("127.0.0.1", port)).await.unwrap();
+        assert_eq!(next_message(&mut events).await, (id, n as u64 + 1));
+    }
+
+    stop(&mut listener, id).await; // finalizes + flushes the recording
+
+    // 1 of every 2 Messages: passes #1 ("A") and #3 ("C") → "AC", decimated.
+    assert_eq!(std::fs::read(&path).unwrap(), b"AC");
+
+    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]

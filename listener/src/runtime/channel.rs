@@ -54,6 +54,15 @@ const SNAPSHOT_REQUESTS: usize = 8;
 /// unattached, so the receiver stays empty for the channel's life.
 pub(crate) const TRANSPORT_NOTICES: usize = 16;
 
+/// How a Channel's data recording (§53) taps the pipeline.
+pub(crate) enum DataRecorder {
+    /// Byte-exact raw `.dat`: tapped pre-extraction on the chunk stream.
+    Raw(Recording<Arc<ReceivedData>>),
+    /// Subsampled, message-framed `.ssdat` (§50.1): tapped post-extraction and
+    /// decimated by the policy.
+    Subsampled(Recording<Arc<ReceivedData>>, Subsample),
+}
+
 /// The transport + pipeline tasks for one Channel. A plain holder, destructured
 /// by [`spawn_monitored_channel`] and the TCP listener supervisor (which each do
 /// their own transport-outcome monitoring).
@@ -77,7 +86,7 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     runner: R,
     extractor: Box<dyn MessageExtractor + Send>,
     decoder: Option<Box<dyn Decoder + Send>>,
-    raw_recorder: Option<Recording<Arc<ReceivedData>>>,
+    data_recorder: Option<DataRecorder>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     view_subsamples: Vec<Subsample>,
     caps: PipelineCapacities,
@@ -92,8 +101,10 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     if let Some(decoder) = decoder {
         pipeline = pipeline.with_decoder(decoder);
     }
-    if let Some(recorder) = raw_recorder {
-        pipeline = pipeline.with_raw_recorder(recorder);
+    match data_recorder {
+        Some(DataRecorder::Raw(r)) => pipeline = pipeline.with_raw_recorder(r),
+        Some(DataRecorder::Subsampled(r, s)) => pipeline = pipeline.with_message_recorder(r, s),
+        None => {}
     }
     // `new` created the default Display View; add the rest to reach the count, then
     // apply each view's subsampling policy (§50.1).
@@ -200,7 +211,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     runner: R,
     extractor: Box<dyn MessageExtractor + Send>,
     decoder: Option<Box<dyn Decoder + Send>>,
-    raw_recorder: Option<Recording<Arc<ReceivedData>>>,
+    data_recorder: Option<DataRecorder>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     view_subsamples: Vec<Subsample>,
     caps: PipelineCapacities,
@@ -222,7 +233,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         runner,
         extractor,
         decoder,
-        raw_recorder,
+        data_recorder,
         display_recorder,
         view_subsamples,
         caps,
@@ -312,7 +323,7 @@ pub fn start_data_channel<R: DataTransportRunner>(
         runner,
         extractor,
         None,
-        raw_recorder,
+        raw_recorder.map(DataRecorder::Raw),
         None,                  // no display recording on a standalone channel
         vec![Subsample::None], // a single default Display View, no subsampling
         caps,

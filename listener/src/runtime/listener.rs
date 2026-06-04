@@ -28,13 +28,13 @@ use crate::record::{
     start_display_recording, start_raw_recording, DisplayFileRecorder, FileRotationPolicy,
     RawFileRecorder, Recording, RecordingMode, RotatingDisplayRecorder, RotatingRawRecorder,
 };
-use crate::transport::{DataTransportRunner, ReceivedData, TransportNotice};
+use crate::transport::{DataTransportRunner, TransportNotice};
 
 use super::build::{
     build_decoder, build_display_view, build_extractor, build_serial, build_tcp_listener,
     build_udp, BuildError,
 };
-use super::channel::{spawn_monitored_channel, MonitoredChannel, TRANSPORT_NOTICES};
+use super::channel::{spawn_monitored_channel, DataRecorder, MonitoredChannel, TRANSPORT_NOTICES};
 use super::pipeline::{DisplayViewHandle, PipelineCapacities};
 use super::snapshot::ChannelSnapshot;
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
@@ -464,7 +464,7 @@ impl Listener {
         id: ChannelId,
         runner: R,
         config: &ChannelConfig,
-        raw_recorder: Option<Recording<Arc<ReceivedData>>>,
+        data_recorder: Option<DataRecorder>,
         display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
         faulted: Arc<AtomicBool>,
         notices_rx: mpsc::Receiver<TransportNotice>,
@@ -474,7 +474,7 @@ impl Listener {
             runner,
             build_extractor(&config.extraction),
             build_decoder(&config.decoder),
-            raw_recorder,
+            data_recorder,
             display_recorder,
             // One runtime Display View per configured view (§48), each with its
             // own subsampling policy (§50.1); at least one (default, no subsample).
@@ -494,7 +494,7 @@ impl Listener {
         &self,
         id: ChannelId,
         config: &ChannelConfig,
-    ) -> Option<Recording<Arc<ReceivedData>>> {
+    ) -> Option<DataRecorder> {
         let recording = &config.recording;
         if recording.mode != RecordingMode::Raw {
             return None;
@@ -507,8 +507,12 @@ impl Listener {
         let policy = recording.overwrite_policy;
         let ts = recording.timestamp_enabled;
         let cap = self.caps.raw_recording;
+        // A subsampled data recording is message-framed `.ssdat` (§50.1/§53), fed
+        // per-Message and decimated; a plain Raw recording is byte-exact `.dat`.
+        let subsampled = recording.subsample != Subsample::None;
+        let ext = if subsampled { ".ssdat" } else { ".dat" };
         // With rotation, `destination` is a directory and files are named per
-        // period from the channel name (§59, `.dat`); otherwise a single file.
+        // period from the channel name (§59); otherwise it is a single file path.
         let created = if recording.file_rotation == FileRotationPolicy::None {
             RawFileRecorder::create(destination, policy, ts)
                 .await
@@ -517,7 +521,7 @@ impl Listener {
             RotatingRawRecorder::create(
                 destination,
                 config.name.as_str(),
-                ".dat",
+                ext,
                 policy,
                 ts,
                 recording.file_rotation,
@@ -526,7 +530,8 @@ impl Listener {
             .map(|r| start_raw_recording(r, cap))
         };
         match created {
-            Ok(recording) => Some(recording),
+            Ok(rec) if subsampled => Some(DataRecorder::Subsampled(rec, recording.subsample)),
+            Ok(rec) => Some(DataRecorder::Raw(rec)),
             Err(_err) => {
                 let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
                 None
@@ -771,6 +776,7 @@ mod tests {
             timestamp_enabled: false,
             overwrite_policy: OverwritePolicy::Refuse,
             file_rotation: FileRotationPolicy::None,
+            subsample: Subsample::None,
         };
         let id = listener.add_channel(config);
 

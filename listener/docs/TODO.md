@@ -164,15 +164,18 @@ runtime-surface expansion stays anchored to a product-readiness bar.
   validation (§71). Tested: period keys/UTC, name safety, raw hour-boundary + display day-boundary
   rotation (unit), config rejection (unit), orchestrator named-file (integration). `.ssdat` (subsampled)
   still pending the subsampling feature.
-- [~] §164 Subsampling — **display-view subsampling DONE.** `config::Subsample` (None / EveryNth{n} /
-  RateLimit{millis}); `runtime::subsample::Subsampler` (count- and time-based); `DisplayViewConfig.subsample`
-  threaded per-view through the pipeline (`set_view_subsamples`), gating each view's history in dispatch;
-  validation rejects `EveryNth{n:0}`. Subsampler advances over the full stream (pause-independent); raw
-  reception/numbering/retention unaffected; subsampled views show gapped (not renumbered) numbers.
-  Tested: Subsampler none/count/rate (unit), config rejection (unit), orchestrator gapped-numbers +
-  other-view/retention-unaffected (integration). *Still to do (part 2)*: `RecordingConfig.subsample` →
-  the **`.ssdat` message-framed data recording** + display-recording (`.disp`) subsampling; per-connection
-  TCP display-subsample inheritance.
+- [x] §164 Subsampling — **DONE** (both acceptance sinks: display view + message recording).
+  `config::Subsample` (None / EveryNth{n} / RateLimit{millis}); `runtime::subsample::Subsampler` (count-
+  and time-based, advances over the full stream so it's pause-independent). **Display views**:
+  `DisplayViewConfig.subsample` threaded per-view (`set_view_subsamples`), gating each view's history in
+  dispatch → gapped (not renumbered) numbers; reception/numbering/retention unaffected. **Data file**:
+  `RecordingConfig.subsample` on a Raw recording makes it a message-framed **`.ssdat`** (vs byte-exact
+  `.dat`) — `pipeline::MessageRecorder` taps the post-extraction Message fan-out, feeding the raw recording
+  task synthetic per-Message chunks, decimated; orchestrator routes Raw+subsample → `.ssdat` via a
+  `DataRecorder` enum. Validation rejects `EveryNth{n:0}`. Tested: Subsampler none/count/rate (unit),
+  config rejection (unit), orchestrator gapped-view + .ssdat decimated-bytes (integration). *Optional
+  extras deferred* (beyond the §164 bar): display-recording (`.disp`) subsampling; per-connection TCP
+  display-subsample inheritance.
 - [ ] §165 Match rules & triggers — each condition fires its actions; record-from-match-forward; mark never touches raw
 - [x] §166 Liveness — **DONE.** `runtime::activity::ActivityMeter` (bounded 5×1s ring) tracks
   `last_data_at` + rolling bytes/sec & msgs/sec; the pipeline records per chunk (ingest) and per
