@@ -18,6 +18,7 @@ use tokio::sync::oneshot;
 use crate::core::{ChannelId, DisplayViewId, RecordingState};
 use crate::diagnostics::Diagnostic;
 
+use super::activity::ChannelActivity;
 use super::pipeline::DecodedMessage;
 
 /// A request for a [`ChannelSnapshot`]: the reply half of a oneshot the pipeline
@@ -43,6 +44,8 @@ pub struct ChannelSnapshot {
     pub diagnostics: DiagnosticsSnapshot,
     /// Raw-recording state, or `None` when raw recording isn't attached (§53).
     pub raw_recording: Option<RecordingState>,
+    /// Liveness facts: rolling throughput + last-data time (§91.1, §166).
+    pub activity: ChannelActivity,
 }
 
 /// One Display View's snapshot: its identity, pause state, and accumulated

@@ -15,6 +15,7 @@
 //!   start/stop/apply-pending in the [`crate::core::RuntimeCommand`] vocabulary.
 //! - [`snapshot`] — on-demand, pull-side readout of a running Channel's state.
 
+pub mod activity;
 pub mod build;
 pub mod channel;
 pub mod listener;
@@ -24,6 +25,7 @@ pub mod queue;
 pub mod snapshot;
 pub mod tcp;
 
+pub use activity::{ActivityMeter, ChannelActivity};
 pub use build::BuildError;
 pub use channel::{start_data_channel, RunningChannel};
 pub use listener::{Listener, OrchestratorError};

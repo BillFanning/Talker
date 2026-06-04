@@ -257,6 +257,39 @@ async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
 }
 
 #[tokio::test]
+async fn snapshot_surfaces_channel_liveness() {
+    // §166: a running channel's snapshot reports liveness — throughput registered
+    // and the last-data time set once data has arrived.
+    let port = free_udp_port();
+    let mut config = templates::udp_template();
+    if let InterfaceConfig::Udp(udp) = &mut config.interface {
+        udp.bind_address = "127.0.0.1".to_string();
+        udp.port = port;
+    }
+    let mut listener = Listener::with_default_capacities();
+    let mut events = listener.take_events().unwrap();
+    let id = listener.add_channel(config);
+    listener.start(id).await.unwrap();
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .send_to(b"hello-liveness", ("127.0.0.1", port))
+        .await
+        .unwrap();
+    assert_eq!(next_message(&mut events).await, (id, 1));
+
+    let snap = listener
+        .snapshot(id)
+        .await
+        .expect("running channel snapshots");
+    assert!(snap.activity.last_data_at.is_some(), "data has arrived");
+    assert!(snap.activity.bytes_per_sec > 0.0, "throughput registered");
+    assert!(snap.activity.messages_per_sec > 0.0);
+
+    stop(&mut listener, id).await;
+}
+
+#[tokio::test]
 async fn snapshot_exposes_message_metadata_and_nmea_integrity() {
     // §157/§160 acceptance: a live snapshot carries per-Message metadata (number,
     // byte count, arrival, reception duration) and NMEA integrity — and a

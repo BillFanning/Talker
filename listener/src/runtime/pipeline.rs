@@ -12,10 +12,12 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 
+use super::activity::ActivityMeter;
 use super::snapshot::{ChannelSnapshot, DiagnosticsSnapshot, DisplayViewSnapshot, SnapshotRequest};
 
 use crate::core::{
@@ -160,6 +162,8 @@ pub struct ChannelPipeline {
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     /// Whether the raw recorder's fault has already been reported.
     recording_fault_reported: bool,
+    /// Per-Channel liveness facts (§91.1): rolling throughput + last-data time.
+    activity: ActivityMeter,
     events: Option<Sender<RuntimeEvent>>,
 }
 
@@ -183,6 +187,7 @@ impl ChannelPipeline {
             ),
             raw_recorder: None,
             recording_fault_reported: false,
+            activity: ActivityMeter::new(),
             events: None,
         }
     }
@@ -220,6 +225,10 @@ impl ChannelPipeline {
     /// and bypasses extraction entirely (§15).
     pub fn ingest(&mut self, data: ReceivedData) {
         let data = Arc::new(data);
+
+        // Liveness (§91.1): count received bytes at the chunk's arrival time.
+        self.activity
+            .record_chunk(data.received_at.monotonic, data.payload.bytes().len());
 
         // 1. Raw recorder tap (pre-extraction, §53). Non-blocking: a full
         // recorder queue faults the recording rather than stalling reception
@@ -268,6 +277,9 @@ impl ChannelPipeline {
     /// non-blocking consumer edges (§108).
     fn dispatch(&mut self, msg: Arc<Message>) {
         let number = msg.number;
+        // Liveness (§91.1): count completed Messages at their arrival time.
+        self.activity
+            .record_message(msg.metadata.arrival_timestamp.monotonic);
 
         // Decoding stage (§102): read-only; failures are isolated (§32) and
         // surfaced as diagnostics (§37), never stopping the pipeline.
@@ -445,6 +457,7 @@ impl ChannelPipeline {
                 errors: self.diagnostics.errors().cloned().collect(),
             },
             raw_recording: self.raw_recorder.as_ref().map(|r| r.state()),
+            activity: self.activity.snapshot(Instant::now()),
         }
     }
 }

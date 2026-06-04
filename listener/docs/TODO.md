@@ -166,7 +166,11 @@ runtime-surface expansion stays anchored to a product-readiness bar.
   still pending the subsampling feature.
 - [ ] §164 Subsampling — per-sink count/time; raw never subsampled; numbering unaffected, gaps not renumbered
 - [ ] §165 Match rules & triggers — each condition fires its actions; record-from-match-forward; mark never touches raw
-- [ ] §166 Liveness — throughput + idle surfaced, bounded, no reception impact
+- [x] §166 Liveness — **DONE.** `runtime::activity::ActivityMeter` (bounded 5×1s ring) tracks
+  `last_data_at` + rolling bytes/sec & msgs/sec; the pipeline records per chunk (ingest) and per
+  Message (dispatch); surfaced in `ChannelSnapshot.activity` (`ChannelActivity`). Fact source only —
+  consumers derive "idle" against their own threshold (unblocks MR&T `Idle`, §50.2). Tested: meter
+  window/decay/zero (unit), orchestrator snapshot shows throughput + last-data (integration).
 - [ ] §167 Network live adjustment — SO_RCVBUF, multicast join/leave + interface; re-bind via apply-pending
 - [ ] §168 Disk-space guard — warn/stop on low disk, clean finalize, reception continues
 
