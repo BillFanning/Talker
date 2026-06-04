@@ -163,6 +163,16 @@ pub fn validate_channel(
         errors.push(ChannelConfigError::InvalidChannelName);
     }
 
+    // A count-based subsample must pass at least one of every N (§50.1).
+    if channel
+        .display
+        .views
+        .iter()
+        .any(|v| matches!(v.subsample, Subsample::EveryNth { n: 0 }))
+    {
+        errors.push(ChannelConfigError::InvalidSubsample);
+    }
+
     // Retention must be bounded (§80): use the channel's own limits, or the
     // profile default if the channel sets none.
     let effective = if channel.retention.is_unbounded() {
@@ -218,6 +228,8 @@ pub enum ChannelConfigError {
         "channel name is not filesystem-safe but recording file rotation uses it in filenames (§59)"
     )]
     InvalidChannelName,
+    #[error("count-based subsampling requires n >= 1 (§50.1)")]
+    InvalidSubsample,
 }
 
 #[cfg(test)]
@@ -264,6 +276,20 @@ mod tests {
             Ok(()) => {}
             Err(e) => assert!(!e.contains(&ChannelConfigError::InvalidChannelName)),
         }
+    }
+
+    #[test]
+    fn count_subsampling_requires_positive_n() {
+        let mut channel = templates::udp_template();
+        let defaults = DefaultConfig::default();
+
+        channel.display.views[0].subsample = Subsample::EveryNth { n: 0 };
+        assert!(validate_channel(&channel, &defaults)
+            .unwrap_err()
+            .contains(&ChannelConfigError::InvalidSubsample));
+
+        channel.display.views[0].subsample = Subsample::EveryNth { n: 5 };
+        assert!(validate_channel(&channel, &defaults).is_ok());
     }
 
     #[test]

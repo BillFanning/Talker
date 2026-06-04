@@ -152,6 +152,20 @@ pub enum DecoderConfig {
     },
 }
 
+/// Per-sink subsampling policy (§50.1): which Messages pass to a sink, to keep a
+/// fast stream readable or a log compact. Applies to display views and
+/// message-oriented recordings; raw byte data (`.dat`) is never subsampled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "policy")]
+pub enum Subsample {
+    #[default]
+    None,
+    /// Count-based: pass one of every `n` Messages (`n >= 1`).
+    EveryNth { n: u32 },
+    /// Time-based: pass at most one Message per `millis` milliseconds.
+    RateLimit { millis: u64 },
+}
+
 /// Display configuration: a set of views (§78).
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct DisplayConfig {
@@ -175,6 +189,9 @@ pub struct DisplayViewConfig {
     pub wrapping: WrappingMode,
     #[serde(default)]
     pub metadata_visible: bool,
+    /// Subsampling for this view's on-screen history (§50.1); default `None`.
+    #[serde(default)]
+    pub subsample: Subsample,
 }
 
 /// Recording configuration (§79).

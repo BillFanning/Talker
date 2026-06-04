@@ -21,7 +21,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::config::schema::InterfaceConfig;
-use crate::config::ChannelConfig;
+use crate::config::{ChannelConfig, Subsample};
 use crate::core::{ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
 use crate::display::{DisplayView, RenderedOutput};
 use crate::record::{
@@ -38,6 +38,16 @@ use super::channel::{spawn_monitored_channel, MonitoredChannel, TRANSPORT_NOTICE
 use super::pipeline::{DisplayViewHandle, PipelineCapacities};
 use super::snapshot::ChannelSnapshot;
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
+
+/// Per-view subsampling policies for a Channel (§50.1), in view order. At least
+/// one entry, so the pipeline's default Display View is always covered.
+fn view_subsamples(config: &ChannelConfig) -> Vec<Subsample> {
+    if config.display.views.is_empty() {
+        vec![Subsample::None]
+    } else {
+        config.display.views.iter().map(|v| v.subsample).collect()
+    }
+}
 
 /// A live Channel's running tasks. Held by the orchestrator so it can stop them.
 enum ChannelHandle {
@@ -466,8 +476,9 @@ impl Listener {
             build_decoder(&config.decoder),
             raw_recorder,
             display_recorder,
-            // One runtime Display View per configured view (§48); at least one.
-            config.display.views.len(),
+            // One runtime Display View per configured view (§48), each with its
+            // own subsampling policy (§50.1); at least one (default, no subsample).
+            view_subsamples(config),
             self.channel_caps(config),
             self.events_tx.clone(),
             faulted,

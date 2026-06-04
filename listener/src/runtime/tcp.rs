@@ -22,6 +22,7 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::Subsample;
 use crate::core::{ChannelId, RuntimeEvent};
 use crate::decode::Decoder;
 use crate::extract::MessageExtractor;
@@ -124,7 +125,9 @@ where
                             // per connection need §59 filename templates).
                             None,
                             None,
-                            1, // one default Display View per connection
+                            // One default Display View per connection; per-connection
+                            // display subsampling inheritance is deferred (§50.1).
+                            vec![Subsample::None],
                             caps,
                             events.clone(),
                             notice_rx,

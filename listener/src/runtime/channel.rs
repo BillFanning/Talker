@@ -25,6 +25,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::Subsample;
 use crate::core::{ChannelId, RuntimeEvent};
 use crate::decode::Decoder;
 use crate::display::{DisplayView, RenderedOutput};
@@ -78,7 +79,7 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     decoder: Option<Box<dyn Decoder + Send>>,
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
-    display_view_count: usize,
+    view_subsamples: Vec<Subsample>,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
     notices_rx: Receiver<TransportNotice>,
@@ -94,10 +95,12 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     if let Some(recorder) = raw_recorder {
         pipeline = pipeline.with_raw_recorder(recorder);
     }
-    // `new` created the default Display View; add the rest to reach the count.
-    for _ in 1..display_view_count.max(1) {
+    // `new` created the default Display View; add the rest to reach the count, then
+    // apply each view's subsampling policy (§50.1).
+    for _ in 1..view_subsamples.len().max(1) {
         pipeline.add_display_view(caps.display);
     }
+    pipeline.set_view_subsamples(&view_subsamples);
     if let Some((renderer, recording)) = display_recorder {
         pipeline.set_display_recorder(renderer, recording);
     }
@@ -199,7 +202,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     decoder: Option<Box<dyn Decoder + Send>>,
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
-    display_view_count: usize,
+    view_subsamples: Vec<Subsample>,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
     faulted: Arc<AtomicBool>,
@@ -221,7 +224,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         decoder,
         raw_recorder,
         display_recorder,
-        display_view_count,
+        view_subsamples,
         caps,
         events,
         notices_rx,
@@ -310,8 +313,8 @@ pub fn start_data_channel<R: DataTransportRunner>(
         extractor,
         None,
         raw_recorder,
-        None, // no display recording on a standalone channel
-        1,    // a single default Display View
+        None,                  // no display recording on a standalone channel
+        vec![Subsample::None], // a single default Display View, no subsampling
         caps,
         event_tx,
         faulted.clone(),

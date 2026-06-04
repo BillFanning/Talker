@@ -19,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::activity::ActivityMeter;
 use super::snapshot::{ChannelSnapshot, DiagnosticsSnapshot, DisplayViewSnapshot, SnapshotRequest};
+use super::subsample::Subsampler;
+use crate::config::Subsample;
 
 use crate::core::{
     ChannelId, DisplayViewId, Message, MessageBytes, ProtocolMetadata, RecordingState, RuntimeEvent,
@@ -125,12 +127,14 @@ struct ViewRecorder {
     recording: Recording<RenderedOutput>,
 }
 
-/// One Display View's runtime state: pause handle, bounded history (§87), and an
-/// optional Display Recording (§54).
+/// One Display View's runtime state: pause handle, bounded history (§87), an
+/// optional Display Recording (§54), and an optional subsampler for its history
+/// (§50.1).
 struct PipelineDisplayView {
     handle: DisplayViewHandle,
     history: DropOldestQueue<DecodedMessage>,
     recorder: Option<ViewRecorder>,
+    subsampler: Subsampler,
 }
 
 impl PipelineDisplayView {
@@ -139,6 +143,7 @@ impl PipelineDisplayView {
             handle: DisplayViewHandle::new_active(),
             history: DropOldestQueue::with_capacity(capacity),
             recorder: None,
+            subsampler: Subsampler::new(Subsample::None),
         }
     }
 }
@@ -303,15 +308,18 @@ impl ChannelPipeline {
         // Display fan-out (§48, §108). For each view:
         //  - Display Recording renders + records the Message regardless of pause
         //    (§58): pausing presentation never pauses recording.
-        //  - Presentation history accumulates only while Active (§50), dropping
-        //    oldest on overflow (§99), without affecting reception/retention/
-        //    numbering or other views.
+        //  - Presentation history accumulates only while Active (§50) and only for
+        //    Messages that pass the view's subsampler (§50.1), dropping oldest on
+        //    overflow (§99), without affecting reception/retention/numbering or
+        //    other views. The subsampler advances over the full stream, so pausing
+        //    does not change which Messages it would pass.
+        let at = decoded.message.metadata.arrival_timestamp.monotonic;
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.as_mut() {
                 let rendered = rec.renderer.render(&decoded.message);
                 rec.recording.try_record(rendered);
             }
-            if !view.handle.is_paused() {
+            if view.subsampler.should_pass(at) && !view.handle.is_paused() {
                 let _ = view.history.push(decoded.clone());
             }
         }
@@ -381,6 +389,14 @@ impl ChannelPipeline {
         let handle = view.handle.clone();
         self.display_views.push(view);
         handle
+    }
+
+    /// Set each Display View's subsampling policy (§50.1), in creation order.
+    /// Views without a matching policy keep `Subsample::None`.
+    pub fn set_view_subsamples(&mut self, policies: &[Subsample]) {
+        for (view, &policy) in self.display_views.iter_mut().zip(policies) {
+            view.subsampler = Subsampler::new(policy);
+        }
     }
 
     /// Attach a Display Recording to the primary (first) Display View (§54),

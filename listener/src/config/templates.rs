@@ -21,6 +21,7 @@ fn view(mode: DisplayMode, metadata_visible: bool) -> DisplayViewConfig {
         background_color: None,
         wrapping: WrappingMode::NoWrap,
         metadata_visible,
+        subsample: Subsample::None,
     }
 }
 

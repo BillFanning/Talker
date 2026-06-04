@@ -23,6 +23,7 @@ pub mod metadata;
 pub mod pipeline;
 pub mod queue;
 pub mod snapshot;
+pub mod subsample;
 pub mod tcp;
 
 pub use activity::{ActivityMeter, ChannelActivity};
@@ -35,4 +36,5 @@ pub use queue::{
     Diagnostic, DiagnosticSeverity, DiagnosticsQueue, DropOldestQueue, FaultOnFullQueue, QueueFull,
 };
 pub use snapshot::{ChannelSnapshot, DiagnosticsSnapshot, DisplayViewSnapshot, SnapshotRequest};
+pub use subsample::Subsampler;
 pub use tcp::{start_tcp_listener, TcpListenerHandle};

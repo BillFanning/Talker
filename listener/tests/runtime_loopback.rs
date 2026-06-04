@@ -257,6 +257,54 @@ async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
 }
 
 #[tokio::test]
+async fn subsampling_thins_a_view_without_renumbering_or_affecting_others() {
+    // §164: a view's subsampler passes a subset of Messages with their original
+    // (gapped, not renumbered) numbers, while retention and other views see every
+    // Message — reception/numbering are unaffected.
+    use listener::config::Subsample;
+
+    let port = free_udp_port();
+    let mut config = templates::udp_template(); // Raw + Hex views
+    if let InterfaceConfig::Udp(udp) = &mut config.interface {
+        udp.bind_address = "127.0.0.1".to_string();
+        udp.port = port;
+    }
+    // Subsample only the first (Raw) view: 1 of every 2 Messages.
+    config.display.views[0].subsample = Subsample::EveryNth { n: 2 };
+
+    let mut listener = Listener::with_default_capacities();
+    let mut events = listener.take_events().unwrap();
+    let id = listener.add_channel(config);
+    listener.start(id).await.unwrap();
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for n in 1..=4u8 {
+        client
+            .send_to(&[b'0' + n], ("127.0.0.1", port))
+            .await
+            .unwrap();
+        assert_eq!(next_message(&mut events).await, (id, n as u64));
+    }
+
+    let snap = listener
+        .snapshot(id)
+        .await
+        .expect("running channel snapshots");
+    let nums = |v: &listener::runtime::DisplayViewSnapshot| -> Vec<u64> {
+        v.messages.iter().map(|d| d.message.number).collect()
+    };
+    // Subsampled view: 1 of every 2, original Message Numbers (gapped, not renumbered).
+    assert_eq!(nums(&snap.display_views[0]), vec![1, 3]);
+    // The other view saw every Message.
+    assert_eq!(nums(&snap.display_views[1]), vec![1, 2, 3, 4]);
+    // Reception/retention/numbering unaffected.
+    let retained: Vec<u64> = snap.retained.iter().map(|d| d.message.number).collect();
+    assert_eq!(retained, vec![1, 2, 3, 4]);
+
+    stop(&mut listener, id).await;
+}
+
+#[tokio::test]
 async fn snapshot_surfaces_channel_liveness() {
     // §166: a running channel's snapshot reports liveness — throughput registered
     // and the last-data time set once data has arrived.
