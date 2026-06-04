@@ -133,8 +133,8 @@ decoder); these are separate, deliberately-scoped omissions:
 ## Acceptance (§153–§160 — the product-ready bar)
 
 Not all acceptance criteria are proven end-to-end yet (some are checked or partial
-below; the v1.2 addendum §161–§168 is entirely unproven). Each generally needs the
-wiring above first.
+below; the v1.2 addendum §161–§168 is mostly implemented now — only §165 remains,
+with §167 UDP-only). Each generally needs the wiring above first.
 
 - [ ] §153 Channel operation — create from templates, start/stop independently, run many
 - [ ] §154 TCP connections — accept, one channel/client, independent, not persisted
@@ -150,7 +150,7 @@ wiring above first.
 - [x] §160 NMEA0183 — decoder behavior proven through a running channel: a valid sentence reports
   integrity Valid + message type, a bad-checksum sentence is retained and annotated Invalid (§37).
 
-### v1.2 acceptance addendum (spec §161–§168) — all unimplemented, all unproven
+### v1.2 acceptance addendum (spec §161–§168) — only §165 remains (§167 UDP-only)
 
 Per the v1.2 review: build acceptance/tests **before** implementing each, so the
 runtime-surface expansion stays anchored to a product-readiness bar.
@@ -203,7 +203,17 @@ runtime-surface expansion stays anchored to a product-readiness bar.
   *Deferred*: `TcpListenerConfig.recv_buffer_bytes` (field added, not yet applied to the listener socket);
   truly-live no-restart commands (`SetReceiveBuffer`/`JoinMulticast`/`LeaveMulticast` into the running UDP
   task) — spec §76.1 marks live RCVBUF best-effort, so apply-pending restart covers it for v1.
-- [ ] §168 Disk-space guard — warn/stop on low disk, clean finalize, reception continues
+- [x] §168 Disk-space guard — **DONE.** `config::DiskGuard` {min_free: `DiskThreshold` (Bytes|Percent),
+  on_low: `LowDiskAction` (Warn|StopRecording)}; `RecordingConfig.disk_guard`. The guard lives in the
+  pipeline (which owns the recorders): `run_channel` polls free space every 5s (`fs2`, off the hot path)
+  via `check_disk_guard`. On a low condition it records a warning diagnostic and emits `DiskSpaceLow`
+  once per episode (debounced; re-arms when space recovers); if the policy is `StopRecording` it
+  finalizes **all** recordings (raw/.ssdat/display) cleanly and emits `RecordingStoppedLowDisk` while
+  reception/extraction/display/retention continue (§96). Events added to `RuntimeEvent` + CLI. Orchestrator
+  wires the guard only when both a guard and a recording destination are configured. Added `fs2` dep.
+  Tested: `disk_is_low` byte/percent/zero-total (unit), pipeline stop-once + both events + idempotence
+  with a real recorder and `min_free = u64::MAX` (unit/async). *Deferred*: the periodic poll is fixed at
+  5s (not yet configurable).
 
 ---
 

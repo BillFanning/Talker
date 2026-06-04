@@ -10,9 +10,10 @@
 //! only edge permitted to stall the reader is the Transport→Extractor channel
 //! (§97.1), the bounded `tokio::sync::mpsc` that feeds [`run_channel`].
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
@@ -20,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use super::activity::ActivityMeter;
 use super::snapshot::{ChannelSnapshot, DiagnosticsSnapshot, DisplayViewSnapshot, SnapshotRequest};
 use super::subsample::Subsampler;
-use crate::config::Subsample;
+use crate::config::{DiskGuard, DiskThreshold, LowDiskAction, Subsample};
 
 use crate::core::{
     ChannelId, ChunkTime, DisplayViewId, Message, MessageBytes, ProtocolMetadata, RecordingState,
@@ -182,6 +183,11 @@ pub struct ChannelPipeline {
     /// Subsampled message-framed data recording (`.ssdat`, §50.1); mutually
     /// exclusive with `raw_recorder` (a Raw recording is one or the other).
     message_recorder: Option<MessageRecorder>,
+    /// Disk-space guard for recording (§56.2, §168): the policy and the path whose
+    /// filesystem free space is polled. `None` = no guard.
+    disk_guard: Option<(DiskGuard, PathBuf)>,
+    /// Whether the low-disk condition has already been reported (debounce).
+    disk_low_reported: bool,
     /// Per-Channel liveness facts (§91.1): rolling throughput + last-data time.
     activity: ActivityMeter,
     events: Option<Sender<RuntimeEvent>>,
@@ -208,6 +214,8 @@ impl ChannelPipeline {
             raw_recorder: None,
             recording_fault_reported: false,
             message_recorder: None,
+            disk_guard: None,
+            disk_low_reported: false,
             activity: ActivityMeter::new(),
             events: None,
         }
@@ -233,6 +241,14 @@ impl ChannelPipeline {
             subsampler: Subsampler::new(subsample),
             fault_reported: false,
         });
+        self
+    }
+
+    /// Attach a disk-space guard (§56.2, §168): `path`'s filesystem free space is
+    /// polled, and on a low condition the guard warns and, per its policy, stops
+    /// recording.
+    pub fn with_disk_guard(mut self, guard: DiskGuard, path: PathBuf) -> Self {
+        self.disk_guard = Some((guard, path));
         self
     }
 
@@ -420,6 +436,63 @@ impl ChannelPipeline {
         }
     }
 
+    /// Poll the recording filesystem's free space and act on a low condition
+    /// (§56.2, §168). Called periodically (not per write). Warns once per low
+    /// episode and, if the policy is `StopRecording`, finalizes and stops the
+    /// recordings while reception continues (§96). A failed space query is ignored.
+    pub async fn check_disk_guard(&mut self) {
+        let Some((guard, path)) = self.disk_guard.clone() else {
+            return;
+        };
+        // Only meaningful while a recording is active.
+        if self.raw_recorder.is_none()
+            && self.message_recorder.is_none()
+            && !self.display_views.iter().any(|v| v.recorder.is_some())
+        {
+            return;
+        }
+        let (Ok(free), Ok(total)) = (fs2::available_space(&path), fs2::total_space(&path)) else {
+            return; // cannot determine free space; do not act
+        };
+        if !disk_is_low(free, total, guard.min_free) {
+            self.disk_low_reported = false;
+            return;
+        }
+        if self.disk_low_reported {
+            return; // already reported this episode
+        }
+        self.disk_low_reported = true;
+        self.diagnostics.record(Diagnostic::warning(format!(
+            "low disk for recording on channel {}: {free} bytes free",
+            self.channel_id
+        )));
+        if let Some(events) = &self.events {
+            let _ = events.try_send(RuntimeEvent::DiskSpaceLow(self.channel_id));
+        }
+        if guard.on_low == LowDiskAction::StopRecording {
+            self.stop_all_recording().await;
+            if let Some(events) = &self.events {
+                let _ = events.try_send(RuntimeEvent::RecordingStoppedLowDisk(self.channel_id));
+            }
+        }
+    }
+
+    /// Finalize and drop every recording on this Channel (§56). Reception,
+    /// extraction, display, and retention are unaffected (§96).
+    async fn stop_all_recording(&mut self) {
+        if let Some(recorder) = self.raw_recorder.take() {
+            recorder.finalize(RecordingStopReason::Disabled).await;
+        }
+        if let Some(mr) = self.message_recorder.take() {
+            mr.recording.finalize(RecordingStopReason::Disabled).await;
+        }
+        for view in &mut self.display_views {
+            if let Some(rec) = view.recorder.take() {
+                rec.recording.finalize(RecordingStopReason::Disabled).await;
+            }
+        }
+    }
+
     /// Called at Channel stop (§110, §112): discard any partial Message (§112)
     /// and finalize the recorder — flush and close (§56).
     pub async fn finish(&mut self) {
@@ -552,6 +625,16 @@ impl ChannelPipeline {
     }
 }
 
+/// Whether `free` bytes is below the disk-guard threshold (§168).
+fn disk_is_low(free: u64, total: u64, threshold: DiskThreshold) -> bool {
+    match threshold {
+        DiskThreshold::Bytes { bytes } => free < bytes,
+        DiskThreshold::Percent { percent } => {
+            total > 0 && (free as u128) * 100 < (total as u128) * (percent as u128)
+        }
+    }
+}
+
 /// The async ingest loop for one Channel (§102, §110, §111).
 ///
 /// Drains the bounded Transport→Extractor channel until cancelled or the sender
@@ -574,6 +657,10 @@ pub async fn run_channel(
 ) -> ChannelPipeline {
     let mut snapshots_open = true;
     let mut notices_open = true;
+    // Periodic disk-space guard poll (§56.2, §168) — not per write. Cheap when no
+    // guard is configured (the check returns immediately).
+    let mut disk_check = tokio::time::interval(Duration::from_secs(5));
+    disk_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             biased;
@@ -588,6 +675,7 @@ pub async fn run_channel(
                 Some(notice) => pipeline.record_notice(notice),
                 None => notices_open = false, // transport gone; keep running
             },
+            _ = disk_check.tick() => pipeline.check_disk_guard().await,
             maybe = ingest.recv() => match maybe {
                 Some(data) => pipeline.ingest(data),
                 None => break,
@@ -1019,6 +1107,70 @@ mod tests {
 
         cancel.cancel();
         let _ = handle.await.unwrap();
+    }
+
+    #[test]
+    fn disk_is_low_compares_bytes_and_percent_thresholds() {
+        // Bytes: low strictly below the floor.
+        let bytes = DiskThreshold::Bytes { bytes: 1_000 };
+        assert!(disk_is_low(999, 10_000, bytes));
+        assert!(!disk_is_low(1_000, 10_000, bytes));
+        // Percent: low when free is below percent% of total.
+        let pct = DiskThreshold::Percent { percent: 10 };
+        assert!(disk_is_low(999, 10_000, pct)); // 9.99% < 10%
+        assert!(!disk_is_low(1_000, 10_000, pct)); // exactly 10% is not low
+                                                   // A zero/unknown total never reads as low (avoids divide-by-zero panics).
+        assert!(!disk_is_low(0, 0, pct));
+    }
+
+    #[tokio::test]
+    async fn disk_guard_stops_recording_once_and_emits_events() {
+        use crate::record::{start_raw_recording, RawFileRecorder};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Unique temp file (coarse Windows clock → use a process-static counter).
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "listener-diskguard-{}-{}.dat",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let cid = ChannelId::new();
+        let recorder =
+            RawFileRecorder::create(&path, crate::record::OverwritePolicy::Overwrite, false)
+                .await
+                .unwrap();
+        let recording = start_raw_recording(recorder, 16);
+
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(8);
+        // min_free = u64::MAX forces a permanent low-disk condition; StopRecording.
+        let guard = DiskGuard {
+            min_free: DiskThreshold::Bytes { bytes: u64::MAX },
+            on_low: LowDiskAction::StopRecording,
+        };
+        let mut p = lf_pipeline(cid, PipelineCapacities::default())
+            .with_raw_recorder(recording)
+            .with_event_sender(ev_tx)
+            .with_disk_guard(guard, std::env::temp_dir());
+        assert!(p.raw_recorder.is_some());
+
+        p.check_disk_guard().await;
+
+        // The guard warned, stopped the recording, and announced both (§168).
+        assert!(p.raw_recorder.is_none(), "recording stopped on low disk");
+        assert_eq!(ev_rx.recv().await.unwrap(), RuntimeEvent::DiskSpaceLow(cid));
+        assert_eq!(
+            ev_rx.recv().await.unwrap(),
+            RuntimeEvent::RecordingStoppedLowDisk(cid)
+        );
+
+        // Idempotent within one low episode: a second poll re-emits nothing.
+        p.check_disk_guard().await;
+        assert!(ev_rx.try_recv().is_err());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

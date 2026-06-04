@@ -228,6 +228,7 @@ async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::Hourly,
         subsample: Subsample::None,
+        disk_guard: None,
     };
 
     let mut listener = Listener::with_default_capacities();
@@ -333,6 +334,7 @@ async fn subsampled_data_recording_writes_decimated_message_bytes() {
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
         subsample: Subsample::EveryNth { n: 2 },
+        disk_guard: None,
     };
 
     let mut listener = Listener::with_default_capacities();

@@ -23,6 +23,9 @@ serialport = "4"
 # ── Raw socket options (SO_RCVBUF, §167) ──────────────────────────────────────
 socket2 = "0.5"
 
+# ── Filesystem free space for the recording disk guard (§168) ─────────────────
+fs2 = "0.4"
+
 # ── GUI ───────────────────────────────────────────────────────────────────────
 # eframe and egui MUST share the same minor version.
 eframe = { version = "0.34", default-features = false, features = [

@@ -128,6 +128,7 @@ where
                             // One default Display View per connection; per-connection
                             // display subsampling inheritance is deferred (§50.1).
                             vec![Subsample::None],
+                            None, // per-connection recording (and its guard) deferred
                             caps,
                             events.clone(),
                             notice_rx,

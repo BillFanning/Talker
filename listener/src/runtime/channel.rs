@@ -25,7 +25,9 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::Subsample;
+use std::path::PathBuf;
+
+use crate::config::{DiskGuard, Subsample};
 use crate::core::{ChannelId, RuntimeEvent};
 use crate::decode::Decoder;
 use crate::display::{DisplayView, RenderedOutput};
@@ -89,6 +91,7 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     data_recorder: Option<DataRecorder>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     view_subsamples: Vec<Subsample>,
+    disk_guard: Option<(DiskGuard, PathBuf)>,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
     notices_rx: Receiver<TransportNotice>,
@@ -114,6 +117,9 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     pipeline.set_view_subsamples(&view_subsamples);
     if let Some((renderer, recording)) = display_recorder {
         pipeline.set_display_recorder(renderer, recording);
+    }
+    if let Some((guard, path)) = disk_guard {
+        pipeline = pipeline.with_disk_guard(guard, path);
     }
     let display_handles = pipeline.display_view_handles();
 
@@ -214,6 +220,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     data_recorder: Option<DataRecorder>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     view_subsamples: Vec<Subsample>,
+    disk_guard: Option<(DiskGuard, PathBuf)>,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
     faulted: Arc<AtomicBool>,
@@ -236,6 +243,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         data_recorder,
         display_recorder,
         view_subsamples,
+        disk_guard,
         caps,
         events,
         notices_rx,
@@ -326,6 +334,7 @@ pub fn start_data_channel<R: DataTransportRunner>(
         raw_recorder.map(DataRecorder::Raw),
         None,                  // no display recording on a standalone channel
         vec![Subsample::None], // a single default Display View, no subsampling
+        None,                  // no disk guard on a standalone channel
         caps,
         event_tx,
         faulted.clone(),

@@ -44,4 +44,10 @@ pub enum RuntimeEvent {
     ChannelReconnected(ChannelId),
     /// Auto-reconnect gave up after `max_attempts`; the Channel stays Faulted.
     ChannelReconnectGaveUp(ChannelId),
+    /// Free disk space for a Channel's recording fell below its guard threshold
+    /// (§56.2, §168). Recording may continue (Warn) or stop (see below).
+    DiskSpaceLow(ChannelId),
+    /// A recording was stopped and finalized because of low disk (§168); reception
+    /// continues.
+    RecordingStoppedLowDisk(ChannelId),
 }

@@ -671,6 +671,12 @@ impl Listener {
             // One runtime Display View per configured view (§48), each with its
             // own subsampling policy (§50.1); at least one (default, no subsample).
             view_subsamples(config),
+            // Disk-space guard (§56.2, §168): only when both a guard and a
+            // recording destination are configured.
+            config
+                .recording
+                .disk_guard
+                .zip(config.recording.destination.clone()),
             self.channel_caps(config),
             self.events_tx.clone(),
             faulted,
@@ -1068,6 +1074,7 @@ mod tests {
             overwrite_policy: OverwritePolicy::Refuse,
             file_rotation: FileRotationPolicy::None,
             subsample: Subsample::None,
+            disk_guard: None,
         };
         let id = listener.add_channel(config);
 

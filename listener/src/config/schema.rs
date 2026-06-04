@@ -271,6 +271,37 @@ pub struct RecordingConfig {
     /// `.dat` (raw byte data is never subsampled, §53). Default `None`.
     #[serde(default)]
     pub subsample: Subsample,
+    /// Disk-space guard for long-running recordings (§56.2, §168); `None` = off.
+    #[serde(default)]
+    pub disk_guard: Option<DiskGuard>,
+}
+
+/// Disk-space guard for a recording (§56.2, §168). When free space on the
+/// destination filesystem falls below `min_free`, Listener warns and, if
+/// `on_low` is `StopRecording`, finalizes the recording cleanly and stops it while
+/// reception continues. Free space is polled periodically, not per write.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DiskGuard {
+    pub min_free: DiskThreshold,
+    pub on_low: LowDiskAction,
+}
+
+/// A low-disk threshold (§168): absolute bytes or a percentage of the filesystem.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum DiskThreshold {
+    Bytes { bytes: u64 },
+    Percent { percent: u8 },
+}
+
+/// What to do when free disk space is low (§168).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LowDiskAction {
+    /// Warn only; recording continues.
+    #[default]
+    Warn,
+    /// Finalize and stop the recording cleanly; reception continues (§96).
+    StopRecording,
 }
 
 /// Retention limits (§80). At least one applicable limit must be set — an

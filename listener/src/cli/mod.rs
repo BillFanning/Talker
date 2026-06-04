@@ -159,6 +159,10 @@ fn format_event(event: &RuntimeEvent) -> String {
         }
         RuntimeEvent::ChannelReconnected(id) => format!("[{id}] reconnected"),
         RuntimeEvent::ChannelReconnectGaveUp(id) => format!("[{id}] reconnect gave up"),
+        RuntimeEvent::DiskSpaceLow(id) => format!("[{id}] LOW DISK"),
+        RuntimeEvent::RecordingStoppedLowDisk(id) => {
+            format!("[{id}] recording stopped (low disk)")
+        }
     }
 }
 
