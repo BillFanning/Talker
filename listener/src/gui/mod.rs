@@ -13,7 +13,10 @@ pub mod state;
 
 use anyhow::anyhow;
 
-use crate::config::{templates, ChannelConfig, DecoderConfig, InterfaceConfig};
+use crate::config::{
+    templates, ChannelConfig, DataBits, DecoderConfig, FlowControl, InterfaceConfig, Parity,
+    StopBits,
+};
 use crate::core::ChannelId;
 use crate::decode::NmeaValidationMode;
 
@@ -212,6 +215,10 @@ struct ListenerApp {
     add_endpoint: String,
     add_baud: u32,
     add_nmea: bool,
+    add_data_bits: DataBits,
+    add_parity: Parity,
+    add_stop_bits: StopBits,
+    add_flow_control: FlowControl,
     msg_view: MsgView,
     /// Edit buffer for the selected channel's port/baud (the "Configure" row), and
     /// which channel it was seeded from (re-seeded when the selection changes).
@@ -231,6 +238,10 @@ impl ListenerApp {
             add_endpoint: String::new(),
             add_baud: 9600,
             add_nmea: false,
+            add_data_bits: DataBits::default(),
+            add_parity: Parity::default(),
+            add_stop_bits: StopBits::default(),
+            add_flow_control: FlowControl::default(),
             msg_view: MsgView::Text,
             edit_for: None,
             edit_endpoint: String::new(),
@@ -289,6 +300,10 @@ impl ListenerApp {
                 if let InterfaceConfig::Serial(serial) = &mut config.interface {
                     serial.port = endpoint.to_string();
                     serial.baud_rate = self.add_baud;
+                    serial.data_bits = self.add_data_bits;
+                    serial.parity = self.add_parity;
+                    serial.stop_bits = self.add_stop_bits;
+                    serial.flow_control = self.add_flow_control;
                 }
                 config
             }
@@ -309,7 +324,7 @@ impl ListenerApp {
                 self.status = format!("added a {kind} channel");
                 self.add_endpoint.clear();
             }
-            None => self.status = "enter a valid port (UDP/TCP) or port name (serial)".to_string(),
+            None => self.status = invalid_endpoint_message(self.add_kind),
         }
     }
 
@@ -348,7 +363,10 @@ impl ListenerApp {
             }
         };
         if !ok {
-            self.status = "enter a valid port to apply".to_string();
+            self.status = match config.interface {
+                InterfaceConfig::Serial(_) => "enter a serial port name (e.g. COM3)".to_string(),
+                _ => "enter a valid port number (1–65535)".to_string(),
+            };
             return;
         }
         self.send(UiCommand::Reconfigure(id, Box::new(config)));
@@ -386,6 +404,22 @@ impl ListenerApp {
                 self.add_channel();
             }
         });
+        // Serial framing options (§74) on a second row when Serial is selected.
+        if self.add_kind == AddKind::Serial {
+            ui.horizontal(|ui| {
+                ui.label("Serial:");
+                combo(ui, "data_bits", "data", &mut self.add_data_bits, DATA_BITS);
+                combo(ui, "parity", "parity", &mut self.add_parity, PARITY);
+                combo(ui, "stop_bits", "stop", &mut self.add_stop_bits, STOP_BITS);
+                combo(
+                    ui,
+                    "flow_control",
+                    "flow",
+                    &mut self.add_flow_control,
+                    FLOW_CONTROL,
+                );
+            });
+        }
         if !self.status.is_empty() {
             ui.label(&self.status);
         }
@@ -419,6 +453,12 @@ impl ListenerApp {
         }
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            // A fixed row height keyed off the 1.5x glyph, so the row does not jump
+            // vertically when the status glyph changes (different glyphs/fallback
+            // fonts have different metrics).
+            let base = egui::TextStyle::Body.resolve(ui.style()).size;
+            let text_color = ui.visuals().text_color();
+            let row_height = base * 1.5 + 8.0;
             for (id, name, status, messages, bps, warnings) in rows {
                 let selected = self.selected == Some(id);
                 let warn = if warnings > 0 {
@@ -429,8 +469,6 @@ impl ListenerApp {
                 // Build the row text as a LayoutJob so the status glyph can be 50%
                 // larger and status-coloured (green = running, etc.) while the rest
                 // stays the normal body size/colour.
-                let base = egui::TextStyle::Body.resolve(ui.style()).size;
-                let text_color = ui.visuals().text_color();
                 let mut job = egui::text::LayoutJob::default();
                 job.append(
                     status_glyph(status),
@@ -452,10 +490,10 @@ impl ListenerApp {
                         ..Default::default()
                     },
                 );
-                // Full-width selectable: the whole row box is clickable and
-                // highlighted, not just the text.
+                // Full-width, fixed-height selectable: the whole row box is clickable
+                // and highlighted, and the height is stable across status changes.
                 let response = ui.add_sized(
-                    [ui.available_width(), 0.0],
+                    [ui.available_width(), row_height],
                     egui::Button::selectable(selected, job),
                 );
                 if response.clicked() {
@@ -668,6 +706,62 @@ impl eframe::App for ListenerApp {
             .default_size(320.0)
             .show_inside(ui, |ui| self.show_channel_list(ui));
         egui::CentralPanel::default().show_inside(ui, |ui| self.show_detail(ui));
+    }
+}
+
+/// Serial option tables (value, label) for the add-channel combos (§74).
+const DATA_BITS: &[(DataBits, &str)] = &[
+    (DataBits::Five, "5"),
+    (DataBits::Six, "6"),
+    (DataBits::Seven, "7"),
+    (DataBits::Eight, "8"),
+];
+const PARITY: &[(Parity, &str)] = &[
+    (Parity::None, "None"),
+    (Parity::Even, "Even"),
+    (Parity::Odd, "Odd"),
+    (Parity::Mark, "Mark"),
+    (Parity::Space, "Space"),
+];
+const STOP_BITS: &[(StopBits, &str)] = &[
+    (StopBits::One, "1"),
+    (StopBits::OnePointFive, "1.5"),
+    (StopBits::Two, "2"),
+];
+const FLOW_CONTROL: &[(FlowControl, &str)] = &[
+    (FlowControl::None, "None"),
+    (FlowControl::RtsCts, "RTS/CTS"),
+];
+
+/// A small labelled combo box bound to an enum value with a fixed option table.
+fn combo<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    value: &mut T,
+    options: &[(T, &str)],
+) {
+    let selected = options
+        .iter()
+        .find(|(v, _)| v == value)
+        .map(|(_, s)| *s)
+        .unwrap_or("");
+    ui.label(label);
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            for (v, s) in options {
+                ui.selectable_value(value, *v, *s);
+            }
+        });
+}
+
+/// A message specific to the selected interface's endpoint, so the user isn't told
+/// about serial port names when adding a UDP channel.
+fn invalid_endpoint_message(kind: AddKind) -> String {
+    match kind {
+        AddKind::Udp | AddKind::Tcp => "enter a valid port number (1–65535)".to_string(),
+        AddKind::Serial => "enter a serial port name (e.g. COM3)".to_string(),
     }
 }
 
