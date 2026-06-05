@@ -14,9 +14,10 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::config::ChannelConfig;
+use crate::config::{ChannelConfig, InterfaceConfig};
 use crate::core::{ChannelId, DisplayViewId, RuntimeEvent};
 use crate::runtime::{ChannelSnapshot, Listener};
+use crate::transport::udp::UdpMode;
 
 /// How often the driver polls running Channels for a fresh snapshot (the pull
 /// surface, ADR-006). 5 Hz is responsive without busy-polling.
@@ -36,6 +37,9 @@ pub enum UiCommand {
     AddChannel(Box<ChannelConfig>),
     Start(ChannelId),
     Stop(ChannelId),
+    /// Remove a channel from the runtime entirely (stops it first if live). Used to
+    /// recover from a misconfigured channel (e.g. a bind conflict).
+    RemoveChannel(ChannelId),
     ApplyPending(ChannelId),
     PauseDisplay(ChannelId, DisplayViewId),
     ResumeDisplay(ChannelId, DisplayViewId),
@@ -50,12 +54,39 @@ pub enum UiCommand {
 /// carries owned data, so a slow UI can never stall reception.
 #[derive(Debug)]
 pub enum UiUpdate {
-    /// A channel was registered: its runtime id and display name.
-    ChannelAdded(ChannelId, String),
+    /// A channel was registered: its runtime id, display name, and a one-line
+    /// human-readable connection description (interface + endpoint).
+    ChannelAdded(ChannelId, String, String),
+    /// A channel was removed from the runtime; the UI should drop it.
+    ChannelRemoved(ChannelId),
+    /// A command on a channel failed (e.g. a Start whose bind hit "address in
+    /// use"): the channel id and the error text, so the UI can show the reason.
+    ChannelError(ChannelId, String),
     /// A forwarded runtime event (the authoritative push surface, ADR-006).
     Event(RuntimeEvent),
     /// A periodic snapshot of a running channel (the pull surface).
     Snapshot(ChannelId, Box<ChannelSnapshot>),
+}
+
+/// A one-line, human-readable description of a channel's interface and endpoint,
+/// for the connection-details line in the UI.
+fn describe_interface(config: &ChannelConfig) -> String {
+    match &config.interface {
+        InterfaceConfig::Udp(udp) => {
+            let mode = match udp.mode {
+                UdpMode::Unicast => "unicast",
+                UdpMode::Broadcast => "broadcast",
+                UdpMode::Multicast => "multicast",
+            };
+            format!("UDP {mode} · bind {}:{}", udp.bind_address, udp.port)
+        }
+        InterfaceConfig::TcpListener(tcp) => {
+            format!("TCP listener · {}:{}", tcp.bind_address, tcp.port)
+        }
+        InterfaceConfig::Serial(serial) => {
+            format!("Serial · {} @ {} baud", serial.port, serial.baud_rate)
+        }
+    }
 }
 
 /// The background driver: owns the `Listener`, drains commands, forwards events,
@@ -128,18 +159,32 @@ impl Driver {
         match cmd {
             UiCommand::AddChannel(config) => {
                 let name = config.name.as_str().to_string();
+                let details = describe_interface(&config);
                 let id = self.listener.add_channel(*config);
                 self.channels.push(id);
-                self.push(UiUpdate::ChannelAdded(id, name));
+                self.push(UiUpdate::ChannelAdded(id, name, details));
             }
             UiCommand::Start(id) => {
-                let _ = self.listener.start(id).await;
+                // Surface the reason on failure (e.g. a bind "address in use"),
+                // instead of leaving the channel Faulted with no explanation.
+                if let Err(err) = self.listener.start(id).await {
+                    self.push(UiUpdate::ChannelError(id, err.to_string()));
+                }
             }
             UiCommand::Stop(id) => {
-                let _ = self.listener.stop(id).await;
+                if let Err(err) = self.listener.stop(id).await {
+                    self.push(UiUpdate::ChannelError(id, err.to_string()));
+                }
+            }
+            UiCommand::RemoveChannel(id) => {
+                let _ = self.listener.remove_channel(id).await;
+                self.channels.retain(|c| *c != id);
+                self.push(UiUpdate::ChannelRemoved(id));
             }
             UiCommand::ApplyPending(id) => {
-                let _ = self.listener.apply_pending(id).await;
+                if let Err(err) = self.listener.apply_pending(id).await {
+                    self.push(UiUpdate::ChannelError(id, err.to_string()));
+                }
             }
             UiCommand::PauseDisplay(id, view) => {
                 let _ = self.listener.pause_display(id, view);
@@ -276,10 +321,14 @@ mod tests {
             .await
             .unwrap();
 
-        // The driver mints the id and reports it.
+        // The driver mints the id and reports it, with connection details.
         let id = loop {
-            if let UiUpdate::ChannelAdded(id, name) = next(&mut upd_rx).await {
+            if let UiUpdate::ChannelAdded(id, name, details) = next(&mut upd_rx).await {
                 assert_eq!(name, "UDP Channel");
+                assert!(
+                    details.contains("UDP"),
+                    "details name the interface: {details}"
+                );
                 break id;
             }
         };
@@ -315,6 +364,71 @@ mod tests {
             .await
             .expect("driver did not shut down")
             .unwrap();
+    }
+
+    /// A Start that can't bind (two channels on one UDP port) reports the reason
+    /// to the UI instead of leaving the channel Faulted with no explanation.
+    #[tokio::test]
+    async fn starting_two_channels_on_one_udp_port_reports_the_conflict() {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let driver = Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {}));
+        let handle = tokio::spawn(driver.run());
+
+        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("driver update timed out")
+                .expect("update stream closed")
+        }
+
+        let port = free_udp_port();
+
+        // First channel binds the port and starts.
+        cmd_tx
+            .send(UiCommand::AddChannel(Box::new(udp_config(port))))
+            .await
+            .unwrap();
+        let id1 = loop {
+            if let UiUpdate::ChannelAdded(id, ..) = next(&mut upd_rx).await {
+                break id;
+            }
+        };
+        cmd_tx.send(UiCommand::Start(id1)).await.unwrap();
+        loop {
+            if let UiUpdate::Event(RuntimeEvent::ChannelStarted(e)) = next(&mut upd_rx).await {
+                if e == id1 {
+                    break;
+                }
+            }
+        }
+
+        // Second channel on the same port can't bind — the driver says why.
+        cmd_tx
+            .send(UiCommand::AddChannel(Box::new(udp_config(port))))
+            .await
+            .unwrap();
+        let id2 = loop {
+            if let UiUpdate::ChannelAdded(id, ..) = next(&mut upd_rx).await {
+                if id != id1 {
+                    break id;
+                }
+            }
+        };
+        cmd_tx.send(UiCommand::Start(id2)).await.unwrap();
+        let reason = loop {
+            if let UiUpdate::ChannelError(e, msg) = next(&mut upd_rx).await {
+                if e == id2 {
+                    break msg;
+                }
+            }
+        };
+        assert!(!reason.is_empty(), "the bind conflict reason is reported");
+
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
     /// Dropping the command sender ends the driver (the App closed).

@@ -446,6 +446,22 @@ impl Listener {
         Ok(())
     }
 
+    /// Remove a Channel from the registry entirely (e.g. a GUI "remove", or
+    /// discarding a misconfigured channel). If it is Running or Faulted it is first
+    /// stopped (best-effort) so its tasks and socket are released, then it is
+    /// dropped. Unknown id is an error. After this, `state(id)` is `None`.
+    pub async fn remove_channel(&mut self, id: ChannelId) -> Result<(), OrchestratorError> {
+        let state = self
+            .state(id)
+            .ok_or(OrchestratorError::UnknownChannel(id))?;
+        if matches!(state, ChannelState::Running | ChannelState::Faulted) {
+            // Release the interface/tasks; ignore a stop error — we're discarding it.
+            let _ = self.stop(id).await;
+        }
+        self.channels.remove(&id);
+        Ok(())
+    }
+
     /// Stop every live Channel (§113, application exit). Includes spontaneously
     /// faulted channels so their tasks and Display Views are cleaned up too.
     pub async fn shutdown(&mut self) {
@@ -825,6 +841,29 @@ mod tests {
     fn udp_channel() -> ChannelConfig {
         // Template binds 0.0.0.0:0 (ephemeral) — binds cleanly in tests.
         templates::udp_template()
+    }
+
+    #[tokio::test]
+    async fn remove_channel_drops_it_from_the_registry() {
+        let mut listener = Listener::with_default_capacities();
+        let id = listener.add_channel(udp_channel());
+        assert_eq!(listener.state(id), Some(ChannelState::Stopped));
+
+        listener.remove_channel(id).await.unwrap();
+        assert_eq!(listener.state(id), None, "the channel is gone");
+        // Removing it again is an error (it's unknown now).
+        assert!(listener.remove_channel(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn remove_running_channel_stops_then_drops_it() {
+        let mut listener = Listener::with_default_capacities();
+        let id = listener.add_channel(udp_channel());
+        listener.start(id).await.unwrap();
+        assert_eq!(listener.state(id), Some(ChannelState::Running));
+
+        listener.remove_channel(id).await.unwrap();
+        assert_eq!(listener.state(id), None);
     }
 
     #[tokio::test]

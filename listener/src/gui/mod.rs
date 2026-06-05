@@ -57,6 +57,7 @@ pub fn run() -> anyhow::Result<()> {
         "Listener",
         options,
         Box::new(|cc| {
+            apply_style(&cc.egui_ctx);
             // The driver wakes the UI by requesting a repaint when it pushes an
             // update, so a streaming source refreshes without busy-polling.
             let ctx = cc.egui_ctx.clone();
@@ -69,6 +70,111 @@ pub fn run() -> anyhow::Result<()> {
         }),
     )
     .map_err(|e| anyhow!("{e}"))
+}
+
+/// Apply the app's base style: Noto Sans as the UI font (matching talker), slightly
+/// larger text (≈5%), and a light theme with darker, higher-contrast text. Set once
+/// at startup.
+fn apply_style(ctx: &egui::Context) {
+    install_unicode_fallback_fonts(ctx);
+    install_control_pictures_fallback_font(ctx);
+    ctx.set_pixels_per_point(1.05);
+    let mut style = (*ctx.global_style()).clone();
+    style.visuals = egui::Visuals::light();
+    style.visuals.override_text_color = Some(egui::Color32::from_gray(20));
+    ctx.set_global_style(style);
+}
+
+/// Install Noto Sans as the primary proportional UI font, plus per-script Noto
+/// files as lowest-priority fallbacks (mirrors talker's `gui` setup).
+///
+/// `NotoSans-Regular` (Latin / Greek / Cyrillic / Vietnamese) is registered at
+/// **Highest** priority for the `Proportional` family, so it wins over egui's
+/// default Ubuntu-Light for the whole UI — one consistent humanist sans. It is also
+/// a *lowest*-priority `Monospace` fallback so the message-dump face stays monospace
+/// but Noto fills any Latin gaps. The per-script files (Symbols2, Thai, Arabic,
+/// Hebrew, Devanagari) are lowest-priority fallbacks for both families so non-Latin
+/// codepoints render with real glyphs instead of tofu. CJK is not bundled. See
+/// `assets/fonts/README.md`.
+fn install_unicode_fallback_fonts(ctx: &egui::Context) {
+    use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
+    use egui::FontFamily::{Monospace, Proportional};
+
+    ctx.add_font(FontInsert::new(
+        "noto_sans",
+        egui::FontData::from_static(include_bytes!("../../assets/fonts/NotoSans-Regular.ttf")),
+        vec![
+            InsertFontFamily {
+                family: Proportional,
+                priority: FontPriority::Highest,
+            },
+            InsertFontFamily {
+                family: Monospace,
+                priority: FontPriority::Lowest,
+            },
+        ],
+    ));
+
+    const FALLBACKS: &[(&str, &[u8])] = &[
+        (
+            "noto_sans_symbols2",
+            include_bytes!("../../assets/fonts/NotoSansSymbols2-Regular.ttf"),
+        ),
+        (
+            "noto_sans_thai",
+            include_bytes!("../../assets/fonts/NotoSansThai-Regular.ttf"),
+        ),
+        (
+            "noto_sans_arabic",
+            include_bytes!("../../assets/fonts/NotoSansArabic-Regular.ttf"),
+        ),
+        (
+            "noto_sans_hebrew",
+            include_bytes!("../../assets/fonts/NotoSansHebrew-Regular.ttf"),
+        ),
+        (
+            "noto_sans_devanagari",
+            include_bytes!("../../assets/fonts/NotoSansDevanagari-Regular.ttf"),
+        ),
+    ];
+    for (name, bytes) in FALLBACKS {
+        ctx.add_font(FontInsert::new(
+            name,
+            egui::FontData::from_static(bytes),
+            vec![
+                InsertFontFamily {
+                    family: Monospace,
+                    priority: FontPriority::Lowest,
+                },
+                InsertFontFamily {
+                    family: Proportional,
+                    priority: FontPriority::Lowest,
+                },
+            ],
+        ));
+    }
+}
+
+/// Register a Unicode Control Pictures fallback (an ~18 KB Cascadia Mono subset
+/// covering U+2400–U+2421) as a low-priority fallback for both families, so a Glyph
+/// rendering of control bytes (`␊` `␍` …, §46) shows real pictures, not tofu.
+fn install_control_pictures_fallback_font(ctx: &egui::Context) {
+    use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
+    const FONT: &[u8] = include_bytes!("../../assets/fonts/CascadiaMono-ControlPictures.ttf");
+    ctx.add_font(FontInsert::new(
+        "control_pictures",
+        egui::FontData::from_static(FONT),
+        vec![
+            InsertFontFamily {
+                family: egui::FontFamily::Monospace,
+                priority: FontPriority::Lowest,
+            },
+            InsertFontFamily {
+                family: egui::FontFamily::Proportional,
+                priority: FontPriority::Lowest,
+            },
+        ],
+    ));
 }
 
 /// Which interface a new channel uses, in the add-channel form.
@@ -89,6 +195,13 @@ impl AddKind {
     }
 }
 
+/// How the detail pane renders a Message's bytes (presentation-only, §42).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MsgView {
+    Text,
+    Hex,
+}
+
 /// The eframe application root: the runtime bridge, the folded view-model, the
 /// selected channel, and the add-channel form's draft state.
 struct ListenerApp {
@@ -99,6 +212,7 @@ struct ListenerApp {
     add_endpoint: String,
     add_baud: u32,
     add_nmea: bool,
+    msg_view: MsgView,
     status: String,
 }
 
@@ -112,13 +226,22 @@ impl ListenerApp {
             add_endpoint: String::new(),
             add_baud: 9600,
             add_nmea: false,
+            msg_view: MsgView::Text,
             status: String::new(),
         }
     }
 
-    /// Drain every pending update into the view-model (non-blocking, §99).
+    /// Drain every pending update into the view-model (non-blocking, §99). A newly
+    /// added channel takes focus; a removed one that was selected clears it.
     fn drain_updates(&mut self) {
         while let Ok(update) = self.bridge.updates.try_recv() {
+            match &update {
+                bridge::UiUpdate::ChannelAdded(id, ..) => self.selected = Some(*id),
+                bridge::UiUpdate::ChannelRemoved(id) if self.selected == Some(*id) => {
+                    self.selected = None;
+                }
+                _ => {}
+            }
             self.state.apply(update);
         }
     }
@@ -257,16 +380,38 @@ impl ListenerApp {
                     "{}  {name}  ·  {messages} msg  ·  {bps:.0} B/s{warn}",
                     status_glyph(status)
                 );
-                if ui.selectable_label(selected, label).clicked() {
+                // Full-width selectable: the whole row box is clickable and
+                // highlighted, not just the text.
+                let response = ui.add_sized(
+                    [ui.available_width(), 0.0],
+                    egui::Button::selectable(selected, label),
+                );
+                if response.clicked() {
                     self.selected = Some(id);
                 }
                 ui.horizontal(|ui| {
-                    if status == ChannelStatus::Running {
-                        if ui.small_button("Stop").clicked() {
-                            self.send(UiCommand::Stop(id));
+                    match status {
+                        ChannelStatus::Running => {
+                            if ui.small_button("Stop").clicked() {
+                                self.send(UiCommand::Stop(id));
+                            }
                         }
-                    } else if ui.small_button("Start").clicked() {
-                        self.send(UiCommand::Start(id));
+                        // A Faulted channel can't go straight to Starting (§8.5): it
+                        // must pass through Stopped, so "Retry" sends Stop then Start.
+                        ChannelStatus::Faulted => {
+                            if ui.small_button("Retry").clicked() {
+                                self.send(UiCommand::Stop(id));
+                                self.send(UiCommand::Start(id));
+                            }
+                        }
+                        _ => {
+                            if ui.small_button("Start").clicked() {
+                                self.send(UiCommand::Start(id));
+                            }
+                        }
+                    }
+                    if ui.small_button("Remove").clicked() {
+                        self.send(UiCommand::RemoveChannel(id));
                     }
                 });
                 ui.separator();
@@ -279,43 +424,122 @@ impl ListenerApp {
             ui.label("Select a channel to see its details.");
             return;
         };
-        let Some(view) = self.state.channel(id) else {
+        // Header + the view-mode toggle mutate nothing heavy: take cheap copies of
+        // the view so the toggle can borrow `self` mutably without conflicting with
+        // a live `&self.state` borrow, then re-borrow for snapshot rendering below.
+        let Some((name, details, status, messages, bps, warnings, last_error)) =
+            self.state.channel(id).map(|v| {
+                (
+                    v.name.clone(),
+                    v.details.clone(),
+                    v.status,
+                    v.messages,
+                    v.bytes_per_sec,
+                    v.warnings,
+                    v.last_error.clone(),
+                )
+            })
+        else {
             ui.label("That channel is no longer present.");
             return;
         };
 
-        ui.heading(&view.name);
-        ui.label(format!("Status: {}", status_label(view.status)));
+        ui.heading(&name);
+        ui.label(format!("Connection: {details}"));
+        ui.label(format!("Status: {}", status_label(status)));
         ui.label(format!(
-            "Messages: {}    Throughput: {:.0} B/s    Warnings: {}",
-            view.messages, view.bytes_per_sec, view.warnings
+            "Messages: {messages}    Throughput: {bps:.0} B/s    Warnings: {warnings}"
         ));
+        // Surface a failed command (e.g. a bind conflict) with the reason and a
+        // way out, instead of a bare "faulted" with no explanation.
+        if let Some(err) = &last_error {
+            ui.colored_label(egui::Color32::from_rgb(170, 30, 30), format!("⚠ {err}"));
+            ui.label(
+                "Recourse: free the resource (e.g. Stop the other channel on that \
+                 port) then Retry, or Remove this channel.",
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.label("View:");
+            ui.selectable_value(&mut self.msg_view, MsgView::Text, "Text");
+            ui.selectable_value(&mut self.msg_view, MsgView::Hex, "Hex");
+        });
+        let msg_view = self.msg_view;
         ui.separator();
 
+        let Some(view) = self.state.channel(id) else {
+            return;
+        };
         let Some(snapshot) = &view.snapshot else {
             ui.label("No snapshot yet — start the channel to see live data.");
             return;
         };
 
+        // Diagnostics: counts, with the actual recent messages on demand (§91–§95).
         ui.label(format!(
             "Diagnostics — events {}, warnings {}, errors {}",
             snapshot.diagnostics.events.len(),
             snapshot.diagnostics.warnings.len(),
             snapshot.diagnostics.errors.len(),
         ));
-        if !snapshot.matches.is_empty() {
-            ui.label(format!("Match rule firings: {}", snapshot.matches.len()));
+        if !snapshot.diagnostics.warnings.is_empty() || !snapshot.diagnostics.errors.is_empty() {
+            egui::CollapsingHeader::new("Diagnostic messages")
+                .id_salt("diagnostics")
+                .show(ui, |ui| {
+                    for d in snapshot.diagnostics.errors.iter().rev().take(20) {
+                        ui.colored_label(egui::Color32::from_rgb(170, 30, 30), &d.message);
+                    }
+                    for d in snapshot.diagnostics.warnings.iter().rev().take(20) {
+                        ui.colored_label(egui::Color32::from_rgb(150, 100, 0), &d.message);
+                    }
+                });
         }
-        ui.separator();
-        ui.label(format!(
-            "Recent messages ({} retained):",
-            snapshot.retained.len()
-        ));
 
+        // Match Rule firings (§50.2, §165): which rule fired, on which Message.
+        if !snapshot.matches.is_empty() {
+            egui::CollapsingHeader::new(format!("Match firings ({})", snapshot.matches.len()))
+                .id_salt("matches")
+                .show(ui, |ui| {
+                    for m in snapshot.matches.iter().rev().take(20) {
+                        let on = m
+                            .message_number
+                            .map(|n| format!("#{n}"))
+                            .unwrap_or_else(|| "(idle)".to_string());
+                        ui.monospace(format!("{on}  rule {}", short_id(&m.rule_id.to_string())));
+                    }
+                });
+        }
+
+        ui.separator();
+
+        // Pause/Resume the primary Display View (§11, §50). Pause freezes this
+        // view's on-screen history; reception, recording, and retention continue.
+        // The message list below reads the view's history, so pause is visible here.
+        if let Some(v0) = snapshot.display_views.first() {
+            ui.horizontal(|ui| {
+                if v0.paused {
+                    if ui.button("Resume").clicked() {
+                        self.send(UiCommand::ResumeDisplay(id, v0.id));
+                    }
+                    ui.label("view paused — reception continues");
+                } else if ui.button("Pause").clicked() {
+                    self.send(UiCommand::PauseDisplay(id, v0.id));
+                }
+            });
+        }
+
+        // The primary view's history (frozen while paused); fall back to retention
+        // if a channel somehow has no view.
+        let messages = snapshot
+            .display_views
+            .first()
+            .map(|v| v.messages.as_slice())
+            .unwrap_or(snapshot.retained.as_slice());
+        ui.label(format!("Recent messages ({}):", messages.len()));
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                for decoded in &snapshot.retained {
+                for decoded in messages {
                     let number = decoded.message.number;
                     let kind = decoded
                         .protocol
@@ -323,10 +547,11 @@ impl ListenerApp {
                         .and_then(|p| p.message_type.clone())
                         .map(|t| format!("[{t}] "))
                         .unwrap_or_default();
-                    ui.monospace(format!(
-                        "#{number}  {kind}{}",
-                        render_bytes(&decoded.message.bytes)
-                    ));
+                    let body = match msg_view {
+                        MsgView::Text => render_bytes(&decoded.message.bytes),
+                        MsgView::Hex => render_hex(&decoded.message.bytes),
+                    };
+                    ui.monospace(format!("#{number}  {kind}{body}"));
                 }
             });
     }
@@ -365,9 +590,9 @@ fn status_glyph(status: ChannelStatus) -> &'static str {
     }
 }
 
-/// Render Message bytes for display: printable ASCII as-is, other bytes as a
-/// `⟨HH⟩` marker (matching the spec's inline-marker convention, §5.3). This is a
-/// presentation-only rendering; the bytes themselves are never modified (§40).
+/// Render Message bytes as text: printable ASCII as-is, other bytes as a `⟨HH⟩`
+/// marker (matching the spec's inline-marker convention, §5.3). Presentation-only;
+/// the bytes themselves are never modified (§40).
 fn render_bytes(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -379,4 +604,18 @@ fn render_bytes(bytes: &[u8]) -> String {
             }
         })
         .collect()
+}
+
+/// Render Message bytes as space-separated uppercase hex (§45). Presentation-only.
+fn render_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Shorten a UUID string to its first segment, enough to disambiguate at a glance.
+fn short_id(id: &str) -> &str {
+    id.split('-').next().unwrap_or(id)
 }

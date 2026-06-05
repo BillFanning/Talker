@@ -28,6 +28,8 @@ pub enum ChannelStatus {
 pub struct ChannelView {
     pub id: ChannelId,
     pub name: String,
+    /// A one-line connection description (interface + endpoint), from registration.
+    pub details: String,
     pub status: ChannelStatus,
     /// Highest Message Number seen (from events or the latest snapshot).
     pub messages: u64,
@@ -35,20 +37,25 @@ pub struct ChannelView {
     pub bytes_per_sec: f64,
     /// Retained-warning count from the latest snapshot (§88).
     pub warnings: usize,
+    /// The reason the last command on this Channel failed (e.g. a bind conflict),
+    /// cleared on a successful (re)start. `None` when there's nothing to report.
+    pub last_error: Option<String>,
     /// The most recent full snapshot, for detail panes (retained Messages, hex,
     /// diagnostics, match firings). `None` until the first poll arrives.
     pub snapshot: Option<ChannelSnapshot>,
 }
 
 impl ChannelView {
-    fn new(id: ChannelId, name: String) -> Self {
+    fn new(id: ChannelId, name: String, details: String) -> Self {
         Self {
             id,
             name,
+            details,
             status: ChannelStatus::Stopped,
             messages: 0,
             bytes_per_sec: 0.0,
             warnings: 0,
+            last_error: None,
             snapshot: None,
         }
     }
@@ -75,10 +82,19 @@ impl AppState {
     /// Fold one update into the model.
     pub fn apply(&mut self, update: UiUpdate) {
         match update {
-            UiUpdate::ChannelAdded(id, name) => {
+            UiUpdate::ChannelAdded(id, name, details) => {
                 if !self.views.contains_key(&id) {
                     self.order.push(id);
-                    self.views.insert(id, ChannelView::new(id, name));
+                    self.views.insert(id, ChannelView::new(id, name, details));
+                }
+            }
+            UiUpdate::ChannelRemoved(id) => {
+                self.views.remove(&id);
+                self.order.retain(|c| *c != id);
+            }
+            UiUpdate::ChannelError(id, message) => {
+                if let Some(view) = self.views.get_mut(&id) {
+                    view.last_error = Some(message);
                 }
             }
             UiUpdate::Event(event) => self.apply_event(event),
@@ -98,7 +114,12 @@ impl AppState {
     /// the list shows configured Channels; per-connection views come later.
     fn apply_event(&mut self, event: RuntimeEvent) {
         match event {
-            RuntimeEvent::ChannelStarted(id) => self.set_status(id, ChannelStatus::Running),
+            RuntimeEvent::ChannelStarted(id) => {
+                self.set_status(id, ChannelStatus::Running);
+                if let Some(view) = self.views.get_mut(&id) {
+                    view.last_error = None; // a successful start clears the prior error
+                }
+            }
             RuntimeEvent::ChannelStopped(id) => self.set_status(id, ChannelStatus::Stopped),
             RuntimeEvent::ChannelFaulted(id) => self.set_status(id, ChannelStatus::Faulted),
             RuntimeEvent::ChannelReconnecting(id, _) => {
@@ -162,7 +183,11 @@ mod tests {
         let mut state = AppState::default();
         let id = ChannelId::new();
 
-        state.apply(UiUpdate::ChannelAdded(id, "udp".into()));
+        state.apply(UiUpdate::ChannelAdded(
+            id,
+            "udp".into(),
+            "UDP · test".into(),
+        ));
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Stopped);
         assert_eq!(state.channels().count(), 1);
 
@@ -180,7 +205,11 @@ mod tests {
     fn reconnect_events_drive_status() {
         let mut state = AppState::default();
         let id = ChannelId::new();
-        state.apply(UiUpdate::ChannelAdded(id, "serial".into()));
+        state.apply(UiUpdate::ChannelAdded(
+            id,
+            "serial".into(),
+            "Serial · COM3".into(),
+        ));
 
         state.apply(UiUpdate::Event(RuntimeEvent::ChannelReconnecting(id, 1)));
         assert_eq!(
@@ -197,7 +226,11 @@ mod tests {
     fn snapshot_updates_liveness_and_is_retained() {
         let mut state = AppState::default();
         let id = ChannelId::new();
-        state.apply(UiUpdate::ChannelAdded(id, "udp".into()));
+        state.apply(UiUpdate::ChannelAdded(
+            id,
+            "udp".into(),
+            "UDP · test".into(),
+        ));
 
         state.apply(UiUpdate::Snapshot(
             id,
@@ -211,10 +244,52 @@ mod tests {
     }
 
     #[test]
+    fn channel_error_is_recorded_and_cleared_on_a_successful_start() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(UiUpdate::ChannelAdded(
+            id,
+            "udp".into(),
+            "UDP · :9000".into(),
+        ));
+        assert!(state.channel(id).unwrap().last_error.is_none());
+        assert_eq!(state.channel(id).unwrap().details, "UDP · :9000");
+
+        // A failed start surfaces the reason.
+        state.apply(UiUpdate::ChannelError(
+            id,
+            "failed to bind: address in use".into(),
+        ));
+        assert_eq!(
+            state.channel(id).unwrap().last_error.as_deref(),
+            Some("failed to bind: address in use")
+        );
+
+        // A later successful start clears it.
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(id)));
+        assert!(state.channel(id).unwrap().last_error.is_none());
+        assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
+    }
+
+    #[test]
+    fn channel_removed_drops_it_from_the_model() {
+        let mut state = AppState::default();
+        let a = ChannelId::new();
+        let b = ChannelId::new();
+        state.apply(UiUpdate::ChannelAdded(a, "a".into(), "UDP".into()));
+        state.apply(UiUpdate::ChannelAdded(b, "b".into(), "TCP".into()));
+
+        state.apply(UiUpdate::ChannelRemoved(a));
+        assert_eq!(state.channels().count(), 1);
+        assert!(state.channel(a).is_none());
+        assert!(state.channel(b).is_some());
+    }
+
+    #[test]
     fn events_for_unknown_channels_are_ignored() {
         let mut state = AppState::default();
         let known = ChannelId::new();
-        state.apply(UiUpdate::ChannelAdded(known, "a".into()));
+        state.apply(UiUpdate::ChannelAdded(known, "a".into(), "UDP".into()));
 
         // A runtime-minted (e.g. TCP connection) id we never registered.
         state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(
@@ -229,11 +304,11 @@ mod tests {
     fn registration_order_is_stable() {
         let mut state = AppState::default();
         let (a, b, c) = (ChannelId::new(), ChannelId::new(), ChannelId::new());
-        state.apply(UiUpdate::ChannelAdded(a, "a".into()));
-        state.apply(UiUpdate::ChannelAdded(b, "b".into()));
-        state.apply(UiUpdate::ChannelAdded(c, "c".into()));
+        state.apply(UiUpdate::ChannelAdded(a, "a".into(), "UDP".into()));
+        state.apply(UiUpdate::ChannelAdded(b, "b".into(), "TCP".into()));
+        state.apply(UiUpdate::ChannelAdded(c, "c".into(), "Serial".into()));
         // A duplicate add does not reorder or duplicate.
-        state.apply(UiUpdate::ChannelAdded(a, "a-again".into()));
+        state.apply(UiUpdate::ChannelAdded(a, "a-again".into(), "UDP".into()));
 
         let names: Vec<&str> = state.channels().map(|v| v.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
