@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use crate::config::ChannelConfig;
 use crate::core::{ChannelId, RuntimeEvent};
 use crate::runtime::ChannelSnapshot;
 
@@ -28,8 +29,11 @@ pub enum ChannelStatus {
 pub struct ChannelView {
     pub id: ChannelId,
     pub name: String,
-    /// A one-line connection description (interface + endpoint), from registration.
+    /// A one-line connection description (interface + endpoint).
     pub details: String,
+    /// The channel's configuration, so the UI can edit it (e.g. change the port).
+    /// Updated on reconfigure.
+    pub config: ChannelConfig,
     pub status: ChannelStatus,
     /// Highest Message Number seen (from events or the latest snapshot).
     pub messages: u64,
@@ -46,11 +50,12 @@ pub struct ChannelView {
 }
 
 impl ChannelView {
-    fn new(id: ChannelId, name: String, details: String) -> Self {
+    fn new(id: ChannelId, name: String, details: String, config: ChannelConfig) -> Self {
         Self {
             id,
             name,
             details,
+            config,
             status: ChannelStatus::Stopped,
             messages: 0,
             bytes_per_sec: 0.0,
@@ -82,10 +87,17 @@ impl AppState {
     /// Fold one update into the model.
     pub fn apply(&mut self, update: UiUpdate) {
         match update {
-            UiUpdate::ChannelAdded(id, name, details) => {
+            UiUpdate::ChannelAdded(id, name, details, config) => {
                 if !self.views.contains_key(&id) {
                     self.order.push(id);
-                    self.views.insert(id, ChannelView::new(id, name, details));
+                    self.views
+                        .insert(id, ChannelView::new(id, name, details, *config));
+                }
+            }
+            UiUpdate::ChannelReconfigured(id, details, config) => {
+                if let Some(view) = self.views.get_mut(&id) {
+                    view.details = details;
+                    view.config = *config;
                 }
             }
             UiUpdate::ChannelRemoved(id) => {
@@ -150,8 +162,20 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::templates;
     use crate::runtime::snapshot::{ChannelSnapshot, DiagnosticsSnapshot};
     use crate::runtime::ChannelActivity;
+
+    /// A `ChannelAdded` update with a throwaway config (the reducer tests don't
+    /// inspect the config; the editor uses it).
+    fn added(id: ChannelId, name: &str, details: &str) -> UiUpdate {
+        UiUpdate::ChannelAdded(
+            id,
+            name.into(),
+            details.into(),
+            Box::new(templates::udp_template()),
+        )
+    }
 
     fn snapshot_with(
         id: ChannelId,
@@ -183,11 +207,7 @@ mod tests {
         let mut state = AppState::default();
         let id = ChannelId::new();
 
-        state.apply(UiUpdate::ChannelAdded(
-            id,
-            "udp".into(),
-            "UDP · test".into(),
-        ));
+        state.apply(added(id, "udp", "UDP · test"));
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Stopped);
         assert_eq!(state.channels().count(), 1);
 
@@ -205,11 +225,7 @@ mod tests {
     fn reconnect_events_drive_status() {
         let mut state = AppState::default();
         let id = ChannelId::new();
-        state.apply(UiUpdate::ChannelAdded(
-            id,
-            "serial".into(),
-            "Serial · COM3".into(),
-        ));
+        state.apply(added(id, "serial", "Serial · COM3"));
 
         state.apply(UiUpdate::Event(RuntimeEvent::ChannelReconnecting(id, 1)));
         assert_eq!(
@@ -226,11 +242,7 @@ mod tests {
     fn snapshot_updates_liveness_and_is_retained() {
         let mut state = AppState::default();
         let id = ChannelId::new();
-        state.apply(UiUpdate::ChannelAdded(
-            id,
-            "udp".into(),
-            "UDP · test".into(),
-        ));
+        state.apply(added(id, "udp", "UDP · test"));
 
         state.apply(UiUpdate::Snapshot(
             id,
@@ -247,11 +259,7 @@ mod tests {
     fn channel_error_is_recorded_and_cleared_on_a_successful_start() {
         let mut state = AppState::default();
         let id = ChannelId::new();
-        state.apply(UiUpdate::ChannelAdded(
-            id,
-            "udp".into(),
-            "UDP · :9000".into(),
-        ));
+        state.apply(added(id, "udp", "UDP · :9000"));
         assert!(state.channel(id).unwrap().last_error.is_none());
         assert_eq!(state.channel(id).unwrap().details, "UDP · :9000");
 
@@ -272,12 +280,37 @@ mod tests {
     }
 
     #[test]
+    fn channel_reconfigured_updates_details_and_config() {
+        use crate::config::InterfaceConfig;
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · :9000"));
+
+        let mut new_config = templates::udp_template();
+        if let InterfaceConfig::Udp(udp) = &mut new_config.interface {
+            udp.port = 9100;
+        }
+        state.apply(UiUpdate::ChannelReconfigured(
+            id,
+            "UDP · :9100".into(),
+            Box::new(new_config),
+        ));
+
+        let view = state.channel(id).unwrap();
+        assert_eq!(view.details, "UDP · :9100");
+        match &view.config.interface {
+            InterfaceConfig::Udp(udp) => assert_eq!(udp.port, 9100),
+            other => panic!("expected UDP, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn channel_removed_drops_it_from_the_model() {
         let mut state = AppState::default();
         let a = ChannelId::new();
         let b = ChannelId::new();
-        state.apply(UiUpdate::ChannelAdded(a, "a".into(), "UDP".into()));
-        state.apply(UiUpdate::ChannelAdded(b, "b".into(), "TCP".into()));
+        state.apply(added(a, "a", "UDP"));
+        state.apply(added(b, "b", "TCP"));
 
         state.apply(UiUpdate::ChannelRemoved(a));
         assert_eq!(state.channels().count(), 1);
@@ -289,7 +322,7 @@ mod tests {
     fn events_for_unknown_channels_are_ignored() {
         let mut state = AppState::default();
         let known = ChannelId::new();
-        state.apply(UiUpdate::ChannelAdded(known, "a".into(), "UDP".into()));
+        state.apply(added(known, "a", "UDP"));
 
         // A runtime-minted (e.g. TCP connection) id we never registered.
         state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(
@@ -304,11 +337,11 @@ mod tests {
     fn registration_order_is_stable() {
         let mut state = AppState::default();
         let (a, b, c) = (ChannelId::new(), ChannelId::new(), ChannelId::new());
-        state.apply(UiUpdate::ChannelAdded(a, "a".into(), "UDP".into()));
-        state.apply(UiUpdate::ChannelAdded(b, "b".into(), "TCP".into()));
-        state.apply(UiUpdate::ChannelAdded(c, "c".into(), "Serial".into()));
+        state.apply(added(a, "a", "UDP"));
+        state.apply(added(b, "b", "TCP"));
+        state.apply(added(c, "c", "Serial"));
         // A duplicate add does not reorder or duplicate.
-        state.apply(UiUpdate::ChannelAdded(a, "a-again".into(), "UDP".into()));
+        state.apply(added(a, "a-again", "UDP"));
 
         let names: Vec<&str> = state.channels().map(|v| v.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);

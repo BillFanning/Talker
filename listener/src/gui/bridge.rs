@@ -40,6 +40,10 @@ pub enum UiCommand {
     /// Remove a channel from the runtime entirely (stops it first if live). Used to
     /// recover from a misconfigured channel (e.g. a bind conflict).
     RemoveChannel(ChannelId),
+    /// Replace a channel's configuration (e.g. change its port) via the §13
+    /// pending-config/apply path: a Running channel restarts onto the new config;
+    /// a Stopped/Faulted one swaps it in to be used on the next Start/Retry.
+    Reconfigure(ChannelId, Box<ChannelConfig>),
     ApplyPending(ChannelId),
     PauseDisplay(ChannelId, DisplayViewId),
     ResumeDisplay(ChannelId, DisplayViewId),
@@ -54,9 +58,13 @@ pub enum UiCommand {
 /// carries owned data, so a slow UI can never stall reception.
 #[derive(Debug)]
 pub enum UiUpdate {
-    /// A channel was registered: its runtime id, display name, and a one-line
-    /// human-readable connection description (interface + endpoint).
-    ChannelAdded(ChannelId, String, String),
+    /// A channel was registered: its runtime id, display name, a one-line
+    /// connection description (interface + endpoint), and a copy of its config (so
+    /// the UI can edit it, e.g. change the port).
+    ChannelAdded(ChannelId, String, String, Box<ChannelConfig>),
+    /// A channel's configuration changed (§13): its new connection description and
+    /// config, so the UI refreshes its editor and details.
+    ChannelReconfigured(ChannelId, String, Box<ChannelConfig>),
     /// A channel was removed from the runtime; the UI should drop it.
     ChannelRemoved(ChannelId),
     /// A command on a channel failed (e.g. a Start whose bind hit "address in
@@ -160,9 +168,21 @@ impl Driver {
             UiCommand::AddChannel(config) => {
                 let name = config.name.as_str().to_string();
                 let details = describe_interface(&config);
+                let echo = config.clone();
                 let id = self.listener.add_channel(*config);
                 self.channels.push(id);
-                self.push(UiUpdate::ChannelAdded(id, name, details));
+                self.push(UiUpdate::ChannelAdded(id, name, details, echo));
+            }
+            UiCommand::Reconfigure(id, config) => {
+                let config = *config;
+                let details = describe_interface(&config);
+                let _ = self.listener.set_pending_config(id, config.clone());
+                match self.listener.apply_pending(id).await {
+                    Ok(()) => {
+                        self.push(UiUpdate::ChannelReconfigured(id, details, Box::new(config)))
+                    }
+                    Err(err) => self.push(UiUpdate::ChannelError(id, err.to_string())),
+                }
             }
             UiCommand::Start(id) => {
                 // Surface the reason on failure (e.g. a bind "address in use"),
@@ -323,7 +343,7 @@ mod tests {
 
         // The driver mints the id and reports it, with connection details.
         let id = loop {
-            if let UiUpdate::ChannelAdded(id, name, details) = next(&mut upd_rx).await {
+            if let UiUpdate::ChannelAdded(id, name, details, _) = next(&mut upd_rx).await {
                 assert_eq!(name, "UDP Channel");
                 assert!(
                     details.contains("UDP"),

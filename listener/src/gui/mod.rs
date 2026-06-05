@@ -213,6 +213,11 @@ struct ListenerApp {
     add_baud: u32,
     add_nmea: bool,
     msg_view: MsgView,
+    /// Edit buffer for the selected channel's port/baud (the "Configure" row), and
+    /// which channel it was seeded from (re-seeded when the selection changes).
+    edit_for: Option<ChannelId>,
+    edit_endpoint: String,
+    edit_baud: u32,
     status: String,
 }
 
@@ -227,6 +232,9 @@ impl ListenerApp {
             add_baud: 9600,
             add_nmea: false,
             msg_view: MsgView::Text,
+            edit_for: None,
+            edit_endpoint: String::new(),
+            edit_baud: 9600,
             status: String::new(),
         }
     }
@@ -305,6 +313,48 @@ impl ListenerApp {
         }
     }
 
+    /// Apply the edited port/baud to the selected channel (§13). Clones the stored
+    /// config (so all other settings are preserved), patches the endpoint, and sends
+    /// a `Reconfigure`. A Running channel restarts onto it; a Stopped/Faulted one
+    /// swaps it in for the next Start/Retry.
+    fn apply_reconfigure(&mut self, id: ChannelId) {
+        let Some(mut config) = self.state.channel(id).map(|v| v.config.clone()) else {
+            return;
+        };
+        let endpoint = self.edit_endpoint.trim();
+        let ok = match &mut config.interface {
+            InterfaceConfig::Udp(udp) => match endpoint.parse() {
+                Ok(port) => {
+                    udp.port = port;
+                    true
+                }
+                Err(_) => false,
+            },
+            InterfaceConfig::TcpListener(tcp) => match endpoint.parse() {
+                Ok(port) => {
+                    tcp.port = port;
+                    true
+                }
+                Err(_) => false,
+            },
+            InterfaceConfig::Serial(serial) => {
+                if endpoint.is_empty() {
+                    false
+                } else {
+                    serial.port = endpoint.to_string();
+                    serial.baud_rate = self.edit_baud;
+                    true
+                }
+            }
+        };
+        if !ok {
+            self.status = "enter a valid port to apply".to_string();
+            return;
+        }
+        self.send(UiCommand::Reconfigure(id, Box::new(config)));
+        self.status = "reconfigured — Start/Retry to use it on a stopped channel".to_string();
+    }
+
     // ── Panels ──────────────────────────────────────────────────────────────
 
     fn show_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -376,15 +426,37 @@ impl ListenerApp {
                 } else {
                     String::new()
                 };
-                let label = format!(
-                    "{}  {name}  ·  {messages} msg  ·  {bps:.0} B/s{warn}",
-                    status_glyph(status)
+                // Build the row text as a LayoutJob so the status glyph can be 50%
+                // larger and status-coloured (green = running, etc.) while the rest
+                // stays the normal body size/colour.
+                let base = egui::TextStyle::Body.resolve(ui.style()).size;
+                let text_color = ui.visuals().text_color();
+                let mut job = egui::text::LayoutJob::default();
+                job.append(
+                    status_glyph(status),
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::proportional(base * 1.5),
+                        color: status_color(status),
+                        valign: egui::Align::Center,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    &format!("  {name}  ·  {messages} msg  ·  {bps:.0} B/s{warn}"),
+                    0.0,
+                    egui::TextFormat {
+                        font_id: egui::FontId::proportional(base),
+                        color: text_color,
+                        valign: egui::Align::Center,
+                        ..Default::default()
+                    },
                 );
                 // Full-width selectable: the whole row box is clickable and
                 // highlighted, not just the text.
                 let response = ui.add_sized(
                     [ui.available_width(), 0.0],
-                    egui::Button::selectable(selected, label),
+                    egui::Button::selectable(selected, job),
                 );
                 if response.clicked() {
                     self.selected = Some(id);
@@ -455,10 +527,39 @@ impl ListenerApp {
         if let Some(err) = &last_error {
             ui.colored_label(egui::Color32::from_rgb(170, 30, 30), format!("⚠ {err}"));
             ui.label(
-                "Recourse: free the resource (e.g. Stop the other channel on that \
-                 port) then Retry, or Remove this channel.",
+                "Recourse: change the port below and Apply, free the resource (Stop \
+                 the other channel on that port) then Retry, or Remove this channel.",
             );
         }
+
+        // Configure: edit the port (and baud, for serial), then Apply (§13). Seed the
+        // buffer from the channel's config whenever the selection changes.
+        if self.edit_for != Some(id) {
+            if let Some((endpoint, baud)) =
+                self.state.channel(id).map(|v| config_endpoint(&v.config))
+            {
+                self.edit_endpoint = endpoint;
+                self.edit_baud = baud;
+            }
+            self.edit_for = Some(id);
+        }
+        let is_serial = self
+            .state
+            .channel(id)
+            .map(|v| matches!(v.config.interface, InterfaceConfig::Serial(_)))
+            .unwrap_or(false);
+        ui.horizontal(|ui| {
+            ui.label("Port:");
+            ui.add(egui::TextEdit::singleline(&mut self.edit_endpoint).desired_width(120.0));
+            if is_serial {
+                ui.label("baud");
+                ui.add(egui::DragValue::new(&mut self.edit_baud).range(50..=4_000_000));
+            }
+            if ui.button("Apply").clicked() {
+                self.apply_reconfigure(id);
+            }
+        });
+
         ui.horizontal(|ui| {
             ui.label("View:");
             ui.selectable_value(&mut self.msg_view, MsgView::Text, "Text");
@@ -570,6 +671,16 @@ impl eframe::App for ListenerApp {
     }
 }
 
+/// The editable endpoint of a channel's config: the port string (UDP/TCP) or the
+/// serial port name, plus the baud (0 for non-serial, which ignore it).
+fn config_endpoint(config: &ChannelConfig) -> (String, u32) {
+    match &config.interface {
+        InterfaceConfig::Udp(udp) => (udp.port.to_string(), 0),
+        InterfaceConfig::TcpListener(tcp) => (tcp.port.to_string(), 0),
+        InterfaceConfig::Serial(serial) => (serial.port.clone(), serial.baud_rate),
+    }
+}
+
 /// A short status word for the detail pane.
 fn status_label(status: ChannelStatus) -> &'static str {
     match status {
@@ -587,6 +698,17 @@ fn status_glyph(status: ChannelStatus) -> &'static str {
         ChannelStatus::Running => "●",
         ChannelStatus::Faulted => "✖",
         ChannelStatus::Reconnecting => "↻",
+    }
+}
+
+/// The colour for a status glyph: green running, grey stopped, red faulted, amber
+/// reconnecting.
+fn status_color(status: ChannelStatus) -> egui::Color32 {
+    match status {
+        ChannelStatus::Running => egui::Color32::from_rgb(30, 150, 30),
+        ChannelStatus::Stopped => egui::Color32::from_gray(120),
+        ChannelStatus::Faulted => egui::Color32::from_rgb(190, 40, 40),
+        ChannelStatus::Reconnecting => egui::Color32::from_rgb(200, 140, 0),
     }
 }
 
