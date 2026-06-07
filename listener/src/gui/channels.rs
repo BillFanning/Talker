@@ -1,0 +1,171 @@
+//! The channel-list (tabs) panel and its row snapshot, split out of `mod.rs`.
+
+use crate::core::ChannelId;
+
+use super::bridge::UiCommand;
+use super::state::ChannelStatus;
+use super::widgets::{status_color, AddKind, BOX_STROKE};
+use super::ListenerApp;
+
+/// One channel's row data, snapshotted before rendering so the list isn't borrowing
+/// the view-model while a click mutates the selection.
+struct ChannelRow {
+    id: ChannelId,
+    name: String,
+    details: String,
+    status: ChannelStatus,
+    messages: u64,
+    bytes_per_sec: f64,
+    info: usize,
+    warnings: usize,
+    errors: usize,
+}
+
+impl ListenerApp {
+    pub(super) fn show_channel_list(&mut self, ui: &mut egui::Ui) {
+        // Heading + the "Add" menu (the only place channels are created now), plus
+        // bulk Start all / Stop all (#5).
+        ui.horizontal(|ui| {
+            if ui
+                .button("\u{25C0}")
+                .on_hover_text("Collapse channel list")
+                .clicked()
+            {
+                self.channels_collapsed = true;
+            }
+            ui.heading("Channels");
+            ui.menu_button("+ Add", |ui| {
+                if ui.button("UDP").clicked() {
+                    self.add_channel(AddKind::Udp);
+                    ui.close();
+                }
+                if ui.button("TCP").clicked() {
+                    self.add_channel(AddKind::Tcp);
+                    ui.close();
+                }
+                if ui.button("Serial").clicked() {
+                    self.add_channel(AddKind::Serial);
+                    ui.close();
+                }
+            });
+            if ui.button("Start all").clicked() {
+                for cid in self.state.channel_ids() {
+                    // Route through the same guard: complete channels start; each
+                    // unconfigured one gets an inline complaint instead (#3, #6).
+                    self.try_start(cid);
+                }
+            }
+            if ui.button("Stop all").clicked() {
+                for cid in self.state.channel_ids() {
+                    self.send(UiCommand::Stop(cid));
+                }
+            }
+        });
+        ui.separator();
+
+        // Snapshot the rows first so the list isn't borrowing `state` while a click
+        // mutates `selected`.
+        let rows: Vec<ChannelRow> = self
+            .state
+            .channels()
+            .map(|v| ChannelRow {
+                id: v.id,
+                name: v.name.clone(),
+                details: v.details.clone(),
+                status: v.status,
+                messages: v.messages,
+                bytes_per_sec: v.bytes_per_sec,
+                info: v.info,
+                warnings: v.warnings,
+                errors: v.errors,
+            })
+            .collect();
+
+        if rows.is_empty() {
+            ui.label("No channels yet — use “+ Add”.");
+            return;
+        }
+
+        let base = egui::TextStyle::Body.resolve(ui.style()).size;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for row in rows {
+                let id = row.id;
+                let selected = self.selected == Some(id);
+                // Each box gets its own id scope so widget ids don't collide between
+                // channels (that collision was why the 2nd channel couldn't be
+                // selected, #4).
+                ui.push_id(id, |ui| {
+                    let visuals = ui.visuals();
+                    let mut frame = egui::Frame::group(ui.style())
+                        .inner_margin(8.0)
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .stroke(egui::Stroke::new(1.5, BOX_STROKE));
+                    if selected {
+                        frame.fill = visuals.selection.bg_fill;
+                        frame.stroke = egui::Stroke::new(1.5, visuals.selection.stroke.color);
+                    }
+                    let response = frame
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            // Line 1: status dot + name.
+                            let mut line1 = egui::text::LayoutJob::default();
+                            line1.append(
+                                "\u{25CF}",
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: egui::FontId::proportional(base * 1.4),
+                                    color: status_color(row.status),
+                                    valign: egui::Align::Center,
+                                    ..Default::default()
+                                },
+                            );
+                            line1.append(
+                                &format!("  {}", row.name),
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: egui::FontId::proportional(base * 1.1),
+                                    color: ui.visuals().text_color(),
+                                    valign: egui::Align::Center,
+                                    ..Default::default()
+                                },
+                            );
+                            ui.label(line1);
+                            // Line 2: connection details.
+                            ui.label(egui::RichText::new(&row.details).weak());
+                            // Line 3: live stats.
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} msg  ·  {:.0} B/s",
+                                    row.messages, row.bytes_per_sec
+                                ))
+                                .weak(),
+                            );
+                            // Line 4: per-severity diagnostic counts, color-coded (#8).
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{} info", row.info))
+                                        .weak()
+                                        .color(egui::Color32::from_gray(110)),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("{} warn", row.warnings))
+                                        .color(egui::Color32::from_rgb(150, 100, 0)),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("{} err", row.errors))
+                                        .color(egui::Color32::from_rgb(170, 30, 30)),
+                                );
+                            });
+                        })
+                        .response;
+                    // The whole box is display-only and selects on click (#8). It is
+                    // interactable as a unit since it holds no inner buttons now.
+                    if response.interact(egui::Sense::click()).clicked() {
+                        self.selected = Some(id);
+                    }
+                });
+                ui.add_space(6.0);
+            }
+        });
+    }
+}

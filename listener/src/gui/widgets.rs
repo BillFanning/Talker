@@ -349,6 +349,68 @@ pub(super) fn config_incomplete(config: &ChannelConfig) -> bool {
     }
 }
 
+/// One step of an "Apply & Start/Restart" config commit, in dispatch order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CommitStep {
+    Stop,
+    Reconfigure,
+    Start,
+}
+
+/// Plan an "Apply & Start/Restart": the ordered commands to install the edited
+/// config and bring the channel up, given its current state. `None` means the
+/// config can't start (e.g. no port) — the caller complains and changes nothing.
+///
+/// Pure (no egui, no bridge) so the state-machine sequencing is unit-tested. Start
+/// must be a legal `Stopped → Running` transition (§8.5), so anything currently up
+/// (Running) or not cleanly stoppable (Faulted/Reconnecting) is Stopped first.
+pub(super) fn plan_config_commit(
+    status: ChannelStatus,
+    config_incomplete: bool,
+) -> Option<Vec<CommitStep>> {
+    if config_incomplete {
+        return None;
+    }
+    let mut steps = Vec::new();
+    if matches!(
+        status,
+        ChannelStatus::Running | ChannelStatus::Faulted | ChannelStatus::Reconnecting
+    ) {
+        steps.push(CommitStep::Stop);
+    }
+    steps.push(CommitStep::Reconfigure);
+    steps.push(CommitStep::Start);
+    Some(steps)
+}
+
+/// The primary lifecycle action offered for a channel in its current state — the
+/// label and meaning of the big action button. `Retry` is Stop-then-Start (a
+/// Faulted channel can't Start directly, §8.5). Pure, so it's unit-tested.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LifecycleAction {
+    Stop,
+    Retry,
+    Start,
+}
+
+impl LifecycleAction {
+    pub(super) fn from_status(status: ChannelStatus) -> Self {
+        match status {
+            ChannelStatus::Running => LifecycleAction::Stop,
+            ChannelStatus::Faulted => LifecycleAction::Retry,
+            _ => LifecycleAction::Start,
+        }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            LifecycleAction::Stop => "Stop",
+            LifecycleAction::Retry => "Retry",
+            LifecycleAction::Start => "Start",
+        }
+    }
+}
+
 /// The headline diagnostic for the real-time status line: the most recent error,
 /// else the most recent warning, else the most recent event, with its display color.
 /// Errors win so a fault stays visible in the collapsed header while troubleshooting.
@@ -477,6 +539,61 @@ mod tests {
         // A fresh serial template has no port selected → incomplete.
         let serial = templates::serial_template();
         assert!(config_incomplete(&serial));
+    }
+
+    #[test]
+    fn config_commit_sequences_by_state() {
+        use CommitStep::*;
+        // Running = a real restart: Stop → Reconfigure → Start.
+        assert_eq!(
+            plan_config_commit(ChannelStatus::Running, false),
+            Some(vec![Stop, Reconfigure, Start])
+        );
+        // Stopped just installs + starts (nothing to stop).
+        assert_eq!(
+            plan_config_commit(ChannelStatus::Stopped, false),
+            Some(vec![Reconfigure, Start])
+        );
+        // Faulted/Reconnecting must be Stopped first so Start is legal (§8.5).
+        for s in [ChannelStatus::Faulted, ChannelStatus::Reconnecting] {
+            assert_eq!(
+                plan_config_commit(s, false),
+                Some(vec![Stop, Reconfigure, Start]),
+                "{s:?}"
+            );
+        }
+        // An incomplete config can't start in any state → refuse (None).
+        for s in [
+            ChannelStatus::Running,
+            ChannelStatus::Stopped,
+            ChannelStatus::Faulted,
+            ChannelStatus::Reconnecting,
+        ] {
+            assert_eq!(plan_config_commit(s, true), None, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_action_maps_state_to_button() {
+        assert_eq!(
+            LifecycleAction::from_status(ChannelStatus::Running),
+            LifecycleAction::Stop
+        );
+        assert_eq!(
+            LifecycleAction::from_status(ChannelStatus::Faulted),
+            LifecycleAction::Retry
+        );
+        assert_eq!(
+            LifecycleAction::from_status(ChannelStatus::Stopped),
+            LifecycleAction::Start
+        );
+        assert_eq!(
+            LifecycleAction::from_status(ChannelStatus::Reconnecting),
+            LifecycleAction::Start
+        );
+        assert_eq!(LifecycleAction::Stop.label(), "Stop");
+        assert_eq!(LifecycleAction::Retry.label(), "Retry");
+        assert_eq!(LifecycleAction::Start.label(), "Start");
     }
 
     #[test]
