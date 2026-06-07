@@ -13,7 +13,11 @@ editor, preview, output pane, and logs instead of tofu boxes.
 | File | Role | Coverage |
 |---|---|---|
 | `CascadiaMono-ControlPictures.ttf` | fallback | U+2400–2421 control-character pictures (`␊` `␍` `␛` etc.) for the Raw display mode |
-| `NotoSans-Regular.ttf` | **primary UI font** (Highest for Proportional; lowest fallback for Monospace) | Latin Extended + Greek + Cyrillic + Vietnamese (Noto Sans core) |
+| `CascadiaMono.ttf` | selectable message-view monospace | Microsoft Cascadia Mono — `LICENSE-Cascadia.txt` (OFL-1.1) |
+| `JetBrainsMono-Regular.ttf` | selectable message-view monospace | JetBrains Mono — `LICENSE-JetBrainsMono.txt` (OFL-1.1) |
+| `DejaVuSansMono.ttf` | selectable message-view monospace **and** the wide-coverage fallback for the other mono faces (keeps columns aligned before resorting to proportional Noto) — `LICENSE-DejaVu.txt` (Bitstream Vera; DejaVu changes public domain) | DejaVu Sans Mono |
+| `NotoSans-Regular.ttf` | **primary UI font** (Proportional) + last-resort Latin fallback for every mono face | Latin Extended + Greek + Cyrillic + Vietnamese (Noto Sans core) |
+| `NotoSans-Bold.ttf` | named family `ui_bold` for genuinely-bold section/field titles (egui `.strong()` only recolors) — `LICENSE-Noto.txt` (OFL-1.1) | Noto Sans Bold (static instance, wght 700) |
 | `NotoSansSymbols2-Regular.ttf` | fallback | Math symbols, arrows, geometric shapes, technical / misc symbols |
 | `NotoSansThai-Regular.ttf` | fallback | Thai (U+0E00–0E7F) |
 | `NotoSansArabic-Regular.ttf` | fallback | Arabic + Supplement + Extended (RTL shaping not done by us; egui renders glyphs only) |
@@ -27,7 +31,7 @@ editor, preview, output pane, and logs instead of tofu boxes.
   coverage. Talker users mostly push NMEA / ASCII / Western text, so
   the binary-size cost wasn't worth the marginal benefit. If you
   need CJK, drop a `NotoSansCJK-Regular.ttc` (or equivalent) in here
-  and add a matching entry to `install_unicode_fallback_fonts`.
+  and add a matching entry to `install_fonts`.
 - **Indic scripts beyond Devanagari** (Tamil, Bengali, Telugu,
   Kannada, Malayalam, …). Same reasoning — add as needed.
 - **SE Asian beyond Thai** (Lao, Khmer, Myanmar). Ditto.
@@ -36,8 +40,9 @@ editor, preview, output pane, and logs instead of tofu boxes.
 
 ## Sizes
 
-Total bundled font payload is ~3 MB. The release binary grows from
-~9 MB to ~12 MB.
+Total bundled font payload is ~4.6 MB (Noto Sans + Bold, the four
+selectable monospace faces, and the script/symbol fallbacks). The
+release binary grows correspondingly.
 
 ## Cascadia Mono — Control Pictures subset
 

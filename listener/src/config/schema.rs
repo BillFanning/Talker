@@ -153,6 +153,9 @@ pub enum StopBits {
 pub enum FlowControl {
     #[default]
     None,
+    /// Software flow control (XON/XOFF).
+    XonXoff,
+    /// Hardware flow control (RTS/CTS).
     RtsCts,
 }
 

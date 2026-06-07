@@ -120,6 +120,7 @@ fn map_stop_bits(bits: CfgStopBits) -> Result<StopBits, BuildError> {
 fn map_flow_control(flow: CfgFlowControl) -> FlowControl {
     match flow {
         CfgFlowControl::None => FlowControl::None,
+        CfgFlowControl::XonXoff => FlowControl::Software,
         CfgFlowControl::RtsCts => FlowControl::Hardware,
     }
 }

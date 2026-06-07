@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use crate::config::ChannelConfig;
 use crate::core::{ChannelId, RuntimeEvent};
 use crate::runtime::ChannelSnapshot;
+use crate::transport::SerialControlLines;
 
 use super::bridge::UiUpdate;
 
@@ -39,14 +40,19 @@ pub struct ChannelView {
     pub messages: u64,
     /// Rolling throughput from the latest snapshot (§91.1, §166).
     pub bytes_per_sec: f64,
-    /// Retained-warning count from the latest snapshot (§88).
+    /// Retained per-severity diagnostic counts from the latest snapshot (§88), shown
+    /// on the channel tab (#8).
+    pub info: usize,
     pub warnings: usize,
+    pub errors: usize,
     /// The reason the last command on this Channel failed (e.g. a bind conflict),
     /// cleared on a successful (re)start. `None` when there's nothing to report.
     pub last_error: Option<String>,
     /// The most recent full snapshot, for detail panes (retained Messages, hex,
     /// diagnostics, match firings). `None` until the first poll arrives.
     pub snapshot: Option<ChannelSnapshot>,
+    /// Live serial control/status lines (§161) while running; `None` otherwise.
+    pub control_lines: Option<SerialControlLines>,
 }
 
 impl ChannelView {
@@ -59,9 +65,12 @@ impl ChannelView {
             status: ChannelStatus::Stopped,
             messages: 0,
             bytes_per_sec: 0.0,
+            info: 0,
             warnings: 0,
+            errors: 0,
             last_error: None,
             snapshot: None,
+            control_lines: None,
         }
     }
 }
@@ -84,6 +93,45 @@ impl AppState {
         self.views.get(&id)
     }
 
+    /// The Channel adjacent to `id` in list order: the one above it, or — if `id` is
+    /// first — the one below. `None` if `id` is unknown or the only Channel. Used to
+    /// keep a selection after the selected Channel is removed (#2).
+    pub fn neighbor(&self, id: ChannelId) -> Option<ChannelId> {
+        let pos = self.order.iter().position(|c| *c == id)?;
+        if pos > 0 {
+            self.order.get(pos - 1).copied()
+        } else {
+            self.order.get(pos + 1).copied()
+        }
+    }
+
+    /// The Channel before/after `id` in list order, wrapping around — for keyboard
+    /// tab-cycling (#3). `None` if `id` is unknown.
+    pub fn cycle(&self, id: ChannelId, forward: bool) -> Option<ChannelId> {
+        let n = self.order.len();
+        if n == 0 {
+            return None;
+        }
+        let pos = self.order.iter().position(|c| *c == id)?;
+        let next = if forward {
+            (pos + 1) % n
+        } else {
+            (pos + n - 1) % n
+        };
+        self.order.get(next).copied()
+    }
+
+    /// The first Channel in list order, if any (for selecting something sensible
+    /// when nothing is focused).
+    pub fn first(&self) -> Option<ChannelId> {
+        self.order.first().copied()
+    }
+
+    /// All Channel ids in list order (for bulk Start all / Stop all, #5).
+    pub fn channel_ids(&self) -> Vec<ChannelId> {
+        self.order.clone()
+    }
+
     /// Fold one update into the model.
     pub fn apply(&mut self, update: UiUpdate) {
         match update {
@@ -97,7 +145,17 @@ impl AppState {
             UiUpdate::ChannelReconfigured(id, details, config) => {
                 if let Some(view) = self.views.get_mut(&id) {
                     view.details = details;
+                    // Mirror a renamed channel into the list row (#6).
+                    view.name = config.name.as_str().to_string();
                     view.config = *config;
+                }
+            }
+            UiUpdate::ChannelRenamed(id, name) => {
+                if let Some(view) = self.views.get_mut(&id) {
+                    // Keep both the list label and the editor's seed config in step,
+                    // so re-opening the editor shows the new name (§6).
+                    view.config.name = crate::core::ChannelName::new(name.clone());
+                    view.name = name;
                 }
             }
             UiUpdate::ChannelRemoved(id) => {
@@ -114,8 +172,15 @@ impl AppState {
                 if let Some(view) = self.views.get_mut(&id) {
                     view.messages = snapshot.next_message_number.saturating_sub(1);
                     view.bytes_per_sec = snapshot.activity.bytes_per_sec;
+                    view.info = snapshot.diagnostics.events.len();
                     view.warnings = snapshot.diagnostics.warnings.len();
+                    view.errors = snapshot.diagnostics.errors.len();
                     view.snapshot = Some(*snapshot);
+                }
+            }
+            UiUpdate::ControlLines(id, lines) => {
+                if let Some(view) = self.views.get_mut(&id) {
+                    view.control_lines = Some(lines);
                 }
             }
         }
@@ -132,7 +197,12 @@ impl AppState {
                     view.last_error = None; // a successful start clears the prior error
                 }
             }
-            RuntimeEvent::ChannelStopped(id) => self.set_status(id, ChannelStatus::Stopped),
+            RuntimeEvent::ChannelStopped(id) => {
+                self.set_status(id, ChannelStatus::Stopped);
+                if let Some(view) = self.views.get_mut(&id) {
+                    view.control_lines = None; // no live lines while stopped
+                }
+            }
             RuntimeEvent::ChannelFaulted(id) => self.set_status(id, ChannelStatus::Faulted),
             RuntimeEvent::ChannelReconnecting(id, _) => {
                 self.set_status(id, ChannelStatus::Reconnecting)
@@ -345,5 +415,51 @@ mod tests {
 
         let names: Vec<&str> = state.channels().map(|v| v.name.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn neighbor_picks_the_channel_above_then_below() {
+        let mut state = AppState::default();
+        let (a, b, c) = (ChannelId::new(), ChannelId::new(), ChannelId::new());
+        state.apply(added(a, "a", "UDP"));
+        state.apply(added(b, "b", "TCP"));
+        state.apply(added(c, "c", "Serial"));
+
+        // Middle/last fall back to the one above; the first falls back to the next.
+        assert_eq!(state.neighbor(b), Some(a));
+        assert_eq!(state.neighbor(c), Some(b));
+        assert_eq!(state.neighbor(a), Some(b));
+
+        // The sole remaining channel has no neighbor.
+        state.apply(UiUpdate::ChannelRemoved(b));
+        state.apply(UiUpdate::ChannelRemoved(c));
+        assert_eq!(state.neighbor(a), None);
+        assert_eq!(state.neighbor(ChannelId::new()), None); // unknown
+    }
+
+    #[test]
+    fn cycle_wraps_in_both_directions() {
+        let mut state = AppState::default();
+        let (a, b, c) = (ChannelId::new(), ChannelId::new(), ChannelId::new());
+        state.apply(added(a, "a", "UDP"));
+        state.apply(added(b, "b", "TCP"));
+        state.apply(added(c, "c", "Serial"));
+
+        assert_eq!(state.cycle(a, true), Some(b));
+        assert_eq!(state.cycle(c, true), Some(a)); // wrap forward
+        assert_eq!(state.cycle(a, false), Some(c)); // wrap back
+        assert_eq!(state.first(), Some(a));
+    }
+
+    #[test]
+    fn renamed_updates_both_the_label_and_the_editor_seed() {
+        let mut state = AppState::default();
+        let a = ChannelId::new();
+        state.apply(added(a, "a", "UDP"));
+
+        state.apply(UiUpdate::ChannelRenamed(a, "Bridge".into()));
+        let v = state.channel(a).unwrap();
+        assert_eq!(v.name, "Bridge");
+        assert_eq!(v.config.name.as_str(), "Bridge");
     }
 }

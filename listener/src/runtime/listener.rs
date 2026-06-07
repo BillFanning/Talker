@@ -261,6 +261,11 @@ impl Listener {
         self.channels.get(&id).is_some_and(|c| c.pending.is_some())
     }
 
+    /// The accepted-but-unapplied configuration for a Channel (§13), if any.
+    pub fn pending(&self, id: ChannelId) -> Option<&ChannelConfig> {
+        self.channels.get(&id).and_then(|c| c.pending.as_ref())
+    }
+
     /// The Display View ids of a running Channel (§48); empty while Stopped.
     pub fn display_views(&self, channel: ChannelId) -> Vec<DisplayViewId> {
         self.channels
@@ -442,6 +447,26 @@ impl Listener {
         }
         if was_running {
             self.start(id).await?;
+        }
+        Ok(())
+    }
+
+    /// Rename a Channel in place (§6). The name is a user-facing label only and the
+    /// pipeline does not key off it, so this takes effect immediately — no restart,
+    /// no interface churn — unlike the full reconfigure path. A queued pending config
+    /// is renamed too, so applying it later does not revert the name.
+    pub fn rename(
+        &mut self,
+        id: ChannelId,
+        name: crate::core::ChannelName,
+    ) -> Result<(), OrchestratorError> {
+        let channel = self
+            .channels
+            .get_mut(&id)
+            .ok_or(OrchestratorError::UnknownChannel(id))?;
+        channel.config.name = name.clone();
+        if let Some(pending) = &mut channel.pending {
+            pending.name = name;
         }
         Ok(())
     }
@@ -958,6 +983,45 @@ mod tests {
 
         listener.shutdown().await;
         assert_eq!(listener.state(id), Some(ChannelState::Stopped));
+    }
+
+    #[tokio::test]
+    async fn rename_takes_effect_immediately_without_restarting() {
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        listener.start(id).await.unwrap();
+
+        listener
+            .rename(id, crate::core::ChannelName::new("Bridge feed"))
+            .unwrap();
+        // The label changed and the channel kept Running — no coordinated restart.
+        assert_eq!(listener.config(id).unwrap().name.as_str(), "Bridge feed");
+        assert_eq!(listener.state(id), Some(ChannelState::Running));
+
+        listener.shutdown().await;
+    }
+
+    #[test]
+    fn rename_also_updates_a_queued_pending_config() {
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+
+        // A pending edit is queued (e.g. a port change the user has not applied).
+        let mut pending = udp_channel();
+        if let InterfaceConfig::Udp(udp) = &mut pending.interface {
+            udp.port = 9100;
+        }
+        listener.set_pending_config(id, pending).unwrap();
+
+        // Renaming updates the live config and the pending one, so applying the
+        // pending edit later does not revert the new name.
+        listener
+            .rename(id, crate::core::ChannelName::new("Renamed"))
+            .unwrap();
+        assert_eq!(listener.config(id).unwrap().name.as_str(), "Renamed");
+        assert_eq!(listener.pending(id).unwrap().name.as_str(), "Renamed");
     }
 
     #[tokio::test]

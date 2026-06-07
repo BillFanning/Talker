@@ -15,9 +15,10 @@ use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::config::{ChannelConfig, InterfaceConfig};
-use crate::core::{ChannelId, DisplayViewId, RuntimeEvent};
-use crate::runtime::{ChannelSnapshot, Listener};
+use crate::core::{ChannelId, ChannelName, DisplayViewId, RuntimeEvent};
+use crate::runtime::{ChannelSnapshot, Listener, PipelineCapacities};
 use crate::transport::udp::UdpMode;
+use crate::transport::SerialControlLines;
 
 /// How often the driver polls running Channels for a fresh snapshot (the pull
 /// surface, ADR-006). 5 Hz is responsive without busy-polling.
@@ -44,6 +45,8 @@ pub enum UiCommand {
     /// pending-config/apply path: a Running channel restarts onto the new config;
     /// a Stopped/Faulted one swaps it in to be used on the next Start/Retry.
     Reconfigure(ChannelId, Box<ChannelConfig>),
+    /// Rename a channel in place — instant, no restart (the name is a label only).
+    Rename(ChannelId, ChannelName),
     ApplyPending(ChannelId),
     PauseDisplay(ChannelId, DisplayViewId),
     ResumeDisplay(ChannelId, DisplayViewId),
@@ -65,6 +68,9 @@ pub enum UiUpdate {
     /// A channel's configuration changed (§13): its new connection description and
     /// config, so the UI refreshes its editor and details.
     ChannelReconfigured(ChannelId, String, Box<ChannelConfig>),
+    /// A channel was renamed in place (§6) — its new display name. No restart and
+    /// no connection change, so only the label updates.
+    ChannelRenamed(ChannelId, String),
     /// A channel was removed from the runtime; the UI should drop it.
     ChannelRemoved(ChannelId),
     /// A command on a channel failed (e.g. a Start whose bind hit "address in
@@ -74,6 +80,9 @@ pub enum UiUpdate {
     Event(RuntimeEvent),
     /// A periodic snapshot of a running channel (the pull surface).
     Snapshot(ChannelId, Box<ChannelSnapshot>),
+    /// Current serial control/status lines for a running serial channel (§161),
+    /// polled alongside snapshots.
+    ControlLines(ChannelId, SerialControlLines),
 }
 
 /// A one-line, human-readable description of a channel's interface and endpoint,
@@ -201,6 +210,11 @@ impl Driver {
                 self.channels.retain(|c| *c != id);
                 self.push(UiUpdate::ChannelRemoved(id));
             }
+            UiCommand::Rename(id, name) => {
+                if self.listener.rename(id, name.clone()).is_ok() {
+                    self.push(UiUpdate::ChannelRenamed(id, name.as_str().to_string()));
+                }
+            }
             UiCommand::ApplyPending(id) => {
                 if let Err(err) = self.listener.apply_pending(id).await {
                     self.push(UiUpdate::ChannelError(id, err.to_string()));
@@ -232,6 +246,11 @@ impl Driver {
         for id in self.channels.clone() {
             if let Some(snap) = self.listener.snapshot(id).await {
                 self.push(UiUpdate::Snapshot(id, Box::new(snap)));
+            }
+            // Live serial control/status lines (§161); `None` for non-serial or
+            // stopped channels.
+            if let Some(lines) = self.listener.serial_control_lines(id) {
+                self.push(UiUpdate::ControlLines(id, lines));
             }
         }
     }
@@ -276,7 +295,14 @@ pub fn spawn(repaint: impl Fn() + Send + 'static) -> anyhow::Result<BridgeHandle
                 }
             };
             runtime.block_on(async move {
-                let mut listener = Listener::with_default_capacities();
+                // A roomy recent-message buffer for scrollback — the message view
+                // virtualizes (renders only visible rows), so a large ring is cheap
+                // to display (#4). Other capacities stay at their defaults.
+                let mut listener = Listener::new(PipelineCapacities {
+                    display: 50_000,
+                    retention: 50_000,
+                    ..PipelineCapacities::default()
+                });
                 let events = listener
                     .take_events()
                     .expect("the event stream is available exactly once");

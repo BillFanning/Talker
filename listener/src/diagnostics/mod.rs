@@ -8,6 +8,8 @@
 //! ([`DiagnosticsQueue`](crate::runtime::queue::DiagnosticsQueue)) is a separate,
 //! drop-oldest-low-priority edge built over [`Diagnostic`].
 
+use std::time::SystemTime;
+
 use crate::retention::{CountBounded, RetentionStore, DEFAULT_BACKSTOP};
 
 pub use crate::core::ErrorCategory;
@@ -26,11 +28,13 @@ pub enum DiagnosticSeverity {
     Error,
 }
 
-/// A diagnostic record retained for review (§91–§95).
+/// A diagnostic record retained for review (§91–§95). `timestamp` is the wall-clock
+/// time the record was created (millisecond display precision, §26-style).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     pub severity: DiagnosticSeverity,
     pub message: String,
+    pub timestamp: SystemTime,
 }
 
 impl Diagnostic {
@@ -38,6 +42,20 @@ impl Diagnostic {
         Self {
             severity,
             message: message.into(),
+            timestamp: SystemTime::now(),
+        }
+    }
+
+    /// Construct with an explicit timestamp (for deterministic tests / replay).
+    pub fn at(
+        severity: DiagnosticSeverity,
+        message: impl Into<String>,
+        timestamp: SystemTime,
+    ) -> Self {
+        Self {
+            severity,
+            message: message.into(),
+            timestamp,
         }
     }
 
@@ -163,5 +181,20 @@ mod tests {
     fn severity_orders_low_to_high() {
         assert!(DiagnosticSeverity::Event < DiagnosticSeverity::Warning);
         assert!(DiagnosticSeverity::Warning < DiagnosticSeverity::Error);
+    }
+
+    #[test]
+    fn diagnostics_carry_a_timestamp() {
+        use std::time::{Duration, SystemTime};
+        // Constructed records stamp "now"; `at` lets tests pin an exact time so a
+        // merged log can be ordered chronologically across severities.
+        let t0 = SystemTime::UNIX_EPOCH;
+        let t1 = t0 + Duration::from_millis(250);
+        let a = Diagnostic::at(DiagnosticSeverity::Event, "first", t0);
+        let b = Diagnostic::at(DiagnosticSeverity::Error, "second", t1);
+        assert!(a.timestamp < b.timestamp);
+
+        let fresh = Diagnostic::event("now");
+        assert!(fresh.timestamp <= SystemTime::now());
     }
 }
