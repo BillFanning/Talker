@@ -59,16 +59,16 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  # Dependency vulnerability scan (RustSec advisory DB). Reads Cargo.lock; no build.
-  # Uses a prebuilt cargo-audit binary (downloaded, not compiled) so the job stays
-  # fast while running exactly the same `cargo audit` as a local checkout.
-  audit:
-    name: cargo-audit
+  # Dependency policy (deny.toml): licenses, RustSec security advisories,
+  # banned/duplicate crates, and crate sources. Subsumes cargo-audit's advisory
+  # scan. Prebuilt cargo-deny binary (downloaded, not compiled) for speed.
+  deny:
+    name: cargo-deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit
-      - run: cargo audit
+          tool: cargo-deny
+      - run: cargo deny check
