@@ -258,13 +258,29 @@ impl ListenerApp {
         }
     }
 
-    /// Apply the edit draft to its channel (§13): send a `Reconfigure`. A Running
-    /// channel restarts onto it; a Stopped/Faulted one swaps it in for the next
-    /// Start/Retry.
-    fn apply_edit_draft(&mut self) {
-        if let Some((id, config)) = self.edit_draft.clone() {
-            self.send(UiCommand::Reconfigure(id, Box::new(config)));
+    /// Apply the edited config and bring the channel up on it in one action (§13) —
+    /// the single "Apply & Restart" button, so there's no separate Apply-then-Start.
+    /// Drives the channel to Stopped first (if it's Running/Faulted/Reconnecting),
+    /// swaps in the new config, then Starts — so Start is always a legal
+    /// Stopped→Running transition (§8.5). Refuses, with an inline complaint, if the
+    /// new config can't start (e.g. no port), leaving the channel as-is.
+    fn apply_and_restart(&mut self, id: ChannelId) {
+        let Some((_, config)) = self.edit_draft.clone() else {
+            return;
+        };
+        if config_incomplete(&config) {
+            self.complain_unconfigured(id);
+            return;
         }
+        let status = self.state.channel(id).map(|v| v.status);
+        if matches!(
+            status,
+            Some(ChannelStatus::Running | ChannelStatus::Faulted | ChannelStatus::Reconnecting)
+        ) {
+            self.send(UiCommand::Stop(id));
+        }
+        self.send(UiCommand::Reconfigure(id, Box::new(config)));
+        self.send(UiCommand::Start(id));
     }
 
     /// Start a channel, but refuse (and complain) if its config is incomplete — e.g.
@@ -545,7 +561,9 @@ impl ListenerApp {
             );
         }
 
-        // Configure: edit the full interface config on a working copy, then Apply.
+        // Configure: edit the full interface config on a working copy, then commit
+        // with one click — "Apply & Restart" installs it and brings the channel up
+        // (no separate Apply-then-Start step).
         let ports = self.serial_ports.clone();
         // Force the section open for one frame when focus moved to a needy channel
         // (task 1); `None` afterwards so the user can still collapse it.
@@ -563,7 +581,7 @@ impl ListenerApp {
                     refresh = ui
                         .push_id("edit_iface", |ui| edit_interface(ui, id, config, &ports))
                         .inner;
-                    apply = ui.button("Apply").clicked();
+                    apply = ui.button("Apply & Restart").clicked();
                 });
         }
         self.force_config_open = false;
@@ -571,7 +589,7 @@ impl ListenerApp {
             self.refresh_serial_ports();
         }
         if apply {
-            self.apply_edit_draft();
+            self.apply_and_restart(id);
         }
 
         // Live serial control/status lines (§161): green = high, grey = low.
