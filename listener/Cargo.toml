@@ -46,7 +46,7 @@ chrono = { workspace = true }
 socket2 = { workspace = true }
 
 # Filesystem free space for the recording disk-space guard (§168, §56.2)
-fs2 = { workspace = true }
+fs4 = { workspace = true }
 
 # async methods in the recorder traits (§142)
 async-trait = { workspace = true }

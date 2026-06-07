@@ -24,7 +24,8 @@ serialport = "4"
 socket2 = "0.5"
 
 # ── Filesystem free space for the recording disk guard (§168) ─────────────────
-fs2 = "0.4"
+# fs4 is the maintained successor to fs2 (same free-function disk-space API).
+fs4 = "1"
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 # eframe and egui MUST share the same minor version.

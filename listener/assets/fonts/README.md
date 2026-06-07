@@ -12,8 +12,7 @@ editor, preview, output pane, and logs instead of tofu boxes.
 
 | File | Role | Coverage |
 |---|---|---|
-| `CascadiaMono-ControlPictures.ttf` | fallback | U+2400–2421 control-character pictures (`␊` `␍` `␛` etc.) for the Raw display mode |
-| `CascadiaMono.ttf` | selectable message-view monospace | Microsoft Cascadia Mono — `LICENSE-Cascadia.txt` (OFL-1.1) |
+| `CascadiaMono.ttf` | selectable message-view monospace **and** the control-picture fallback (covers U+2400–2421, `␊` `␍` …) for the UI and the other mono faces — `LICENSE-Cascadia.txt` (OFL-1.1) | Microsoft Cascadia Mono |
 | `JetBrainsMono-Regular.ttf` | selectable message-view monospace | JetBrains Mono — `LICENSE-JetBrainsMono.txt` (OFL-1.1) |
 | `DejaVuSansMono.ttf` | selectable message-view monospace **and** the wide-coverage fallback for the other mono faces (keeps columns aligned before resorting to proportional Noto) — `LICENSE-DejaVu.txt` (Bitstream Vera; DejaVu changes public domain) | DejaVu Sans Mono |
 | `NotoSans-Regular.ttf` | **primary UI font** (Proportional) + last-resort Latin fallback for every mono face | Latin Extended + Greek + Cyrillic + Vietnamese (Noto Sans core) |
@@ -44,36 +43,13 @@ Total bundled font payload is ~4.6 MB (Noto Sans + Bold, the four
 selectable monospace faces, and the script/symbol fallbacks). The
 release binary grows correspondingly.
 
-## Cascadia Mono — Control Pictures subset
+## Control pictures (␊ ␍ …)
 
-A subset of [Cascadia Mono](https://github.com/microsoft/cascadia-code)
-containing only Unicode codepoints **U+2400 through U+2421** — the C0
-control-character pictures plus `␠` (U+2420) and `␡` (U+2421).
-
-Full Cascadia Mono is ~714 KB. Subsetting to the 34 glyphs we need
-brings it to ~19 KB, with hinting and OpenType layout tables stripped.
-
-Cascadia Code / Mono is licensed under the SIL Open Font License
-v1.1. See `LICENSE-Cascadia.txt`.
-
-Regenerate with `fonttools`:
-
-```python
-from fontTools.subset import Subsetter, Options
-from fontTools.ttLib import TTFont
-
-font = TTFont('CascadiaMono.ttf')
-opts = Options()
-opts.layout_features = []
-opts.hinting = False
-opts.desubroutinize = True
-opts.notdef_outline = False
-opts.drop_tables += ['GSUB', 'GPOS', 'GDEF', 'BASE', 'JSTF', 'DSIG', 'MATH', 'kern']
-sub = Subsetter(options=opts)
-sub.populate(unicodes=list(range(0x2400, 0x2422)))
-sub.subset(font)
-font.save('CascadiaMono-ControlPictures.ttf')
-```
+The full `CascadiaMono.ttf` (a selectable message-view face) covers the
+Unicode Control Pictures block (U+2400–U+2421), so it doubles as the
+control-picture fallback for the proportional UI and the other mono
+faces — no separate subset font is bundled. Cascadia Code / Mono is
+licensed under the SIL Open Font License v1.1 (`LICENSE-Cascadia.txt`).
 
 ## Noto Sans family
 

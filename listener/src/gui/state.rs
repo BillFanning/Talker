@@ -178,6 +178,16 @@ impl AppState {
                     view.snapshot = Some(*snapshot);
                 }
             }
+            // Cheap per-tab health for non-selected channels (no message history).
+            UiUpdate::Stats(id, stats) => {
+                if let Some(view) = self.views.get_mut(&id) {
+                    view.messages = stats.next_message_number.saturating_sub(1);
+                    view.bytes_per_sec = stats.activity.bytes_per_sec;
+                    view.info = stats.event_count;
+                    view.warnings = stats.warning_count;
+                    view.errors = stats.error_count;
+                }
+            }
             UiUpdate::ControlLines(id, lines) => {
                 if let Some(view) = self.views.get_mut(&id) {
                     view.control_lines = Some(lines);

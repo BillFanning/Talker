@@ -42,7 +42,7 @@ use super::channel::{
     spawn_monitored_channel, DataRecorder, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES,
 };
 use super::pipeline::{DisplayViewHandle, PipelineCapacities, RawRecordArming};
-use super::snapshot::ChannelSnapshot;
+use super::snapshot::{ChannelSnapshot, ChannelStats};
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
 
 /// Per-view subsampling policies for a Channel (§50.1), in view order. At least
@@ -212,6 +212,16 @@ impl Listener {
     pub async fn snapshot(&self, id: ChannelId) -> Option<ChannelSnapshot> {
         match self.channels.get(&id)?.handle.as_ref()? {
             ChannelHandle::Data(tasks) => tasks.snapshot().await,
+            ChannelHandle::TcpListener(_) => None,
+        }
+    }
+
+    /// Cheap O(1) liveness stats for a running data Channel (§91.1, ADR-006) — the
+    /// counters a multi-channel overview shows per tab, without cloning retained
+    /// Messages. `None` when unknown, not running, or a TCP listener.
+    pub async fn channel_stats(&self, id: ChannelId) -> Option<ChannelStats> {
+        match self.channels.get(&id)?.handle.as_ref()? {
+            ChannelHandle::Data(tasks) => tasks.stats().await,
             ChannelHandle::TcpListener(_) => None,
         }
     }
@@ -489,6 +499,12 @@ impl Listener {
 
     /// Stop every live Channel (§113, application exit). Includes spontaneously
     /// faulted channels so their tasks and Display Views are cleaned up too.
+    /// Per-channel grace window for [`shutdown`](Self::shutdown): generous, since a
+    /// normal graceful stop drains the small bounded ingest queue and finalizes
+    /// files in milliseconds — this only guards against a pathologically stuck
+    /// finalize hanging process exit.
+    const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
     pub async fn shutdown(&mut self) {
         let live: Vec<ChannelId> = self
             .channels
@@ -502,7 +518,14 @@ impl Listener {
             .map(|(id, _)| *id)
             .collect();
         for id in live {
-            let _ = self.stop(id).await;
+            // Graceful stop (§110) preserves the accepted backlog — it drains the
+            // bounded ingest queue into recordings before finalizing — so we prefer
+            // it over a forced abort, which would abandon up to `caps.ingest`
+            // buffered chunks. But it is *bounded*: should a recorder's finalize
+            // hang, the timeout abandons the wait so process exit can't deadlock.
+            // The transport is already cancelled inside `stop`, so the detached
+            // tasks wind down on their own.
+            let _ = tokio::time::timeout(Self::SHUTDOWN_GRACE, self.stop(id)).await;
         }
     }
 

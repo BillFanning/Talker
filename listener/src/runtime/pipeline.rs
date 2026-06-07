@@ -22,7 +22,9 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 
 use super::activity::ActivityMeter;
-use super::snapshot::{ChannelSnapshot, DiagnosticsSnapshot, DisplayViewSnapshot, SnapshotRequest};
+use super::snapshot::{
+    ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
+};
 use super::subsample::Subsampler;
 use crate::config::{
     DiskGuard, DiskThreshold, LowDiskAction, MatchAction, MatchRule, RecordControl, RecordTarget,
@@ -715,7 +717,7 @@ impl ChannelPipeline {
         {
             return;
         }
-        let (Ok(free), Ok(total)) = (fs2::available_space(&path), fs2::total_space(&path)) else {
+        let (Ok(free), Ok(total)) = (fs4::available_space(&path), fs4::total_space(&path)) else {
             return; // cannot determine free space; do not act
         };
         if !disk_is_low(free, total, guard.min_free) {
@@ -864,6 +866,20 @@ impl ChannelPipeline {
     /// ADR-006): retained Messages, per-view display history, diagnostics, and
     /// recording state. Messages are shared as `Arc`s, so this clones references,
     /// not payloads.
+    /// Cheap O(1) counters for a multi-channel overview (§91.1) — no Message
+    /// cloning, unlike [`snapshot`](Self::snapshot). Polled per-Channel each tick;
+    /// the full snapshot is reserved for the Channel actually on screen.
+    pub fn stats(&self) -> ChannelStats {
+        ChannelStats {
+            next_message_number: self.numbering.peek(),
+            activity: self.activity.snapshot(Instant::now()),
+            event_count: self.diagnostics.events().count(),
+            warning_count: self.diagnostics.warnings().count(),
+            error_count: self.diagnostics.errors().count(),
+            raw_recording: self.raw_recording_state(),
+        }
+    }
+
     pub fn snapshot(&self) -> ChannelSnapshot {
         ChannelSnapshot {
             channel_id: self.channel_id,
@@ -907,20 +923,21 @@ fn disk_is_low(free: u64, total: u64, threshold: DiskThreshold) -> bool {
 /// caller can finalize/inspect it. Cancellation is cooperative and checked
 /// first (`biased`) so shutdown does not depend on draining the queue (§111).
 ///
-/// Between reads it also serves snapshot requests (§137, ADR-006) and records
+/// Between reads it also serves snapshot/stats requests (§137, ADR-006) and records
 /// transport notices (§95, §101, ADR-007): a requester sends a oneshot reply on
-/// `snapshots` and the loop answers from current state; a transport sends a
-/// `TransportNotice` on `notices` and the loop records it as a diagnostic. Both
-/// are checked ahead of reads (they are rare and cheap) so they are serviced
-/// promptly; a closed `snapshots`/`notices` channel simply stops being polled.
+/// `requests` and the loop answers (full snapshot or cheap stats) from current
+/// state; a transport sends a `TransportNotice` on `notices` and the loop records
+/// it as a diagnostic. Both are checked ahead of reads (they are rare and cheap) so
+/// they are serviced promptly; a closed `requests`/`notices` channel simply stops
+/// being polled.
 pub async fn run_channel(
     mut ingest: Receiver<ReceivedData>,
-    mut snapshots: Receiver<SnapshotRequest>,
+    mut requests: Receiver<PipelineRequest>,
     mut notices: Receiver<TransportNotice>,
     mut pipeline: ChannelPipeline,
     cancel: CancellationToken,
 ) -> ChannelPipeline {
-    let mut snapshots_open = true;
+    let mut requests_open = true;
     let mut notices_open = true;
     // Periodic disk-space guard poll (§56.2, §168) — not per write. Cheap when no
     // guard is configured (the check returns immediately).
@@ -934,11 +951,14 @@ pub async fn run_channel(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
-            reply = snapshots.recv(), if snapshots_open => match reply {
-                Some(tx) => {
+            req = requests.recv(), if requests_open => match req {
+                Some(PipelineRequest::Snapshot(tx)) => {
                     let _ = tx.send(pipeline.snapshot());
                 }
-                None => snapshots_open = false, // all requesters gone; keep running
+                Some(PipelineRequest::Stats(tx)) => {
+                    let _ = tx.send(pipeline.stats());
+                }
+                None => requests_open = false, // all requesters gone; keep running
             },
             notice = notices.recv(), if notices_open => match notice {
                 Some(notice) => pipeline.record_notice(notice),
@@ -1329,7 +1349,10 @@ mod tests {
         // and the snapshot race in the select loop).
         let snapshot = loop {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            snap_tx.send(reply_tx).await.unwrap();
+            snap_tx
+                .send(PipelineRequest::Snapshot(reply_tx))
+                .await
+                .unwrap();
             let snap = reply_rx.await.unwrap();
             if snap.retained.len() == 2 {
                 break snap;
@@ -1342,6 +1365,35 @@ mod tests {
         assert_eq!(nums, vec![1, 2]);
         assert_eq!(snapshot.display_views.len(), 1);
         assert_eq!(snapshot.display_views[0].messages.len(), 2);
+
+        cancel.cancel();
+        let _ = handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_channel_serves_cheap_stats_while_running() {
+        // ADR-006: the stats query returns the same counters as a full snapshot
+        // (message number, diagnostic counts) without cloning retained Messages.
+        let cid = ChannelId::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
+        let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(4);
+        let p = lf_pipeline(cid, PipelineCapacities::default());
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_channel(rx, req_rx, notice_rx, p, cancel.clone()));
+
+        tx.send(bytes_chunk(cid, b"one\ntwo\n")).await.unwrap();
+
+        let stats = loop {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            req_tx.send(PipelineRequest::Stats(reply_tx)).await.unwrap();
+            let s = reply_rx.await.unwrap();
+            if s.next_message_number == 3 {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(stats.error_count, 0);
 
         cancel.cancel();
         let _ = handle.await.unwrap();
@@ -1377,7 +1429,10 @@ mod tests {
 
         // A live snapshot shows the retained warning naming the stall duration.
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        snap_tx.send(reply_tx).await.unwrap();
+        snap_tx
+            .send(PipelineRequest::Snapshot(reply_tx))
+            .await
+            .unwrap();
         let snap = reply_rx.await.unwrap();
         assert_eq!(snap.diagnostics.warnings.len(), 1);
         assert!(snap.diagnostics.warnings[0]

@@ -21,9 +21,36 @@ use crate::diagnostics::Diagnostic;
 use super::activity::ChannelActivity;
 use super::pipeline::DecodedMessage;
 
-/// A request for a [`ChannelSnapshot`]: the reply half of a oneshot the pipeline
-/// fulfils from its current state. Dropping the sender simply yields no snapshot.
-pub type SnapshotRequest = oneshot::Sender<ChannelSnapshot>;
+/// A query the pipeline task answers from its current state, replying on a
+/// oneshot. Dropping the reply sender simply yields nothing.
+///
+/// Two granularities so observers pay only for what they show (listener ADR-006):
+/// - [`Stats`](Self::Stats): O(1) counters — no Message cloning. A multi-channel
+///   overview polls this for *every* Channel to keep per-tab health current.
+/// - [`Snapshot`](Self::Snapshot): the full point-in-time state, including cloned
+///   retained/display Messages. Polled only for the Channel actually on screen, so
+///   a large retention buffer isn't deep-copied for every Channel each tick.
+pub enum PipelineRequest {
+    Snapshot(oneshot::Sender<ChannelSnapshot>),
+    Stats(oneshot::Sender<ChannelStats>),
+}
+
+/// Cheap, O(1) liveness counters for a Channel — everything a multi-channel
+/// overview needs per tab without cloning any retained Messages (the expensive
+/// part of a full [`ChannelSnapshot`]).
+#[derive(Clone, Debug)]
+pub struct ChannelStats {
+    /// The next Message Number to be assigned (== Messages produced so far + 1).
+    pub next_message_number: u64,
+    /// Liveness facts: rolling throughput + last-data time (§91.1, §166).
+    pub activity: ChannelActivity,
+    /// Retained-diagnostic counts by severity (§88) — for per-tab health.
+    pub event_count: usize,
+    pub warning_count: usize,
+    pub error_count: usize,
+    /// Raw-recording state, or `None` when raw recording isn't attached (§53).
+    pub raw_recording: Option<RecordingState>,
+}
 
 /// A point-in-time, owned copy of one Channel's observable pipeline state.
 ///

@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::config::{ChannelConfig, InterfaceConfig};
 use crate::core::{ChannelId, ChannelName, DisplayViewId, RuntimeEvent};
-use crate::runtime::{ChannelSnapshot, Listener, PipelineCapacities};
+use crate::runtime::{ChannelSnapshot, ChannelStats, Listener, PipelineCapacities};
 use crate::transport::udp::UdpMode;
 use crate::transport::SerialControlLines;
 
@@ -52,6 +52,9 @@ pub enum UiCommand {
     ResumeDisplay(ChannelId, DisplayViewId),
     SetRts(ChannelId, bool),
     SetDtr(ChannelId, bool),
+    /// Tell the driver which channel is on screen (`None` = none). Only the selected
+    /// channel gets a full snapshot polled; the rest get cheap stats (ADR-006).
+    Select(Option<ChannelId>),
     /// Stop all channels and end the driver (the App is closing).
     Shutdown,
 }
@@ -78,8 +81,11 @@ pub enum UiUpdate {
     ChannelError(ChannelId, String),
     /// A forwarded runtime event (the authoritative push surface, ADR-006).
     Event(RuntimeEvent),
-    /// A periodic snapshot of a running channel (the pull surface).
+    /// A periodic full snapshot of the *selected* running channel (the pull surface).
     Snapshot(ChannelId, Box<ChannelSnapshot>),
+    /// Periodic cheap liveness stats for a running channel, polled for *every*
+    /// channel to keep per-tab health current without cloning retained Messages.
+    Stats(ChannelId, Box<ChannelStats>),
     /// Current serial control/status lines for a running serial channel (§161),
     /// polled alongside snapshots.
     ControlLines(ChannelId, SerialControlLines),
@@ -115,8 +121,10 @@ pub struct Driver {
     commands: Receiver<UiCommand>,
     updates: Sender<UiUpdate>,
     repaint: Box<dyn Fn() + Send>,
-    /// Channels registered so far, polled for snapshots.
+    /// Channels registered so far, polled for stats.
     channels: Vec<ChannelId>,
+    /// The channel currently on screen; only this one gets a full snapshot polled.
+    selected: Option<ChannelId>,
 }
 
 impl Driver {
@@ -136,6 +144,7 @@ impl Driver {
             updates,
             repaint,
             channels: Vec::new(),
+            selected: None,
         }
     }
 
@@ -232,20 +241,29 @@ impl Driver {
             UiCommand::SetDtr(id, on) => {
                 let _ = self.listener.set_dtr(id, on).await;
             }
+            UiCommand::Select(id) => self.selected = id,
             UiCommand::Shutdown => return false,
         }
         true
     }
 
-    /// Poll every known channel for a snapshot (stopped/unknown yield `None`).
+    /// Poll channels for the UI's pull surface. Every channel gets cheap **stats**
+    /// (per-tab health); only the **selected** channel gets a full snapshot, so a
+    /// large retention buffer isn't deep-copied for every channel each tick (the
+    /// load fix — ADR-006). Stopped/unknown channels yield `None`.
+    ///
     /// Takes `&mut self` (not `&self`) so the `run` future stays `Send` — a shared
     /// `&Driver` held across the await would require `Driver: Sync`, which the mpsc
     /// `Receiver` is not. The real driver runs via `block_on` (no `Send` needed),
     /// but keeping it `Send` lets it run on a multi-thread runtime and be spawned.
     async fn poll_snapshots(&mut self) {
         for id in self.channels.clone() {
-            if let Some(snap) = self.listener.snapshot(id).await {
-                self.push(UiUpdate::Snapshot(id, Box::new(snap)));
+            if Some(id) == self.selected {
+                if let Some(snap) = self.listener.snapshot(id).await {
+                    self.push(UiUpdate::Snapshot(id, Box::new(snap)));
+                }
+            } else if let Some(stats) = self.listener.channel_stats(id).await {
+                self.push(UiUpdate::Stats(id, Box::new(stats)));
             }
             // Live serial control/status lines (§161); `None` for non-serial or
             // stopped channels.
@@ -380,6 +398,9 @@ mod tests {
         };
 
         cmd_tx.send(UiCommand::Start(id)).await.unwrap();
+        // Select the channel so the driver polls a *full* snapshot for it (others
+        // get cheap stats only).
+        cmd_tx.send(UiCommand::Select(Some(id))).await.unwrap();
 
         // Lifecycle event is forwarded…
         let mut started = false;

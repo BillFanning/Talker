@@ -38,7 +38,8 @@ pub use queue::{
     Diagnostic, DiagnosticSeverity, DiagnosticsQueue, DropOldestQueue, FaultOnFullQueue, QueueFull,
 };
 pub use snapshot::{
-    ChannelSnapshot, DiagnosticsSnapshot, DisplayViewSnapshot, SnapshotRequest, TriggeredMatch,
+    ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
+    TriggeredMatch,
 };
 pub use subsample::Subsampler;
 pub use tcp::{start_tcp_listener, TcpListenerHandle};
