@@ -27,8 +27,9 @@ editor, preview, output pane, and logs instead of tofu boxes.
 
 - **CJK** (Chinese / Japanese / Korean). A non-CJK build is ~3 MB of
   fonts; adding CJK would push that to 15–25 MB depending on
-  coverage. Talker users mostly push NMEA / ASCII / Western text, so
-  the binary-size cost wasn't worth the marginal benefit. If you
+  coverage. wiredata mostly carries NMEA / ASCII / Western text (sent
+  by talker, received by listener), so the binary-size cost wasn't
+  worth the marginal benefit. If you
   need CJK, drop a `NotoSansCJK-Regular.ttc` (or equivalent) in here
   and add a matching entry to `install_fonts`.
 - **Indic scripts beyond Devanagari** (Tamil, Bengali, Telugu,
