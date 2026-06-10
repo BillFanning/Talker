@@ -4,7 +4,7 @@ use crate::core::ChannelId;
 
 use super::bridge::UiCommand;
 use super::state::ChannelStatus;
-use super::widgets::{status_color, AddKind, BOX_STROKE};
+use super::widgets::{human_bytes, status_color, AddKind, BOX_STROKE};
 use super::ListenerApp;
 
 /// One channel's row data, snapshotted before rendering so the list isn't borrowing
@@ -14,7 +14,7 @@ struct ChannelRow {
     name: String,
     details: String,
     status: ChannelStatus,
-    messages: u64,
+    bytes_total: u64,
     bytes_per_sec: f64,
     info: usize,
     warnings: usize,
@@ -73,7 +73,7 @@ impl ListenerApp {
                 name: v.name.clone(),
                 details: v.details.clone(),
                 status: v.status,
-                messages: v.messages,
+                bytes_total: v.bytes_total,
                 bytes_per_sec: v.bytes_per_sec,
                 info: v.info,
                 warnings: v.warnings,
@@ -135,8 +135,9 @@ impl ListenerApp {
                             // Line 3: live stats.
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "{} msg  ·  {:.0} B/s",
-                                    row.messages, row.bytes_per_sec
+                                    "{}  ·  {:.0} B/s",
+                                    human_bytes(row.bytes_total),
+                                    row.bytes_per_sec
                                 ))
                                 .weak(),
                             );

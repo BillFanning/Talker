@@ -137,9 +137,6 @@ struct ListenerApp {
     /// control-character style used in Raw mode (§46).
     msg_mode: DisplayMode,
     msg_chars: CharacterRendering,
-    /// View options for the message list: prepend the Message Number / timestamp.
-    show_msg_number: bool,
-    show_timestamp: bool,
     /// Message-view font size and color scheme.
     msg_font_size: f32,
     /// Editable text backing the font-size combo, so a typed size persists across
@@ -177,8 +174,6 @@ impl ListenerApp {
             last_selected_sent: None,
             msg_mode: DisplayMode::Rendered,
             msg_chars: CharacterRendering::Glyph,
-            show_msg_number: true,
-            show_timestamp: false,
             msg_font_size: 13.0,
             font_text: "13".to_string(),
             msg_font: MonoFont::Cascadia,

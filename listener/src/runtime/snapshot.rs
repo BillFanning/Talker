@@ -13,6 +13,8 @@
 //! requests a snapshot when it needs the actual retained content. Observers never
 //! own or block the pipeline.
 
+use std::sync::Arc;
+
 use tokio::sync::oneshot;
 
 use crate::core::{ChannelId, DisplayViewId, MatchRuleId, RecordingState};
@@ -76,6 +78,11 @@ pub struct ChannelSnapshot {
     /// Recent Match Rule firings, oldest → newest, bounded (§50.2, §165). A GUI
     /// cross-references these against retained Messages to highlight/annotate.
     pub matches: Vec<TriggeredMatch>,
+    /// The most recent verbatim **pre-extraction** bytes, oldest → newest, byte-
+    /// capped (§88 count-retention doesn't apply — there are no Message boundaries).
+    /// Feeds the Stream display source (ADR-009, §18/§41): rendering it reconstructs
+    /// the wire regardless of framing or read-chunk boundaries.
+    pub stream_tail: Arc<[u8]>,
 }
 
 /// A single Match Rule firing (§50.2). Records which rule fired and, for a

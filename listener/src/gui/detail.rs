@@ -11,8 +11,8 @@ use super::bridge::{self, UiCommand};
 use super::fonts::{bold, MonoFont};
 use super::state::ChannelStatus;
 use super::widgets::{
-    edit_interface, latest_diagnostic, line_indicator, line_toggle, short_id, status_color,
-    status_label, truncate, vsep, ColorScheme, LifecycleAction, MSG_FONT_SIZES,
+    edit_interface, human_bytes, latest_diagnostic, line_indicator, line_toggle, short_id,
+    status_color, status_label, truncate, vsep, ColorScheme, LifecycleAction, MSG_FONT_SIZES,
 };
 use super::ListenerApp;
 
@@ -23,15 +23,17 @@ impl ListenerApp {
             return;
         };
         self.sync_edit_draft(id);
-        let Some((details, status, messages, bps, last_error)) = self.state.channel(id).map(|v| {
-            (
-                v.details.clone(),
-                v.status,
-                v.messages,
-                v.bytes_per_sec,
-                v.last_error.clone(),
-            )
-        }) else {
+        let Some((details, status, bytes_total, bps, last_error)) =
+            self.state.channel(id).map(|v| {
+                (
+                    v.details.clone(),
+                    v.status,
+                    v.bytes_total,
+                    v.bytes_per_sec,
+                    v.last_error.clone(),
+                )
+            })
+        else {
             ui.label("That channel is no longer present.");
             return;
         };
@@ -79,9 +81,12 @@ impl ListenerApp {
             ui.label("·");
             ui.label(egui::RichText::new(&details).weak());
         });
-        // Messages + throughput. (Warnings live in the Diagnostics line below — the
-        // two were the same per-channel count, so the duplicate here is dropped, #5.)
-        ui.label(format!("Messages: {messages}    Throughput: {bps:.0} B/s"));
+        // Byte-based liveness for the Stream viewer (§18: Stream Mode has no Message
+        // count). Total received + rolling throughput; warnings live in Diagnostics.
+        ui.label(format!(
+            "Received: {}    Throughput: {bps:.0} B/s",
+            human_bytes(bytes_total)
+        ));
         // Lifecycle actions, below the stats line (#6); bigger so Stop/Remove stand out.
         ui.horizontal(|ui| {
             let size = egui::vec2(86.0, 30.0);
@@ -199,10 +204,6 @@ impl ListenerApp {
                 ui.radio_value(&mut self.msg_chars, CharacterRendering::HexEscape, "<0A>")
                     .on_hover_text("Hex escapes (<0A> <0D> <09> …)");
             });
-            vsep(ui);
-            ui.label(bold("Add"));
-            ui.checkbox(&mut self.show_msg_number, "msg #");
-            ui.checkbox(&mut self.show_timestamp, "timestamp");
         });
         ui.horizontal(|ui| {
             ui.label(bold("Size"));
@@ -255,8 +256,6 @@ impl ListenerApp {
         });
         let msg_mode = self.msg_mode;
         let msg_chars = self.msg_chars;
-        let show_number = self.show_msg_number;
-        let show_timestamp = self.show_timestamp;
         let font_size = self.msg_font_size;
         let mono_family = self.msg_font.family();
         let fg = self.msg_colors.fg();
@@ -404,33 +403,33 @@ impl ListenerApp {
             .channel(id)
             .map(|v| v.snapshot.is_some())
             .unwrap_or(false);
-        let count = self
+        let stream_bytes = self
             .state
             .channel(id)
             .and_then(|v| v.snapshot.as_ref())
-            .map(|s| {
-                s.display_views
-                    .first()
-                    .map(|v| v.messages.len())
-                    .unwrap_or(s.retained.len())
-            })
+            .map(|s| s.stream_tail.len())
             .unwrap_or(0);
-        ui.label(format!("Recent messages ({count}):"));
+        ui.label(format!("Stream ({stream_bytes} bytes):"));
         egui::Frame::new()
             .fill(bg)
             .inner_margin(4.0)
             .show(ui, |ui| {
-                if count == 0 {
+                if stream_bytes == 0 {
                     let note = if has_snapshot {
-                        "no messages received yet"
+                        "no data received yet"
                     } else {
                         "waiting for data — Start the channel"
                     };
                     ui.label(egui::RichText::new(note).weak());
                     return;
                 }
-                // Render via the domain DisplayView so the GUI matches the runtime's
-                // Hex/Rendered/Raw + character-rendering semantics (§42/§46).
+                // The Stream display source (ADR-009, §18/§41): render the verbatim
+                // pre-extraction bytes through the domain DisplayView (§42/§46), so the
+                // GUI matches the runtime's Hex/Rendered/Raw semantics. Line breaks
+                // come only from the data — Rendered honors real CR/LF (terminal
+                // semantics, §44), Raw shows control pictures, Hex is a byte run. The
+                // Label soft-wraps so the stream reflows at the panel width; serial and
+                // UDP render identically because nothing here reframes the bytes.
                 let renderer = DisplayView {
                     mode: msg_mode,
                     encoding: DisplayEncoding::Utf8,
@@ -440,59 +439,24 @@ impl ListenerApp {
                     hex_separator: " ".to_string(),
                     hex_bytes_per_line: 16,
                 };
-                // Virtualized: only the visible rows are laid out, so the buffer can
-                // hold many thousands of messages without stalling the UI (#4). One
-                // message per row; long lines extend (use the horizontal scrollbar).
-                let row_h = ui.fonts_mut(|f| {
-                    f.row_height(&egui::FontId::new(font_size, mono_family.clone()))
-                });
-                egui::ScrollArea::both()
-                    .id_salt("messages")
+                let text = match self.state.channel(id).and_then(|v| v.snapshot.as_ref()) {
+                    None => String::new(),
+                    Some(snapshot) => renderer.render_text(&snapshot.stream_tail),
+                };
+                egui::ScrollArea::vertical()
+                    .id_salt("stream")
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
-                    .show_rows(ui, row_h, count, |ui, range| {
-                        let Some(snapshot) =
-                            self.state.channel(id).and_then(|v| v.snapshot.as_ref())
-                        else {
-                            return;
-                        };
-                        let messages = snapshot
-                            .display_views
-                            .first()
-                            .map(|v| v.messages.as_slice())
-                            .unwrap_or(snapshot.retained.as_slice());
-                        let end = range.end.min(messages.len());
-                        let start = range.start.min(end);
-                        for decoded in &messages[start..end] {
-                            let mut prefix = String::new();
-                            if show_timestamp {
-                                let dt: chrono::DateTime<chrono::Local> =
-                                    decoded.message.metadata.arrival_timestamp.wall_clock.into();
-                                prefix.push_str(&format!("{} ", dt.format("%H:%M:%S%.3f")));
-                            }
-                            if show_number {
-                                prefix.push_str(&format!("#{} ", decoded.message.number));
-                            }
-                            let kind = decoded
-                                .protocol
-                                .as_ref()
-                                .and_then(|p| p.message_type.clone())
-                                .map(|t| format!("[{t}] "))
-                                .unwrap_or_default();
-                            // Flatten embedded CR/LF so each message stays a single
-                            // virtualized row (Raw+Native can otherwise emit newlines).
-                            let body = renderer
-                                .render_text(&decoded.message.bytes)
-                                .replace(['\n', '\r'], " ");
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(format!("{prefix}{kind}{body}"))
-                                        .font(egui::FontId::new(font_size, mono_family.clone()))
-                                        .color(fg),
-                                )
-                                .wrap_mode(egui::TextWrapMode::Extend),
-                            );
-                        }
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(text)
+                                    .font(egui::FontId::new(font_size, mono_family.clone()))
+                                    .color(fg),
+                            )
+                            .wrap()
+                            .selectable(true),
+                        );
                     });
             });
     }

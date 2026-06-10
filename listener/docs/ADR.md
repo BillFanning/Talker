@@ -314,6 +314,84 @@ window [this step]; (2) the driver + `UiCommand`/`UiUpdate` + a pure `AppState`
 reducer, unit-tested, no egui; (3) a one-Channel vertical slice (list + start/stop +
 a live snapshot pane); (4) breadth by mapping snapshot fields to panes.
 
+---
+
+## ADR-009 — The live viewer is fed from the verbatim pre-extraction byte stream (`DisplaySource::Stream`)
+
+**Status:** Accepted. **Context:** spec §17 (per-Channel Stream vs Message Mode),
+§18 (Stream Mode: continuous bytes, no Message Numbers/timestamps, "displayed as a
+stream"), §41 (`DisplaySource { Stream, Messages }` — a Display View operates on
+either stream data or completed Messages), §24 (in Message Mode with delimiter
+exclusion, CRLF "need not remain in the Message payload"), §53/§142 (the
+pre-extraction chunk path, `write_chunk` — bytes "exactly as received"), §99.1
+(non-blocking distribution order), §88 (retention is Message-**count** based);
+ADR-006 (snapshots are the pull surface) and ADR-008 (the GUI↔runtime bridge).
+
+**Problem.** The live viewer was wired only to the **Messages** display source —
+extracted, numbered, decoded frames. That is the wrong source for a wire
+troubleshooting view, three ways:
+- **Delimiter extraction strips the terminator** (§24). For NMEA the `\r\n` that
+  *defines* each sentence is consumed by the extractor, so the viewer literally
+  cannot show what is on the wire.
+- **Stream-Mode channels produce no Messages at all** (`StreamExtractor` emits
+  nothing — the generic serial default), so their viewer is empty.
+- **Chunk boundaries are arbitrary.** Non-UDP reads return "whatever the OS has,
+  when it has it" — capped at a 4 KB (serial) / 8 KB (TCP) buffer, with serial also
+  returning empty on a 100 ms cancellation timeout. A read can split a sentence
+  anywhere; boundaries track OS buffering and timing, never content. So a Messages-
+  or chunk-segmented viewer diverges between serial and UDP for the same data.
+
+The spec already defines the right source — `DisplaySource::Stream` (§18/§41), the
+verbatim pre-extraction bytes — but it was never surfaced: the chunk path (§53/§142)
+fed only raw *recording*, not the viewer.
+
+**Decision.** Feed the live viewer from the **verbatim pre-extraction byte stream**.
+Maintain a bounded per-Channel byte ring, appended in `Pipeline::ingest` *before*
+extraction — a second non-blocking pre-extraction tap alongside the raw recorder
+(§53/§99.1), **independent of the Channel's extraction config**. Surface its tail in
+`ChannelSnapshot` (ADR-006 pull surface), cloned only for the on-screen Channel. The
+GUI renders the tail as one continuous, selectable view through the existing
+`DisplayView` renderer: Rendered honors the data's real CR/LF (terminal semantics,
+§44), Hex is a bytes-per-line dump, Raw shows control pictures. Concatenating chunks
+in arrival order reconstructs the exact wire stream regardless of read-chunk
+boundaries — the reassembly an extractor must do across buffers (§21) is unnecessary
+here because nothing is reframed. This makes serial and UDP behave identically and
+gives **every** Channel a working viewer.
+
+The work is phased. Phase 1: the verbatim Stream viewer becomes the default — and,
+for now, only — viewer. Phase 2: the per-view `DisplaySource` **Stream ↔ Messages**
+switch (§41), which restores the Messages-source view (decoded, numbered,
+`[type]`-tagged, match-highlighted). Until then the Messages machinery keeps running
+for decoding, Match Rules, diagnostics, and message-framed recording — it is simply
+not rendered.
+
+**Why not the alternatives.**
+- *Render from extracted Messages (the prior direction).* Loses the delimiters under
+  delimiter extraction (§24), shows nothing under Stream extraction, and segments on
+  arbitrary frame/chunk boundaries — none of which is the wire.
+- *Concatenate the Messages display history into a pseudo-stream (an interim hack).*
+  Same source defect: CRLF-stripped frames run together with no breaks. Wrong layer.
+- *Reuse the raw-recording path.* That writes to disk; the viewer needs an in-memory,
+  bounded, snapshot-cloneable tail. Same data, different sink.
+
+**Consequences.**
+- A new bounded byte ring per Channel, capped by **bytes** (~128 KB default) — there
+  are no Message boundaries to count, so §88's count-based retention does not apply.
+  Trivial CPU/memory; always-on even for Stream-Mode channels.
+- Stream Mode has no Message Numbers or timestamps (§18): the Stream viewer drops the
+  per-message prefix (timestamp / # / `[type]`), and "Recent messages (N)" becomes a
+  byte count. Match-rule highlighting (message-number-keyed, §50.2/§165) and
+  Display-View pause move to the deferred Messages view.
+- The snapshot grows by the tail clone (≤ cap), polled at the ADR-006 cadence (5 Hz)
+  for the selected Channel only — negligible.
+- The recently built Messages-based viewer (line-virtualized per-message log) is set
+  aside, to return behind the §41 source switch.
+
+**Build order (small, reversible first):** (1) byte ring + `ChannelSnapshot` field +
+GUI render + revert the interim hack [this step]; (2) the per-view
+`DisplaySource::Stream/Messages` switch (§41), restoring the Messages view; (3)
+Stream-view pause and optional byte/line gutters.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

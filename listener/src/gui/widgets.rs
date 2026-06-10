@@ -4,11 +4,9 @@
 //! the parent module call into these.
 
 use crate::config::{
-    templates, ChannelConfig, DataBits, DecoderConfig, FlowControl, InterfaceConfig, Parity,
-    StopBits,
+    templates, ChannelConfig, DataBits, FlowControl, InterfaceConfig, Parity, StopBits,
 };
 use crate::core::ChannelId;
-use crate::decode::NmeaValidationMode;
 use crate::transport::udp::UdpMode;
 
 use super::fonts::bold;
@@ -150,22 +148,9 @@ pub(super) fn edit_interface(
 ) -> bool {
     let mut refresh = false;
 
-    // NMEA decode belongs with the connection: it's the per-channel decoder (§30),
-    // not a display option. Toggling it sets the channel's decoder.
-    let mut nmea = matches!(config.decoder, DecoderConfig::Nmea0183 { .. });
-    if ui
-        .checkbox(&mut nmea, "NMEA decode")
-        .on_hover_text("Decode received messages as NMEA 0183 (adds protocol metadata)")
-        .changed()
-    {
-        config.decoder = if nmea {
-            DecoderConfig::Nmea0183 {
-                validation_mode: NmeaValidationMode::Standard,
-            }
-        } else {
-            DecoderConfig::None
-        };
-    }
+    // The decoder (NMEA 0183 protocol metadata, §30) only feeds the Messages display
+    // source and Match Rules, not the Stream viewer — so the toggle lives with the
+    // Messages view (ADR-009 phase 2), not here. The config keeps its template default.
 
     match &mut config.interface {
         InterfaceConfig::Udp(udp) => {
@@ -436,6 +421,23 @@ pub(super) fn truncate(s: &str, max: usize) -> String {
     } else {
         let kept: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{kept}\u{2026}")
+    }
+}
+
+/// Format a byte count compactly in SI units (kB = 1000 B, MB = 1000 kB, …) for the
+/// stream liveness readouts (ADR-009): the Channel list rows and the detail header.
+pub(super) fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1000.0 && u < UNITS.len() - 1 {
+        v /= 1000.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
     }
 }
 

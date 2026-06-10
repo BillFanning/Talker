@@ -10,6 +10,7 @@
 //! only edge permitted to stall the reader is the Transport→Extractor channel
 //! (§97.1), the bounded `tokio::sync::mpsc` that feeds [`run_channel`].
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -61,6 +62,10 @@ pub struct PipelineCapacities {
     pub retention: usize,
     /// Retained-Message total **byte** limit (§88), if any.
     pub retention_bytes: Option<usize>,
+    /// Verbatim Stream-viewer byte ring (ADR-009, §41 Stream source): how many of
+    /// the most recent pre-extraction bytes to keep. Byte-capped, not count-capped,
+    /// since Stream data has no Message boundaries (§18).
+    pub stream_display: usize,
     pub raw_recording: usize,
     /// Per-type retained-diagnostic limits (§88): events, warnings, errors.
     pub event_retention: Option<usize>,
@@ -77,6 +82,7 @@ impl Default for PipelineCapacities {
             display: 1024,
             retention: 1024,
             retention_bytes: None,
+            stream_display: 128 * 1024,
             raw_recording: 1024,
             event_retention: None,
             warning_retention: None,
@@ -215,6 +221,11 @@ pub struct ChannelPipeline {
     /// Anchor for the `Idle` condition before any data has arrived (§50.2): idle is
     /// measured from the last data, or from this instant when none has arrived yet.
     created_at: Instant,
+    /// Verbatim pre-extraction byte ring for the Stream display source (ADR-009).
+    /// Trimmed from the front to `stream_cap` bytes; a second pre-extraction tap
+    /// alongside the raw recorder (§53/§99.1), independent of extraction config.
+    stream_buf: VecDeque<u8>,
+    stream_cap: usize,
 }
 
 /// A `Record` action queued for asynchronous application (§50.2).
@@ -271,6 +282,8 @@ impl ChannelPipeline {
             pending_record_controls: Vec::new(),
             record_arming: None,
             created_at: Instant::now(),
+            stream_buf: VecDeque::new(),
+            stream_cap: caps.stream_display,
         }
     }
 
@@ -372,6 +385,26 @@ impl ChannelPipeline {
             )));
             if let Some(events) = &self.events {
                 let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+            }
+        }
+
+        // 1b. Verbatim Stream-viewer tap (ADR-009, §41 Stream source). Keep the most
+        // recent bytes exactly as received — pre-extraction, so the viewer shows the
+        // wire regardless of framing or read-chunk boundaries. A byte ring, trimmed
+        // from the front (no Message boundaries to count, §18).
+        {
+            let bytes = data.payload.bytes();
+            if bytes.len() >= self.stream_cap {
+                // A single chunk already exceeds the cap: keep only its tail.
+                self.stream_buf.clear();
+                self.stream_buf
+                    .extend(bytes[bytes.len() - self.stream_cap..].iter().copied());
+            } else {
+                self.stream_buf.extend(bytes.iter().copied());
+                let overflow = self.stream_buf.len().saturating_sub(self.stream_cap);
+                if overflow > 0 {
+                    self.stream_buf.drain(..overflow);
+                }
             }
         }
 
@@ -902,6 +935,7 @@ impl ChannelPipeline {
             raw_recording: self.raw_recording_state(),
             activity: self.activity.snapshot(Instant::now()),
             matches: self.recent_matches.iter().copied().collect(),
+            stream_tail: self.stream_buf.iter().copied().collect(),
         }
     }
 }
@@ -1039,6 +1073,29 @@ mod tests {
         let decoded = p.retention().iter().next().unwrap();
         assert_eq!(decoded.message.number, 1);
         assert_eq!(&*decoded.message.bytes, b"hello");
+    }
+
+    #[test]
+    fn stream_tail_is_verbatim_across_chunks_and_byte_capped() {
+        let cid = ChannelId::new();
+        // Small cap so trimming is observable. The extractor is irrelevant: the tail
+        // is a pre-extraction tap (ADR-009), independent of framing.
+        let caps = PipelineCapacities {
+            stream_display: 8,
+            ..PipelineCapacities::default()
+        };
+        let mut p = lf_pipeline(cid, caps);
+        // Reconstructs the wire across read-chunk boundaries — including the CRLF the
+        // `\n` extractor strips from Messages (the whole point of the Stream source).
+        p.ingest(bytes_chunk(cid, b"$ABC"));
+        p.ingest(bytes_chunk(cid, b"\r\n"));
+        assert_eq!(&*p.snapshot().stream_tail, &b"$ABC\r\n"[..]);
+        // Over the cap: keep only the most recent `stream_display` bytes.
+        p.ingest(bytes_chunk(cid, b"123456")); // "$ABC\r\n123456" (12) → drop front 4
+        assert_eq!(&*p.snapshot().stream_tail, &b"\r\n123456"[..]);
+        // A single chunk larger than the cap keeps just its tail.
+        p.ingest(bytes_chunk(cid, b"0123456789"));
+        assert_eq!(&*p.snapshot().stream_tail, &b"23456789"[..]);
     }
 
     #[test]

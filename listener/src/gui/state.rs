@@ -36,8 +36,9 @@ pub struct ChannelView {
     /// Updated on reconfigure.
     pub config: ChannelConfig,
     pub status: ChannelStatus,
-    /// Highest Message Number seen (from events or the latest snapshot).
-    pub messages: u64,
+    /// Total bytes received since start (the Stream-oriented liveness counter — §18,
+    /// ADR-009; Stream Mode has no Message count). From the latest snapshot/stats.
+    pub bytes_total: u64,
     /// Rolling throughput from the latest snapshot (§91.1, §166).
     pub bytes_per_sec: f64,
     /// Retained per-severity diagnostic counts from the latest snapshot (§88), shown
@@ -63,7 +64,7 @@ impl ChannelView {
             details,
             config,
             status: ChannelStatus::Stopped,
-            messages: 0,
+            bytes_total: 0,
             bytes_per_sec: 0.0,
             info: 0,
             warnings: 0,
@@ -170,7 +171,7 @@ impl AppState {
             UiUpdate::Event(event) => self.apply_event(event),
             UiUpdate::Snapshot(id, snapshot) => {
                 if let Some(view) = self.views.get_mut(&id) {
-                    view.messages = snapshot.next_message_number.saturating_sub(1);
+                    view.bytes_total = snapshot.activity.total_bytes;
                     view.bytes_per_sec = snapshot.activity.bytes_per_sec;
                     view.info = snapshot.diagnostics.events.len();
                     view.warnings = snapshot.diagnostics.warnings.len();
@@ -181,7 +182,7 @@ impl AppState {
             // Cheap per-tab health for non-selected channels (no message history).
             UiUpdate::Stats(id, stats) => {
                 if let Some(view) = self.views.get_mut(&id) {
-                    view.messages = stats.next_message_number.saturating_sub(1);
+                    view.bytes_total = stats.activity.total_bytes;
                     view.bytes_per_sec = stats.activity.bytes_per_sec;
                     view.info = stats.event_count;
                     view.warnings = stats.warning_count;
@@ -219,11 +220,8 @@ impl AppState {
             }
             RuntimeEvent::ChannelReconnected(id) => self.set_status(id, ChannelStatus::Running),
             RuntimeEvent::ChannelReconnectGaveUp(id) => self.set_status(id, ChannelStatus::Faulted),
-            RuntimeEvent::MessageReceived(id, number) => {
-                if let Some(view) = self.views.get_mut(&id) {
-                    view.messages = number;
-                }
-            }
+            // `MessageReceived` no longer drives the list: liveness is byte-based now
+            // (ADR-009), refreshed by the periodic snapshot/stats poll like throughput.
             // Warnings, recording, disk, control-line, match, and TCP-connection
             // events are reflected through the periodic snapshot (or land in later
             // panes); the list view does not need them directly. `RuntimeEvent` is
@@ -259,13 +257,13 @@ mod tests {
 
     fn snapshot_with(
         id: ChannelId,
-        next_number: u64,
+        total_bytes: u64,
         bps: f64,
         warnings: usize,
     ) -> ChannelSnapshot {
         ChannelSnapshot {
             channel_id: id,
-            next_message_number: next_number,
+            next_message_number: 1,
             retained: vec![],
             display_views: vec![],
             diagnostics: DiagnosticsSnapshot {
@@ -277,13 +275,15 @@ mod tests {
                 last_data_at: None,
                 bytes_per_sec: bps,
                 messages_per_sec: 0.0,
+                total_bytes,
             },
             matches: vec![],
+            stream_tail: Vec::new().into(),
         }
     }
 
     #[test]
-    fn folds_registration_lifecycle_and_message_count() {
+    fn folds_registration_and_lifecycle() {
         let mut state = AppState::default();
         let id = ChannelId::new();
 
@@ -293,9 +293,6 @@ mod tests {
 
         state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(id)));
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
-
-        state.apply(UiUpdate::Event(RuntimeEvent::MessageReceived(id, 5)));
-        assert_eq!(state.channel(id).unwrap().messages, 5);
 
         state.apply(UiUpdate::Event(RuntimeEvent::ChannelFaulted(id)));
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Faulted);
@@ -326,10 +323,10 @@ mod tests {
 
         state.apply(UiUpdate::Snapshot(
             id,
-            Box::new(snapshot_with(id, 11, 42.0, 2)),
+            Box::new(snapshot_with(id, 4096, 42.0, 2)),
         ));
         let view = state.channel(id).unwrap();
-        assert_eq!(view.messages, 10); // next_number - 1
+        assert_eq!(view.bytes_total, 4096);
         assert_eq!(view.bytes_per_sec, 42.0);
         assert_eq!(view.warnings, 2);
         assert!(view.snapshot.is_some());

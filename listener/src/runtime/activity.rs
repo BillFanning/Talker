@@ -27,6 +27,9 @@ pub struct ChannelActivity {
     pub last_data_at: Option<Instant>,
     pub bytes_per_sec: f64,
     pub messages_per_sec: f64,
+    /// Total bytes received since the Channel started (pre-extraction, all chunks).
+    /// The stream-oriented liveness counter (§18: Stream Mode has no Message count).
+    pub total_bytes: u64,
 }
 
 /// Internal per-Channel activity accumulator (bounded ring of one-second buckets).
@@ -37,6 +40,8 @@ pub struct ActivityMeter {
     msgs: [u64; BUCKETS],
     /// The most recent second index that has received data.
     newest_sec: u64,
+    /// Running total of all bytes received (monotonic; not windowed).
+    total_bytes: u64,
 }
 
 impl ActivityMeter {
@@ -54,6 +59,7 @@ impl ActivityMeter {
             bytes: [0; BUCKETS],
             msgs: [0; BUCKETS],
             newest_sec: 0,
+            total_bytes: 0,
         }
     }
 
@@ -81,6 +87,7 @@ impl ActivityMeter {
         let sec = self.sec_of(at);
         self.advance_to(sec);
         self.bytes[(sec % BUCKETS as u64) as usize] += bytes as u64;
+        self.total_bytes += bytes as u64;
         self.last_data_at = Some(at);
     }
 
@@ -112,6 +119,7 @@ impl ActivityMeter {
             last_data_at: self.last_data_at,
             bytes_per_sec: bytes as f64 / w,
             messages_per_sec: msgs as f64 / w,
+            total_bytes: self.total_bytes,
         }
     }
 }
@@ -149,6 +157,7 @@ mod tests {
         assert_eq!(a.bytes_per_sec, 200.0 / 5.0);
         assert_eq!(a.messages_per_sec, 4.0 / 5.0);
         assert!(a.last_data_at.is_some());
+        assert_eq!(a.total_bytes, 200);
 
         // Long after the data stops, the rate decays to zero — but last_data_at
         // still records when data last arrived (the liveness/idle fact).
@@ -156,6 +165,7 @@ mod tests {
         assert_eq!(quiet.bytes_per_sec, 0.0);
         assert_eq!(quiet.messages_per_sec, 0.0);
         assert!(quiet.last_data_at.is_some());
+        assert_eq!(quiet.total_bytes, 200); // monotonic — does not decay with the window
     }
 
     #[test]
