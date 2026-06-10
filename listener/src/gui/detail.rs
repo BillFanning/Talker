@@ -12,7 +12,8 @@ use super::fonts::{bold, MonoFont};
 use super::state::ChannelStatus;
 use super::widgets::{
     edit_interface, human_bytes, latest_diagnostic, line_indicator, line_toggle, short_id,
-    status_color, status_label, truncate, vsep, ColorScheme, LifecycleAction, MSG_FONT_SIZES,
+    status_color, status_label, truncate, vsep, ColorScheme, DisplaySource, LifecycleAction,
+    MSG_FONT_SIZES,
 };
 use super::ListenerApp;
 
@@ -181,6 +182,13 @@ impl ListenerApp {
 
         ui.horizontal(|ui| {
             let base = egui::TextStyle::Body.resolve(ui.style()).size;
+            // Display source (§41): the verbatim wire, or decoded Messages.
+            ui.label(bold("Source"));
+            ui.radio_value(&mut self.msg_source, DisplaySource::Stream, "Stream")
+                .on_hover_text("Verbatim bytes as received (no Message boundaries, §18)");
+            ui.radio_value(&mut self.msg_source, DisplaySource::Messages, "Messages")
+                .on_hover_text("Extracted, numbered, decoder-tagged Messages");
+            vsep(ui);
             ui.label(bold("View"));
             ui.radio_value(&mut self.msg_mode, DisplayMode::Hex, "Hex");
             ui.radio_value(&mut self.msg_mode, DisplayMode::Rendered, "Rendered");
@@ -204,6 +212,13 @@ impl ListenerApp {
                 ui.radio_value(&mut self.msg_chars, CharacterRendering::HexEscape, "<0A>")
                     .on_hover_text("Hex escapes (<0A> <0D> <09> …)");
             });
+            // Per-message prefix — Messages source only (§18: Stream has no Message #).
+            if self.msg_source == DisplaySource::Messages {
+                vsep(ui);
+                ui.label(bold("Add"));
+                ui.checkbox(&mut self.show_msg_number, "msg #");
+                ui.checkbox(&mut self.show_timestamp, "timestamp");
+            }
         });
         ui.horizontal(|ui| {
             ui.label(bold("Size"));
@@ -256,6 +271,9 @@ impl ListenerApp {
         });
         let msg_mode = self.msg_mode;
         let msg_chars = self.msg_chars;
+        let msg_source = self.msg_source;
+        let show_number = self.show_msg_number;
+        let show_timestamp = self.show_timestamp;
         let font_size = self.msg_font_size;
         let mono_family = self.msg_font.family();
         let fg = self.msg_colors.fg();
@@ -403,61 +421,183 @@ impl ListenerApp {
             .channel(id)
             .map(|v| v.snapshot.is_some())
             .unwrap_or(false);
-        let stream_bytes = self
-            .state
-            .channel(id)
-            .and_then(|v| v.snapshot.as_ref())
-            .map(|s| s.stream_tail.len())
-            .unwrap_or(0);
-        ui.label(format!("Stream ({stream_bytes} bytes):"));
-        egui::Frame::new()
-            .fill(bg)
-            .inner_margin(4.0)
-            .show(ui, |ui| {
-                if stream_bytes == 0 {
-                    let note = if has_snapshot {
-                        "no data received yet"
-                    } else {
-                        "waiting for data — Start the channel"
-                    };
-                    ui.label(egui::RichText::new(note).weak());
-                    return;
-                }
-                // The Stream display source (ADR-009, §18/§41): render the verbatim
-                // pre-extraction bytes through the domain DisplayView (§42/§46), so the
-                // GUI matches the runtime's Hex/Rendered/Raw semantics. Line breaks
-                // come only from the data — Rendered honors real CR/LF (terminal
-                // semantics, §44), Raw shows control pictures, Hex is a byte run. The
-                // Label soft-wraps so the stream reflows at the panel width; serial and
-                // UDP render identically because nothing here reframes the bytes.
-                let renderer = DisplayView {
-                    mode: msg_mode,
-                    encoding: DisplayEncoding::Utf8,
-                    character_rendering: msg_chars,
-                    wrapping: WrappingMode::NoWrap,
-                    wrap_width: None,
-                    hex_separator: " ".to_string(),
-                    hex_bytes_per_line: 16,
-                };
-                let text = match self.state.channel(id).and_then(|v| v.snapshot.as_ref()) {
-                    None => String::new(),
-                    Some(snapshot) => renderer.render_text(&snapshot.stream_tail),
-                };
-                egui::ScrollArea::vertical()
-                    .id_salt("stream")
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
+        // Shared renderer: same Hex/Rendered/Raw semantics for whichever source.
+        let renderer = DisplayView {
+            mode: msg_mode,
+            encoding: DisplayEncoding::Utf8,
+            character_rendering: msg_chars,
+            wrapping: WrappingMode::NoWrap,
+            wrap_width: None,
+            hex_separator: " ".to_string(),
+            hex_bytes_per_line: 16,
+        };
+        match msg_source {
+            DisplaySource::Stream => {
+                let stream_bytes = self
+                    .state
+                    .channel(id)
+                    .and_then(|v| v.snapshot.as_ref())
+                    .map(|s| s.stream_tail.len())
+                    .unwrap_or(0);
+                ui.label(format!("Stream ({}):", human_bytes(stream_bytes as u64)));
+                egui::Frame::new()
+                    .fill(bg)
+                    .inner_margin(4.0)
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(text)
-                                    .font(egui::FontId::new(font_size, mono_family.clone()))
-                                    .color(fg),
-                            )
-                            .wrap()
-                            .selectable(true),
-                        );
+                        if stream_bytes == 0 {
+                            let note = if has_snapshot {
+                                "no data received yet"
+                            } else {
+                                "waiting for data — Start the channel"
+                            };
+                            ui.label(egui::RichText::new(note).weak());
+                            return;
+                        }
+                        // Verbatim pre-extraction bytes (ADR-009, §18/§41): line breaks come
+                        // only from the data — Rendered honors real CR/LF (§44), Raw shows
+                        // control pictures, Hex is a byte run. The Label soft-wraps so the
+                        // stream reflows; serial and UDP render identically (no reframing).
+                        let text = match self.state.channel(id).and_then(|v| v.snapshot.as_ref()) {
+                            None => String::new(),
+                            Some(snapshot) => renderer.render_text(&snapshot.stream_tail),
+                        };
+                        egui::ScrollArea::vertical()
+                            .id_salt("stream")
+                            .stick_to_bottom(true)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(text)
+                                            .font(egui::FontId::new(font_size, mono_family.clone()))
+                                            .color(fg),
+                                    )
+                                    .wrap()
+                                    .selectable(true),
+                                );
+                            });
                     });
-            });
+            }
+            DisplaySource::Messages => {
+                let count = self
+                    .state
+                    .channel(id)
+                    .and_then(|v| v.snapshot.as_ref())
+                    .map(|s| {
+                        s.display_views
+                            .first()
+                            .map(|v| v.messages.len())
+                            .unwrap_or(s.retained.len())
+                    })
+                    .unwrap_or(0);
+                ui.label(format!("Messages ({count}):"));
+                egui::Frame::new()
+                    .fill(bg)
+                    .inner_margin(4.0)
+                    .show(ui, |ui| {
+                        if count == 0 {
+                            let note = if has_snapshot {
+                                "no messages — this channel isn't framed (set NMEA / a delimiter)"
+                            } else {
+                                "waiting for data — Start the channel"
+                            };
+                            ui.label(egui::RichText::new(note).weak());
+                            return;
+                        }
+                        // Decoded Messages (§41). Compose rows up front — the display buffer
+                        // is bounded (§88, ~1024) so this is cheap, and it lets us virtualize
+                        // by *line*: a datagram can carry several CRLF-terminated sentences,
+                        // so Rendered (§44) shows one row per sentence; Hex/Raw stay one
+                        // non-wrapping row per message (long lines extend, horizontal scroll).
+                        let lines: Vec<String> = match self
+                            .state
+                            .channel(id)
+                            .and_then(|v| v.snapshot.as_ref())
+                        {
+                            None => Vec::new(),
+                            Some(snapshot) => {
+                                let messages = snapshot
+                                    .display_views
+                                    .first()
+                                    .map(|v| v.messages.as_slice())
+                                    .unwrap_or(snapshot.retained.as_slice());
+                                let mut lines = Vec::with_capacity(messages.len());
+                                for decoded in messages {
+                                    let mut head = String::new();
+                                    if show_timestamp {
+                                        let dt: chrono::DateTime<chrono::Local> = decoded
+                                            .message
+                                            .metadata
+                                            .arrival_timestamp
+                                            .wall_clock
+                                            .into();
+                                        head.push_str(&format!("{} ", dt.format("%H:%M:%S%.3f")));
+                                    }
+                                    if show_number {
+                                        head.push_str(&format!("#{} ", decoded.message.number));
+                                    }
+                                    if let Some(t) = decoded
+                                        .protocol
+                                        .as_ref()
+                                        .and_then(|p| p.message_type.clone())
+                                    {
+                                        head.push_str(&format!("[{t}] "));
+                                    }
+                                    let text = renderer.render_text(&decoded.message.bytes);
+                                    match msg_mode {
+                                        // Honor CRLF: one row per sentence. Drop a single
+                                        // trailing newline so a CRLF-terminated datagram
+                                        // doesn't add a blank row after it.
+                                        DisplayMode::Rendered => {
+                                            let body = text.strip_suffix('\n').unwrap_or(&text);
+                                            let mut segs = body.split('\n');
+                                            match segs.next() {
+                                                None => lines.push(head),
+                                                Some(first) => {
+                                                    lines.push(format!("{head}{first}"));
+                                                    // Continuation sentences carry no prefix.
+                                                    for seg in segs {
+                                                        lines.push(seg.to_string());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Hex / Raw: one non-wrapping row per message.
+                                        _ => {
+                                            let body = text.replace(['\n', '\r'], " ");
+                                            lines.push(format!("{head}{body}"));
+                                        }
+                                    }
+                                }
+                                lines
+                            }
+                        };
+                        let row_h = ui.fonts_mut(|f| {
+                            f.row_height(&egui::FontId::new(font_size, mono_family.clone()))
+                        });
+                        egui::ScrollArea::both()
+                            .id_salt("messages")
+                            .stick_to_bottom(true)
+                            .auto_shrink([false, false])
+                            .show_rows(ui, row_h, lines.len(), |ui, range| {
+                                let end = range.end.min(lines.len());
+                                let start = range.start.min(end);
+                                for line in &lines[start..end] {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(line.clone())
+                                                .font(egui::FontId::new(
+                                                    font_size,
+                                                    mono_family.clone(),
+                                                ))
+                                                .color(fg),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                    );
+                                }
+                            });
+                    });
+            }
+        }
     }
 }

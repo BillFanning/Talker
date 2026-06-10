@@ -4,9 +4,11 @@
 //! the parent module call into these.
 
 use crate::config::{
-    templates, ChannelConfig, DataBits, FlowControl, InterfaceConfig, Parity, StopBits,
+    templates, ChannelConfig, DataBits, DecoderConfig, FlowControl, InterfaceConfig, Parity,
+    StopBits,
 };
 use crate::core::ChannelId;
+use crate::decode::NmeaValidationMode;
 use crate::transport::udp::UdpMode;
 
 use super::fonts::bold;
@@ -21,6 +23,17 @@ pub(super) enum AddKind {
     Udp,
     Tcp,
     Serial,
+}
+
+/// Which data the viewer renders (spec §41 `DisplaySource`): the verbatim
+/// pre-extraction wire stream, or the extracted/decoded Messages (ADR-009).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum DisplaySource {
+    /// The verbatim byte stream as received (no Message boundaries, §18). Default.
+    #[default]
+    Stream,
+    /// Completed Messages: numbered, optionally timestamped and protocol-tagged.
+    Messages,
 }
 
 /// A simple preset color scheme for the message view (#6 — simpler than a picker).
@@ -148,9 +161,23 @@ pub(super) fn edit_interface(
 ) -> bool {
     let mut refresh = false;
 
-    // The decoder (NMEA 0183 protocol metadata, §30) only feeds the Messages display
-    // source and Match Rules, not the Stream viewer — so the toggle lives with the
-    // Messages view (ADR-009 phase 2), not here. The config keeps its template default.
+    // NMEA decode is the per-channel decoder (§30): it adds the protocol metadata the
+    // Messages source shows (`[GLL]` tags, §134) and that `DecodedField` Match Rules
+    // need. It does not affect the verbatim Stream source.
+    let mut nmea = matches!(config.decoder, DecoderConfig::Nmea0183 { .. });
+    if ui
+        .checkbox(&mut nmea, "NMEA decode")
+        .on_hover_text("Decode received messages as NMEA 0183 (adds protocol metadata)")
+        .changed()
+    {
+        config.decoder = if nmea {
+            DecoderConfig::Nmea0183 {
+                validation_mode: NmeaValidationMode::Standard,
+            }
+        } else {
+            DecoderConfig::None
+        };
+    }
 
     match &mut config.interface {
         InterfaceConfig::Udp(udp) => {

@@ -26,7 +26,7 @@ use fonts::{install_fonts, MonoFont};
 use state::{AppState, ChannelStatus};
 use widgets::{
     config_incomplete, list_serial_ports, plan_config_commit, status_color, template_for, AddKind,
-    ColorScheme, CommitStep,
+    ColorScheme, CommitStep, DisplaySource,
 };
 
 /// Detach the inherited console when going graphical. The binary is a
@@ -137,6 +137,12 @@ struct ListenerApp {
     /// control-character style used in Raw mode (§46).
     msg_mode: DisplayMode,
     msg_chars: CharacterRendering,
+    /// Which data the viewer renders (§41): verbatim Stream or decoded Messages.
+    msg_source: DisplaySource,
+    /// Messages-source prefix options (§18: not applicable to Stream): prepend the
+    /// Message Number / arrival timestamp.
+    show_msg_number: bool,
+    show_timestamp: bool,
     /// Message-view font size and color scheme.
     msg_font_size: f32,
     /// Editable text backing the font-size combo, so a typed size persists across
@@ -174,6 +180,9 @@ impl ListenerApp {
             last_selected_sent: None,
             msg_mode: DisplayMode::Rendered,
             msg_chars: CharacterRendering::Glyph,
+            msg_source: DisplaySource::default(),
+            show_msg_number: true,
+            show_timestamp: false,
             msg_font_size: 13.0,
             font_text: "13".to_string(),
             msg_font: MonoFont::Cascadia,
