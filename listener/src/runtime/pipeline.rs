@@ -391,7 +391,13 @@ impl ChannelPipeline {
         // 1b. Verbatim Stream-viewer tap (ADR-009, §41 Stream source). Keep the most
         // recent bytes exactly as received — pre-extraction, so the viewer shows the
         // wire regardless of framing or read-chunk boundaries. A byte ring, trimmed
-        // from the front (no Message boundaries to count, §18).
+        // from the front (no Message boundaries to count, §18). Honors the default
+        // view's pause (§50): a paused view freezes its stream just like the message
+        // history below, while reception and recording (the raw tap above) keep going.
+        if !self
+            .display_views
+            .first()
+            .is_some_and(|v| v.handle.is_paused())
         {
             let bytes = data.payload.bytes();
             if bytes.len() >= self.stream_cap {
@@ -1096,6 +1102,25 @@ mod tests {
         // A single chunk larger than the cap keeps just its tail.
         p.ingest(bytes_chunk(cid, b"0123456789"));
         assert_eq!(&*p.snapshot().stream_tail, &b"23456789"[..]);
+    }
+
+    #[test]
+    fn paused_view_freezes_the_stream_tail() {
+        let cid = ChannelId::new();
+        let mut p = lf_pipeline(cid, PipelineCapacities::default());
+        let view = p.display_view_handles()[0].clone();
+        p.ingest(bytes_chunk(cid, b"AB"));
+        assert_eq!(&*p.snapshot().stream_tail, &b"AB"[..]);
+        // Pause: the Stream viewer freezes (like the message history, §50), but
+        // reception still counts the bytes — the liveness counter keeps moving.
+        view.pause();
+        p.ingest(bytes_chunk(cid, b"CD"));
+        assert_eq!(&*p.snapshot().stream_tail, &b"AB"[..]);
+        assert_eq!(p.snapshot().activity.total_bytes, 4);
+        // Resume: the stream continues from live data (no backfill of the gap).
+        view.resume();
+        p.ingest(bytes_chunk(cid, b"EF"));
+        assert_eq!(&*p.snapshot().stream_tail, &b"ABEF"[..]);
     }
 
     #[test]
