@@ -392,6 +392,30 @@ GUI render + revert the interim hack [this step]; (2) the per-view
 `DisplaySource::Stream/Messages` switch (§41), restoring the Messages view; (3)
 Stream-view pause and optional byte/line gutters.
 
+> **Superseded by ADR-010 (spec v2.0).** ADR-009 phases 1–2 shipped, but v2.0 then
+> removed the Message half entirely, so the phase-2 "Messages source" is gone. The
+> Stream viewer ADR-009 introduced is now the *only* viewer.
+
+---
+
+## ADR-010 — Stream-only architecture: the Message infrastructure is removed (spec v2.0)
+
+**Status:** Accepted. **Context:** spec **v2.0** (revision note + §17–18, §40–46, §50.2, §51–59), which supersedes the Message-mode half of v1.x. ADR-009 (the Stream display source) was the first step; v2.0 finishes the trajectory by removing the Message half rather than keeping both.
+
+**Decision.** `Listener` is a pure **stream** tool. Received bytes are one verbatim stream that is displayed (Raw/Rendered/Hex), searched (Find & Triggers), and recorded (Raw `.raw` + Display `.disp`). Removed: Message Mode, Message Extraction (delimiter / fixed-length / protocol), Message Numbering, decoders + the `nmea0183` dependency, integrity metadata, message-framed recording (`.ssdat`) + subsampling, the Messages display source, and message-keyed Match conditions. Find & Triggers re-root on the byte stream — `BytePattern` (cross-chunk scan) + `Idle` conditions; `Highlight` (byte range), `Record`, `Notify`, `Mark` actions anchored on **byte offset**.
+
+**Why.** The actual use (single-stream troubleshooting; long-run multi-channel logging) is stream-centric. The extraction→decode→message spine added surface (framing config, decode config, numbering, `.ssdat`) the workflow never used, and made the wire view harder to keep faithful (delimiter extraction strips the very bytes that define a sentence). A stream-only tool is simpler, smaller, and a better fit; `nmea0183` lives on for `talker`.
+
+**Consequences.**
+- `extract/` and `decode/` modules are removed; `listener` drops its `nmea0183` dependency.
+- The pipeline collapses to: transport → bounded pipeline queue → non-blocking fan-out (raw recorder, display/scrollback, display recorder, find/triggers, diagnostics). The single backpressure edge (§99) is now **Transport→Pipeline**.
+- `ChannelConfig` loses `extraction` and `decoder`; `RecordingConfig` loses `subsample`; `DisplayViewConfig` loses `source`/`annotations`/`subsample`/`timestamp`; `RetentionConfig` is byte-based. `schema_version` bumps (breaking; v1 profiles refused).
+- Recording extensions: **`.raw`** (was `.dat`) and `.disp`; `.ssdat` gone.
+- The GUI loses the framing selector, decode toggle, Messages-source switch, and per-message toggles (some only just built); the Stream viewer, byte-based liveness, recording UI, and pause all stay.
+- Reversible in git; low-regret — the message path was unused in the workflow.
+
+**Build order.** (1) spec rewrite to v2.0 [done]; (2) strip the runtime (remove `extract/`/`decode/`, collapse the pipeline, byte-based retention); (3) trim the config schema + GUI; (4) re-root Find & Triggers on the stream; (5) test cleanup.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

@@ -1,9 +1,43 @@
-# Listener Specification v1.2
+# Listener Specification v2.0
 
-Status: Draft 1 (revised — concurrency model, recording semantics, and review fixes folded in)
-Audience: human reviewers, Rust implementers, and Codex/code-generation agents
+Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
+Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
-Primary editor workflow: VS Code + rust-analyzer + Codex
+Primary editor workflow: VS Code + rust-analyzer
+
+Revision v2.0 (architecture pivot — **stream-only**):
+
+`Listener` is now a pure **stream** acquisition / inspection / recording tool.
+Received bytes are a single verbatim stream that is displayed (Raw / Rendered / Hex)
+and recorded. The entire Message infrastructure is removed — there is no Message
+Mode, Message Extraction, Message Numbering, decoders, NMEA decoding, integrity
+metadata, message-framed recording, or message-keyed display.
+
+Removed (the superseded sections are kept as numbered stubs so existing §N
+cross-references stay valid): §19 Message Mode; §20–23 Extraction; §24 Message
+Number; §28 Integrity Metadata; §29–39 Decoders + all NMEA sections; §49 Metadata
+Display; §50.1 Subsampling; §77 Decoder Config; §83 NMEA Serial Template; §131–135
+Message types; §139/§140 Extractor/Decoder traits; §105/§107 Extractor/Decoder
+ownership; and the message-framed recording path.
+
+Rebased onto the stream:
+- §17–18 — the input model is **stream only**; no per-channel Stream/Message switch.
+- §40–46 — the display renders the verbatim stream (Raw/Rendered/Hex + character
+  rendering); §41 has a single source (the stream).
+- §50.2 / §165 — **Find & Triggers**: conditions are `BytePattern` (cross-chunk
+  stream scan) and `Idle`; actions are `Highlight` (a byte range in the scrollback),
+  `Record { Begin | Stop, target: Raw | Display | Both }`, `Notify`, and `Mark` (a
+  time/offset marker into the display and the display recording). No decoded-field or
+  message-size conditions; highlight/mark anchor on a **byte offset**, not a Message
+  Number.
+- §51–59 / §79 / §142 — recording is **Raw** (byte-exact, extension **`.raw`**) and
+  **Display** (the rendered output of the active view mode, extension **`.disp`**),
+  each with optional timestamps and time-based rotation. `.ssdat` and subsampling are
+  removed; `.raw` replaces the former `.dat`.
+
+`schema_version` bumps (a breaking config change: the extraction, decoder, subsample,
+and message-recording fields are gone). `nmea0183` remains a workspace crate used by
+`talker`; `listener` no longer depends on it.
 
 Revision v1.2 (feature expansion — troubleshooting & long-run logging):
 - §59 — **time-based file rotation** (Hourly/Daily); generated filenames
@@ -41,7 +75,7 @@ alter the normative module boundaries or behavior.
 
 This document defines the functional requirements, architecture, runtime model, and recommended Rust implementation structure for `Listener`.
 
-`Listener` is a cross-platform utility for receiving byte-oriented data from serial and network sources, displaying that data in multiple representations, optionally decoding protocol metadata, and optionally recording received data to files.
+`Listener` is a cross-platform utility for receiving byte-oriented data from serial and network sources, displaying that verbatim byte stream in multiple representations, and optionally recording it to files.
 
 This document is intended to be placed at:
 
@@ -57,19 +91,18 @@ Codex and other code-generation tools should treat this specification as authori
 
 ## 1. Product Overview
 
-`Listener` is a streamed communication data acquisition, inspection, display, and recording application.
+`Listener` is a streamed communication data acquisition, inspection, display, and recording application. It treats every source as a verbatim byte stream — it does not parse, frame, or decode that stream into messages.
 
 Primary use cases:
 
 - Inspect data arriving from serial ports.
 - Inspect UDP unicast, broadcast, and multicast data.
 - Listen for TCP clients and inspect their transmitted data.
-- Validate NMEA0183 sentence formatting and checksum metadata.
-- Display byte-oriented data in Raw, Rendered, and Hex views.
-- Record original received data or rendered display output.
-- Support future protocol decoders without redesigning the core pipeline.
+- Display the received byte stream in Raw, Rendered, and Hex views.
+- Find and highlight byte patterns in the stream, and trigger actions on them.
+- Record the original received bytes or the rendered display output.
 
-`Listener` is a passive receive-side tool. It observes, displays, decodes, and records. It is not a packet injection tool, control system, SCADA system, or hard real-time system.
+`Listener` is a passive receive-side tool. It observes, displays, and records. It is not a packet injection tool, control system, SCADA system, or hard real-time system.
 
 ## 2. Supported Platforms
 
@@ -115,83 +148,33 @@ A Byte Stream is an ordered sequence of received bytes.
 
 Serial and TCP Connection Channels produce Byte Streams.
 
-### 4.3 Message
+### 4.3 Stream
 
-A Message is a logical unit extracted from a Byte Stream or provided directly by a message-oriented transport.
-
-Examples:
-
-- One delimiter-terminated text record
-- One fixed-length binary record
-- One UDP datagram
-- One NMEA0183 sentence after CRLF extraction
+The received data is a single verbatim **byte stream** — the bytes as the transport read them, in arrival order. `Listener` does not segment the stream into records. (UDP datagrams arrive with their boundaries preserved, §15, but those boundaries are a reception/recording detail, not a unit the stream is reframed around.)
 
 ### 4.4 Message Extraction
 
-Message Extraction determines where Messages begin and end.
-
-Extraction answers:
-
-```text
-Where does this Message begin and end?
-```
-
-Extraction does not determine protocol meaning.
+_Removed in v2.0. There is no extraction (§20)._
 
 ### 4.5 Decoder
 
-A Decoder interprets completed Messages.
-
-Decoding answers:
-
-```text
-What does this Message mean?
-```
-
-Decoders do not determine Message boundaries and do not modify Message contents.
+_Removed in v2.0. There is no decoder (§29)._
 
 ### 4.6 Metadata
 
-Metadata is supplemental information associated with a Message.
-
-Metadata shall remain logically separate from Message contents.
+_Removed in v2.0. The only reception facts kept are the running byte count (§25) and the per-chunk arrival time (§26); there is no per-Message metadata._
 
 ### 4.7 Payload Metadata
 
-Payload Metadata is protocol-independent Message information.
-
-Version 1 Payload Metadata:
-
-- Message Number
-- Total Byte Count
-- Arrival Timestamp
-- Reception Duration
+_Removed in v2.0 (see §4.6)._
 
 ### 4.8 Protocol Metadata
 
-Protocol Metadata is produced by Decoders.
-
-Examples:
-
-- Protocol Identifier
-- NMEA Talker Identifier
-- NMEA Sentence Identifier
-- Integrity Status
-- Integrity Algorithm
+_Removed in v2.0 (see §4.5)._
 
 ### 4.9 Integrity Metadata
 
-Integrity Metadata describes validation of an integrity field.
-
-Integrity Metadata shall distinguish between:
-
-- Protocol integrity
-- Payload integrity
-
-Examples:
-
-- NMEA XOR checksum = Protocol integrity
-- Future payload CRC = Payload integrity
+_Removed in v2.0 (see §4.5)._
 
 ### 4.10 Display View
 
@@ -224,9 +207,7 @@ A Runtime Object exists only while Listener is running and is not persisted in P
 Examples:
 
 - TCP Connection Channels
-- Message Numbers
-- Display History
-- Retained Messages
+- Display History (stream scrollback)
 - Active file handles
 - Runtime warnings/errors
 
@@ -238,36 +219,26 @@ Examples:
 
 ### 5.1 Byte Stream First
 
-Received bytes are the authoritative source.
+Received bytes are the authoritative source. Display, recording, find/triggers, and export are all derived from the verbatim byte stream — nothing reframes or reinterprets it.
 
-Messages, metadata, decoding, display, recording, and export are derived from received bytes.
+### 5.2 No Reframing
 
-### 5.2 Extraction Defines Structure
+The stream is never segmented into messages or records. There is no extraction stage and no message boundary (§17–18).
 
-Message Extraction determines boundaries.
+### 5.3 No Decoding
 
-Extraction shall not interpret protocol meaning.
-
-### 5.3 Decoding Defines Meaning
-
-Decoders interpret completed Messages.
-
-Decoders shall not modify Messages, determine Message boundaries, or control Channel lifecycle.
+`Listener` does not interpret protocol meaning. NMEA and any other protocol are carried as ordinary bytes (§29).
 
 ### 5.4 Display Is Presentation Only
 
 Display rendering shall not alter:
 
 - Received bytes
-- Messages
-- Metadata
 - Raw recordings
 
-### 5.5 Metadata Remains Separate
+### 5.5 Recording Fidelity
 
-Metadata shall not be inserted into, appended to, or otherwise become part of Message contents.
-
-Metadata may be displayed adjacent to, above, below, beside, or in a dedicated metadata panel.
+Raw recording is byte-exact (§53). Display recording reflects exactly what the chosen view renders (§54). Neither alters the received bytes.
 
 ### 5.6 Recording Preserves Original Data
 
@@ -357,8 +328,6 @@ The Channel is inactive.
 
 - Interface closed
 - No reception
-- No message extraction
-- No decoding
 - No recording
 
 ### 8.2 Starting
@@ -377,7 +346,6 @@ The Channel is operational.
 
 - Interface open
 - Reception may occur
-- Message extraction may occur
 - Recording may occur if enabled
 
 ### 8.4 Stopping
@@ -446,11 +414,7 @@ Start shall:
 
 - Open the underlying communication interface.
 - Begin receiving data.
-- Initialize Message Numbering for the Channel.
-- Enable configured Message Extraction.
-- Enable configured Protocol Decoding.
-
-Message Number 1 is assigned to the first completed Message after Start.
+- Reset the byte counter (§25) and begin recording if configured (§79).
 
 ### 10.2 Stop
 
@@ -458,11 +422,7 @@ Stop shall:
 
 - Close the underlying communication interface.
 - Terminate data reception.
-- Terminate Message Extraction.
-- Terminate Protocol Decoding.
 - Attempt to flush accepted recording data.
-
-The next Start operation restarts Message Numbering at 1.
 
 ## 11. Display Pause and Resume
 
@@ -484,11 +444,8 @@ Display Pause shall not affect:
 
 - Interface state
 - Reception
-- Message extraction
-- Decoding
 - Recording
-- Message Numbering
-- Metadata generation
+- The byte counter / liveness
 
 ## 12. Recording State
 
@@ -532,7 +489,7 @@ Apply Configuration
 Start Channel
 ```
 
-Message Numbering resets only because the interface was stopped and started.
+The byte counter (§25) resets only because the interface was stopped and started.
 
 Restarting a TCP Listener terminates all of its TCP Connection Channels (they are
 runtime-only — §16.3). A `TcpClientDisconnected` event (§137) shall be emitted for
@@ -588,10 +545,8 @@ CTS, DSR, DCD, and RI are normally input/status lines relative to Listener and a
 
 Manual RTS/DTR changes shall not affect:
 
-- Message Numbering
-- Message Extraction
+- Reception
 - Recording
-- Decoding
 
 ### 14.3 Live Control-Line State and Control
 
@@ -641,9 +596,7 @@ A UDP Channel shall receive complete UDP datagrams.
 
 Each UDP datagram shall become one Message.
 
-UDP datagram boundaries shall be preserved.
-
-Additional Message Extraction inside UDP payloads shall not be applied unless explicitly configured in a future version.
+UDP datagram boundaries shall be preserved (as a reception/recording detail, §53); the payload is otherwise carried as ordinary stream bytes.
 
 ## 16. TCP Listener and TCP Connection Channels
 
@@ -673,10 +626,8 @@ Each accepted TCP client connection shall be represented by a separate TCP Conne
 Each TCP Connection Channel shall have:
 
 - Independent Byte Stream
-- Independent Message Numbering
 - Independent Display Configuration
 - Independent Recording Configuration
-- Independent Metadata
 - Independent runtime state
 
 Data from different TCP clients shall not be merged into a common Byte Stream.
@@ -708,364 +659,119 @@ Each connection is displayed and processed separately.
 
 ---
 
-# Part VI — Message Extraction
+# Part VI — Stream Input
 
 ## 17. Input Processing Model
 
-A Channel may operate in:
+A Channel processes received data as a single **verbatim byte stream**. There is no per-Channel mode switch — the stream is the only model. (The former Message Mode and its per-Channel Stream/Message toggle are removed in v2.0.)
 
-- Stream Mode
-- Message Mode
+## 18. Stream Processing
 
-Users can switch between Stream Mode and Message Mode per Channel.
+In stream processing:
 
-## 18. Stream Mode
-
-In Stream Mode:
-
-- Data is processed as a continuous sequence of bytes.
-- No Message boundaries are recognized.
-- Message Numbering is not applicable.
-- Message timestamps are not applicable.
-
-Stream Mode data is displayed as a stream and may be recorded as raw bytes.
+- Data is processed as a continuous sequence of bytes, in arrival order.
+- No Message boundaries are recognized; the bytes are never reframed or buffered into records.
+- Datagram boundaries (UDP, §15) are preserved as a reception/recording detail only; they do not segment the stream for display.
+- The stream is displayed (§40–46), searchable (§50.2), and recordable (§51–59).
+- There is no Message Numbering and there are no per-Message timestamps; liveness is measured in bytes (§25, §166).
 
 ## 19. Message Mode
 
-In Message Mode:
-
-- Data is buffered until Message completion criteria are satisfied.
-- Completed Messages are assigned Message Numbers.
-- Completed Messages may receive Arrival Timestamps.
-- Completed Messages may be decoded.
+_Removed in v2.0. `Listener` has no Message Mode; all input is a verbatim stream (§17–18)._
 
 ## 20. Extraction Methods
 
-Supported extraction methods:
-
-```rust
-enum ExtractionConfig {
-    Stream,
-    Delimiter {
-        delimiter: Vec<u8>,
-        include_delimiter: bool,
-    },
-    FixedLength {
-        length: usize,
-        sync_marker: Option<Vec<u8>>,
-    },
-    Protocol {
-        protocol: ProtocolId,
-    },
-}
-```
-
-Only one extraction method shall be active per Channel.
+_Removed in v2.0. There is no Message Extraction. The former `ExtractionConfig` (`Stream` / `Delimiter` / `FixedLength` / `Protocol`) and the `MessageExtractor` trait (§139) are gone; received bytes are a verbatim stream (§17–18)._
 
 ## 21. Delimiter-Based Extraction
 
-A Message is complete when the configured delimiter sequence is observed.
-
-Delimiter sequences may consist of one or more arbitrary bytes.
-
-Examples:
-
-```text
-LF
-CR
-CRLF
-NUL
-AA 55
-FF FF FF
-```
-
-Delimiter bytes may be included in or excluded from the Message according to configuration.
-
-Delimiter detection shall support delimiter sequences that occur across receive-buffer boundaries.
+_Removed in v2.0 (see §20)._
 
 ## 22. Fixed-Length Extraction
 
-A Message is complete when the configured number of bytes has been received.
-
-Fixed-Length extraction shall support:
-
-- Immediate Synchronization
-- Optional Synchronization Marker
-
-### 22.1 Immediate Synchronization
-
-Message extraction begins with the first byte received after Channel Start or after extraction mode activation.
-
-### 22.2 Optional Synchronization Marker
-
-A synchronization marker is a user-configurable byte sequence.
-
-When configured, Listener ignores bytes until the marker is found.
-
-After marker detection, fixed-length extraction begins.
-
-Version 1 shall not perform heuristic or protocol-aware synchronization recovery beyond marker detection.
+_Removed in v2.0 (see §20)._
 
 ## 23. Protocol-Based Extraction
 
-Protocol-Based Extraction uses protocol-specific boundary rules.
-
-Version 1 may use Delimiter Extraction for NMEA rather than a separate NMEA extractor.
+_Removed in v2.0 (see §20)._
 
 ---
 
-# Part VII — Message Metadata
+# Part VII — Stream Reception Facts
 
 ## 24. Message Number
 
-A Message Number is a monotonically increasing integer assigned to each completed Message within a Channel.
-
-Message numbering shall:
-
-- Begin at 1 when a Channel is Started.
-- Increase by one for each completed Message.
-- Continue across configuration changes that do not Stop the Channel.
-- End when the Channel is Stopped.
-- Restart at 1 upon the next Start operation.
-- Not be affected by retention eviction.
-
-Message Numbers are Channel-local and not globally unique.
-
-Message Numbers are only applicable when Message Extraction is enabled.
-
-Listener shall not expose OS receive-block numbers or implementation receive-buffer boundaries as user-visible objects.
+_Removed in v2.0. There are no Messages, so there is no Message Numbering. Liveness is byte-based (§25, §166)._
 
 ## 25. Total Byte Count
 
-Total Byte Count is the number of bytes in the completed Message.
+Total Byte Count is the number of bytes a Channel has received since it was Started. It is protocol-independent, monotonic while the Channel is Running, and resets on the next Start. It anchors the byte-based liveness readouts (§166).
 
-It is protocol-independent.
+## 26. Chunk Arrival Time
 
-## 26. Arrival Timestamp
+Each received chunk/datagram carries an arrival timestamp (`ChunkTime`: wall clock + monotonic, §133). This is a reception fact, not a per-Message timestamp (there are no Messages) — it drives the activity monitor (§166) and, when enabled, the recording timestamp sidecar (§57).
 
-Timestamping applies only to completed Messages.
-
-Arrival Timestamp is associated with receipt of the first byte of the Message.
-
-Stream Mode has no Message timestamps.
-
-Supported timestamp sources:
-
-- Local Time
-- UTC
-- Relative Time Since Channel Start
-
-Supported timestamp resolution:
-
-- Seconds
-- Milliseconds
-- Microseconds
-
-> **Precision is not accuracy.** Timestamp resolution selects how finely a time
-> is displayed and stored; it does not guarantee timing accuracy. Userland
-> serial/UDP arrival times carry OS scheduling and driver-buffering jitter that
-> can exceed the selected resolution — a microsecond-resolution timestamp is not
-> a microsecond-accurate one. See §133.
+> **Precision is not accuracy.** A finer timestamp resolution selects how finely a time is displayed and stored; it does not guarantee timing accuracy. Userland serial/UDP arrival times carry OS scheduling and driver-buffering jitter that can exceed the selected resolution. See §133.
 
 ## 27. Reception Duration
 
-Reception Duration is the elapsed time between receipt of the first byte of a Message and receipt of the final byte required to complete the Message.
-
-Reception Duration is optional Payload Metadata.
-
-Completion Timestamp is not a primary user-facing concept in Version 1.
+_Removed in v2.0 (a per-Message concept)._
 
 ## 28. Integrity Metadata
 
-Use a unified integrity model rather than separate checksum/CRC fields.
-
-```rust
-enum IntegrityScope {
-    Protocol,
-    Payload,
-}
-
-enum IntegrityStatus {
-    NotPresent,
-    Valid,
-    Invalid,
-    NotChecked,
-    DecoderError,
-}
-
-struct IntegrityMetadata {
-    scope: IntegrityScope,
-    status: IntegrityStatus,
-    algorithm: Option<String>,
-}
-```
-
-Examples:
-
-```text
-NMEA XOR checksum → Protocol Integrity
-Future payload CRC → Payload Integrity
-```
+_Removed in v2.0. Integrity checking belonged to decoders, which are removed (§29); the `IntegrityScope` / `IntegrityStatus` / `IntegrityMetadata` types are gone._
 
 ---
 
-# Part VIII — Decoder Architecture
+# Part VIII — Decoder Architecture (removed in v2.0)
 
 ## 29. Decoder Responsibilities
 
-A Decoder may:
-
-- Parse Message contents.
-- Validate protocol structure.
-- Validate integrity checks.
-- Produce Protocol Metadata.
-- Produce Decoder Validation Errors.
-
-A Decoder shall not:
-
-- Modify Messages.
-- Modify Byte Streams.
-- Modify Recording.
-- Modify Display Configuration.
-- Modify Message Numbering.
-- Control Channel lifecycle.
+_Removed in v2.0. `Listener` decodes nothing — it is a verbatim stream tool. The `Decoder` trait (§140) and all decoder selection/output/isolation rules are gone._
 
 ## 30. Decoder Selection
 
-Decoder selection shall be explicit per Channel.
-
-Automatic protocol detection is deferred from Version 1.
+_Removed in v2.0 (see §29)._
 
 ## 31. Decoder Output
 
-Decoder output shall be logically separate from Message contents.
-
-Version 1 Decoder output:
-
-- Protocol Metadata
-- Decoder Validation Errors
-
-Version 1 shall not perform Protocol Field extraction.
-
-Deferred examples:
-
-- Latitude
-- Longitude
-- Speed
-- Heading
-- Device readings
-- Structured semantic fields
+_Removed in v2.0 (see §29)._
 
 ## 32. Decoder Failure Isolation
 
-Decoder failures shall not prevent:
-
-- Reception
-- Raw Recording
-- Display of undecoded Messages
-- Message Numbering
-
-unless the Decoder is required for Message Extraction.
+_Removed in v2.0 (see §29)._
 
 ---
 
-# Part IX — NMEA0183 Decoder
+# Part IX — NMEA0183 Decoder (removed in v2.0)
 
 ## 33. NMEA0183 Scope
 
-The NMEA0183 Decoder validates and identifies NMEA0183 sentences.
-
-It does not extract semantic fields in Version 1.
-
-It shall use the local `nmea0183` crate for NMEA functionality.
-
-The local `nmea0183` crate shall be standalone and suitable for independent publication.
+_Removed in v2.0. `Listener` no longer decodes NMEA0183 and no longer depends on the `nmea0183` crate (which remains a workspace crate used by `talker`). NMEA data is carried, displayed, searched, and recorded as ordinary stream bytes._
 
 ## 34. NMEA Message Boundary Requirement
 
-An NMEA Message must be terminated by CRLF during extraction.
-
-Recognition requires:
-
-- Message begins with `$` (standard/proprietary) or `!` (AIS encapsulation,
-  e.g. `!AIVDM` / `!AIVDO`).
-- CRLF termination was observed by the Message Extraction subsystem.
-
-CRLF is part of extraction and need not remain in the Message payload if delimiter exclusion is configured.
+_Removed in v2.0 (see §33)._
 
 ## 35. NMEA Metadata
 
-The NMEA Decoder shall produce Protocol Metadata including:
-
-- Protocol Identifier: `NMEA0183`
-- Talker Identifier
-- Sentence Identifier
-- Proprietary Identifier where applicable
-- Integrity Status
-- Integrity Algorithm: `NMEA XOR`
+_Removed in v2.0 (see §33)._
 
 ## 36. NMEA Checksum Validation
 
-When a sentence contains `*hh`, the Decoder shall validate the checksum using NMEA XOR rules.
-
-The checksum calculation shall use bytes between the start delimiter (`$` or `!`)
-and `*`, excluding both delimiters.
+_Removed in v2.0 (see §33)._
 
 ## 37. NMEA Validation Modes
 
-Validation mode shall be user-selectable.
-
-```rust
-enum NmeaValidationMode {
-    Standard,
-    Strict,
-}
-```
-
-Validation mode affects only the `IntegrityStatus` assigned and the diagnostics
-raised. It never suppresses display, recording, or retention: an invalid or
-malformed sentence is marked and surfaced, not hidden. (Listener is a forensic
-receive-side tool; bad data is often the most important data.)
-
-### 37.1 Standard Mode
-
-Standard Mode shall:
-
-- Mark valid checksums `Valid`.
-- Accept missing checksums, marked `NotPresent`.
-- Mark malformed checksum fields `Invalid` and raise a diagnostic.
-
-### 37.2 Strict Mode
-
-Strict Mode shall:
-
-- Mark valid checksums `Valid`.
-- Mark missing checksums `Invalid` (Strict requires a checksum).
-- Mark invalid checksums `Invalid`.
-- Mark malformed checksum fields `Invalid`, each with a diagnostic.
+_Removed in v2.0 (see §33)._
 
 ## 38. NMEA Proprietary Sentences
 
-The Decoder shall recognize proprietary sentences.
-
-Examples:
-
-```text
-$PASHR
-$PSRF
-$PGRMZ
-```
-
-The proprietary identifier shall be exposed as Protocol Metadata.
+_Removed in v2.0 (see §33)._
 
 ## 39. NMEA Multi-Sentence Groups
 
-Version 1 shall treat each NMEA sentence as an independent Message.
-
-Version 1 shall not reassemble multi-sentence logical groups such as GSV groups
-or multi-fragment AIS (`!AIVDM`) messages. Each AIS fragment is validated and
-identified (talker `AI`, sentence VDM/VDO, checksum) but its armored payload is
-not assembled or decoded — payload field extraction is deferred (§31).
+_Removed in v2.0 (see §33)._
 
 ---
 
@@ -1078,20 +784,11 @@ Display is presentation-only.
 Display functions shall not modify:
 
 - Incoming bytes
-- Messages
-- Metadata
 - Recorded data
 
-## 41. Display Sources
+## 41. Display Source
 
-A Display View may operate on:
-
-- Stream data
-- Completed Messages
-
-The selected source is independent of Display Mode where practical, and is
-configured **per view** (`DisplayViewConfig.source`, §78): one view may show the
-raw stream for forensic inspection while another shows completed Messages.
+A Display View operates on the received **byte stream** — the verbatim sequence of bytes as received (§17–18). There is a single source; the former per-view Stream/Messages source selector is removed in v2.0. Multiple views may render the same stream in different modes (§48).
 
 ## 42. Display Modes
 
@@ -1169,7 +866,6 @@ Display View configuration may include:
 - Background Color
 - Wrapping Mode
 - Character Rendering
-- Metadata Visibility
 
 ## 48. Multi-View Display
 
@@ -1185,96 +881,34 @@ Each Display View may maintain independent display settings where practical.
 
 ## 49. Metadata Display
 
-Metadata may be displayed adjacent to or associated with Messages but shall not be inserted into Message contents.
-
-Correct principle:
-
-```text
-Message data remains visually and logically distinct from metadata.
-```
-
-Incorrect principle:
-
-```text
-Metadata becomes part of the displayed Message text.
-```
-
-Which metadata annotates each Message is configured **per view** via
-`MessageAnnotations` (§78): independently toggleable **Message Number** and
-**timestamp** (rendered with the view's `TimestampDisplay`, §133), with room to
-add byte count, reception duration, and integrity later. These annotations also
-govern what a Display Recording (`.disp`, §54) writes inline (§57); they are always
-adjacent, never inserted into Message bytes.
+_Removed in v2.0. There are no Messages and no per-Message metadata to display; a view shows the stream bytes only._
 
 ## 50. Display Pause
 
 When Display is Paused:
 
-- Channel operation continues.
-- Message Extraction continues.
-- Decoding continues.
+- Channel operation continues (reception is never interrupted).
 - Recording continues if enabled.
-- Retention continues according to policy.
+- The view stops accumulating new stream bytes; on Resume it continues from live data, with no backfill of the gap.
 
 ## 50.1 Sink Subsampling
 
-A Message-oriented sink may **subsample** — present or record only a subset of
-Messages — to keep a fast stream readable or a log compact. Subsampling is
-**per-sink and independent**: each Display View and each Message-oriented recording
-carries its own.
+_Removed in v2.0. Subsampling was a Message-oriented filter (`.dat` → `.ssdat`); with no Messages it does not apply. Raw recording is byte-exact and full-fidelity-or-off (§53); Display recording captures the rendered stream (§54)._
 
-```rust
-enum Subsample {
-    None,
-    EveryNth(u32),        // count-based: 1 of every N Messages
-    RateLimit(Duration),  // time-based: at most one Message per interval
-}
-```
+## 50.2 Find and Triggers
 
-Subsampling is a **presentation/recording filter only**. It shall not affect
-reception, Message Numbering, retention, or any other sink (cf. §99/§100).
-Subsampled views and logs therefore show **gapped Message Numbers** — the true
-numbers, never renumbered (§89).
+A **Match Rule** scans the received **byte stream** with a predicate; on a match it fires one or more **Actions**. Rules are per-Channel and **presentation/control only** — they never modify the stream, recordings, or reception (§40, §103, §116).
 
-**Raw data is never subsampled.** Raw Recording is byte-exact, contiguous, and
-forensic (§5.6/§53/§56); it has no Message boundaries to count and is full-fidelity
-or off. Subsampling applies only to Display Views, Display Recording, and a
-**message-framed** data recording — see §53 for how enabling subsampling changes a
-data recording's output (`.dat` → `.ssdat`).
-
-## 50.2 Match Rules and Triggers
-
-A **Match Rule** evaluates a predicate against received data; on a match it fires
-one or more **Actions**. Highlighting a matched item is one action; recording,
-marking, notifying, and pausing are others. Match Rules are per-Channel and
-**presentation/control only** — they never modify Messages, bytes, recordings, or
-metadata (§40, §103, §116).
-
-**Match conditions** (v1: one condition per rule; compound AND/OR/sequence logic is
-deferred):
+**Match conditions** (one condition per rule; compound AND/OR/sequence logic is deferred):
 
 ```rust
 enum MatchCondition {
-    BytePattern { pattern: Vec<u8> },                       // bytes/hex/text within a Message
-    DecodedField(DecodedMatch),                             // requires a decoder
-    Idle { timeout: Duration },                             // no data for `timeout` (timer-based)
-    MessageSize { min: Option<usize>, max: Option<usize> }, // byte count outside [min, max]
-}
-
-enum DecodedMatch {
-    MessageType(String),       // e.g. "GLL"
-    TalkerId(String),          // e.g. "GP"
-    Integrity(IntegrityStatus),// e.g. Invalid (bad checksum)
+    BytePattern { pattern: Vec<u8> },   // a byte/hex/text sequence, scanned across the stream
+    Idle { timeout: Duration },         // no data received for `timeout` (timer-based)
 }
 ```
 
-`BytePattern` matches over Message bytes in v1 (cross-chunk stream scanning is
-deferred). `DecodedField` matches **only Protocol Metadata already produced by a
-decoder** (§134/§135) — message type, talker id, integrity status — and **not**
-arbitrary protocol field extraction, which is deferred (Appendix A). It requires a
-configured decoder, else the rule never matches and configuration validation warns
-(§71). `Idle` uses the per-Channel activity monitor (§91.1): it fires once when the
-stream has been quiet for `timeout` and re-arms when data resumes.
+`BytePattern` scans the live stream and matches **across receive-chunk boundaries** (a pattern split between two reads still matches). `Idle` uses the per-Channel activity monitor (§166): it fires once when the stream has been quiet for `timeout` and re-arms when data resumes. (The former `DecodedField` and `MessageSize` conditions are removed with the decoder/message infrastructure.)
 
 **Actions:**
 
@@ -1282,7 +916,7 @@ stream has been quiet for `timeout` and re-arms when data resumes.
 enum MatchAction {
     Highlight { style: HighlightStyle },                     // presentation only
     Record { target: RecordTarget, control: RecordControl }, // begin/stop, from the match forward
-    Mark,                                                    // correlation marker + tagged event
+    Mark,                                                     // a time/offset marker + tagged event
     Notify { severity: DiagnosticSeverity },                 // raise an event/warning (§92–94)
     PauseDisplay { view: Option<DisplayViewId> },            // freeze a view, or all
 }
@@ -1291,13 +925,10 @@ enum RecordTarget { Raw, Display, Both }
 enum RecordControl { Begin, Stop }
 ```
 
-- **Record** begins or stops recording **from the match forward**; there is **no
-  pre-match backfill** (§158). Pre-trigger / pre-match capture is deferred.
-- **Mark** drops a correlation marker into the display, the Display Recording
-  (`.disp`), and a tagged event (§137) — **never** into the raw `.dat` byte stream,
-  which stays byte-exact (§5.6/§49).
-- **Notify** raises a diagnostic event/warning (§92–94). **PauseDisplay** freezes a
-  view (or all views, §50); reception and recording continue.
+- **Highlight** styles the matched byte range in the stream scrollback, anchored on a **byte offset** (there are no Message Numbers).
+- **Record** begins or stops recording **from the match forward**; there is **no pre-match backfill** (§158). Pre-trigger capture is deferred.
+- **Mark** drops a correlation marker — a byte offset / arrival time — into the display and the Display Recording (`.disp`), plus a tagged event (§137). It is **never** written into the raw `.raw` byte stream, which stays byte-exact (§49, §53).
+- **Notify** raises a diagnostic event/warning (§92–94). **PauseDisplay** freezes a view (or all views, §50); reception and recording continue.
 
 **Configuration** (persists in profiles):
 
@@ -1312,10 +943,7 @@ struct MatchRule {
 
 Rules are part of `ChannelConfig` (§72) as `match_rules: Vec<MatchRule>`.
 
-**Evaluation and constraints.** Rules evaluate per-Message after decoding and
-before fan-out, plus an idle timer for the `Idle` condition. Evaluation is bounded
-and shall not stall reception (§100). One condition per rule; no cross-channel
-rules; no pre-trigger capture — all deferred.
+**Evaluation and constraints.** `BytePattern` rules evaluate as bytes arrive (the scanner keeps a carry of up to `pattern.len() − 1` bytes across chunks); `Idle` runs on a timer. Evaluation is bounded and shall not stall reception (§100). One condition per rule; no cross-channel rules; no pre-trigger capture — all deferred.
 
 ---
 
@@ -1356,15 +984,13 @@ at once; each has its own state, queue, file, and fault status.
 
 Raw Recording writes received bytes exactly as received.
 
-**Position:** it consumes the transport's `ReceivedData` chunk stream, before
-Message Extraction. It therefore operates in both Stream Mode and Message Mode
-and does not depend on Message boundaries.
+**Position:** it consumes the transport's `ReceivedData` chunk stream directly. It does not depend on message boundaries (there are none, §17–18).
 
 Up to its truncation point (§56.1), Raw Recording shall preserve:
 
 - Byte values
 - Byte ordering
-- Datagram / message ordering
+- Datagram / chunk ordering
 
 The byte-stream artifact shall contain received payload bytes only. Optional
 timestamps (§57) shall **not** be interleaved into the byte stream — doing so
@@ -1374,12 +1000,7 @@ sidecar index keyed by byte offset.
 Raw Recording is authoritative for the data it contains. It is **not** guaranteed
 complete under sustained overload — see §56.1.
 
-A full-fidelity raw recording is written with the **`.dat`** extension (§59). Raw
-data is **never subsampled** (§50.1): a byte stream has no Message boundaries to
-decimate. If a data recording is configured with a subsample (§50.1), it instead
-produces a **message-framed, decimated** file with the **`.ssdat`** extension — the
-distinct extension signals that the file is *not* byte-exact and *not* complete.
-The byte-exactness guarantee above applies to `.dat` only.
+A raw recording is written with the **`.raw`** extension (§59) and is always full-fidelity — byte-exact and contiguous — or off. There is no subsampling (§50.1 removed): `.raw` replaces the former `.dat`, and the message-framed `.ssdat` variant is removed.
 
 ## 54. Display Recording
 
@@ -1427,9 +1048,9 @@ fan-out (display). When that queue cannot accept new items because the recorder
 is not draining fast enough (slow disk, etc.):
 
 - The producer shall **not** block reception to wait for the recorder. A
-  recorder queue uses non-blocking enqueue. Only the Transport→Extractor queue
+  recorder queue uses non-blocking enqueue. Only the Transport→Pipeline queue
   may exert backpressure on the reader (ADR-001, §97.1; §99).
-- The recorder transitions to `Faulted`. Reception, extraction, display,
+- The recorder transitions to `Faulted`. Reception, display,
   retention, and the *other* recorder continue unaffected (§96).
 - A faulted recording shall **not** silently gap and then resume. It is
   contiguous from start to a single truncation point, then ends. `Faulted` is
@@ -1510,12 +1131,11 @@ generates a new file at the start of each period.
 - `<start-time>` is the period's start at the **least resolution the period
   needs**: `Daily` → `YYYY-MM-DD`; `Hourly` → `YYYY-MM-DD_HH`.
 - `<ext>` identifies the file's contents:
-  - **`.dat`** — full-fidelity raw data (byte-exact, never subsampled, §53).
-  - **`.ssdat`** — subsampled data (message-framed, decimated, §50.1/§53).
+  - **`.raw`** — raw data, byte-exact and contiguous (§53).
   - **`.disp`** — Display Recording (rendered text, §54).
   - **`.log`** — diagnostic/event log only (§114); not a Channel recording.
 
-Example (Hourly, channel "GPS"): `GPS_2026-06-03_08.dat`.
+Example (Hourly, channel "GPS"): `GPS_2026-06-03_08.raw`.
 
 **Rotation boundary.** At each period boundary Listener finalizes the current file
 (flush + close, §56) and opens the next. A rotation is a clean **file boundary, not
@@ -1545,7 +1165,6 @@ Export is distinct from Recording.
 
 Exports may operate on:
 
-- Retained Messages
 - Retained Stream Data
 - Retained Events
 - Retained Errors and Warnings
@@ -1588,8 +1207,6 @@ Configuration categories:
 
 - Channel Configuration
 - Interface Configuration
-- Message Extraction Configuration
-- Decoder Configuration
 - Display Configuration
 - Recording Configuration
 - Retention Configuration
@@ -1609,11 +1226,10 @@ Profiles may contain:
 - Serial Channel configuration
 - UDP Channel configuration
 - TCP Listener Channel configuration
-- Message Extraction configuration
-- Decoder configuration
 - Display configuration
 - Recording configuration
 - Retention configuration
+- Find/trigger rules (§50.2)
 
 ## 69. Profiles Exclude
 
@@ -1621,10 +1237,7 @@ Profiles shall not contain:
 
 - TCP Connection Channels
 - Active connections
-- Message Numbers
-- Display History
-- Retained Messages
-- Runtime Metadata
+- Display History (stream scrollback)
 - Active Recordings
 - Channel Start/Stop state
 - Recording Enabled/Faulted runtime state
@@ -1636,8 +1249,7 @@ Loading a Profile shall:
 - Restore configured Channels.
 - Restore display configuration.
 - Restore recording configuration.
-- Restore decoder configuration.
-- Restore extraction configuration.
+- Restore find/trigger rules.
 
 Loading a Profile shall not:
 
@@ -1694,15 +1306,16 @@ struct ChannelConfig {
     name: ChannelName,
     kind: ChannelKind,
     interface: InterfaceConfig,
-    extraction: ExtractionConfig,
-    decoder: DecoderConfig,
     display: DisplayConfig,
     recording: RecordingConfig,
     retention: RetentionConfig,
-    match_rules: Vec<MatchRule>,   // §50.2; default empty
+    match_rules: Vec<MatchRule>,   // §50.2 find/triggers; default empty
     reconnect: ReconnectPolicy,    // §9.1; default disabled
 }
 ```
+
+The `extraction` and `decoder` fields are removed in v2.0 (there is no Message
+Extraction or decoding); `schema_version` bumps for this breaking change (§72.1).
 
 ### 72.1 Schema Version Compatibility
 
@@ -1799,14 +1412,7 @@ status/snapshot for troubleshooting.
 
 ## 77. Decoder Configuration
 
-```rust
-enum DecoderConfig {
-    None,
-    Nmea0183 {
-        validation_mode: NmeaValidationMode,
-    },
-}
-```
+_Removed in v2.0. There is no decoder (§29); `DecoderConfig` is gone._
 
 ## 78. Display Configuration
 
@@ -1816,8 +1422,7 @@ struct DisplayConfig {
 }
 
 struct DisplayViewConfig {
-    mode: DisplayMode,
-    source: DisplaySource,             // §41: Stream vs Messages
+    mode: DisplayMode,                 // §42: Raw / Rendered / Hex
     encoding: DisplayEncoding,
     character_rendering: CharacterRendering,
     font: Option<String>,
@@ -1825,34 +1430,33 @@ struct DisplayViewConfig {
     background_color: Option<String>,
     wrapping: WrappingMode,
     hex_grouping: HexGrouping,         // §45
-    timestamp: TimestampDisplay,       // §133: source + resolution
-    annotations: MessageAnnotations,   // §49/§57: replaces metadata_visible
-    subsample: Subsample,              // §50.1
 }
 ```
+
+The `source`, `timestamp`, `annotations`, and `subsample` fields are removed in
+v2.0: there is one source (the stream, §41), no per-Message annotations or
+timestamps (§49), and no subsampling (§50.1).
 
 ## 79. Recording Configuration
 
 ```rust
 struct RecordingConfig {
-    mode: RecordingMode,
+    mode: RecordingMode,            // Disabled / Raw (.raw) / Display (.disp)
     destination: Option<PathBuf>,   // a file when rotation = None; a directory otherwise (§59)
-    timestamp_enabled: bool,
+    timestamp_enabled: bool,        // §57: sidecar index for Raw, inline for Display
     overwrite_policy: OverwritePolicy,
     file_rotation: FileRotationPolicy, // §59; default None
-    subsample: Subsample,           // §50.1; default None. Non-None makes a data recording
-                                    // message-framed (.dat → .ssdat, §53); raw byte output is never subsampled.
-                                    // Ignored for Display recording's byte-exactness (it is already rendered).
     disk_guard: Option<DiskGuard>,  // §56.2
 }
 ```
+
+The `subsample` field is removed in v2.0 (§50.1); raw recording is byte-exact-or-off.
 
 ## 80. Retention Configuration
 
 ```rust
 struct RetentionConfig {
-    message_limit: Option<usize>,
-    byte_limit: Option<usize>,
+    byte_limit: Option<usize>,     // stream scrollback in bytes (replaces message_limit)
     event_limit: Option<usize>,
     warning_limit: Option<usize>,
     error_limit: Option<usize>,
@@ -1872,11 +1476,6 @@ limits unset reaches the runtime (e.g. via a hand-edited profile loaded under
 Central types referenced by the configuration and data structures above:
 
 ```rust
-pub enum ProtocolId {
-    Nmea0183,
-    // additional protocols may be added without a breaking change
-}
-
 pub enum DisplayEncoding {
     Ascii,
     Utf8,
@@ -1920,21 +1519,15 @@ pub struct DefaultConfig {
     pub retention: Option<RetentionConfig>,
 }
 
-// --- v1.2 additions ---
-// (Subsample §50.1, FileRotationPolicy §59, MatchRule/MatchCondition/MatchAction/
-//  DecodedMatch/RecordTarget/RecordControl §50.2, DiskGuard §56.2, and
-//  SerialControlLines §14.3 are defined in their body sections.)
-
-pub enum DisplaySource { Stream, Messages } // §41
+// (FileRotationPolicy §59, MatchRule/MatchCondition/MatchAction/RecordTarget/
+//  RecordControl §50.2, DiskGuard §56.2, and SerialControlLines §14.3 are defined
+//  in their body sections.)
 
 // §45; groups_per_line 0 = fit to the display width.
 pub struct HexGrouping { pub bytes_per_group: u8, pub groups_per_line: u8 }
 
-// §133 (TimestampSource / TimestampResolution are defined in §133).
+// §57 — timestamp format for the recording sidecar (Raw) / inline (Display).
 pub struct TimestampDisplay { pub source: TimestampSource, pub resolution: TimestampResolution }
-
-// §49/§57 — replaces `metadata_visible`. Room to grow: byte_count, duration, integrity.
-pub struct MessageAnnotations { pub message_number: bool, pub timestamp: bool }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MatchRuleId(uuid::Uuid); // §50.2
@@ -1981,31 +1574,13 @@ Data Bits: 8
 Parity: None
 Stop Bits: 1
 Flow Control: None
-Extraction: Stream
-Decoder: None
 Recording: Disabled
 Display: Raw + Hex
 ```
 
 ## 83. NMEA Serial Template
 
-Defaults:
-
-```text
-Kind: Serial
-Name: NMEA Serial
-Baud Rate: 4800
-Data Bits: 8
-Parity: None
-Stop Bits: 1
-Flow Control: None
-Extraction: Delimiter CRLF
-Include Delimiter: false
-Decoder: NMEA0183
-Validation: Standard
-Recording: Disabled
-Display: Raw + Metadata
-```
+_Removed in v2.0. There is no NMEA-specific template — NMEA arrives as ordinary stream bytes on a Serial channel (§33). Use the Serial template (§82); a common NMEA serial port is 4800 8N1._
 
 ## 84. UDP Template
 
@@ -2015,8 +1590,6 @@ Defaults:
 Kind: UDP
 Name: UDP Channel
 Bind Address: 0.0.0.0
-Extraction: Datagram as Message
-Decoder: None
 Recording: Disabled
 Display: Raw + Hex
 ```
@@ -2041,8 +1614,7 @@ Recording: Disabled
 
 Listener may retain:
 
-- Display History
-- Messages
+- Display History (stream scrollback)
 - Stream Data
 - Events
 - Warnings
@@ -2064,8 +1636,7 @@ Retention shall be bounded.
 
 Supported limits:
 
-- Message Count
-- Byte Count
+- Byte Count (stream scrollback)
 - Event Count
 - Warning Count
 - Error Count
@@ -2076,7 +1647,7 @@ Memory-based limits may be implementation-specific but are not primary user-faci
 
 When retention limits are exceeded, oldest retained items shall be discarded first.
 
-Message Numbers shall not be renumbered after eviction.
+Eviction discards the oldest stream bytes; it never reorders the bytes that remain.
 
 ## 90. Clearing Runtime Data
 
@@ -2165,7 +1736,6 @@ Examples:
 - TCP bind failure
 - UDP bind failure
 - Recording file creation failure
-- Decoder initialization failure
 
 ## 95. Error Categories
 
@@ -2175,7 +1745,6 @@ enum ErrorCategory {
     Resource,
     Communication,
     Recording,
-    Decoder,
     Internal,
 }
 ```
@@ -2187,7 +1756,6 @@ Failures shall be isolated to the smallest affected subsystem whenever practical
 Examples:
 
 - Recording Failure faults Recording but does not stop Reception.
-- Decoder Failure faults Decoder but does not stop Reception.
 - TCP client failure does not stop the TCP Listener.
 - One Channel failure does not stop other Channels.
 
@@ -2222,24 +1790,24 @@ Listener uses a hybrid runtime model.
 
 Consequences:
 
-- `blocking_send` backpressure on the Transport→Extractor queue can stall the
+- `blocking_send` backpressure on the Transport→Pipeline queue can stall the
   serial reader, which can cause UART/driver overrun. This is the mechanism
   behind "transport-specific loss" in §99 and shall be reported per §101.
-- Because every stage downstream of the extractor is non-blocking (drop, evict,
-  skip, or fault), the extractor never stalls on a slow consumer; the only
+- Because every fan-out consumer downstream of the pipeline is non-blocking (drop,
+  evict, or fault), the pipeline never stalls on a slow consumer; the only
   condition that can stall the reader is the CPU failing to keep up with the line
   rate.
 - Continuous blocking receive loops require a bounded read timeout (or handle
   close) so they can observe cancellation; shutdown does not rely on interrupting
   an in-progress blocking read (§111).
-- Message timing is chunk-granular, not true per-byte hardware timing
-  (`ChunkTime`, §138); per-message timing is derived in the extractor (§26, §27).
+- Timing is chunk-granular, not true per-byte hardware timing (`ChunkTime`, §138);
+  recording timestamps derive from it (§26, §57).
 
 ### 97.2 Blocking-to-Async Handoff
 
 Blocking producer threads shall hand received data to the async runtime using
 bounded `tokio::sync::mpsc` channels; the producer uses `Sender::blocking_send`.
-This channel is the Transport→Extractor queue and participates in the §99
+This channel is the Transport→Pipeline queue and participates in the §99
 backpressure policy. Implementations shall not introduce an unbounded
 intermediate queue between blocking transport threads and the async runtime.
 
@@ -2248,53 +1816,44 @@ intermediate queue between blocking transport threads and the async runtime.
 Each Channel shall maintain independent:
 
 - Reception
-- Extraction
-- Decoding
 - Recording
-- Retention
-- Message Numbering
+- Retention (stream scrollback)
+- Find / trigger state
 
 ## 99. Queue and Backpressure Matrix
 
 | Queue | Bounded | Overflow Behavior |
 |---|---:|---|
-| Transport → Extractor | Yes | `blocking_send`; may stall the reader (the only edge permitted to); transport-specific loss may occur and is reported (§101) |
-| Chunk tap → Raw Recording | Yes | `try_send`; Raw Recording faults on full; never stalls reception |
-| Extractor → Metadata | Yes | Warn; affected Channel may fault |
-| Metadata → Decoder | Yes | Warn; decoder may skip messages |
-| Fan-out → Display | Yes | Drop oldest display items |
+| Transport → Pipeline | Yes | `blocking_send`; may stall the reader (the only edge permitted to); transport-specific loss may occur and is reported (§101) |
+| Fan-out → Raw Recording | Yes | `try_send`; Raw Recording faults on full; never stalls reception |
+| Fan-out → Display / scrollback | Yes | Drop oldest display items |
 | Fan-out → Display Recording | Yes | `try_send`; Display Recording faults on full; never stalls reception |
-| Fan-out → Retention | Yes | Evict oldest retained items |
+| Fan-out → Find / Triggers | Yes | Bounded scan; never stalls reception |
 | Diagnostics | Yes | Drop oldest low-priority diagnostics first |
 
-Only the Transport→Extractor edge may exert backpressure on the reader. Every
-other edge shall drop, evict, skip, or fault — never stall acquisition.
+Only the Transport→Pipeline edge may exert backpressure on the reader. Every
+other edge shall drop, evict, or fault — never stall acquisition.
 
 ### 99.1 Queue Topology
 
 ```text
 transport reader
+  │  [bounded transport→pipeline queue; blocking_send — the only edge that may stall the reader]
+  ▼
+pipeline (per channel)
   │
   ▼
-chunk distribution             ← runs on the reader thread/task
-  ├─ extractor queue           [bounded; blocking_send — may stall reader]
-  └─ raw recorder queue        [bounded; try_send — fault on full; never stalls]
-
-extractor
-  │
-  ▼
-fan-out
-  ├─ display queues            [bounded; drop oldest]
-  ├─ display recorder queues   [bounded; try_send — fault on full]
-  ├─ retention queue           [bounded; evict oldest]
+fan-out (non-blocking)
+  ├─ raw recorder queue        [bounded; try_send — fault on full; never stalls]
+  ├─ display / scrollback      [bounded; drop oldest]
+  ├─ display recorder queue    [bounded; try_send — fault on full]
+  ├─ find / triggers           [bounded scan]
   └─ diagnostics queue         [bounded; drop oldest low-priority first]
 ```
 
-Distribution order at the chunk split shall be:
-
-1. attempt raw recorder delivery with non-blocking enqueue;
-2. deliver to the extractor queue, which is the only edge permitted to block or
-   stall the reader.
+The transport→pipeline queue is the only edge permitted to block or stall the
+reader; every fan-out consumer uses non-blocking enqueue and drops or faults rather
+than stalling acquisition.
 
 Chunk payloads shall be shared between branches using `Arc`-backed storage rather
 than copied per consumer.
@@ -2324,52 +1883,29 @@ can detect rather than guaranteeing detection of all loss.
 
 ## 102. Processing Pipeline
 
-Stream-oriented Channels:
+All Channels share one stream pipeline. UDP datagrams and serial/TCP byte chunks differ only in how the transport reads them; both become `ReceivedData` (§138):
 
 ```text
-Receive Bytes
+Receive Bytes (chunk / datagram)
   ↓
-Raw Recording (optional)
+Activity / liveness (byte count, last-data time)
   ↓
-Message Extraction
-  ↓
-Metadata Generation
-  ↓
-Protocol Decoding (optional)
-  ↓
-Fan-out
-  ├─ Display
-  ├─ Recording
-  ├─ Retention
+Fan-out (non-blocking, §99–100)
+  ├─ Raw Recording (optional, byte-exact tap)
+  ├─ Stream scrollback (display history)
+  ├─ Display + Display Recording (rendered)
+  ├─ Find / Triggers (BytePattern scan, Idle)
   └─ Diagnostics
 ```
 
-UDP Channels:
-
-```text
-Receive Datagram
-  ↓
-Message Creation
-  ↓
-Raw Recording (optional)
-  ↓
-Metadata Generation
-  ↓
-Protocol Decoding (optional)
-  ↓
-Fan-out
-```
+There is no extraction, metadata, or decoding stage. The only edge that may backpressure the reader is the bounded transport→pipeline queue (§99); every fan-out consumer is non-blocking and may drop or fault rather than stall reception (§100).
 
 ## 103. Ownership Principle
 
-Each stage owns only the state it creates.
-
-Once a Message is created, it is immutable.
-
-Recommended sharing:
+Each stage owns only the state it creates. A received chunk is immutable once read; consumers share it without copying:
 
 ```rust
-Arc<Message>
+Arc<ReceivedData>
 ```
 
 ## 104. Transport Ownership
@@ -2388,43 +1924,19 @@ was read.
 
 ## 105. Extractor Ownership
 
-Extractor owns:
+_Removed in v2.0. There is no extractor (§20)._
 
-- Partial message buffers
-- Delimiter state
-- Fixed-length synchronization state
+## 106. Liveness Ownership
 
-Extractor outputs completed Message bytes.
-
-Because chunk boundaries do not align with Message boundaries (and are not a
-user-visible concept — §24), the extractor associates each completed Message with
-the `ChunkTime` (§138) of the chunk that supplied its first byte and the chunk
-that supplied its last byte. The metadata stage uses these to compute Arrival
-Timestamp (§26) and Reception Duration (§27); a Message wholly contained in one
-chunk has a Reception Duration of zero (or `None`). Per-byte arrival time is not
-available from the OS and is not represented.
-
-## 106. Metadata Ownership
-
-Metadata stage owns:
-
-- Message counter
-- Arrival timestamp calculation
-- Reception duration calculation
-
-Metadata stage creates immutable Message objects.
+The activity/liveness stage owns the per-Channel byte counter and last-data time (§25, §166). It derives rolling throughput and the idle signal used by `Idle` Find rules (§50.2). It creates no Message objects — there are none.
 
 ## 107. Decoder Ownership
 
-Decoder consumes immutable Messages and produces Protocol Metadata.
-
-Decoder shall not mutate Messages.
+_Removed in v2.0. There is no decoder (§29)._
 
 ## 108. Fan-Out Ownership
 
-Fan-out distributes immutable Messages and associated metadata to independent consumers.
-
-No consumer owns the pipeline.
+Fan-out distributes each immutable received chunk to independent consumers (recording, display/scrollback, find/triggers, diagnostics). No consumer owns the pipeline.
 
 ---
 
@@ -2472,14 +1984,9 @@ bounded read timeout (and/or handle close) so they periodically return to observ
 cancellation; shutdown shall not rely on interrupting an in-progress blocking
 read.
 
-## 112. Partial Messages During Shutdown
+## 112. Partial Data During Shutdown
 
-Incomplete Messages at shutdown:
-
-- Shall not receive Message Numbers.
-- Shall not be decoded.
-- May be discarded.
-- May generate warnings if configured.
+_There are no Messages, so nothing is "partial." At shutdown, in-flight stream bytes already accepted by a recorder are flushed (§56); transports then close (§110). Bytes still in transit may be discarded._
 
 ## 113. Application Exit
 
@@ -2594,11 +2101,11 @@ Listener shall avoid unbounded growth of:
 
 ## 125. Deterministic Ordering
 
-Messages within a Channel shall preserve receive order.
+Stream bytes within a Channel shall preserve receive order.
 
-Listener shall not reorder Messages within a Channel.
+Listener shall not reorder received data within a Channel.
 
-If timestamps are equal, Message Number determines ordering.
+If wall-clock timestamps are equal, the monotonic capture order (§133) determines ordering.
 
 ## 126. Undefined Timing Guarantees
 
@@ -2642,8 +2149,6 @@ wiredata/                    # workspace root
       lib.rs                 # declares + re-exports the modules below
       core/                  # → listener-core
       transport/             # → listener-transport
-      extract/               # → listener-extract
-      decode/                # → listener-decode
       display/               # → listener-display
       record/                # → listener-record
       retention/             # → listener-retention
@@ -2669,8 +2174,7 @@ The boundaries below are normative regardless of whether each lives in its own c
 Owns:
 
 - Common types
-- Message model
-- Metadata model
+- `ReceivedData` / `ChunkTime`
 - Channel IDs
 - State enums
 - Shared errors
@@ -2692,26 +2196,16 @@ Owns:
 
 Does not know about:
 
-- NMEA
 - Display
 - Recording format
 
-### listener-extract  (`src/extract/`)
+### listener-extract — removed in v2.0
 
-Owns:
+There is no extraction module; received bytes are a verbatim stream (§20).
 
-- Stream Mode
-- Delimiter extraction
-- Fixed-length extraction
-- Sync marker handling
+### listener-decode — removed in v2.0
 
-### listener-decode  (`src/decode/`)
-
-Owns:
-
-- Decoder trait
-- NMEA0183 decoder adapter
-- Future decoders
+There is no decoder module; `listener` no longer depends on `nmea0183` (§29).
 
 ### listener-display  (`src/display/`)
 
@@ -2827,112 +2321,32 @@ pub enum RecordingState {
 
 ## 131. Message
 
-```rust
-use std::sync::Arc;
-
-#[derive(Clone, Debug)]
-pub struct Message {
-    pub channel_id: ChannelId,
-    pub number: u64,
-    pub bytes: Arc<[u8]>,
-    pub metadata: MessageMetadata,
-}
-```
-
-Rules:
-
-- Message bytes are immutable.
-- Message Number is Channel-local.
-- Message Number resets on Start.
-- Message Number exists only in Message Mode.
+_Removed in v2.0. There are no Messages; received data is a verbatim stream (§17–18)._
 
 ## 132. Message Metadata
 
-```rust
-use std::time::Duration;
-
-#[derive(Clone, Debug)]
-pub struct MessageMetadata {
-    pub total_byte_count: usize,
-    pub arrival_timestamp: MessageTimestamp,
-    pub reception_duration: Option<Duration>,
-}
-```
+_Removed in v2.0 (see §131)._
 
 ## 133. Timestamp
 
-Internal timing uses one model, not strings: a monotonic `Instant` for
-ordering/duration and the §125 tie-break, and a wall-clock `SystemTime` for
-Local/UTC display. A Message timestamp is derived from the `ChunkTime` (§138) of
-the chunk containing the Message's first byte (§26). Formatting to a display
-string — source (Local / UTC / Relative) and resolution (seconds / ms / µs) — is
-done in the display/rendering layer, not in stored state.
+Internal timing uses one model, not strings: a monotonic `Instant` for ordering and the §125 tie-break, and a wall-clock `SystemTime` for Local/UTC display. The unit is the per-chunk `ChunkTime` (§138); recording timestamps (§57) and the activity monitor (§166) derive from it. Formatting to a display string — source (Local / UTC / Relative) and resolution (seconds / ms / µs) — is done in the display/recording layer, not in stored state.
 
 ```rust
-#[derive(Clone, Debug)]
-pub struct MessageTimestamp {
-    pub monotonic: std::time::Instant,
-    pub wall_clock: std::time::SystemTime,
-}
-
-// Display-time selection:
+// Display/recording-time selection (formatting only; the captured time is the
+// ChunkTime defined in §138):
 pub enum TimestampSource { Local, Utc, RelativeToStart }
 pub enum TimestampResolution { Seconds, Millis, Micros }
 ```
 
-Timestamp *resolution* is a display/storage precision choice, not an accuracy
-guarantee; userland serial/UDP arrival times carry OS scheduling jitter that may
-exceed the displayed resolution.
+Timestamp *resolution* is a display/storage precision choice, not an accuracy guarantee; userland serial/UDP arrival times carry OS scheduling jitter that may exceed the displayed resolution.
 
 ## 134. Protocol Metadata
 
-```rust
-use std::collections::BTreeMap;
-
-#[derive(Clone, Debug)]
-pub struct ProtocolMetadata {
-    pub protocol: ProtocolId,
-    pub message_type: Option<String>,
-    pub integrity: Vec<IntegrityMetadata>,
-    pub attributes: BTreeMap<String, String>,
-}
-```
-
-For NMEA:
-
-```text
-protocol = NMEA0183
-message_type = GLL
-attributes:
-  talker_id = GP
-  proprietary_id = optional
-```
+_Removed in v2.0. There is no decoder to produce protocol metadata (§29)._
 
 ## 135. Integrity Metadata
 
-```rust
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IntegrityScope {
-    Protocol,
-    Payload,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IntegrityStatus {
-    NotPresent,
-    Valid,
-    Invalid,
-    NotChecked,
-    DecoderError,
-}
-
-#[derive(Clone, Debug)]
-pub struct IntegrityMetadata {
-    pub scope: IntegrityScope,
-    pub status: IntegrityStatus,
-    pub algorithm: Option<String>,
-}
-```
+_Removed in v2.0 (see §28, §134)._
 
 ## 136. Runtime Commands
 
@@ -2967,7 +2381,6 @@ pub enum RuntimeEvent {
     ChannelStarted(ChannelId),
     ChannelStopped(ChannelId),
     ChannelFaulted(ChannelId),
-    MessageReceived(ChannelId, u64),
     RecordingFaulted(ChannelId),
     WarningRaised(ChannelId),
     TcpClientConnected(ChannelId),
@@ -3035,8 +2448,8 @@ pub struct ReceivedData {
 }
 
 pub enum ReceivedPayload {
-    Bytes(Vec<u8>),    // stream chunk; framing decided by the extractor
-    Datagram(Vec<u8>), // already one complete message (UDP); no byte extraction
+    Bytes(Vec<u8>),    // a stream chunk (serial / TCP)
+    Datagram(Vec<u8>), // one UDP datagram; boundary preserved as a recording detail (§15)
 }
 
 // Single capture per chunk. Monotonic for ordering/duration/tie-break (§125);
@@ -3059,49 +2472,30 @@ pub struct NewConnection {
 
 ## 139. Message Extractor Trait
 
-```rust
-pub trait MessageExtractor {
-    // `at` is the ChunkTime of this chunk (§138); the extractor attaches the
-    // first/last chunk times to each completed Message for §26/§27.
-    fn push_chunk(&mut self, bytes: &[u8], at: ChunkTime) -> Vec<MessageBytes>;
-    fn finish(&mut self) -> Vec<MessageBytes>;
-}
-```
-
-Extractor owns partial-message state, including the first-byte `ChunkTime` of any
-Message currently being assembled.
+_Removed in v2.0. There is no extractor (§20)._
 
 ## 140. Decoder Trait
 
-```rust
-pub trait Decoder {
-    fn decode(&self, message: &Message) -> DecodeResult;
-}
-
-pub struct DecodeResult {
-    pub metadata: Option<ProtocolMetadata>,
-    pub errors: Vec<DecodeError>,
-}
-```
+_Removed in v2.0. There is no decoder (§29)._
 
 ## 141. Renderer Trait
 
 ```rust
 pub trait Renderer {
-    fn render(&self, message: &Message) -> RenderedOutput;
+    // Render a span of stream bytes under the chosen Display Mode + character
+    // rendering (§42–46) to display/recording text. There are no Messages.
+    fn render(&self, bytes: &[u8]) -> RenderedOutput;
 }
 ```
 
 ## 142. Recorder Traits
 
-The single `write_raw(&Message)` primitive is removed: it could not express
-Stream-Mode raw recording or byte-level pre-extraction recording. It is replaced
-by two writers matching the two recording systems (§51).
+Two writers match the two recording systems (§51): a byte-exact raw writer and a rendered display writer.
 
 ```rust
 #[async_trait::async_trait]
 pub trait RawRecorder {
-    /// Append one received chunk (pre-extraction) exactly as received.
+    /// Append one received chunk exactly as received.
     async fn write_chunk(&mut self, chunk: &ReceivedData) -> Result<(), RecordError>;
     async fn flush(&mut self) -> Result<(), RecordError>;
     /// Flush, close, and write the truncation marker (for faults).
@@ -3215,44 +2609,31 @@ Integration tests shall live in the crate `tests/` directory.
 
 Required tests:
 
-- Delimiter extraction
-- Delimiter across buffer boundary
-- Consecutive delimiters
-- Missing delimiter
-- Fixed-length extraction
-- Sync marker detection
-- UDP datagram Message mapping
-- Message Numbering
-- Retention eviction
-- Raw recording integrity
+- Byte-pattern find across receive-chunk boundaries (§50.2)
+- Idle-rule firing and re-arming
+- UDP datagram boundary preservation
+- Stream-scrollback eviction (byte-bounded, ordered)
+- Raw recording byte-exactness
+- Display recording reflects the rendered view
+- File rotation (hourly/daily, clean boundary, filesystem-safe name)
 - Display Pause behavior
-- NMEA checksum validation
-- NMEA Standard vs Strict mode
 - TCP Connection Channel creation
 - State transitions
-- Queue overflow handling
+- Queue overflow handling (single backpressure edge; consumers drop/fault)
 - Failure isolation
 - Graceful shutdown
 
 ## 151. NMEA Tests
 
-NMEA tests shall cover:
-
-- Valid checksum
-- Invalid checksum
-- Missing checksum
-- Malformed checksum
-- Proprietary sentence
-- Missing CRLF observation
-- Invalid sentence identifier
+_Removed in v2.0. There is no NMEA decoder to test (§29); NMEA data is exercised as ordinary stream bytes by the stream display/recording tests._
 
 ## 152. Backpressure Tests
 
 Backpressure tests shall verify:
 
-- Display queue overflow does not stop reception.
+- Display/scrollback queue overflow does not stop reception.
 - Recording failure faults recording but not reception.
-- Retention eviction preserves Message Numbering.
+- Stream-scrollback eviction is byte-bounded and preserves order.
 - Diagnostics overflow drops low-priority entries first.
 
 ---
@@ -3277,16 +2658,13 @@ A TCP Listener shall:
 - Keep client streams independent.
 - Avoid persisting TCP Connection Channels.
 
-## 155. Message Processing
+## 155. Stream Find and Triggers
 
-A user shall be able to configure:
+A user shall be able to:
 
-- Stream Mode
-- Delimiter Extraction
-- Fixed-Length Extraction
-- Optional sync marker
-
-UDP datagrams shall become Messages.
+- Define a `BytePattern` find rule and see matches highlighted in the stream (§50.2).
+- Define an `Idle` rule and have it fire after the configured quiet time.
+- Attach `Record` / `Notify` / `Mark` actions to a rule and observe them fire.
 
 ## 156. Display
 
@@ -3297,17 +2675,16 @@ A user shall be able to:
 - Configure font, foreground color, background color, wrapping, and character rendering.
 - Pause and Resume display without affecting reception or recording.
 
-Raw Display shall show actual data only and shall not insert message-boundary structure.
+Raw Display shall show actual data only and shall not insert structure of its own.
 
-## 157. Metadata and Timing
+## 157. Liveness and Timing
 
-In Message Mode, Listener shall provide:
+`Listener` shall provide, per Channel:
 
-- Message Number
-- Total Byte Count
-- Arrival Timestamp
-- Optional Reception Duration
-- Optional Protocol Integrity Metadata
+- Total bytes received (§25)
+- Rolling throughput and last-data time (§166)
+
+Recording timestamps (§57), when enabled, use the per-chunk arrival time (§26).
 
 ## 158. Recording
 
@@ -3338,20 +2715,11 @@ Profile loading shall not:
 - Start Channels.
 - Begin recording.
 - Restore TCP Connection Channels.
-- Restore Message Numbers.
 - Restore runtime state.
 
 ## 160. NMEA0183
 
-The NMEA Decoder shall:
-
-- Operate only on complete Messages.
-- Require `$` (standard/proprietary) or `!` (AIS) at Message start.
-- Require CRLF observation during extraction.
-- Support Standard and Strict validation modes.
-- Validate NMEA XOR checksums.
-- Recognize proprietary sentences.
-- Produce Protocol Metadata without modifying Message contents.
+_Removed in v2.0. There is no NMEA decoder (§29); NMEA arrives as ordinary stream bytes._
 
 ---
 
@@ -3365,7 +2733,7 @@ is unverified end-to-end until proven.
 
 A user shall be able to: see CTS/DSR/DCD/RI state live and observe it change; set
 RTS/DTR at open and toggle them live while Running. Control-line activity shall not
-affect Message Numbering, Extraction, Recording, or Decoding (§14.2–§14.3).
+affect reception or Recording (§14.2–§14.3).
 
 ## 162. Auto-Reconnect
 
@@ -3377,28 +2745,26 @@ TCP Connection Channels shall not auto-reconnect.
 ## 163. File Rotation
 
 An Hourly/Daily recording shall produce period files named
-`<channel>_<start-time><ext>` with the correct extension (`.dat`/`.ssdat`/`.disp`),
+`<channel>_<start-time><ext>` with the correct extension (`.raw`/`.disp`),
 finalize each file cleanly at the boundary (no gap, no backfill), and reject a
 filesystem-unsafe channel name at config time (§59, §71).
 
 ## 164. Subsampling
 
-Count- and time-based subsampling shall apply per sink (display view / message
-recording) without affecting reception, Message Numbering, retention, or other
-sinks; subsampled output shall show gapped (not renumbered) Message Numbers. Raw
-data (`.dat`) shall never be subsampled (§50.1).
+_Removed in v2.0 (§50.1). Raw recording is byte-exact-or-off; there is no message-framed `.ssdat`._
 
-## 165. Match Rules and Triggers
+## 165. Find and Triggers
 
-Each match condition (byte pattern, decoded field, idle, message size) shall fire
+Each match condition (`BytePattern` scanned across the stream, `Idle`) shall fire
 its actions; `Record` shall begin/stop from the match forward with no pre-match
-backfill; `Mark` shall annotate display/`.disp`/events but never the raw `.dat`
-stream; decoded matching shall be limited to existing Protocol Metadata (§50.2).
+backfill; `Highlight` shall style the matched byte range; `Mark` shall annotate the
+display / `.disp` / events but never the raw `.raw` stream (§50.2).
 
 ## 166. Liveness
 
-A running Channel shall surface throughput (bytes/sec, msgs/sec), time-since-last-
-data, and a derived idle indicator, bounded and without affecting reception (§91.1).
+A running Channel shall surface throughput (bytes/sec), total bytes received,
+time-since-last-data, and a derived idle indicator, bounded and without affecting
+reception (§91.1).
 
 ## 167. Network Live Adjustment
 
@@ -3442,33 +2808,23 @@ Deferred from Version 1:
 ```text
 Serial Port
   ↓
-Byte Stream
+Byte Stream (verbatim; NMEA is just bytes)
   ↓
-CRLF Delimiter Extraction
-  ↓
-Message
-  ↓
-Payload Metadata
-  ↓
-NMEA Decoder
-  ↓
-Protocol Metadata
-  ↓
-Display / Recording / Retention
+Fan-out
+  ├─ Display (Rendered shows each CRLF as a line; Hex/Raw show the bytes)
+  ├─ Raw Recording (.raw)
+  ├─ Display Recording (.disp)
+  └─ Find / Triggers (e.g. BytePattern "$GPGGA")
 ```
 
 ## B.2 UDP
 
 ```text
-UDP Datagram
+UDP Datagram (boundary preserved)
   ↓
-Message
+Byte Stream
   ↓
-Payload Metadata
-  ↓
-Optional Decoder
-  ↓
-Display / Recording / Retention
+Fan-out (Display / Raw Recording / Display Recording / Find)
 ```
 
 ## B.3 TCP
@@ -3482,20 +2838,7 @@ TCP Connection Channel
   ↓
 Byte Stream
   ↓
-Message Extraction
-  ↓
-Pipeline
-```
-
-## B.4 Fixed-Length With Sync Marker
-
-```text
-Sync Marker: AA 55
-Length: 16 bytes
-
-Ignore bytes until AA 55 observed.
-Then collect 16 bytes as one Message.
-Repeat.
+Fan-out (Display / Raw Recording / Display Recording / Find)
 ```
 
 ---
