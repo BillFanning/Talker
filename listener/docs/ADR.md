@@ -27,13 +27,17 @@ the same as talker's ADR-001.
 **Consequences:**
 - `blocking_send` backpressure can stall a serial reader → UART/driver overrun, reported as transport-specific loss (§99, §101).
 - Continuous blocking loops need a bounded read timeout so they can observe cancellation; shutdown never relies on interrupting an in-progress blocking read (§111).
-- Message timing is chunk-granular (`ChunkTime`, §138), not true per-byte hardware timing; per-message timing is derived in the extractor.
+- Timing is chunk-granular (`ChunkTime`, §138), not true per-byte hardware timing; recording timestamps and liveness derive from it (§26, §57, §166). *(Originally "per-message timing in the extractor" — both removed by ADR-010.)*
 
 ---
 
 ## ADR-002 — Messages are immutable; decoders are read-only
 
-**Authoritative context:** spec Part on Messages/Decoders (§131–§135, §140).
+> **Superseded by ADR-010 (spec v2.0):** Messages and decoders are removed. The
+> surviving principles live on as §103 (received chunks are immutable, shared via
+> `Arc`) and §5.4/§5.5 (display/recording never alter received bytes).
+
+**Authoritative context:** spec Part on Messages/Decoders (§131–§135, §140; removed in v2.0).
 
 **Decision:** A `Message` is immutable once emitted by the extractor. Decoders never mutate Messages — they only produce read-only annotations (protocol metadata, integrity metadata). Display formatting never affects what is recorded (Raw Recording is independent of rendering).
 
@@ -65,9 +69,12 @@ the same as talker's ADR-001.
 
 ## ADR-005 — Delimiter extraction emits a Message at every delimiter, including empty payloads
 
-**Authoritative context:** spec §21 (delimiter extraction) and §150 (the
-required "consecutive delimiters" test). The spec mandates the test but does not
-prescribe the outcome, so the behavior is fixed here.
+> **Obsolete under ADR-010 (spec v2.0):** delimiter extraction is removed entirely;
+> there is nothing to emit. Kept for historical context only.
+
+**Authoritative context:** spec §21 (delimiter extraction; removed in v2.0) and §150 (the
+required "consecutive delimiters" test). The spec mandated the test but did not
+prescribe the outcome, so the behavior was fixed here.
 
 **Decision:** `DelimiterExtractor` completes a Message at **every** delimiter
 occurrence, even when no payload bytes precede it. Consecutive delimiters
@@ -149,9 +156,10 @@ clean path and does not foreclose it.
   TCP **listener-acceptor** fault is not reconciled through this flag in v1 (its
   supervisor reports per-connection faults as events); revisit if acceptor faults
   need to surface as listener state.
-- Live readout of *retained* messages / diagnostics / decoded metadata while a
-  channel runs still requires an on-demand snapshot API — separate, upcoming work
-  (the observability surface), not covered here.
+- Live readout of retained content (the stream scrollback / diagnostics under
+  ADR-010; originally retained messages / decoded metadata) while a channel runs
+  still requires the on-demand snapshot API — built since, and the message-era
+  parts of this ADR are superseded by ADR-010.
 - Pinned by tests: `runtime::channel` (`is_faulted` after a fault) and
   `runtime::listener` (`state()` reconciles to `Faulted`, then clears on `stop`).
 

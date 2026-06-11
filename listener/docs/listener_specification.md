@@ -123,7 +123,7 @@ Listener shall eventually support:
 
 Both interfaces shall be thin presentation layers over shared core/runtime logic.
 
-The UI shall not own transport handles, recording handles, decoder state, or channel pipeline state.
+The UI shall not own transport handles, recording handles, or channel pipeline state.
 
 ---
 
@@ -249,8 +249,8 @@ guaranteed complete under sustained overload — see fault behavior (§56.1).
 Raw Recording shall preserve:
 
 - Original byte values
-- Original ordering
-- Original Message ordering
+- Original byte ordering
+- Original chunk / datagram ordering
 
 ### 5.7 Configuration and Runtime Separation
 
@@ -594,8 +594,6 @@ UDP Channels shall support:
 
 A UDP Channel shall receive complete UDP datagrams.
 
-Each UDP datagram shall become one Message.
-
 UDP datagram boundaries shall be preserved (as a reception/recording detail, §53); the payload is otherwise carried as ordinary stream bytes.
 
 ## 16. TCP Listener and TCP Connection Channels
@@ -816,7 +814,7 @@ Raw Display shall:
 - Display all bytes using configured character rendering.
 - Allow the space character to be replaced by glyph or escape sequence.
 - Wrap at the display boundary when wrapping is enabled.
-- Not insert Message-boundary structure.
+- Not insert structure of its own (no synthesized boundaries or separators).
 
 Raw Display is intended for forensic inspection.
 
@@ -958,8 +956,7 @@ or Faulted (§12).
 There are two independent recording systems, with different inputs, pipeline
 positions, and guarantees:
 
-- **Raw Recording** — byte-oriented; taps the received-chunk stream *before*
-  extraction.
+- **Raw Recording** — byte-oriented; taps the received-chunk stream directly.
 - **Display Recording** — rendered-output-oriented; consumes a display view's
   output *after* rendering.
 
@@ -1056,7 +1053,7 @@ is not draining fast enough (slow disk, etc.):
   contiguous from start to a single truncation point, then ends. `Faulted` is
   terminal until the user re-enables recording, which begins a *new* artifact.
 - On fault, the recorder records the truncation point — total bytes written
-  (raw) or last line/message written (display), plus wall-clock and monotonic
+  (raw) or last rendered line written (display), plus wall-clock and monotonic
   time — finalizes the file, emits `RecordingFaulted(ChannelId)` (§137), and
   raises a diagnostic (§101) naming the channel, time, and estimated loss where
   practical.
@@ -1090,8 +1087,8 @@ when rotation is configured (§59) — the time remaining until the next rotatio
 ## 57. Timestamp Recording
 
 Timestamp recording is optional and is the only metadata a recorder writes.
-Rationale: most metadata is regenerable from recorded bytes via deterministic
-extraction (§148); original timing is not.
+Rationale: the recorded bytes are self-sufficient; original timing is the one
+fact that cannot be regenerated from them.
 
 - **Raw Recording:** timestamps are `ChunkTime` values (wall clock + monotonic)
   written to a sidecar index keyed by byte offset; the byte stream stays pure.
@@ -1681,13 +1678,13 @@ Examples:
 ### 91.1 Channel Activity and Liveness
 
 Each Channel maintains a lightweight **activity monitor** of pure facts, updated
-per received chunk/Message and exposed in status/snapshot:
+per received chunk and exposed in status/snapshot:
 
 ```rust
 struct ChannelActivity {
     last_data_at: Option<Instant>,  // arrival of the last chunk/datagram; None until first data
     bytes_per_sec: f64,             // rolling
-    messages_per_sec: f64,          // rolling
+    total_bytes: u64,               // since Start (§25)
 }
 ```
 
@@ -1720,9 +1717,7 @@ Warnings indicate conditions that may affect operation but do not prevent operat
 Examples:
 
 - Queue overflow
-- Checksum invalid
 - Display backpressure
-- Unsupported decoder field
 - Connection rejected (max connections reached)
 
 ## 94. Errors
@@ -2567,19 +2562,19 @@ Recommended `.vscode/settings.json`:
 
 ## 147. Development Order
 
-Recommended implementation order:
+Recommended implementation order (v2.0; for the v1→v2 strip, follow ADR-010's build order):
 
-1. `listener-core`
-2. `listener-extract`
-3. extraction tests
-4. `listener-runtime` skeleton
-5. queue/backpressure tests
-6. UDP transport
-7. serial transport
-8. TCP listener/connection transport
-9. recording
-10. display
-11. GUI/CLI
+1. `listener-core` (`ReceivedData`, `ChunkTime`, channel IDs/states)
+2. transport contracts + queue/backpressure tests (the single backpressure edge, §99)
+3. `listener-runtime` stream pipeline skeleton (fan-out, failure isolation)
+4. byte-bounded retention / stream scrollback
+5. UDP transport
+6. serial transport
+7. TCP listener/connection transport
+8. raw recording (`.raw`), then rendering + display recording (`.disp`)
+9. stream find/triggers (`BytePattern` across chunks, `Idle`)
+10. config/schema + profiles (v1 refusal)
+11. CLI, then GUI
 
 Do not start with GUI.
 
@@ -2593,10 +2588,9 @@ Observable behavior matters more than implementation details.
 
 Given identical input and configuration, Listener shall produce deterministic:
 
-- Message boundaries
-- Message ordering
-- Message numbering
-- Metadata
+- Stream byte ordering
+- Chunk / datagram ordering
+- Find/trigger match results (byte offsets)
 - Raw recording output
 
 ## 149. Unit Test Placement
@@ -2855,8 +2849,8 @@ this specification**, not agent advice, and remain in their authoritative locati
 
 - *Deferred features* (no automatic protocol detection, no protocol field extraction,
   no CSV/JSON export, no TCP client mode) — Appendix A.
-- *Read-only decoders, immutable Messages, GUI out of core* — Part on Messages/Decoders
-  (§131–§135, §140) and listener [`ADR.md`](ADR.md) ADR-002.
+- *Immutable received chunks, GUI out of core* — §103 and listener [`ADR.md`](ADR.md)
+  ADR-010 (decoders and Messages are removed in v2.0).
 - *Display formatting must not affect Raw Recording* — §5.6 / §1185 ff.
 - *Runtime TCP Connection Channels are not persisted* — the TCP transport sections.
 
