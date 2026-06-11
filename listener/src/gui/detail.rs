@@ -4,6 +4,7 @@
 
 use std::time::SystemTime;
 
+use crate::core::RecordingState;
 use crate::diagnostics::DiagnosticSeverity;
 use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, DisplayView, WrappingMode};
 
@@ -24,7 +25,7 @@ impl ListenerApp {
             return;
         };
         self.sync_edit_draft(id);
-        let Some((details, status, bytes_total, bps, last_error)) =
+        let Some((details, status, bytes_total, bps, last_error, recording, rec_dest)) =
             self.state.channel(id).map(|v| {
                 (
                     v.details.clone(),
@@ -32,6 +33,8 @@ impl ListenerApp {
                     v.bytes_total,
                     v.bytes_per_sec,
                     v.last_error.clone(),
+                    v.recording,
+                    v.config.recording.destination.clone(),
                 )
             })
         else {
@@ -88,6 +91,27 @@ impl ListenerApp {
             "Received: {}    Throughput: {bps:.0} B/s",
             human_bytes(bytes_total)
         ));
+        // Recording indicator (§53): live state from the snapshot, destination from
+        // the config. Off/None shows nothing — only Configure surfaces the setting.
+        match recording {
+            Some(RecordingState::Enabled) => {
+                let dest = rec_dest
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(no destination)".to_string());
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 40, 40),
+                    format!("\u{25CF} Recording \u{2192} {dest}"),
+                );
+            }
+            Some(RecordingState::Faulted) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(170, 30, 30),
+                    "\u{26A0} Recording faulted — see Diagnostics",
+                );
+            }
+            Some(RecordingState::Disabled) | None => {}
+        }
         // Lifecycle actions, below the stats line (#6); bigger so Stop/Remove stand out.
         ui.horizontal(|ui| {
             let size = egui::vec2(86.0, 30.0);

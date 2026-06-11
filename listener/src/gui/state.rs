@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use crate::config::ChannelConfig;
-use crate::core::{ChannelId, RuntimeEvent};
+use crate::core::{ChannelId, RecordingState, RuntimeEvent};
 use crate::runtime::ChannelSnapshot;
 use crate::transport::SerialControlLines;
 
@@ -54,6 +54,9 @@ pub struct ChannelView {
     pub snapshot: Option<ChannelSnapshot>,
     /// Live serial control/status lines (§161) while running; `None` otherwise.
     pub control_lines: Option<SerialControlLines>,
+    /// Raw-recording state from the latest snapshot/stats (§53), or `None` when no
+    /// recorder is attached. Drives the recording indicator in the detail pane.
+    pub recording: Option<RecordingState>,
 }
 
 impl ChannelView {
@@ -72,6 +75,7 @@ impl ChannelView {
             last_error: None,
             snapshot: None,
             control_lines: None,
+            recording: None,
         }
     }
 }
@@ -176,6 +180,7 @@ impl AppState {
                     view.info = snapshot.diagnostics.events.len();
                     view.warnings = snapshot.diagnostics.warnings.len();
                     view.errors = snapshot.diagnostics.errors.len();
+                    view.recording = snapshot.raw_recording;
                     view.snapshot = Some(*snapshot);
                 }
             }
@@ -187,6 +192,7 @@ impl AppState {
                     view.info = stats.event_count;
                     view.warnings = stats.warning_count;
                     view.errors = stats.error_count;
+                    view.recording = stats.raw_recording;
                 }
             }
             UiUpdate::ControlLines(id, lines) => {

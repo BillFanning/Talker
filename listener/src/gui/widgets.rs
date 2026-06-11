@@ -3,12 +3,15 @@
 //! functions. Nothing here holds application state — the `ListenerApp` panels in
 //! the parent module call into these.
 
+use std::path::PathBuf;
+
 use crate::config::{
     templates, ChannelConfig, DataBits, DecoderConfig, ExtractionConfig, FlowControl,
     InterfaceConfig, Parity, StopBits,
 };
 use crate::core::ChannelId;
 use crate::decode::NmeaValidationMode;
+use crate::record::{FileRotationPolicy, OverwritePolicy, RecordingMode};
 use crate::transport::udp::UdpMode;
 
 use super::fonts::bold;
@@ -444,7 +447,89 @@ pub(super) fn edit_interface(
             radio_row(ui, "Flow", &mut serial.flow_control, FLOW_CONTROL);
         }
     }
+    ui.separator();
+    edit_recording(ui, config);
     refresh
+}
+
+/// Edit the channel's recording (§51–§59): write received data to a file. Mode
+/// picks the system — byte-exact Raw `.dat` (§53) or rendered Display `.disp`
+/// (§54). The rest sets the destination, overwrite handling, and time rotation.
+/// Config-driven: applied via a §13 Reconfigure, so Apply & Restart begins it.
+fn edit_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
+    let rec = &mut config.recording;
+    ui.horizontal(|ui| {
+        ui.label(bold("Recording"));
+        ui.radio_value(&mut rec.mode, RecordingMode::Disabled, "Off");
+        ui.radio_value(&mut rec.mode, RecordingMode::Raw, "Raw (.dat)")
+            .on_hover_text("Byte-exact, exactly as received — pre-extraction (§53)");
+        ui.radio_value(&mut rec.mode, RecordingMode::Display, "Display (.disp)")
+            .on_hover_text("The rendered view output (§54)");
+    });
+    if rec.mode == RecordingMode::Disabled {
+        return;
+    }
+    // A single file when not rotating; a directory of <channel>_<period> files
+    // otherwise (§59). `rotating` reflects this frame's start — a one-frame lag
+    // when the user flips rotation below is harmless.
+    let rotating = rec.file_rotation != FileRotationPolicy::None;
+    ui.horizontal(|ui| {
+        ui.label(if rotating { "Folder" } else { "File" });
+        let mut path = rec
+            .destination
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        if ui
+            .add(egui::TextEdit::singleline(&mut path).desired_width(260.0))
+            .changed()
+        {
+            let trimmed = path.trim();
+            rec.destination = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed));
+        }
+        if ui.button("Browse…").clicked() {
+            let picked = if rotating {
+                rfd::FileDialog::new().pick_folder()
+            } else {
+                rfd::FileDialog::new().save_file()
+            };
+            if let Some(p) = picked {
+                rec.destination = Some(p);
+            }
+        }
+    });
+    if rec.destination.is_none() {
+        ui.label(
+            egui::RichText::new("⚠ set a destination — recording won't start without one")
+                .color(egui::Color32::from_rgb(150, 100, 0)),
+        );
+    }
+    ui.horizontal(|ui| {
+        ui.label("On exists");
+        ui.radio_value(&mut rec.overwrite_policy, OverwritePolicy::Refuse, "Refuse");
+        ui.radio_value(
+            &mut rec.overwrite_policy,
+            OverwritePolicy::Overwrite,
+            "Overwrite",
+        );
+        ui.radio_value(
+            &mut rec.overwrite_policy,
+            OverwritePolicy::AppendIfExists,
+            "Append",
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("Rotate");
+        ui.radio_value(&mut rec.file_rotation, FileRotationPolicy::None, "None");
+        ui.radio_value(&mut rec.file_rotation, FileRotationPolicy::Hourly, "Hourly");
+        ui.radio_value(&mut rec.file_rotation, FileRotationPolicy::Daily, "Daily")
+            .on_hover_text(
+                "Rotating files are named <channel>_<period> — keep the channel name \
+                 filesystem-safe (§59)",
+            );
+    });
+    ui.checkbox(&mut rec.timestamp_enabled, "Record timestamps")
+        .on_hover_text("Sidecar index for Raw; inline for Display (§57)");
 }
 
 /// The available serial port names, sorted (§14.4). Empty if enumeration fails.

@@ -63,6 +63,8 @@ clap = { workspace = true }
 # channels and never blocks or does I/O (AGENTS §5, listener ADR-008).
 eframe = { workspace = true }
 egui = { workspace = true }
+# Native file/folder picker for the recording-destination "Browse…" button.
+rfd = { workspace = true }
 
 # Diagnostic logging (§114) — tracing facade + env-filtered subscriber
 tracing = { workspace = true }
