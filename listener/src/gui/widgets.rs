@@ -4,8 +4,8 @@
 //! the parent module call into these.
 
 use crate::config::{
-    templates, ChannelConfig, DataBits, DecoderConfig, FlowControl, InterfaceConfig, Parity,
-    StopBits,
+    templates, ChannelConfig, DataBits, DecoderConfig, ExtractionConfig, FlowControl,
+    InterfaceConfig, Parity, StopBits,
 };
 use crate::core::ChannelId;
 use crate::decode::NmeaValidationMode;
@@ -149,6 +149,121 @@ fn port_field(ui: &mut egui::Ui, id: &str, port: &mut u16) {
     });
 }
 
+/// The framing method shown in the Configure selector — the GUI face of the core
+/// [`ExtractionConfig`] (§20). `Protocol` is presented as `Delimiter`, since it
+/// realizes as CRLF-delimiter framing in v1 (§23).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FramingMethod {
+    Stream,
+    Delimiter,
+    Fixed,
+}
+
+impl FramingMethod {
+    fn of(config: &ExtractionConfig) -> Self {
+        match config {
+            ExtractionConfig::Stream => FramingMethod::Stream,
+            ExtractionConfig::FixedLength { .. } => FramingMethod::Fixed,
+            ExtractionConfig::Delimiter { .. } | ExtractionConfig::Protocol { .. } => {
+                FramingMethod::Delimiter
+            }
+        }
+    }
+
+    /// A sensible default config when switching *to* this method.
+    fn default_config(self) -> ExtractionConfig {
+        match self {
+            FramingMethod::Stream => ExtractionConfig::Stream,
+            // CRLF, delimiter stripped from the payload — the NMEA convention (§24).
+            FramingMethod::Delimiter => ExtractionConfig::Delimiter {
+                delimiter: vec![b'\r', b'\n'],
+                include_delimiter: false,
+            },
+            FramingMethod::Fixed => ExtractionConfig::FixedLength {
+                length: 256,
+                sync_marker: None,
+            },
+        }
+    }
+}
+
+/// Common delimiter presets (label, bytes) for the framing selector.
+const DELIMITERS: &[(&str, &[u8])] = &[
+    ("CRLF (\\r\\n)", b"\r\n"),
+    ("LF (\\n)", b"\n"),
+    ("CR (\\r)", b"\r"),
+    ("NUL (\\0)", b"\0"),
+];
+
+/// Edit how the byte stream is split into Messages (§20): the framing method and
+/// its parameters. This is what *defines a Message* for the channel — without it
+/// (Stream), the Messages display source and Message-framed recording produce
+/// nothing. Applied via a §13 Reconfigure, like the rest of the config.
+fn edit_extraction(ui: &mut egui::Ui, config: &mut ChannelConfig) {
+    // UDP self-frames: each datagram is one Message and bypasses extraction (§15),
+    // so the method here would have no effect — show the fact instead of a control.
+    if matches!(config.interface, InterfaceConfig::Udp(_)) {
+        ui.horizontal(|ui| {
+            ui.label(bold("Framing"));
+            ui.label(egui::RichText::new("one Message per datagram (UDP)").weak())
+                .on_hover_text(
+                    "UDP preserves datagram boundaries, so each datagram is a Message (§15)",
+                );
+        });
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.label(bold("Framing"));
+        let mut method = FramingMethod::of(&config.extraction);
+        let before = method;
+        ui.radio_value(&mut method, FramingMethod::Stream, "Stream")
+            .on_hover_text("No Message boundaries — bytes only (Stream source, §18)");
+        ui.radio_value(&mut method, FramingMethod::Delimiter, "Delimiter")
+            .on_hover_text("Split on a byte sequence (CRLF for NMEA, §23)");
+        ui.radio_value(&mut method, FramingMethod::Fixed, "Fixed length")
+            .on_hover_text("Every N bytes is one Message");
+        // Only rewrite the config when the method actually changes, so editing a
+        // method's parameters below isn't clobbered each frame.
+        if method != before {
+            config.extraction = method.default_config();
+        }
+    });
+    match &mut config.extraction {
+        ExtractionConfig::Delimiter {
+            delimiter,
+            include_delimiter,
+        } => {
+            ui.horizontal(|ui| {
+                ui.label("Delimiter");
+                let selected = DELIMITERS
+                    .iter()
+                    .find(|(_, b)| *b == delimiter.as_slice())
+                    .map_or("Custom", |(name, _)| name);
+                egui::ComboBox::from_id_salt("delimiter")
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        for (name, bytes) in DELIMITERS {
+                            ui.selectable_value(delimiter, bytes.to_vec(), *name);
+                        }
+                    });
+                ui.checkbox(include_delimiter, "keep delimiter")
+                    .on_hover_text("Include the delimiter bytes in the Message payload");
+            });
+        }
+        ExtractionConfig::FixedLength { length, .. } => {
+            ui.horizontal(|ui| {
+                ui.label("Length");
+                ui.add(
+                    egui::DragValue::new(length)
+                        .range(1..=65_536)
+                        .suffix(" bytes"),
+                );
+            });
+        }
+        _ => {}
+    }
+}
+
 /// Edit a channel's interface config in place, laid out like talker (§74/§75).
 /// Presentation only — applied via a §13 Reconfigure. Returns whether the serial
 /// port list should be refreshed (the ⟳ button was clicked). `channel_id` keys the
@@ -161,9 +276,15 @@ pub(super) fn edit_interface(
 ) -> bool {
     let mut refresh = false;
 
+    // Framing first (§20): how the byte stream is split into Messages — it *defines*
+    // what a Message is for this channel, so the Messages display source and any
+    // Message-framed recording have something to produce.
+    edit_extraction(ui, config);
+
     // NMEA decode is the per-channel decoder (§30): it adds the protocol metadata the
     // Messages source shows (`[GLL]` tags, §134) and that `DecodedField` Match Rules
-    // need. It does not affect the verbatim Stream source.
+    // need. It annotates already-framed Messages; it does not define boundaries and
+    // does not affect the verbatim Stream source.
     let mut nmea = matches!(config.decoder, DecoderConfig::Nmea0183 { .. });
     if ui
         .checkbox(&mut nmea, "NMEA decode")
@@ -178,6 +299,7 @@ pub(super) fn edit_interface(
             DecoderConfig::None
         };
     }
+    ui.separator();
 
     match &mut config.interface {
         InterfaceConfig::Udp(udp) => {
@@ -464,7 +586,7 @@ pub(super) fn human_bytes(n: u64) -> String {
     if u == 0 {
         format!("{n} B")
     } else {
-        format!("{v:.1} {}", UNITS[u])
+        format!("{v:.3} {}", UNITS[u])
     }
 }
 
