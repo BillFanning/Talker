@@ -3,9 +3,8 @@
 
 use std::time::Duration;
 
-use listener::config::{templates, DecoderConfig, ExtractionConfig, InterfaceConfig};
-use listener::core::{ChannelId, ChannelState, IntegrityScope, IntegrityStatus, RuntimeEvent};
-use listener::decode::NmeaValidationMode;
+use listener::config::{templates, ExtractionConfig, InterfaceConfig};
+use listener::core::{ChannelId, ChannelState, RuntimeEvent};
 use listener::runtime::Listener;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Receiver;
@@ -209,27 +208,21 @@ async fn tcp_listener_accepts_a_client_and_receives_a_message() {
 }
 
 #[tokio::test]
-async fn snapshot_exposes_decoded_messages_of_a_running_channel() {
+async fn snapshot_exposes_retained_messages_of_a_running_channel() {
     // #4 observability surface: while the channel runs, an on-demand snapshot
-    // reveals the retained Messages *and* their decoder annotations — the decode
-    // readout the event stream alone can't carry (§137, ADR-006).
+    // reveals the retained Messages (§137, ADR-006).
     let port = free_udp_port();
     let mut config = templates::udp_template();
     if let InterfaceConfig::Udp(udp) = &mut config.interface {
         udp.bind_address = "127.0.0.1".to_string();
         udp.port = port;
     }
-    config.decoder = DecoderConfig::Nmea0183 {
-        validation_mode: NmeaValidationMode::Standard,
-    };
-
     let mut listener = Listener::with_default_capacities();
     let mut events = listener.take_events().unwrap();
     let id = listener.add_channel(config);
     listener.start(id).await.unwrap();
 
     let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    // A valid GLL sentence (one datagram → one Message, §15).
     client
         .send_to(b"$GPGLL,4916.45,N,12311.12,W*00", ("127.0.0.1", port))
         .await
@@ -243,18 +236,9 @@ async fn snapshot_exposes_decoded_messages_of_a_running_channel() {
     assert_eq!(snapshot.channel_id, id);
     assert_eq!(snapshot.next_message_number, 2);
     assert_eq!(snapshot.retained.len(), 1);
-    // The decoder annotation is observable live — this is the readout #2 deferred.
     let decoded = &snapshot.retained[0];
     assert_eq!(decoded.message.number, 1);
-    assert_eq!(
-        decoded
-            .protocol
-            .as_ref()
-            .expect("decoder ran")
-            .message_type
-            .as_deref(),
-        Some("GLL")
-    );
+    assert_eq!(&*decoded.message.bytes, b"$GPGLL,4916.45,N,12311.12,W*00");
     // Every Display View (the template configures Raw + Hex) accumulated it.
     assert_eq!(snapshot.display_views.len(), 2);
     assert!(snapshot.display_views.iter().all(|v| v.messages.len() == 1));
@@ -457,19 +441,16 @@ async fn snapshot_surfaces_channel_liveness() {
 }
 
 #[tokio::test]
-async fn snapshot_exposes_message_metadata_and_nmea_integrity() {
-    // §157/§160 acceptance: a live snapshot carries per-Message metadata (number,
-    // byte count, arrival, reception duration) and NMEA integrity — and a
-    // bad-checksum sentence is retained and annotated Invalid, never dropped (§37).
+async fn snapshot_exposes_message_metadata() {
+    // §157 acceptance: a live snapshot carries per-Message reception facts
+    // (number, byte count, arrival time) — and any byte content, including a
+    // bad-checksum NMEA sentence, is retained byte-exact, never dropped.
     let port = free_udp_port();
     let mut config = templates::udp_template();
     if let InterfaceConfig::Udp(udp) = &mut config.interface {
         udp.bind_address = "127.0.0.1".to_string();
         udp.port = port;
     }
-    config.decoder = DecoderConfig::Nmea0183 {
-        validation_mode: NmeaValidationMode::Standard,
-    };
 
     let mut listener = Listener::with_default_capacities();
     let mut events = listener.take_events().unwrap();
@@ -499,20 +480,12 @@ async fn snapshot_exposes_message_metadata_and_nmea_integrity() {
     assert_eq!(m1.message.metadata.reception_duration, Some(Duration::ZERO));
     // Arrival timestamp is sane: captured after we started sending.
     assert!(m1.message.metadata.arrival_timestamp.wall_clock >= before);
-    let p1 = m1.protocol.as_ref().expect("decoder ran");
-    assert_eq!(p1.message_type.as_deref(), Some("GLL"));
-    let xor1 = &p1.integrity[0];
-    assert_eq!(xor1.scope, IntegrityScope::Protocol);
-    assert_eq!(xor1.status, IntegrityStatus::Valid);
-    assert_eq!(xor1.algorithm.as_deref(), Some("NMEA XOR"));
+    assert_eq!(&*m1.message.bytes, good.as_slice());
 
-    // Message 2: bad checksum — retained, annotated Invalid, byte-exact (§37).
+    // Message 2: a bad-checksum NMEA sentence is just bytes — retained byte-exact.
     let m2 = &snapshot.retained[1];
     assert_eq!(m2.message.number, 2);
     assert_eq!(&*m2.message.bytes, bad.as_slice());
-    let p2 = m2.protocol.as_ref().expect("decoder ran");
-    assert_eq!(p2.message_type.as_deref(), Some("HDT"));
-    assert_eq!(p2.integrity[0].status, IntegrityStatus::Invalid);
 
     stop(&mut listener, id).await;
 }
@@ -577,11 +550,10 @@ async fn pausing_a_display_view_freezes_only_that_view() {
 }
 
 #[tokio::test]
-async fn tcp_connection_inherits_the_listener_decoder() {
-    // §16.2: an accepted connection inherits the listener's decoder. We prove the
-    // decoder is wired into the connection pipeline without breaking it. Snapshots
-    // exist for data channels, but per-connection snapshots are deferred (the
-    // supervisor keeps no per-connection handle), so we assert the Message flows.
+async fn tcp_connection_inherits_the_listener_extraction() {
+    // §16.2: an accepted connection inherits the listener's extraction config.
+    // Snapshots exist for data channels, but per-connection snapshots are deferred
+    // (the supervisor keeps no per-connection handle), so we assert the Message flows.
     let port = free_tcp_port();
     let mut config = templates::tcp_listener_template();
     if let InterfaceConfig::TcpListener(tcp) = &mut config.interface {
@@ -592,10 +564,6 @@ async fn tcp_connection_inherits_the_listener_decoder() {
         delimiter: vec![b'\r', b'\n'],
         include_delimiter: false,
     };
-    config.decoder = DecoderConfig::Nmea0183 {
-        validation_mode: NmeaValidationMode::Standard,
-    };
-
     let mut listener = Listener::with_default_capacities();
     let mut events = listener.take_events().unwrap();
     let id = listener.add_channel(config);
@@ -606,8 +574,7 @@ async fn tcp_connection_inherits_the_listener_decoder() {
         .unwrap();
     let conn_id = next_connection(&mut events).await;
 
-    // A CRLF-terminated NMEA sentence is extracted and decoded; the Message is
-    // delivered regardless of the checksum outcome (§37 never hides data).
+    // A CRLF-terminated line is extracted into one Message.
     client.write_all(b"$GPGLL,4916.45,N*00\r\n").await.unwrap();
     assert_eq!(next_message(&mut events).await, (conn_id, 1));
 

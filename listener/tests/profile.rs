@@ -24,7 +24,6 @@ fn profile_round_trips_through_a_toml_file() {
     let mut profile = Profile::new("integration workspace");
     profile.channels = vec![
         templates::udp_template(),
-        templates::nmea_serial_template(),
         templates::tcp_listener_template(),
     ];
 

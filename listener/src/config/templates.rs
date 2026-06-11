@@ -5,7 +5,6 @@
 //! port) are placeholders the user fills in before Start (§71).
 
 use crate::core::{ChannelKind, ChannelName};
-use crate::decode::NmeaValidationMode;
 use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, WrappingMode};
 use crate::transport::udp::UdpMode;
 
@@ -31,18 +30,12 @@ fn raw_and_hex() -> DisplayConfig {
     }
 }
 
-fn raw_with_metadata() -> DisplayConfig {
-    DisplayConfig {
-        views: vec![view(DisplayMode::Raw, true)],
-    }
-}
-
 /// A bounded default retention so templates validate (§80).
 fn default_retention() -> RetentionConfig {
     RetentionConfig::with_message_limit(10_000)
 }
 
-/// Generic serial channel (§82): 9600 8N1, Stream, no decoder, Raw + Hex.
+/// Generic serial channel (§82): 9600 8N1, Raw + Hex.
 pub fn serial_template() -> ChannelConfig {
     ChannelConfig {
         id: None,
@@ -59,40 +52,7 @@ pub fn serial_template() -> ChannelConfig {
             dtr: None,
         }),
         extraction: ExtractionConfig::Stream,
-        decoder: DecoderConfig::None,
         display: raw_and_hex(),
-        recording: RecordingConfig::default(),
-        retention: default_retention(),
-        reconnect: ReconnectPolicy::default(),
-        match_rules: Vec::new(),
-    }
-}
-
-/// NMEA serial channel (§83): 4800 8N1, CRLF delimiter (excluded), NMEA decoder
-/// in Standard mode, Raw + Metadata.
-pub fn nmea_serial_template() -> ChannelConfig {
-    ChannelConfig {
-        id: None,
-        name: ChannelName::new("NMEA Serial"),
-        kind: ChannelKind::Serial,
-        interface: InterfaceConfig::Serial(SerialConfig {
-            port: String::new(),
-            baud_rate: 4800,
-            data_bits: DataBits::Eight,
-            parity: Parity::None,
-            stop_bits: StopBits::One,
-            flow_control: FlowControl::None,
-            rts: None,
-            dtr: None,
-        }),
-        extraction: ExtractionConfig::Delimiter {
-            delimiter: vec![b'\r', b'\n'],
-            include_delimiter: false,
-        },
-        decoder: DecoderConfig::Nmea0183 {
-            validation_mode: NmeaValidationMode::Standard,
-        },
-        display: raw_with_metadata(),
         recording: RecordingConfig::default(),
         retention: default_retention(),
         reconnect: ReconnectPolicy::default(),
@@ -115,7 +75,6 @@ pub fn udp_template() -> ChannelConfig {
             recv_buffer_bytes: None,
         }),
         extraction: ExtractionConfig::Stream,
-        decoder: DecoderConfig::None,
         display: raw_and_hex(),
         recording: RecordingConfig::default(),
         retention: default_retention(),
@@ -124,7 +83,7 @@ pub fn udp_template() -> ChannelConfig {
     }
 }
 
-/// TCP listener (§85): bind 0.0.0.0, no connection cap. Extraction/decoder/display
+/// TCP listener (§85): bind 0.0.0.0, no connection cap. Extraction/display
 /// here apply to its accepted connection channels (§16.2).
 pub fn tcp_listener_template() -> ChannelConfig {
     ChannelConfig {
@@ -138,7 +97,6 @@ pub fn tcp_listener_template() -> ChannelConfig {
             recv_buffer_bytes: None,
         }),
         extraction: ExtractionConfig::Stream,
-        decoder: DecoderConfig::None,
         display: raw_and_hex(),
         recording: RecordingConfig::default(),
         retention: default_retention(),

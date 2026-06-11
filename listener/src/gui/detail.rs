@@ -211,7 +211,7 @@ impl ListenerApp {
             ui.radio_value(&mut self.msg_source, DisplaySource::Stream, "Stream")
                 .on_hover_text("Verbatim bytes as received (no Message boundaries, §18)");
             ui.radio_value(&mut self.msg_source, DisplaySource::Messages, "Messages")
-                .on_hover_text("Extracted, numbered, decoder-tagged Messages");
+                .on_hover_text("Extracted, numbered Messages");
             vsep(ui);
             ui.label(bold("View"));
             ui.radio_value(&mut self.msg_mode, DisplayMode::Hex, "Hex");
@@ -559,13 +559,6 @@ impl ListenerApp {
                                     }
                                     if show_number {
                                         head.push_str(&format!("#{} ", decoded.message.number));
-                                    }
-                                    if let Some(t) = decoded
-                                        .protocol
-                                        .as_ref()
-                                        .and_then(|p| p.message_type.clone())
-                                    {
-                                        head.push_str(&format!("[{t}] "));
                                     }
                                     let text = renderer.render_text(&decoded.message.bytes);
                                     match msg_mode {

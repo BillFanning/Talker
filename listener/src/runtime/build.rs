@@ -1,7 +1,7 @@
 //! Map validated configuration to live runtime objects (spec §128 — the runtime
 //! owns this mapping, not config).
 //!
-//! Pure and synchronous: it constructs extractors, decoders, and *unopened*
+//! Pure and synchronous: it constructs extractors and *unopened*
 //! transports from a [`ChannelConfig`](crate::config::ChannelConfig). Opening /
 //! binding is async and happens at Start in the orchestrator (§8.2, §71). Serial
 //! parameters that `serialport` cannot represent (Mark/Space parity, 1.5 stop
@@ -12,20 +12,15 @@ use std::net::SocketAddr;
 use serialport::{DataBits, FlowControl, Parity, StopBits};
 
 use crate::config::schema::{
-    DataBits as CfgDataBits, DecoderConfig, DisplayViewConfig, ExtractionConfig,
-    FlowControl as CfgFlowControl, Parity as CfgParity, SerialConfig, StopBits as CfgStopBits,
-    TcpListenerConfig, UdpConfig,
+    DataBits as CfgDataBits, DisplayViewConfig, ExtractionConfig, FlowControl as CfgFlowControl,
+    Parity as CfgParity, SerialConfig, StopBits as CfgStopBits, TcpListenerConfig, UdpConfig,
 };
-use crate::core::{ChannelId, ProtocolId};
-use crate::decode::{Decoder, NmeaDecoder};
+use crate::core::ChannelId;
 use crate::display::DisplayView;
 use crate::extract::{DelimiterExtractor, FixedLengthExtractor, MessageExtractor, StreamExtractor};
 use crate::transport::serial::SerialTransport;
 use crate::transport::tcp::TcpListenerTransport;
 use crate::transport::udp::UdpTransport;
-
-/// CRLF delimiter for NMEA-by-delimiter extraction (§23, §34).
-const NMEA_DELIMITER: [u8; 2] = [b'\r', b'\n'];
 
 /// A configuration could not be realized as a runtime object.
 #[derive(Debug, thiserror::Error)]
@@ -42,8 +37,7 @@ pub enum BuildError {
     InvalidMulticastInterface(String),
 }
 
-/// Build the extractor for a Channel (§20). `Protocol { Nmea0183 }` is realized
-/// as CRLF delimiter extraction in v1 (§23).
+/// Build the extractor for a Channel (§20).
 pub fn build_extractor(config: &ExtractionConfig) -> Box<dyn MessageExtractor + Send> {
     match config {
         ExtractionConfig::Stream => Box::new(StreamExtractor::new()),
@@ -58,11 +52,6 @@ pub fn build_extractor(config: &ExtractionConfig) -> Box<dyn MessageExtractor + 
             length,
             sync_marker,
         } => Box::new(FixedLengthExtractor::new(*length, sync_marker.clone())),
-        ExtractionConfig::Protocol { protocol } => match protocol {
-            ProtocolId::Nmea0183 => {
-                Box::new(DelimiterExtractor::new(NMEA_DELIMITER.to_vec(), false))
-            }
-        },
     }
 }
 
@@ -78,16 +67,6 @@ pub fn build_display_view(config: &DisplayViewConfig) -> DisplayView {
         wrap_width: None,
         hex_separator: " ".to_string(),
         hex_bytes_per_line: 16,
-    }
-}
-
-/// Build the decoder for a Channel (§30, §77), or `None`.
-pub fn build_decoder(config: &DecoderConfig) -> Option<Box<dyn Decoder + Send>> {
-    match config {
-        DecoderConfig::None => None,
-        DecoderConfig::Nmea0183 { validation_mode } => {
-            Some(Box::new(NmeaDecoder::new(*validation_mode)))
-        }
     }
 }
 
@@ -190,29 +169,9 @@ mod tests {
     use crate::core::{ChannelId, ChunkTime};
 
     #[test]
-    fn protocol_nmea_extracts_by_crlf() {
-        let mut ex = build_extractor(&ExtractionConfig::Protocol {
-            protocol: ProtocolId::Nmea0183,
-        });
-        let out = ex.push_chunk(b"$GPGLL*00\r\n", ChunkTime::now());
-        assert_eq!(out.len(), 1);
-        // CRLF excluded from the payload.
-        assert_eq!(&*out[0].bytes, b"$GPGLL*00");
-    }
-
-    #[test]
     fn stream_extractor_emits_nothing() {
         let mut ex = build_extractor(&ExtractionConfig::Stream);
         assert!(ex.push_chunk(b"anything", ChunkTime::now()).is_empty());
-    }
-
-    #[test]
-    fn decoder_mapping() {
-        assert!(build_decoder(&DecoderConfig::None).is_none());
-        assert!(build_decoder(&DecoderConfig::Nmea0183 {
-            validation_mode: crate::decode::NmeaValidationMode::Strict,
-        })
-        .is_some());
     }
 
     #[test]

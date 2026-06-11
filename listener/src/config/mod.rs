@@ -177,9 +177,7 @@ pub fn validate_channel(
     }
 
     // Match Rules (§50.2, §165). A `BytePattern` with an empty pattern would match
-    // every Message (an empty needle is always found) — reject it like an empty
-    // delimiter. Decoded-field rules without a decoder are a non-fatal *warning*
-    // (see `channel_warnings`): the rule simply never matches, it is not invalid.
+    // everywhere (an empty needle is always found) — reject it.
     for rule in &channel.match_rules {
         if let MatchCondition::BytePattern { pattern } = &rule.condition {
             if pattern.is_empty() {
@@ -212,23 +210,11 @@ pub fn validate_channel(
 /// Non-fatal configuration warnings (§71): the channel is still valid and will
 /// run, but something is likely a mistake. Surfaced to the user (e.g. printed at
 /// profile load) without skipping the channel.
-pub fn channel_warnings(channel: &ChannelConfig) -> Vec<ChannelConfigWarning> {
-    let mut warnings = Vec::new();
-
-    // A decoded-field Match Rule needs a decoder to have anything to match (§50.2):
-    // with `DecoderConfig::None` the rule can never fire. Warn rather than reject.
-    let has_decoder = !matches!(channel.decoder, DecoderConfig::None);
-    if !has_decoder {
-        for rule in &channel.match_rules {
-            if matches!(rule.condition, MatchCondition::DecodedField { .. }) {
-                warnings.push(ChannelConfigWarning::DecodedMatchWithoutDecoder {
-                    rule: rule.name.clone(),
-                });
-            }
-        }
-    }
-
-    warnings
+pub fn channel_warnings(_channel: &ChannelConfig) -> Vec<ChannelConfigWarning> {
+    // No warning conditions currently exist; the v1 decoded-field-without-decoder
+    // warning was removed with the decoder (ADR-010). The surface stays so future
+    // stream-era warnings (§71) have a home.
+    Vec::new()
 }
 
 /// Errors from loading or saving a profile (§72.1).
@@ -272,15 +258,11 @@ pub enum ChannelConfigError {
 }
 
 /// A non-fatal configuration warning (§71): the channel runs, but this is likely
-/// not what the user intended.
+/// not what the user intended. Currently empty — the v1 decoded-field-without-
+/// decoder warning went with the decoder (ADR-010).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ChannelConfigWarning {
-    #[error(
-        "match rule \"{rule}\" tests a decoded field but the channel has no decoder; \
-         it will never match (§50.2)"
-    )]
-    DecodedMatchWithoutDecoder { rule: String },
-}
+#[non_exhaustive]
+pub enum ChannelConfigWarning {}
 
 #[cfg(test)]
 mod tests {
@@ -291,7 +273,6 @@ mod tests {
         let mut profile = Profile::new("test workspace");
         profile.channels = vec![
             templates::serial_template(),
-            templates::nmea_serial_template(),
             templates::udp_template(),
             templates::tcp_listener_template(),
         ];
@@ -372,49 +353,14 @@ mod tests {
     }
 
     #[test]
-    fn decoded_field_rule_without_a_decoder_warns_but_stays_valid() {
-        let mut channel = templates::udp_template(); // DecoderConfig::None
-        channel.match_rules = vec![MatchRule {
-            name: "bad checksums".to_string(),
-            condition: MatchCondition::DecodedField {
-                field: DecodedMatch::Integrity {
-                    status: crate::core::IntegrityStatus::Invalid,
-                },
-            },
-            actions: vec![MatchAction::Notify {
-                severity: crate::diagnostics::DiagnosticSeverity::Warning,
-            }],
-            enabled: true,
-        }];
-
-        // Non-fatal: the channel is still valid (it runs; the rule just never fires).
-        assert!(validate_channel(&channel, &DefaultConfig::default()).is_ok());
-        let warnings = channel_warnings(&channel);
-        assert_eq!(
-            warnings,
-            vec![ChannelConfigWarning::DecodedMatchWithoutDecoder {
-                rule: "bad checksums".to_string()
-            }]
-        );
-
-        // With a decoder configured, there is no warning.
-        channel.decoder = DecoderConfig::Nmea0183 {
-            validation_mode: crate::decode::NmeaValidationMode::Standard,
-        };
-        assert!(channel_warnings(&channel).is_empty());
-    }
-
-    #[test]
     fn match_rules_round_trip_through_toml() {
         let mut profile = Profile::new("rules");
-        let mut channel = templates::nmea_serial_template();
+        let mut channel = templates::serial_template();
         channel.match_rules = vec![
             MatchRule {
                 name: "GGA highlight".to_string(),
-                condition: MatchCondition::DecodedField {
-                    field: DecodedMatch::MessageType {
-                        value: "GGA".to_string(),
-                    },
+                condition: MatchCondition::BytePattern {
+                    pattern: b"$GPGGA".to_vec(),
                 },
                 actions: vec![MatchAction::Highlight {
                     style: HighlightStyle {
@@ -451,7 +397,6 @@ mod tests {
         let mut profile = Profile::new("templates");
         profile.channels = vec![
             templates::serial_template(),
-            templates::nmea_serial_template(),
             templates::udp_template(),
             templates::tcp_listener_template(),
         ];

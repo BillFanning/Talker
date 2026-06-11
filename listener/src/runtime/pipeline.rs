@@ -33,10 +33,9 @@ use crate::config::{
 };
 
 use crate::core::{
-    ChannelId, ChunkTime, DisplayViewId, MatchRuleId, Message, MessageBytes, ProtocolMetadata,
-    RecordingState, RuntimeEvent,
+    ChannelId, ChunkTime, DisplayViewId, MatchRuleId, Message, MessageBytes, RecordingState,
+    RuntimeEvent,
 };
-use crate::decode::Decoder;
 use crate::diagnostics::{Diagnostic, DiagnosticLog};
 use crate::display::{DisplayView, RenderedOutput, Renderer};
 use crate::extract::MessageExtractor;
@@ -92,13 +91,12 @@ impl Default for PipelineCapacities {
     }
 }
 
-/// An immutable Message paired with its decoder annotation (§107, ADR-002). The
-/// metadata is read-only and logically separate from the Message (§4.6); it is
-/// `None` when no decoder is configured for the Channel.
+/// An immutable Message as carried through display/retention. (The v1 decoder
+/// annotation is removed, ADR-010; the wrapper stays until the extract step
+/// removes Messages entirely.)
 #[derive(Clone, Debug)]
 pub struct DecodedMessage {
     pub message: Arc<Message>,
-    pub protocol: Option<ProtocolMetadata>,
 }
 
 impl ByteSized for DecodedMessage {
@@ -185,7 +183,6 @@ pub struct ChannelPipeline {
     channel_id: ChannelId,
     extractor: Box<dyn MessageExtractor + Send>,
     numbering: MessageNumbering,
-    decoder: Option<Box<dyn Decoder + Send>>,
     /// Display Views (§48): a Channel may have several, each independently
     /// paused (§11). The first is the default view created by `new`.
     display_views: Vec<PipelineDisplayView>,
@@ -262,7 +259,6 @@ impl ChannelPipeline {
             channel_id,
             extractor,
             numbering: MessageNumbering::new(),
-            decoder: None,
             display_views: vec![PipelineDisplayView::new(caps.display)],
             retention: MessageRetention::new(Some(caps.retention), caps.retention_bytes),
             diagnostics: DiagnosticLog::new(
@@ -338,14 +334,6 @@ impl ChannelPipeline {
     /// authoritative record lives in retention/recording, not the event stream.
     pub fn with_event_sender(mut self, events: Sender<RuntimeEvent>) -> Self {
         self.events = Some(events);
-        self
-    }
-
-    /// Attach a protocol decoder (§30, §107). Each completed Message is decoded;
-    /// the resulting Protocol Metadata travels with the Message through fan-out,
-    /// and any validation errors are surfaced as diagnostics (§32, §37).
-    pub fn with_decoder(mut self, decoder: Box<dyn Decoder + Send>) -> Self {
-        self.decoder = Some(decoder);
         self
     }
 
@@ -434,40 +422,20 @@ impl ChannelPipeline {
         }
     }
 
-    /// Decode (§107), then fan-out the Message + its annotation to the
-    /// non-blocking consumer edges (§108).
+    /// Fan-out the Message to the non-blocking consumer edges (§108).
     fn dispatch(&mut self, msg: Arc<Message>) {
         let number = msg.number;
         // Liveness (§91.1): count completed Messages at their arrival time.
         self.activity
             .record_message(msg.metadata.arrival_timestamp.monotonic);
 
-        // Decoding stage (§102): read-only; failures are isolated (§32) and
-        // surfaced as diagnostics (§37), never stopping the pipeline.
-        let protocol = if let Some(decoder) = &self.decoder {
-            let result = decoder.decode(&msg);
-            for err in &result.errors {
-                self.diagnostics.record(Diagnostic::warning(format!(
-                    "decoder: {err} (channel {}, message {number})",
-                    self.channel_id
-                )));
-            }
-            result.metadata
-        } else {
-            None
-        };
-        let decoded = DecodedMessage {
-            message: msg,
-            protocol,
-        };
+        let decoded = DecodedMessage { message: msg };
 
-        // Match Rules (§50.2, §165): evaluate the per-Message conditions after
-        // decoding and before fan-out, then apply each fired rule's actions
-        // (presentation/control only — never touching the Message or its bytes).
+        // Match Rules (§50.2, §165): evaluate the data conditions before fan-out,
+        // then apply each fired rule's actions (presentation/control only — never
+        // touching the bytes).
         if !self.match_rules.is_empty() {
-            let fired = self
-                .match_rules
-                .evaluate_message(&decoded.message.bytes, decoded.protocol.as_ref());
+            let fired = self.match_rules.evaluate_message(&decoded.message.bytes);
             if !fired.is_empty() {
                 self.apply_fired_rules(fired, Some(number));
             }
@@ -1082,6 +1050,32 @@ mod tests {
     }
 
     #[test]
+    fn datagram_boundaries_do_not_segment_the_stream() {
+        // v2 invariant (§15, §18): UDP datagram boundaries are a reception/recording
+        // detail only. The stream concatenates datagram payloads verbatim — nothing
+        // is inserted between them and nothing is reframed.
+        let cid = ChannelId::new();
+        let mut p = ChannelPipeline::new(
+            cid,
+            Box::new(StreamExtractor::new()),
+            PipelineCapacities::default(),
+        );
+        p.ingest(datagram(cid, b"$GPGGA,1*00\r\n"));
+        p.ingest(datagram(cid, b"$GPRMC,2*00\r\n"));
+        assert_eq!(
+            &*p.snapshot().stream_tail,
+            &b"$GPGGA,1*00\r\n$GPRMC,2*00\r\n"[..]
+        );
+        // Mixed chunk kinds (a serial-style Bytes chunk after datagrams) still
+        // append verbatim: one stream, regardless of transport read shape.
+        p.ingest(bytes_chunk(cid, b"tail"));
+        assert_eq!(
+            &*p.snapshot().stream_tail,
+            &b"$GPGGA,1*00\r\n$GPRMC,2*00\r\ntail"[..]
+        );
+    }
+
+    #[test]
     fn stream_tail_is_verbatim_across_chunks_and_byte_capped() {
         let cid = ChannelId::new();
         // Small cap so trimming is observable. The extractor is irrelevant: the tail
@@ -1124,64 +1118,17 @@ mod tests {
     }
 
     #[test]
-    fn decoder_annotates_messages_and_surfaces_validation_errors() {
-        use crate::decode::NmeaDecoder;
-        use nmea0183::{NmeaChecksumMode, NmeaSentence, SentenceType, TalkerId};
-
-        let cid = ChannelId::new();
-        let mut p = ChannelPipeline::new(
-            cid,
-            Box::new(StreamExtractor::new()),
-            PipelineCapacities::default(),
-        )
-        .with_decoder(Box::new(NmeaDecoder::standard()));
-
-        // Valid sentence → metadata attached, no diagnostic.
-        let valid = NmeaSentence::new(TalkerId::GP, SentenceType::GLL, vec![]).to_wire();
-        p.ingest(datagram(cid, valid.as_bytes()));
-        // Bad checksum → still annotated, but a warning diagnostic is raised (§37).
-        let bad = NmeaSentence::new(TalkerId::GP, SentenceType::HDT, vec!["1".into()])
-            .to_wire_with(NmeaChecksumMode::Wrong);
-        p.ingest(datagram(cid, bad.as_bytes()));
-
-        let decoded: Vec<_> = p.retention().iter().collect();
-        assert_eq!(decoded.len(), 2);
-        assert_eq!(
-            decoded[0]
-                .protocol
-                .as_ref()
-                .unwrap()
-                .message_type
-                .as_deref(),
-            Some("GLL")
-        );
-        assert_eq!(
-            decoded[1]
-                .protocol
-                .as_ref()
-                .unwrap()
-                .message_type
-                .as_deref(),
-            Some("HDT")
-        );
-        // The invalid checksum produced exactly one decoder warning diagnostic.
-        assert_eq!(p.diagnostics().warnings().count(), 1);
-    }
-
-    #[test]
     fn diagnostic_warning_retention_limit_is_applied() {
         // §88: the per-type diagnostic limit bounds retained warnings.
-        use crate::decode::NmeaDecoder;
         let cid = ChannelId::new();
         let caps = PipelineCapacities {
             warning_retention: Some(2),
             ..PipelineCapacities::default()
         };
-        let mut p = ChannelPipeline::new(cid, Box::new(StreamExtractor::new()), caps)
-            .with_decoder(Box::new(NmeaDecoder::standard()));
-        // Four non-NMEA datagrams → four decoder warnings, capped at two.
-        for _ in 0..4 {
-            p.ingest(datagram(cid, b"not-nmea"));
+        let mut p = ChannelPipeline::new(cid, Box::new(StreamExtractor::new()), caps);
+        // Four warnings recorded, capped at two retained.
+        for i in 0..4 {
+            p.diagnostics.record(Diagnostic::warning(format!("w{i}")));
         }
         assert_eq!(p.diagnostics().warnings().count(), 2);
     }

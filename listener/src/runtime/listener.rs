@@ -35,8 +35,7 @@ use crate::transport::{
 };
 
 use super::build::{
-    build_decoder, build_display_view, build_extractor, build_serial, build_tcp_listener,
-    build_udp, BuildError,
+    build_display_view, build_extractor, build_serial, build_tcp_listener, build_udp, BuildError,
 };
 use super::channel::{
     spawn_monitored_channel, DataRecorder, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES,
@@ -699,14 +698,12 @@ impl Listener {
                     .bind()
                     .await
                     .map_err(OrchestratorError::Bind)?;
-                // Each accepted connection gets a fresh extractor + decoder from
-                // this config (§16.2). Per-connection recording is deferred (§59).
+                // Each accepted connection gets a fresh extractor from this
+                // config (§16.2). Per-connection recording is deferred (§59).
                 let extraction = config.extraction.clone();
-                let decoder = config.decoder.clone();
                 let handle = start_tcp_listener(
                     bound,
                     move || build_extractor(&extraction),
-                    move || build_decoder(&decoder),
                     self.channel_caps(config),
                     tcp.max_connections,
                     self.events_tx.clone(),
@@ -731,7 +728,6 @@ impl Listener {
             id,
             runner,
             build_extractor(&config.extraction),
-            build_decoder(&config.decoder),
             data_recorder,
             display_recorder,
             // One runtime Display View per configured view (§48), each with its

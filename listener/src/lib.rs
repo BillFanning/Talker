@@ -1,7 +1,6 @@
 pub mod cli;
 pub mod config;
 pub mod core;
-pub mod decode;
 pub mod diagnostics;
 pub mod display;
 pub mod extract;

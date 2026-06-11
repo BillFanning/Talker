@@ -10,7 +10,7 @@
 //!
 //! Two evaluation paths, per §50.2:
 //! - **per-Message** ([`evaluate_message`](MatchRuleSet::evaluate_message)) for
-//!   `BytePattern`, `DecodedField`, and `MessageSize`, run after decoding;
+//!   `BytePattern`, run against received bytes;
 //! - **timer-based** ([`evaluate_idle`](MatchRuleSet::evaluate_idle)) for `Idle`,
 //!   which fires once when the stream has been quiet for the timeout and re-arms
 //!   when data resumes ([`note_activity`](MatchRuleSet::note_activity)).
@@ -20,8 +20,8 @@
 
 use std::time::Duration;
 
-use crate::config::{DecodedMatch, MatchAction, MatchCondition, MatchRule};
-use crate::core::{IntegrityStatus, MatchRuleId, ProtocolMetadata};
+use crate::config::{MatchAction, MatchCondition, MatchRule};
+use crate::core::MatchRuleId;
 
 /// One configured rule in runtime form: its minted id, condition, actions, the
 /// enabled flag (live-toggleable via `SetMatchRuleEnabled`, §136), and the small
@@ -97,17 +97,13 @@ impl MatchRuleSet {
         }
     }
 
-    /// Evaluate the per-Message conditions against one decoded Message (§50.2):
-    /// `BytePattern`, `DecodedField`, `MessageSize`. `Idle` rules are never matched
-    /// here — they are timer-driven. Returns the rules that fired, in rule order.
-    pub fn evaluate_message(
-        &self,
-        bytes: &[u8],
-        protocol: Option<&ProtocolMetadata>,
-    ) -> Vec<FiredRule> {
+    /// Evaluate the `BytePattern` conditions against received bytes (§50.2).
+    /// `Idle` rules are never matched here — they are timer-driven. Returns the
+    /// rules that fired, in rule order.
+    pub fn evaluate_message(&self, bytes: &[u8]) -> Vec<FiredRule> {
         let mut fired = Vec::new();
         for rule in &self.rules {
-            if rule.enabled && condition_matches_message(&rule.condition, bytes, protocol) {
+            if rule.enabled && condition_matches_message(&rule.condition, bytes) {
                 fired.push(FiredRule {
                     id: rule.id,
                     actions: rule.actions.clone(),
@@ -150,18 +146,10 @@ impl MatchRuleSet {
     }
 }
 
-/// Whether a per-Message condition matches (`Idle` is never matched here).
-fn condition_matches_message(
-    condition: &MatchCondition,
-    bytes: &[u8],
-    protocol: Option<&ProtocolMetadata>,
-) -> bool {
+/// Whether a data condition matches (`Idle` is never matched here).
+fn condition_matches_message(condition: &MatchCondition, bytes: &[u8]) -> bool {
     match condition {
         MatchCondition::BytePattern { pattern } => contains_subslice(bytes, pattern),
-        MatchCondition::MessageSize { min, max } => message_size_matches(bytes.len(), *min, *max),
-        MatchCondition::DecodedField { field } => {
-            protocol.is_some_and(|meta| decoded_field_matches(field, meta))
-        }
         MatchCondition::Idle { .. } => false,
     }
 }
@@ -175,35 +163,10 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// A Message of `len` bytes matches when its size is **outside** `[min, max]`
-/// (§50.2). An unset bound does not constrain that side; both unset never matches.
-fn message_size_matches(len: usize, min: Option<usize>, max: Option<usize>) -> bool {
-    min.is_some_and(|m| len < m) || max.is_some_and(|m| len > m)
-}
-
-/// Whether a decoded-field predicate matches the Message's Protocol Metadata
-/// (§134/§135). Limited to existing metadata — no field extraction (Appendix A).
-fn decoded_field_matches(field: &DecodedMatch, meta: &ProtocolMetadata) -> bool {
-    match field {
-        DecodedMatch::MessageType { value } => meta.message_type.as_deref() == Some(value.as_str()),
-        DecodedMatch::TalkerId { value } => {
-            meta.attributes.get("talker_id").map(String::as_str) == Some(value.as_str())
-        }
-        DecodedMatch::Integrity { status } => integrity_matches(meta, *status),
-    }
-}
-
-/// Whether any integrity field on the Message reports `status` (§28, §135).
-fn integrity_matches(meta: &ProtocolMetadata, status: IntegrityStatus) -> bool {
-    meta.integrity.iter().any(|i| i.status == status)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{HighlightStyle, MatchRule};
-    use crate::core::metadata::{IntegrityMetadata, IntegrityScope, ProtocolId};
-    use std::collections::BTreeMap;
 
     fn rule(name: &str, condition: MatchCondition) -> MatchRule {
         MatchRule {
@@ -211,27 +174,6 @@ mod tests {
             condition,
             actions: vec![MatchAction::Mark],
             enabled: true,
-        }
-    }
-
-    fn nmea_meta(
-        message_type: Option<&str>,
-        talker: Option<&str>,
-        status: IntegrityStatus,
-    ) -> ProtocolMetadata {
-        let mut attributes = BTreeMap::new();
-        if let Some(t) = talker {
-            attributes.insert("talker_id".to_string(), t.to_string());
-        }
-        ProtocolMetadata {
-            protocol: ProtocolId::Nmea0183,
-            message_type: message_type.map(str::to_string),
-            integrity: vec![IntegrityMetadata {
-                scope: IntegrityScope::Protocol,
-                status,
-                algorithm: Some("NMEA XOR".to_string()),
-            }],
-            attributes,
         }
     }
 
@@ -243,8 +185,8 @@ mod tests {
                 pattern: b"GGA".to_vec(),
             },
         )]);
-        assert_eq!(set.evaluate_message(b"$GPGGA,...", None).len(), 1);
-        assert!(set.evaluate_message(b"$GPGLL,...", None).is_empty());
+        assert_eq!(set.evaluate_message(b"$GPGGA,...").len(), 1);
+        assert!(set.evaluate_message(b"$GPGLL,...").is_empty());
     }
 
     #[test]
@@ -252,70 +194,6 @@ mod tests {
         assert!(!contains_subslice(b"abc", b""));
         assert!(!contains_subslice(b"ab", b"abc"));
         assert!(contains_subslice(b"abc", b"abc"));
-    }
-
-    #[test]
-    fn message_size_matches_outside_the_band() {
-        // Outside [10, 80]: too short or too long.
-        assert!(message_size_matches(9, Some(10), Some(80)));
-        assert!(message_size_matches(81, Some(10), Some(80)));
-        assert!(!message_size_matches(10, Some(10), Some(80)));
-        assert!(!message_size_matches(80, Some(10), Some(80)));
-        // One-sided bounds constrain only their side.
-        assert!(message_size_matches(5, Some(10), None));
-        assert!(!message_size_matches(500, Some(10), None));
-        assert!(message_size_matches(500, None, Some(80)));
-        // Both unset: nothing is outside an unbounded range.
-        assert!(!message_size_matches(0, None, None));
-    }
-
-    #[test]
-    fn decoded_field_matches_type_talker_and_integrity() {
-        let meta = nmea_meta(Some("GLL"), Some("GP"), IntegrityStatus::Invalid);
-
-        let by_type = MatchRuleSet::compile(&[rule(
-            "t",
-            MatchCondition::DecodedField {
-                field: DecodedMatch::MessageType {
-                    value: "GLL".to_string(),
-                },
-            },
-        )]);
-        assert_eq!(by_type.evaluate_message(b"x", Some(&meta)).len(), 1);
-
-        let by_talker = MatchRuleSet::compile(&[rule(
-            "tk",
-            MatchCondition::DecodedField {
-                field: DecodedMatch::TalkerId {
-                    value: "GP".to_string(),
-                },
-            },
-        )]);
-        assert_eq!(by_talker.evaluate_message(b"x", Some(&meta)).len(), 1);
-
-        let bad_checksum = MatchRuleSet::compile(&[rule(
-            "bad",
-            MatchCondition::DecodedField {
-                field: DecodedMatch::Integrity {
-                    status: IntegrityStatus::Invalid,
-                },
-            },
-        )]);
-        assert_eq!(bad_checksum.evaluate_message(b"x", Some(&meta)).len(), 1);
-    }
-
-    #[test]
-    fn decoded_field_never_matches_without_metadata() {
-        let set = MatchRuleSet::compile(&[rule(
-            "t",
-            MatchCondition::DecodedField {
-                field: DecodedMatch::MessageType {
-                    value: "GLL".to_string(),
-                },
-            },
-        )]);
-        // No decoder → no Protocol Metadata → the rule cannot fire (§50.2).
-        assert!(set.evaluate_message(b"$GPGLL", None).is_empty());
     }
 
     #[test]
@@ -328,12 +206,12 @@ mod tests {
         );
         config.enabled = false;
         let mut set = MatchRuleSet::compile(&[config]);
-        assert!(set.evaluate_message(b"X", None).is_empty());
+        assert!(set.evaluate_message(b"X").is_empty());
 
         // Re-enable via the command path and it fires.
         let id = set.ids()[0];
         assert!(set.set_enabled(id, true));
-        assert_eq!(set.evaluate_message(b"X", None).len(), 1);
+        assert_eq!(set.evaluate_message(b"X").len(), 1);
     }
 
     #[test]
@@ -356,7 +234,7 @@ mod tests {
     #[test]
     fn idle_is_never_matched_on_the_per_message_path() {
         let set = MatchRuleSet::compile(&[rule("idle", MatchCondition::Idle { timeout_ms: 1 })]);
-        assert!(set.evaluate_message(b"anything", None).is_empty());
+        assert!(set.evaluate_message(b"anything").is_empty());
     }
 
     #[test]
@@ -374,7 +252,7 @@ mod tests {
             MatchAction::Mark,
         ];
         let set = MatchRuleSet::compile(&[config]);
-        let fired = set.evaluate_message(b"a hit here", None);
+        let fired = set.evaluate_message(b"a hit here");
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].actions.len(), 2);
     }
@@ -396,12 +274,12 @@ mod tests {
             ),
         ]);
         // Only rule "a" matches a message containing "AA" but not "ZZ".
-        let fired = set.evaluate_message(b"--AA--", None);
+        let fired = set.evaluate_message(b"--AA--");
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].id, set.ids()[0]);
         // Both fire when both patterns are present.
-        assert_eq!(set.evaluate_message(b"AA..ZZ", None).len(), 2);
+        assert_eq!(set.evaluate_message(b"AA..ZZ").len(), 2);
         // Neither matches when absent.
-        assert!(set.evaluate_message(b"BBBB", None).is_empty());
+        assert!(set.evaluate_message(b"BBBB").is_empty());
     }
 }

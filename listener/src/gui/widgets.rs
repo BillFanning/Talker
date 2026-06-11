@@ -6,11 +6,10 @@
 use std::path::PathBuf;
 
 use crate::config::{
-    templates, ChannelConfig, DataBits, DecoderConfig, ExtractionConfig, FlowControl,
-    InterfaceConfig, Parity, StopBits,
+    templates, ChannelConfig, DataBits, ExtractionConfig, FlowControl, InterfaceConfig, Parity,
+    StopBits,
 };
 use crate::core::ChannelId;
-use crate::decode::NmeaValidationMode;
 use crate::record::{FileRotationPolicy, OverwritePolicy, RecordingMode};
 use crate::transport::udp::UdpMode;
 
@@ -167,9 +166,7 @@ impl FramingMethod {
         match config {
             ExtractionConfig::Stream => FramingMethod::Stream,
             ExtractionConfig::FixedLength { .. } => FramingMethod::Fixed,
-            ExtractionConfig::Delimiter { .. } | ExtractionConfig::Protocol { .. } => {
-                FramingMethod::Delimiter
-            }
+            ExtractionConfig::Delimiter { .. } => FramingMethod::Delimiter,
         }
     }
 
@@ -284,24 +281,6 @@ pub(super) fn edit_interface(
     // Message-framed recording have something to produce.
     edit_extraction(ui, config);
 
-    // NMEA decode is the per-channel decoder (§30): it adds the protocol metadata the
-    // Messages source shows (`[GLL]` tags, §134) and that `DecodedField` Match Rules
-    // need. It annotates already-framed Messages; it does not define boundaries and
-    // does not affect the verbatim Stream source.
-    let mut nmea = matches!(config.decoder, DecoderConfig::Nmea0183 { .. });
-    if ui
-        .checkbox(&mut nmea, "NMEA decode")
-        .on_hover_text("Decode received messages as NMEA 0183 (adds protocol metadata)")
-        .changed()
-    {
-        config.decoder = if nmea {
-            DecoderConfig::Nmea0183 {
-                validation_mode: NmeaValidationMode::Standard,
-            }
-        } else {
-            DecoderConfig::None
-        };
-    }
     ui.separator();
 
     match &mut config.interface {

@@ -10,7 +10,7 @@
 //! - [`metadata`] — the §106 Message Numbering / metadata stage.
 //! - [`pipeline`] — the §102 per-Channel processing pipeline + async ingest loop.
 //! - [`channel`]/[`tcp`] — per-Channel and TCP-listener task orchestration.
-//! - [`build`] — maps validated config to live transports/extractors/decoders.
+//! - [`build`] — maps validated config to live transports/extractors.
 //! - [`listener`] — the [`Listener`] orchestrator: registry, §9 state machine,
 //!   start/stop/apply-pending in the [`crate::core::RuntimeCommand`] vocabulary.
 //! - [`snapshot`] — on-demand, pull-side readout of a running Channel's state.

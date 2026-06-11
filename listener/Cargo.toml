@@ -20,8 +20,6 @@ name = "listener-gui"
 path = "src/bin/listener-gui.rs"
 
 [dependencies]
-# Workspace crate — listener and talker are equal consumers of nmea0183.
-nmea0183 = { path = "../nmea0183" }
 
 # Error handling (application-level)
 anyhow = { workspace = true }

@@ -29,7 +29,6 @@ use std::path::PathBuf;
 
 use crate::config::{DiskGuard, MatchRule, Subsample};
 use crate::core::{ChannelId, RuntimeEvent};
-use crate::decode::Decoder;
 use crate::display::{DisplayView, RenderedOutput};
 use crate::extract::MessageExtractor;
 use crate::record::Recording;
@@ -107,7 +106,6 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     channel_id: ChannelId,
     runner: R,
     extractor: Box<dyn MessageExtractor + Send>,
-    decoder: Option<Box<dyn Decoder + Send>>,
     data_recorder: Option<DataRecorder>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     view_subsamples: Vec<Subsample>,
@@ -122,9 +120,6 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     let (ingest_tx, ingest_rx) = mpsc::channel(caps.ingest);
 
     let mut pipeline = ChannelPipeline::new(channel_id, extractor, caps).with_event_sender(events);
-    if let Some(decoder) = decoder {
-        pipeline = pipeline.with_decoder(decoder);
-    }
     // Match Rules (§50.2, §165): compile the rules and arm any match-triggered
     // recording before the pipeline starts processing.
     pipeline = pipeline.with_match_rules(&match_setup.rules);
@@ -257,7 +252,6 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     channel_id: ChannelId,
     runner: R,
     extractor: Box<dyn MessageExtractor + Send>,
-    decoder: Option<Box<dyn Decoder + Send>>,
     data_recorder: Option<DataRecorder>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     view_subsamples: Vec<Subsample>,
@@ -281,7 +275,6 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         channel_id,
         runner,
         extractor,
-        decoder,
         data_recorder,
         display_recorder,
         view_subsamples,
@@ -378,7 +371,6 @@ pub fn start_data_channel<R: DataTransportRunner>(
         channel_id,
         runner,
         extractor,
-        None,
         raw_recorder.map(DataRecorder::Raw),
         None,                  // no display recording on a standalone channel
         vec![Subsample::None], // a single default Display View, no subsampling

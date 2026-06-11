@@ -10,12 +10,11 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
-use crate::config::{templates, ChannelConfig, DecoderConfig, InterfaceConfig, Profile};
+use crate::config::{templates, ChannelConfig, InterfaceConfig, Profile};
 use crate::core::RuntimeEvent;
-use crate::decode::NmeaValidationMode;
 use crate::runtime::Listener;
 
-/// Receive, decode, and inspect byte-oriented data from serial and network sources.
+/// Receive and inspect byte-oriented data from serial and network sources.
 #[derive(Parser, Debug)]
 #[command(name = "listener", version, about)]
 pub struct Cli {
@@ -38,10 +37,6 @@ pub struct Cli {
     /// Serial baud rate (used with --serial).
     #[arg(long, default_value_t = 9600)]
     baud: u32,
-
-    /// Decode received Messages as NMEA0183 (for the quick-start channels).
-    #[arg(long)]
-    nmea: bool,
 
     /// Launch the graphical interface. Also the default for a bare invocation
     /// (no source given) — e.g. double-clicking the executable.
@@ -155,7 +150,7 @@ fn build_channel_configs(cli: &Cli) -> Result<Vec<ChannelConfig>> {
         return Ok(valid);
     }
 
-    let mut config = if let Some(port) = cli.udp {
+    let config = if let Some(port) = cli.udp {
         let mut config = templates::udp_template();
         if let InterfaceConfig::Udp(udp) = &mut config.interface {
             udp.port = port;
@@ -178,11 +173,6 @@ fn build_channel_configs(cli: &Cli) -> Result<Vec<ChannelConfig>> {
         bail!("specify --profile, --udp, --tcp, or --serial (see --help)");
     };
 
-    if cli.nmea {
-        config.decoder = DecoderConfig::Nmea0183 {
-            validation_mode: NmeaValidationMode::Standard,
-        };
-    }
     Ok(vec![config])
 }
 
@@ -224,7 +214,6 @@ mod tests {
             tcp: None,
             serial: None,
             baud: 9600,
-            nmea: false,
             gui: false,
             cli: false,
         }
@@ -303,17 +292,6 @@ mod tests {
             }
             other => panic!("expected serial, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn nmea_flag_selects_the_decoder() {
-        let cli = Cli {
-            udp: Some(9000),
-            nmea: true,
-            ..base_cli()
-        };
-        let configs = build_channel_configs(&cli).unwrap();
-        assert!(matches!(configs[0].decoder, DecoderConfig::Nmea0183 { .. }));
     }
 
     #[test]

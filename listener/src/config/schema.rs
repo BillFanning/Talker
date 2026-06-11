@@ -1,7 +1,7 @@
 //! Profile schema data types (spec §72–§80, §80.1).
 //!
 //! These are pure, serde-serializable configuration structures — no behavior,
-//! no runtime state (§5.7, §67). The interface/extraction/decoder enums are
+//! no runtime state (§5.7, §67). The interface enums are
 //! **internally tagged** so every variant serializes as a TOML table (a unit
 //! variant like `Stream` becomes `{ method = "Stream" }`); this keeps the TOML
 //! shape uniform and avoids serializer ordering pitfalls.
@@ -10,8 +10,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::{ChannelKind, ChannelName, IntegrityStatus, ProtocolId, StableConfigId};
-use crate::decode::NmeaValidationMode;
+use crate::core::{ChannelKind, ChannelName, StableConfigId};
 use crate::diagnostics::DiagnosticSeverity;
 use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, WrappingMode};
 use crate::record::{FileRotationPolicy, OverwritePolicy, RecordingMode};
@@ -28,8 +27,6 @@ pub struct ChannelConfig {
     pub interface: InterfaceConfig,
     #[serde(default)]
     pub extraction: ExtractionConfig,
-    #[serde(default)]
-    pub decoder: DecoderConfig,
     #[serde(default)]
     pub display: DisplayConfig,
     #[serde(default)]
@@ -205,20 +202,6 @@ pub enum ExtractionConfig {
         length: usize,
         sync_marker: Option<Vec<u8>>,
     },
-    Protocol {
-        protocol: ProtocolId,
-    },
-}
-
-/// Decoder selection (§77). Explicit per Channel; no auto-detection (§30).
-#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
-#[serde(tag = "decoder")]
-pub enum DecoderConfig {
-    #[default]
-    None,
-    Nmea0183 {
-        validation_mode: NmeaValidationMode,
-    },
 }
 
 /// Per-sink subsampling policy (§50.1): which Messages pass to a sink, to keep a
@@ -332,44 +315,19 @@ pub struct MatchRule {
     pub enabled: bool,
 }
 
-/// What a Match Rule tests (§50.2). One condition per rule in v1 — compound
+/// What a Match Rule tests (§50.2). One condition per rule — compound
 /// AND/OR/sequence logic is deferred (Appendix A). Internally tagged so every
 /// variant is a uniform TOML table.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum MatchCondition {
-    /// A byte pattern occurring within a single Message's bytes (§50.2). v1 scans
-    /// one Message; cross-chunk stream scanning is deferred.
+    /// A byte pattern scanned across the received stream (§50.2), matching across
+    /// receive-chunk boundaries.
     BytePattern { pattern: Vec<u8> },
-    /// A field of the decoder's Protocol Metadata (§134/§135). Requires a
-    /// configured decoder, else the rule never matches and validation warns (§71).
-    DecodedField { field: DecodedMatch },
     /// No data received for `timeout_ms` (timer-based, via the activity monitor
     /// §91.1): fires once when quiet and re-arms when data resumes. (The spec
     /// shows a `Duration`; config carries milliseconds, like `ReconnectPolicy`.)
     Idle { timeout_ms: u64 },
-    /// A Message whose byte count falls **outside** `[min, max]` (either bound
-    /// optional; an unset bound is not enforced on that side).
-    MessageSize {
-        #[serde(default)]
-        min: Option<usize>,
-        #[serde(default)]
-        max: Option<usize>,
-    },
-}
-
-/// A decoded-metadata predicate (§50.2). Limited to Protocol Metadata a decoder
-/// already produced (§134/§135) — message type, talker id, integrity status —
-/// **not** arbitrary protocol field extraction (deferred, Appendix A).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "field")]
-pub enum DecodedMatch {
-    /// e.g. `"GLL"` — matches `ProtocolMetadata.message_type`.
-    MessageType { value: String },
-    /// e.g. `"GP"` — matches the `talker_id` attribute.
-    TalkerId { value: String },
-    /// e.g. `Invalid` (bad checksum) — matches any integrity field's status.
-    Integrity { status: IntegrityStatus },
 }
 
 /// What a matched rule does (§50.2). Presentation/control only.
