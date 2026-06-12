@@ -334,8 +334,9 @@ impl ChannelPipeline {
         }
 
         // 4. Find/triggers (§50.2): evaluate `BytePattern` rules against this
-        // chunk's bytes, anchored at the chunk's stream offset. (Cross-chunk
-        // carry is wired in the find/triggers step.)
+        // chunk's bytes, anchored at the chunk's stream offset. Cross-chunk carry
+        // (matching a pattern split across two reads) is not yet wired — the scan
+        // is per-chunk; see listener TODO "v2 feature gaps".
         if !self.match_rules.is_empty() {
             let fired = self.match_rules.evaluate_message(bytes);
             if !fired.is_empty() {

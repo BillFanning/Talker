@@ -39,15 +39,17 @@ Rebased onto the stream:
 and message-recording fields are gone). `nmea0183` remains a workspace crate used by
 `talker`; `listener` no longer depends on it.
 
-Revision v1.2 (feature expansion — troubleshooting & long-run logging):
+Revision v1.2 (feature expansion — troubleshooting & long-run logging). _Parts of
+this note are superseded by v2.0 above — the supersessions are flagged inline._
 - §59 — **time-based file rotation** (Hourly/Daily); generated filenames
-  `<channel>_<start-time>` with extensions **`.dat`** (raw data), **`.ssdat`**
-  (subsampled data), **`.disp`** (display recording), **`.log`** (diagnostic log only);
-  filesystem-safe channel-name constraints (§71). Size-based rotation stays deferred.
-- §50.1 — **sink subsampling** (count- or time-based, per display view / message
-  recording; raw data is never subsampled).
-- §50.2 — **Match Rules & Triggers**: a predicate (byte pattern / decoded field / idle /
-  message size) fires actions (highlight, begin/stop recording, mark, notify, pause).
+  `<channel>_<start-time>`. _v2.0: extensions are now **`.raw`** (raw data) and
+  **`.disp`** (display recording), plus **`.log`** (diagnostic log only); the former
+  `.dat`/`.ssdat` are gone (§50.1)._ Filesystem-safe channel-name constraints (§71).
+  Size-based rotation stays deferred.
+- §50.1 — sink subsampling. _Removed in v2.0 (it was a Message-oriented filter)._
+- §50.2 — **Match Rules & Triggers**: a predicate fires actions (highlight, begin/stop
+  recording, mark, notify, pause). _v2.0: conditions are byte-pattern / idle only; the
+  decoded-field and message-size conditions are removed (§50.2)._
 - §14.3/§14.4 — full **serial control-line** monitor + control (RTS/DTR set and
   live-toggle; CTS/DSR/DCD/RI live display); port enumeration + hot-plug; RS-422/485
   phased.
@@ -2128,8 +2130,9 @@ available later (extract a module into a `listener-*` member crate when an exter
 consumer or a compile-time concern justifies it) without disturbing the module API.
 
 This also corrects the original sketch, which nested `nmea0183/` inside `listener`.
-In this workspace `nmea0183` is a **top-level sibling crate**, already shared with
-`talker`; `listener` depends on it as an ordinary path/version dependency.
+In this workspace `nmea0183` is a **top-level sibling crate**, shared with `talker`.
+As of v2.0 (ADR-010) `listener` no longer depends on it — the decoder that used it
+was removed (§29) — but it remains a workspace sibling for `talker`.
 
 ```text
 wiredata/                    # workspace root

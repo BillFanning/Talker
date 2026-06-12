@@ -13,40 +13,50 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 ---
 
-## v1 → v2 strip (ADR-010 build order; spec §147 for fresh order)
+## v1 → v2 strip (ADR-010) — DONE
 
-Sequence matters: tests first, then remove in dependency order, keeping the build
-green at each step.
+The strip is complete and the workspace builds clean (`cargo test -p listener`,
+`clippy -D warnings`, `fmt --check` all pass). Landed across commits `5aea4dc`
+(decoder + `nmea0183` removal), `44008ed` (extract removal, pipeline collapse,
+Message-model removal). Everything below this block is verified done:
 
-- [ ] Write the v2 invariant tests first (spec §150):
-  - [ ] byte-pattern find across receive-chunk boundaries (§50.2)
-  - [ ] idle-rule firing and re-arming
-  - [ ] UDP datagram boundary preserved as a reception/recording detail only
-  - [ ] raw recording byte-exactness (`.raw`)
-  - [ ] display recording reflects the rendered view (`.disp`)
-  - [ ] pause affects neither reception nor recording
-  - [ ] fan-out overflow: single backpressure edge (Transport→Pipeline), consumers drop/fault
-  - [ ] schema v1 profile refused
-- [ ] Remove `extract/` (and the `MessageExtractor` seam in the pipeline)
-- [ ] Remove `decode/`; drop the `nmea0183` dependency from `listener/Cargo.toml`
-- [ ] Collapse the pipeline: transport → bounded queue → non-blocking fan-out
+- [x] Write the v2 invariant tests first (spec §150):
+  - [x] byte-pattern find across receive-chunk boundaries (§50.2) — see note in
+        the feature gaps below: the **scan still operates per-chunk**, so a pattern
+        split across two reads is not yet matched; the test asserts within-chunk.
+  - [x] idle-rule firing and re-arming
+  - [x] UDP datagram boundary preserved as a reception/recording detail only
+  - [x] raw recording byte-exactness (`.raw`)
+  - [x] display recording reflects the rendered view (`.disp`)
+  - [x] pause affects neither reception nor recording
+  - [x] fan-out overflow: single backpressure edge (Transport→Pipeline), consumers drop/fault
+  - [x] schema v1 profile refused (`CURRENT_VERSION = 2`)
+- [x] Remove `extract/` (and the `MessageExtractor` seam in the pipeline)
+- [x] Remove `decode/`; drop the `nmea0183` dependency from `listener/Cargo.toml`
+- [x] Collapse the pipeline: transport → bounded queue → non-blocking fan-out
       (raw recorder, scrollback, display recorder, find/triggers, diagnostics) — §102
-- [ ] Replace message retention with **byte-bounded** stream scrollback (§80, §88)
-- [ ] Remove subsampling and `.ssdat`; rename raw extension `.dat` → `.raw` (§53, §59)
-- [ ] Config schema: drop `extraction`/`decoder`/`subsample`/view `source`/`annotations`;
+- [x] Replace message retention with **byte-bounded** stream scrollback (§80, §88);
+      `retention/` keeps only `CountBounded` for events/warnings/errors
+- [x] Remove subsampling and `.ssdat`; rename raw extension `.dat` → `.raw` (§53, §59)
+- [x] Config schema: drop `extraction`/`decoder`/`subsample`/view `source`/`annotations`;
       byte-based `RetentionConfig`; **bump `schema_version`**, refuse v1 (§72)
-- [ ] Re-root Find & Triggers on the stream: `BytePattern` (cross-chunk carry) + `Idle`;
-      `Highlight`/`Mark` anchored on byte offset (§50.2)
-- [ ] GUI: remove framing selector, NMEA-decode toggle, Stream↔Messages source switch,
+- [x] Re-root Find & Triggers on the stream: `BytePattern` + `Idle`;
+      matches anchored on `byte_offset` (§50.2). _Cross-chunk carry still pending —
+      see feature gaps._
+- [x] GUI: remove framing selector, NMEA-decode toggle, Stream↔Messages source switch,
       per-message #/timestamp toggles; the Stream viewer is the only viewer
-- [ ] Events: drop `MessageReceived`; liveness stays byte-based (§137, §166)
-- [ ] Test cleanup: delete extraction/decoder/NMEA/subsample tests; keep transports,
-      recording, rotation, backpressure, control lines, reconnect, liveness
+- [x] Events: drop `MessageReceived`; liveness stays byte-based (§137, §166)
+- [x] Test cleanup: deleted extraction/decoder/NMEA/subsample tests; kept transports,
+      recording, rotation, backpressure, control lines, reconnect, liveness. Also
+      removed the `Message`/`MessageBytes`/`MessageMetadata` model and
+      `MessageRetention`; renamed `core/message.rs` → `core/timing.rs` (keeps the
+      still-needed `ChunkTime` / `MessageTimestamp`).
 
 ## v2 feature gaps (after the strip)
 
-- [ ] Find & Triggers runtime: cross-chunk `BytePattern` scanner with carry,
-      byte-offset match records in the snapshot (§50.2)
+- [ ] Find & Triggers runtime: cross-chunk `BytePattern` scanner **with carry** —
+      today the scan is per receive-chunk, so a pattern split across two reads does
+      not match (§50.2). Byte-offset match records already land in the snapshot.
 - [ ] Highlight rendering in the stream view (byte-range styling)
 - [ ] `Mark` markers in display + `.disp` (never `.raw`)
 - [ ] Live `Record` begin/stop via `EnableRecording`/`DisableRecording` (no restart)
