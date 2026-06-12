@@ -344,7 +344,6 @@ mod tests {
 
         let render = |text: &str, at: SystemTime| RenderedOutput {
             channel_id: ChannelId::new(),
-            message_number: Some(1),
             text: text.to_string(),
             timestamp: Some(MessageTimestamp {
                 monotonic: Instant::now(),

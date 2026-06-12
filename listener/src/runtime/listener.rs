@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::config::schema::InterfaceConfig;
-use crate::config::{ChannelConfig, Subsample};
+use crate::config::ChannelConfig;
 use crate::core::{ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
 use crate::display::{DisplayView, RenderedOutput};
 use crate::record::{
@@ -34,9 +34,7 @@ use crate::transport::{
     TransportNotice,
 };
 
-use super::build::{
-    build_display_view, build_extractor, build_serial, build_tcp_listener, build_udp, BuildError,
-};
+use super::build::{build_display_view, build_serial, build_tcp_listener, build_udp, BuildError};
 use super::channel::{
     spawn_monitored_channel, DataRecorder, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES,
 };
@@ -44,14 +42,10 @@ use super::pipeline::{DisplayViewHandle, PipelineCapacities, RawRecordArming};
 use super::snapshot::{ChannelSnapshot, ChannelStats};
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
 
-/// Per-view subsampling policies for a Channel (§50.1), in view order. At least
-/// one entry, so the pipeline's default Display View is always covered.
-fn view_subsamples(config: &ChannelConfig) -> Vec<Subsample> {
-    if config.display.views.is_empty() {
-        vec![Subsample::None]
-    } else {
-        config.display.views.iter().map(|v| v.subsample).collect()
-    }
+/// How many Display Views a Channel runs (§48): one per configured view, at
+/// least one (the pipeline's default view).
+fn view_count(config: &ChannelConfig) -> usize {
+    config.display.views.len().max(1)
 }
 
 /// Bounded inbox for live serial control-line commands (§161). Tiny: commands are
@@ -626,8 +620,7 @@ impl Listener {
     fn channel_caps(&self, config: &ChannelConfig) -> PipelineCapacities {
         let retention = &config.retention;
         PipelineCapacities {
-            retention: retention.message_limit.unwrap_or(self.caps.retention),
-            retention_bytes: retention.byte_limit,
+            stream_display: retention.byte_limit.unwrap_or(self.caps.stream_display),
             event_retention: retention.event_limit,
             warning_retention: retention.warning_limit,
             error_retention: retention.error_limit,
@@ -698,12 +691,9 @@ impl Listener {
                     .bind()
                     .await
                     .map_err(OrchestratorError::Bind)?;
-                // Each accepted connection gets a fresh extractor from this
-                // config (§16.2). Per-connection recording is deferred (§59).
-                let extraction = config.extraction.clone();
+                // Per-connection recording is deferred (§59).
                 let handle = start_tcp_listener(
                     bound,
-                    move || build_extractor(&extraction),
                     self.channel_caps(config),
                     tcp.max_connections,
                     self.events_tx.clone(),
@@ -727,12 +717,10 @@ impl Listener {
         spawn_monitored_channel(
             id,
             runner,
-            build_extractor(&config.extraction),
             data_recorder,
             display_recorder,
-            // One runtime Display View per configured view (§48), each with its
-            // own subsampling policy (§50.1); at least one (default, no subsample).
-            view_subsamples(config),
+            // One runtime Display View per configured view (§48); at least one.
+            view_count(config),
             // Disk-space guard (§56.2, §168): only when both a guard and a
             // recording destination are configured.
             config
@@ -753,10 +741,10 @@ impl Listener {
     }
 
     /// Arming for a match-triggered `Record` action (§50.2): the bits needed to
-    /// lazily build the Channel's Raw/`.ssdat` recording on a `Begin`, present only
-    /// when a recording destination is configured. Mirrors `build_raw_recorder`'s
-    /// destination/overwrite/timestamp/rotation/subsample choices so a rule-armed
-    /// recording matches what static recording would have produced.
+    /// lazily build the Channel's Raw recording on a `Begin`, present only when a
+    /// recording destination is configured. Mirrors `build_raw_recorder`'s
+    /// destination/overwrite/timestamp/rotation choices so a rule-armed recording
+    /// matches what static recording would have produced.
     fn record_arming(&self, config: &ChannelConfig) -> Option<RawRecordArming> {
         config
             .recording
@@ -768,7 +756,6 @@ impl Listener {
                 overwrite: config.recording.overwrite_policy,
                 timestamps: config.recording.timestamp_enabled,
                 file_rotation: config.recording.file_rotation,
-                subsample: config.recording.subsample,
                 capacity: self.caps.raw_recording,
             })
     }
@@ -794,10 +781,6 @@ impl Listener {
         let policy = recording.overwrite_policy;
         let ts = recording.timestamp_enabled;
         let cap = self.caps.raw_recording;
-        // A subsampled data recording is message-framed `.ssdat` (§50.1/§53), fed
-        // per-Message and decimated; a plain Raw recording is byte-exact `.dat`.
-        let subsampled = recording.subsample != Subsample::None;
-        let ext = if subsampled { ".ssdat" } else { ".dat" };
         // With rotation, `destination` is a directory and files are named per
         // period from the channel name (§59); otherwise it is a single file path.
         let created = if recording.file_rotation == FileRotationPolicy::None {
@@ -808,7 +791,7 @@ impl Listener {
             RotatingRawRecorder::create(
                 destination,
                 config.name.as_str(),
-                ext,
+                ".raw",
                 policy,
                 ts,
                 recording.file_rotation,
@@ -817,7 +800,6 @@ impl Listener {
             .map(|r| start_raw_recording(r, cap))
         };
         match created {
-            Ok(rec) if subsampled => Some(DataRecorder::Subsampled(rec, recording.subsample)),
             Ok(rec) => Some(DataRecorder::Raw(rec)),
             Err(_err) => {
                 let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
@@ -1224,7 +1206,6 @@ mod tests {
             timestamp_enabled: false,
             overwrite_policy: OverwritePolicy::Refuse,
             file_rotation: FileRotationPolicy::None,
-            subsample: Subsample::None,
             disk_guard: None,
         };
         let id = listener.add_channel(config);

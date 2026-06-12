@@ -181,7 +181,6 @@ fn format_event(event: &RuntimeEvent) -> String {
         RuntimeEvent::ChannelStarted(id) => format!("[{id}] started"),
         RuntimeEvent::ChannelStopped(id) => format!("[{id}] stopped"),
         RuntimeEvent::ChannelFaulted(id) => format!("[{id}] FAULTED"),
-        RuntimeEvent::MessageReceived(id, number) => format!("[{id}] message #{number}"),
         RuntimeEvent::RecordingFaulted(id) => format!("[{id}] recording faulted"),
         RuntimeEvent::WarningRaised(id) => format!("[{id}] warning raised"),
         RuntimeEvent::ReceptionStalled(id, dur) => {

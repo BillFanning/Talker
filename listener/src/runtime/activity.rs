@@ -1,7 +1,7 @@
 //! Per-Channel activity monitor and liveness (spec §91.1, §166).
 //!
 //! [`ActivityMeter`] is a small, **bounded** accumulator the pipeline updates per
-//! received chunk (bytes) and per completed Message. It answers the first
+//! received chunk. It answers the first
 //! troubleshooting question — *is data arriving?* — via a rolling throughput and
 //! the time of the last data. It is a **fact source, not a policy source**: it
 //! reports `last_data_at` and rates; each consumer decides "idle" against its own
@@ -26,9 +26,8 @@ pub struct ChannelActivity {
     /// When the last chunk/datagram arrived; `None` until the first data.
     pub last_data_at: Option<Instant>,
     pub bytes_per_sec: f64,
-    pub messages_per_sec: f64,
-    /// Total bytes received since the Channel started (pre-extraction, all chunks).
-    /// The stream-oriented liveness counter (§18: Stream Mode has no Message count).
+    /// Total bytes received since the Channel started (§25) — the byte-based
+    /// liveness counter.
     pub total_bytes: u64,
 }
 
@@ -37,7 +36,6 @@ pub struct ActivityMeter {
     epoch: Instant,
     last_data_at: Option<Instant>,
     bytes: [u64; BUCKETS],
-    msgs: [u64; BUCKETS],
     /// The most recent second index that has received data.
     newest_sec: u64,
     /// Running total of all bytes received (monotonic; not windowed).
@@ -57,7 +55,6 @@ impl ActivityMeter {
             epoch,
             last_data_at: None,
             bytes: [0; BUCKETS],
-            msgs: [0; BUCKETS],
             newest_sec: 0,
             total_bytes: 0,
         }
@@ -77,7 +74,6 @@ impl ActivityMeter {
         for i in 1..=gap {
             let idx = ((self.newest_sec + i) % BUCKETS as u64) as usize;
             self.bytes[idx] = 0;
-            self.msgs[idx] = 0;
         }
         self.newest_sec = sec;
     }
@@ -91,11 +87,9 @@ impl ActivityMeter {
         self.last_data_at = Some(at);
     }
 
-    /// Record one completed Message at `at`.
-    pub fn record_message(&mut self, at: Instant) {
-        let sec = self.sec_of(at);
-        self.advance_to(sec);
-        self.msgs[(sec % BUCKETS as u64) as usize] += 1;
+    /// Total bytes received since start (§25) — the stream offset of the next byte.
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
     }
 
     /// The read-model as of `now`: rolling rates over the last `WINDOW_SECS`,
@@ -103,7 +97,6 @@ impl ActivityMeter {
     pub fn snapshot(&self, now: Instant) -> ChannelActivity {
         let now_sec = self.sec_of(now);
         let mut bytes = 0u64;
-        let mut msgs = 0u64;
         for s in now_sec.saturating_sub(BUCKETS as u64 - 1)..=now_sec {
             // Skip seconds with no data: in the future of recorded data, or older
             // than the ring can represent.
@@ -112,13 +105,11 @@ impl ActivityMeter {
             }
             let idx = (s % BUCKETS as u64) as usize;
             bytes += self.bytes[idx];
-            msgs += self.msgs[idx];
         }
         let w = WINDOW_SECS as f64;
         ChannelActivity {
             last_data_at: self.last_data_at,
             bytes_per_sec: bytes as f64 / w,
-            messages_per_sec: msgs as f64 / w,
             total_bytes: self.total_bytes,
         }
     }
@@ -144,18 +135,13 @@ mod tests {
         let base = Instant::now();
         let mut m = ActivityMeter::with_epoch(base);
 
-        // 100 bytes + 2 messages in second 0, then again in second 1.
+        // 100 bytes in second 0, then again in second 1.
         m.record_chunk(base + ms(500), 100);
-        m.record_message(base + ms(500));
-        m.record_message(base + ms(500));
         m.record_chunk(base + ms(1500), 100);
-        m.record_message(base + ms(1500));
-        m.record_message(base + ms(1500));
 
-        // At t=2s the 5s window still holds both seconds: 200 bytes, 4 messages.
+        // At t=2s the 5s window still holds both seconds: 200 bytes.
         let a = m.snapshot(base + Duration::from_secs(2));
         assert_eq!(a.bytes_per_sec, 200.0 / 5.0);
-        assert_eq!(a.messages_per_sec, 4.0 / 5.0);
         assert!(a.last_data_at.is_some());
         assert_eq!(a.total_bytes, 200);
 
@@ -163,7 +149,6 @@ mod tests {
         // still records when data last arrived (the liveness/idle fact).
         let quiet = m.snapshot(base + Duration::from_secs(60));
         assert_eq!(quiet.bytes_per_sec, 0.0);
-        assert_eq!(quiet.messages_per_sec, 0.0);
         assert!(quiet.last_data_at.is_some());
         assert_eq!(quiet.total_bytes, 200); // monotonic — does not decay with the window
     }
@@ -174,7 +159,6 @@ mod tests {
         let m = ActivityMeter::with_epoch(base);
         let a = m.snapshot(base + ms(100));
         assert_eq!(a.bytes_per_sec, 0.0);
-        assert_eq!(a.messages_per_sec, 0.0);
         assert!(a.last_data_at.is_none());
     }
 

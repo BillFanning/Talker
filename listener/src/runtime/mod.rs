@@ -20,11 +20,9 @@ pub mod build;
 pub mod channel;
 pub mod listener;
 pub mod matchrule;
-pub mod metadata;
 pub mod pipeline;
 pub mod queue;
 pub mod snapshot;
-pub mod subsample;
 pub mod tcp;
 
 pub use activity::{ActivityMeter, ChannelActivity};
@@ -32,8 +30,7 @@ pub use build::BuildError;
 pub use channel::{start_data_channel, RunningChannel};
 pub use listener::{Listener, OrchestratorError};
 pub use matchrule::{FiredRule, MatchRuleSet};
-pub use metadata::MessageNumbering;
-pub use pipeline::{run_channel, ChannelPipeline, DecodedMessage, PipelineCapacities};
+pub use pipeline::{run_channel, ChannelPipeline, PipelineCapacities};
 pub use queue::{
     Diagnostic, DiagnosticSeverity, DiagnosticsQueue, DropOldestQueue, FaultOnFullQueue, QueueFull,
 };
@@ -41,5 +38,4 @@ pub use snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
     TriggeredMatch,
 };
-pub use subsample::Subsampler;
 pub use tcp::{start_tcp_listener, TcpListenerHandle};

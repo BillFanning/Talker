@@ -269,8 +269,6 @@ mod tests {
     ) -> ChannelSnapshot {
         ChannelSnapshot {
             channel_id: id,
-            next_message_number: 1,
-            retained: vec![],
             display_views: vec![],
             diagnostics: DiagnosticsSnapshot {
                 warnings: vec![crate::diagnostics::Diagnostic::warning("w"); warnings],
@@ -280,7 +278,6 @@ mod tests {
             activity: ChannelActivity {
                 last_data_at: None,
                 bytes_per_sec: bps,
-                messages_per_sec: 0.0,
                 total_bytes,
             },
             matches: vec![],

@@ -10,7 +10,7 @@ use crate::transport::udp::UdpMode;
 
 use super::schema::*;
 
-fn view(mode: DisplayMode, metadata_visible: bool) -> DisplayViewConfig {
+fn view(mode: DisplayMode) -> DisplayViewConfig {
     DisplayViewConfig {
         mode,
         encoding: DisplayEncoding::Utf8,
@@ -19,20 +19,18 @@ fn view(mode: DisplayMode, metadata_visible: bool) -> DisplayViewConfig {
         foreground_color: None,
         background_color: None,
         wrapping: WrappingMode::NoWrap,
-        metadata_visible,
-        subsample: Subsample::None,
     }
 }
 
 fn raw_and_hex() -> DisplayConfig {
     DisplayConfig {
-        views: vec![view(DisplayMode::Raw, false), view(DisplayMode::Hex, false)],
+        views: vec![view(DisplayMode::Raw), view(DisplayMode::Hex)],
     }
 }
 
 /// A bounded default retention so templates validate (§80).
 fn default_retention() -> RetentionConfig {
-    RetentionConfig::with_message_limit(10_000)
+    RetentionConfig::with_byte_limit(1_048_576)
 }
 
 /// Generic serial channel (§82): 9600 8N1, Raw + Hex.
@@ -51,7 +49,6 @@ pub fn serial_template() -> ChannelConfig {
             rts: None,
             dtr: None,
         }),
-        extraction: ExtractionConfig::Stream,
         display: raw_and_hex(),
         recording: RecordingConfig::default(),
         retention: default_retention(),
@@ -74,7 +71,6 @@ pub fn udp_template() -> ChannelConfig {
             multicast_interface: None,
             recv_buffer_bytes: None,
         }),
-        extraction: ExtractionConfig::Stream,
         display: raw_and_hex(),
         recording: RecordingConfig::default(),
         retention: default_retention(),
@@ -83,7 +79,7 @@ pub fn udp_template() -> ChannelConfig {
     }
 }
 
-/// TCP listener (§85): bind 0.0.0.0, no connection cap. Extraction/display
+/// TCP listener (§85): bind 0.0.0.0, no connection cap. Display
 /// here apply to its accepted connection channels (§16.2).
 pub fn tcp_listener_template() -> ChannelConfig {
     ChannelConfig {
@@ -96,7 +92,6 @@ pub fn tcp_listener_template() -> ChannelConfig {
             max_connections: None,
             recv_buffer_bytes: None,
         }),
-        extraction: ExtractionConfig::Stream,
         display: raw_and_hex(),
         recording: RecordingConfig::default(),
         retention: default_retention(),

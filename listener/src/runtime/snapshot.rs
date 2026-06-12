@@ -21,7 +21,6 @@ use crate::core::{ChannelId, DisplayViewId, MatchRuleId, RecordingState};
 use crate::diagnostics::Diagnostic;
 
 use super::activity::ChannelActivity;
-use super::pipeline::DecodedMessage;
 
 /// A query the pipeline task answers from its current state, replying on a
 /// oneshot. Dropping the reply sender simply yields nothing.
@@ -38,13 +37,11 @@ pub enum PipelineRequest {
 }
 
 /// Cheap, O(1) liveness counters for a Channel — everything a multi-channel
-/// overview needs per tab without cloning any retained Messages (the expensive
+/// overview needs per tab without cloning the stream scrollback (the expensive
 /// part of a full [`ChannelSnapshot`]).
 #[derive(Clone, Debug)]
 pub struct ChannelStats {
-    /// The next Message Number to be assigned (== Messages produced so far + 1).
-    pub next_message_number: u64,
-    /// Liveness facts: rolling throughput + last-data time (§91.1, §166).
+    /// Liveness facts: rolling throughput, total bytes + last-data time (§91.1, §166).
     pub activity: ChannelActivity,
     /// Retained-diagnostic counts by severity (§88) — for per-tab health.
     pub event_count: usize,
@@ -63,10 +60,6 @@ pub struct ChannelStats {
 #[derive(Clone, Debug)]
 pub struct ChannelSnapshot {
     pub channel_id: ChannelId,
-    /// The next Message Number to be assigned (== Messages produced so far + 1).
-    pub next_message_number: u64,
-    /// Retained decoded Messages, oldest → newest, bounded by §88 retention.
-    pub retained: Vec<DecodedMessage>,
     /// One entry per Display View (§48), in creation order (default view first).
     pub display_views: Vec<DisplayViewSnapshot>,
     /// Retained diagnostics, separated by severity (§88).
@@ -85,26 +78,24 @@ pub struct ChannelSnapshot {
     pub stream_tail: Arc<[u8]>,
 }
 
-/// A single Match Rule firing (§50.2). Records which rule fired and, for a
-/// per-Message condition, the Message Number it fired on (`None` for an `Idle`
-/// firing, which is not tied to a Message). This is the observable record of
+/// A single rule firing (§50.2). Records which rule fired and, for a data
+/// condition, the **stream byte offset** it fired at (`None` for an `Idle`
+/// firing, which is not tied to data). This is the observable record of
 /// `Highlight`/`Mark` (whose visual styling is applied by the UI) and of any
 /// rule's trigger; `Notify` also lands in diagnostics and every firing emits a
 /// `MatchTriggered` event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TriggeredMatch {
     pub rule_id: MatchRuleId,
-    pub message_number: Option<u64>,
+    pub byte_offset: Option<u64>,
 }
 
-/// One Display View's snapshot: its identity, pause state, and accumulated
-/// presentation history (§50, §87).
+/// One Display View's snapshot: its identity and pause state (§50). The viewed
+/// content is the shared `stream_tail`, rendered per view.
 #[derive(Clone, Debug)]
 pub struct DisplayViewSnapshot {
     pub id: DisplayViewId,
     pub paused: bool,
-    /// The view's display history, oldest → newest. Empty or frozen while paused.
-    pub messages: Vec<DecodedMessage>,
 }
 
 /// Retained diagnostics by severity (§92–§95), oldest → newest within each.

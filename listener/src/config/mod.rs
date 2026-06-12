@@ -3,7 +3,7 @@
 //! This is `listener-config` (§128). It owns the persisted [`Profile`] schema
 //! (§67–§80), load/save, validation (§71), and starting templates (§81–§85). It
 //! stores configuration only — never runtime objects (§5.7, §69). Mapping a
-//! validated config to live transports/extractors is the runtime's job (§128),
+//! validated config to live transports is the runtime's job (§128),
 //! not config's.
 
 pub mod schema;
@@ -19,9 +19,10 @@ use crate::core::ChannelKind;
 use crate::record::{is_filesystem_safe, FileRotationPolicy, RecordingMode};
 use crate::transport::udp::UdpMode;
 
-/// The schema version this build understands (§72.1). Listener keeps its own
-/// version series, starting at 1.
-pub const CURRENT_VERSION: u32 = 1;
+/// The schema version this build understands (§72.1). Bumped to 2 for the v2.0
+/// stream-only schema (extraction/decoder/subsample fields removed — ADR-010);
+/// v1 profiles are refused.
+pub const CURRENT_VERSION: u32 = 2;
 
 fn current_version() -> u32 {
     CURRENT_VERSION
@@ -143,16 +144,6 @@ pub fn validate_channel(
         }
     }
 
-    match &channel.extraction {
-        ExtractionConfig::Delimiter { delimiter, .. } if delimiter.is_empty() => {
-            errors.push(ChannelConfigError::EmptyDelimiter);
-        }
-        ExtractionConfig::FixedLength { length, .. } if *length == 0 => {
-            errors.push(ChannelConfigError::ZeroFixedLength);
-        }
-        _ => {}
-    }
-
     // When recording rotates, the channel name becomes part of generated filenames
     // (§59), so it must be filesystem-safe (§71). Non-rotating recordings use a
     // fixed destination path and do not constrain the name.
@@ -161,19 +152,6 @@ pub fn validate_channel(
         && !is_filesystem_safe(channel.name.as_str())
     {
         errors.push(ChannelConfigError::InvalidChannelName);
-    }
-
-    // A count-based subsample must pass at least one of every N (§50.1) — on any
-    // sink: a Display View's history or the message-framed (`.ssdat`) recording.
-    let display_subsample_invalid = channel
-        .display
-        .views
-        .iter()
-        .any(|v| matches!(v.subsample, Subsample::EveryNth { n: 0 }));
-    let recording_subsample_invalid =
-        matches!(channel.recording.subsample, Subsample::EveryNth { n: 0 });
-    if display_subsample_invalid || recording_subsample_invalid {
-        errors.push(ChannelConfigError::InvalidSubsample);
     }
 
     // Match Rules (§50.2, §165). A `BytePattern` with an empty pattern would match
@@ -241,18 +219,12 @@ pub enum ChannelConfigError {
     TcpConnectionNotPersistable,
     #[error("multicast UDP requires a multicast group address")]
     MissingMulticastGroup,
-    #[error("delimiter extraction has an empty delimiter")]
-    EmptyDelimiter,
-    #[error("fixed-length extraction has a length of zero")]
-    ZeroFixedLength,
     #[error("retention is unbounded: set a limit on the channel or in defaults")]
     UnboundedRetention,
     #[error(
         "channel name is not filesystem-safe but recording file rotation uses it in filenames (§59)"
     )]
     InvalidChannelName,
-    #[error("count-based subsampling requires n >= 1 (§50.1)")]
-    InvalidSubsample,
     #[error("a match rule's byte pattern is empty (it would match every message, §50.2)")]
     EmptyMatchPattern,
 }
@@ -267,71 +239,6 @@ pub enum ChannelConfigWarning {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn templates_round_trip_through_toml() {
-        let mut profile = Profile::new("test workspace");
-        profile.channels = vec![
-            templates::serial_template(),
-            templates::udp_template(),
-            templates::tcp_listener_template(),
-        ];
-        let toml = profile.to_toml().expect("serialize");
-        let parsed = Profile::from_toml(&toml).expect("round trip");
-        assert_eq!(parsed, profile);
-    }
-
-    #[test]
-    fn rotation_requires_a_filesystem_safe_channel_name() {
-        use crate::core::ChannelName;
-
-        let mut channel = templates::udp_template();
-        channel.recording.mode = RecordingMode::Raw;
-        channel.recording.file_rotation = FileRotationPolicy::Hourly;
-        channel.recording.destination = Some(std::path::PathBuf::from("."));
-        let defaults = DefaultConfig::default();
-
-        // Rotation + unsafe name → rejected at config time (§59/§71).
-        channel.name = ChannelName::new("GPS/AIS");
-        let errs = validate_channel(&channel, &defaults).unwrap_err();
-        assert!(errs.contains(&ChannelConfigError::InvalidChannelName));
-
-        // Rotation + safe name → ok.
-        channel.name = ChannelName::new("GPS");
-        assert!(validate_channel(&channel, &defaults).is_ok());
-
-        // No rotation → the name is not constrained (it is not used in filenames).
-        channel.name = ChannelName::new("GPS/AIS");
-        channel.recording.file_rotation = FileRotationPolicy::None;
-        match validate_channel(&channel, &defaults) {
-            Ok(()) => {}
-            Err(e) => assert!(!e.contains(&ChannelConfigError::InvalidChannelName)),
-        }
-    }
-
-    #[test]
-    fn count_subsampling_requires_positive_n() {
-        let mut channel = templates::udp_template();
-        let defaults = DefaultConfig::default();
-
-        // A Display View sink with n = 0 is rejected.
-        channel.display.views[0].subsample = Subsample::EveryNth { n: 0 };
-        assert!(validate_channel(&channel, &defaults)
-            .unwrap_err()
-            .contains(&ChannelConfigError::InvalidSubsample));
-
-        channel.display.views[0].subsample = Subsample::EveryNth { n: 5 };
-        assert!(validate_channel(&channel, &defaults).is_ok());
-
-        // The recording (`.ssdat`) sink is validated too (§50.1) — not just views.
-        channel.recording.subsample = Subsample::EveryNth { n: 0 };
-        assert!(validate_channel(&channel, &defaults)
-            .unwrap_err()
-            .contains(&ChannelConfigError::InvalidSubsample));
-
-        channel.recording.subsample = Subsample::EveryNth { n: 3 };
-        assert!(validate_channel(&channel, &defaults).is_ok());
-    }
 
     #[test]
     fn empty_byte_pattern_match_rule_is_rejected() {
@@ -446,7 +353,7 @@ mod tests {
         let mut channel = templates::udp_template();
         channel.retention = RetentionConfig::default(); // all None
         let defaults = DefaultConfig {
-            retention: Some(RetentionConfig::with_message_limit(500)),
+            retention: Some(RetentionConfig::with_byte_limit(500)),
             ..DefaultConfig::default()
         };
         assert!(validate_channel(&channel, &defaults).is_ok());

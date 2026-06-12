@@ -27,10 +27,9 @@ use tokio_util::sync::CancellationToken;
 
 use std::path::PathBuf;
 
-use crate::config::{DiskGuard, MatchRule, Subsample};
+use crate::config::{DiskGuard, MatchRule};
 use crate::core::{ChannelId, RuntimeEvent};
 use crate::display::{DisplayView, RenderedOutput};
-use crate::extract::MessageExtractor;
 use crate::record::Recording;
 use crate::transport::{
     DataTransportRunner, ReceivedData, TransportJoinHandle, TransportNotice, TransportOutcome,
@@ -77,11 +76,8 @@ pub(crate) const TRANSPORT_NOTICES: usize = 16;
 
 /// How a Channel's data recording (§53) taps the pipeline.
 pub(crate) enum DataRecorder {
-    /// Byte-exact raw `.dat`: tapped pre-extraction on the chunk stream.
+    /// Byte-exact raw `.raw`: tapped on the received-chunk stream.
     Raw(Recording<Arc<ReceivedData>>),
-    /// Subsampled, message-framed `.ssdat` (§50.1): tapped post-extraction and
-    /// decimated by the policy.
-    Subsampled(Recording<Arc<ReceivedData>>, Subsample),
 }
 
 /// The transport + pipeline tasks for one Channel. A plain holder, destructured
@@ -105,38 +101,33 @@ pub(crate) struct ChannelTasks {
 pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     channel_id: ChannelId,
     runner: R,
-    extractor: Box<dyn MessageExtractor + Send>,
     data_recorder: Option<DataRecorder>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
-    view_subsamples: Vec<Subsample>,
+    view_count: usize,
     disk_guard: Option<(DiskGuard, PathBuf)>,
     match_setup: MatchSetup,
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
     notices_rx: Receiver<TransportNotice>,
 ) -> ChannelTasks {
-    // The bounded Transport→Extractor queue — the only edge that may stall the
+    // The bounded Transport→Pipeline queue — the only edge that may stall the
     // reader (§97.1, §99). No unbounded intermediate queue is introduced (§97.2).
     let (ingest_tx, ingest_rx) = mpsc::channel(caps.ingest);
 
-    let mut pipeline = ChannelPipeline::new(channel_id, extractor, caps).with_event_sender(events);
+    let mut pipeline = ChannelPipeline::new(channel_id, caps).with_event_sender(events);
     // Match Rules (§50.2, §165): compile the rules and arm any match-triggered
     // recording before the pipeline starts processing.
     pipeline = pipeline.with_match_rules(&match_setup.rules);
     if let Some(arming) = match_setup.arming {
         pipeline = pipeline.with_record_arming(arming);
     }
-    match data_recorder {
-        Some(DataRecorder::Raw(r)) => pipeline = pipeline.with_raw_recorder(r),
-        Some(DataRecorder::Subsampled(r, s)) => pipeline = pipeline.with_message_recorder(r, s),
-        None => {}
+    if let Some(DataRecorder::Raw(r)) = data_recorder {
+        pipeline = pipeline.with_raw_recorder(r);
     }
-    // `new` created the default Display View; add the rest to reach the count, then
-    // apply each view's subsampling policy (§50.1).
-    for _ in 1..view_subsamples.len().max(1) {
-        pipeline.add_display_view(caps.display);
+    // `new` created the default Display View; add the rest to reach the count (§48).
+    for _ in 1..view_count.max(1) {
+        pipeline.add_display_view();
     }
-    pipeline.set_view_subsamples(&view_subsamples);
     if let Some((renderer, recording)) = display_recorder {
         pipeline.set_display_recorder(renderer, recording);
     }
@@ -251,10 +242,9 @@ impl MonitoredChannel {
 pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     channel_id: ChannelId,
     runner: R,
-    extractor: Box<dyn MessageExtractor + Send>,
     data_recorder: Option<DataRecorder>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
-    view_subsamples: Vec<Subsample>,
+    view_count: usize,
     disk_guard: Option<(DiskGuard, PathBuf)>,
     match_setup: MatchSetup,
     caps: PipelineCapacities,
@@ -274,10 +264,9 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     } = spawn_channel_tasks(
         channel_id,
         runner,
-        extractor,
         data_recorder,
         display_recorder,
-        view_subsamples,
+        view_count,
         disk_guard,
         match_setup,
         caps,
@@ -352,13 +341,10 @@ impl RunningChannel {
     }
 }
 
-/// Start a standalone data channel (Serial, UDP, or a lone TCP connection). For
-/// a datagram transport (UDP) the `extractor` is unused because datagrams bypass
-/// extraction (§15) — pass a `StreamExtractor`.
+/// Start a standalone data channel (Serial, UDP, or a lone TCP connection).
 pub fn start_data_channel<R: DataTransportRunner>(
     channel_id: ChannelId,
     runner: R,
-    extractor: Box<dyn MessageExtractor + Send>,
     caps: PipelineCapacities,
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
 ) -> RunningChannel {
@@ -370,12 +356,11 @@ pub fn start_data_channel<R: DataTransportRunner>(
     let tasks = spawn_monitored_channel(
         channel_id,
         runner,
-        extractor,
         raw_recorder.map(DataRecorder::Raw),
-        None,                  // no display recording on a standalone channel
-        vec![Subsample::None], // a single default Display View, no subsampling
-        None,                  // no disk guard on a standalone channel
-        MatchSetup::none(),    // no Match Rules on a standalone channel
+        None,               // no display recording on a standalone channel
+        1,                  // a single default Display View
+        None,               // no disk guard on a standalone channel
+        MatchSetup::none(), // no Match Rules on a standalone channel
         caps,
         event_tx,
         faulted.clone(),
@@ -392,7 +377,6 @@ pub fn start_data_channel<R: DataTransportRunner>(
 mod tests {
     use super::*;
     use crate::core::{ChunkTime, RuntimeEvent};
-    use crate::extract::StreamExtractor;
     use crate::transport::udp::{UdpMode, UdpTransport};
     use crate::transport::{ReceivedData, ReceivedPayload, TransportOutcome};
     use std::time::Duration;
@@ -439,41 +423,31 @@ mod tests {
         let server_addr = bound.local_addr().unwrap();
         let channel_id = bound.channel_id();
 
-        let mut running = start_data_channel(
-            channel_id,
-            bound,
-            Box::new(StreamExtractor::new()),
-            PipelineCapacities::default(),
-            None,
-        );
+        let running = start_data_channel(channel_id, bound, PipelineCapacities::default(), None);
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.send_to(b"alpha", server_addr).await.unwrap();
         client.send_to(b"bravo", server_addr).await.unwrap();
 
-        // Await two MessageReceived events — deterministic synchronization.
-        for expected in 1..=2u64 {
-            match running.events().recv().await.unwrap() {
-                RuntimeEvent::MessageReceived(cid, number) => {
-                    assert_eq!(cid, channel_id);
-                    assert_eq!(number, expected);
+        // Poll the live snapshot until both datagrams land in the stream scrollback,
+        // concatenated verbatim in receive order (no reframing, §18).
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(s) = running.snapshot().await {
+                    if s.stream_tail.len() >= 10 {
+                        break s;
+                    }
                 }
-                other => panic!("unexpected event: {other:?}"),
+                tokio::task::yield_now().await;
             }
-        }
+        })
+        .await
+        .expect("datagrams did not arrive");
+        assert_eq!(snapshot.channel_id, channel_id);
+        assert_eq!(&*snapshot.stream_tail, b"alphabravo");
+        assert_eq!(snapshot.activity.total_bytes, 10);
 
-        // Graceful stop drains and returns the pipeline; both datagrams retained,
-        // each one Message, numbered in receive order.
-        let pipeline = running.stop().await;
-        let retained: Vec<(u64, Vec<u8>)> = pipeline
-            .retention()
-            .iter()
-            .map(|d| (d.message.number, d.message.bytes.to_vec()))
-            .collect();
-        assert_eq!(
-            retained,
-            vec![(1, b"alpha".to_vec()), (2, b"bravo".to_vec())]
-        );
+        let _ = running.stop().await;
     }
 
     #[tokio::test]
@@ -484,19 +458,26 @@ mod tests {
             channel_id: cid,
             chunks: (0u8..5).map(|i| vec![i]).collect(),
         };
-        let running = start_data_channel(
-            cid,
-            transport,
-            Box::new(StreamExtractor::new()),
-            PipelineCapacities::default(),
-            None,
-        );
+        let running = start_data_channel(cid, transport, PipelineCapacities::default(), None);
 
+        // Wait for the five 1-byte datagrams to be received, then stop.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(s) = running.snapshot().await {
+                    if s.activity.total_bytes >= 5 {
+                        return;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("datagrams did not arrive");
         let pipeline = tokio::time::timeout(Duration::from_secs(5), running.stop())
             .await
             .expect("graceful stop hung");
-        // All five datagrams were drained before finalizing.
-        assert_eq!(pipeline.retention().len(), 5);
+        // All five datagrams' bytes were received before finalizing.
+        assert_eq!(pipeline.snapshot().activity.total_bytes, 5);
     }
 
     #[tokio::test]
@@ -508,19 +489,13 @@ mod tests {
             channel_id: cid,
             chunks: (0..1000).map(|i| vec![(i % 256) as u8]).collect(),
         };
-        let running = start_data_channel(
-            cid,
-            transport,
-            Box::new(StreamExtractor::new()),
-            PipelineCapacities::default(),
-            None,
-        );
+        let running = start_data_channel(cid, transport, PipelineCapacities::default(), None);
 
         let pipeline = tokio::time::timeout(Duration::from_secs(5), running.abort())
             .await
             .expect("forced abort hung");
-        // It terminated; it cannot have retained more than was produced.
-        assert!(pipeline.retention().len() <= 1000);
+        // It terminated; it cannot have received more than was produced.
+        assert!(pipeline.snapshot().activity.total_bytes <= 1000);
     }
 
     #[tokio::test]
@@ -541,13 +516,8 @@ mod tests {
         }
 
         let cid = ChannelId::new();
-        let mut running = start_data_channel(
-            cid,
-            FaultingTransport,
-            Box::new(StreamExtractor::new()),
-            PipelineCapacities::default(),
-            None,
-        );
+        let mut running =
+            start_data_channel(cid, FaultingTransport, PipelineCapacities::default(), None);
         assert_eq!(
             running.events().recv().await.unwrap(),
             RuntimeEvent::ChannelFaulted(cid)

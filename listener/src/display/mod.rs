@@ -1,7 +1,7 @@
 //! Raw, rendered, and hex display rendering.
 //!
 //! This is `listener-display` (spec §128, §40–§49). Display is presentation
-//! only: it never alters bytes, Messages, metadata, or recordings (§5.4, §40).
+//! only: it never alters bytes or recordings (§5.4, §40).
 //! The rendering pipeline is pure (no I/O, no async): bytes are decoded per the
 //! Display Encoding (§47) into characters, each character is rendered per the
 //! Character Rendering mode (§46), and the Display Mode (§42) assembles them as
@@ -17,7 +17,7 @@ mod render;
 
 pub use render::DisplayView;
 
-use crate::core::{ChannelId, Message, MessageTimestamp};
+use crate::core::{ChannelId, MessageTimestamp};
 
 /// Display Mode — how received data is assembled for a view (§42).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -57,7 +57,8 @@ pub enum WrappingMode {
     Wrap,
 }
 
-/// The rendered representation of a Message for one Display View (§141).
+/// The rendered representation of a span of stream bytes for one Display View
+/// (§141).
 ///
 /// Display Recording consumes this *after* rendering (§54) — it is explicitly
 /// not byte-exact and is not a substitute for Raw Recording. Because the
@@ -66,16 +67,8 @@ pub enum WrappingMode {
 #[derive(Clone, Debug)]
 pub struct RenderedOutput {
     pub channel_id: ChannelId,
-    /// `None` in Stream Mode, where Messages are not numbered (§18, §24).
-    pub message_number: Option<u64>,
     /// The rendered text for this view (Raw/Rendered/Hex, §42).
     pub text: String,
     /// Arrival timestamp, if the view writes inline timestamps (§57).
     pub timestamp: Option<MessageTimestamp>,
-}
-
-/// Renders a completed Message into a view's output (§141). Display formatting
-/// never affects bytes, Messages, metadata, or recordings (§5.4).
-pub trait Renderer {
-    fn render(&self, message: &Message) -> RenderedOutput;
 }

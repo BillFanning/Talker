@@ -29,8 +29,7 @@ pub enum RuntimeCommand {
     ResumeDisplay(ChannelId, DisplayViewId),
 }
 
-/// Something the runtime reports happened (§137). `MessageReceived` carries the
-/// Channel-local Message Number (§24).
+/// Something the runtime reports happened (§137).
 ///
 /// `#[non_exhaustive]`: the event vocabulary grows across versions, so observers
 /// (notably the GUI's event-folding loop) must keep a wildcard arm and stay
@@ -41,7 +40,6 @@ pub enum RuntimeEvent {
     ChannelStarted(ChannelId),
     ChannelStopped(ChannelId),
     ChannelFaulted(ChannelId),
-    MessageReceived(ChannelId, u64),
     RecordingFaulted(ChannelId),
     WarningRaised(ChannelId),
     TcpClientConnected(ChannelId),

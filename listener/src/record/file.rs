@@ -292,13 +292,11 @@ mod tests {
         let cid = ChannelId::new();
         recording.try_record(RenderedOutput {
             channel_id: cid,
-            message_number: Some(1),
             text: "first".to_string(),
             timestamp: None,
         });
         recording.try_record(RenderedOutput {
             channel_id: cid,
-            message_number: Some(2),
             text: "second".to_string(),
             timestamp: None,
         });

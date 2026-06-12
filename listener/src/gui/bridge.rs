@@ -316,11 +316,7 @@ pub fn spawn(repaint: impl Fn() + Send + 'static) -> anyhow::Result<BridgeHandle
                 // A roomy recent-message buffer for scrollback — the message view
                 // virtualizes (renders only visible rows), so a large ring is cheap
                 // to display (#4). Other capacities stay at their defaults.
-                let mut listener = Listener::new(PipelineCapacities {
-                    display: 50_000,
-                    retention: 50_000,
-                    ..PipelineCapacities::default()
-                });
+                let mut listener = Listener::new(PipelineCapacities::default());
                 let events = listener
                     .take_events()
                     .expect("the event stream is available exactly once");
@@ -405,7 +401,7 @@ mod tests {
         // Lifecycle event is forwarded…
         let mut started = false;
         let mut got_snapshot = false;
-        // Send a datagram so a MessageReceived/snapshot has content.
+        // Send a datagram so the snapshot has stream content.
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         // Drain updates until we've seen both a start event and a snapshot.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);

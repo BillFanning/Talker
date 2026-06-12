@@ -26,8 +26,6 @@ pub struct ChannelConfig {
     pub kind: ChannelKind,
     pub interface: InterfaceConfig,
     #[serde(default)]
-    pub extraction: ExtractionConfig,
-    #[serde(default)]
     pub display: DisplayConfig,
     #[serde(default)]
     pub recording: RecordingConfig,
@@ -187,37 +185,6 @@ pub struct TcpListenerConfig {
     pub recv_buffer_bytes: Option<usize>,
 }
 
-/// Message-extraction configuration (§20). For a TCP Listener these settings
-/// apply to its accepted connection channels (§16.2).
-#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
-#[serde(tag = "method")]
-pub enum ExtractionConfig {
-    #[default]
-    Stream,
-    Delimiter {
-        delimiter: Vec<u8>,
-        include_delimiter: bool,
-    },
-    FixedLength {
-        length: usize,
-        sync_marker: Option<Vec<u8>>,
-    },
-}
-
-/// Per-sink subsampling policy (§50.1): which Messages pass to a sink, to keep a
-/// fast stream readable or a log compact. Applies to display views and
-/// message-oriented recordings; raw byte data (`.dat`) is never subsampled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(tag = "policy")]
-pub enum Subsample {
-    #[default]
-    None,
-    /// Count-based: pass one of every `n` Messages (`n >= 1`).
-    EveryNth { n: u32 },
-    /// Time-based: pass at most one Message per `millis` milliseconds.
-    RateLimit { millis: u64 },
-}
-
 /// Display configuration: a set of views (§78).
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct DisplayConfig {
@@ -239,11 +206,6 @@ pub struct DisplayViewConfig {
     #[serde(default)]
     pub background_color: Option<String>,
     pub wrapping: WrappingMode,
-    #[serde(default)]
-    pub metadata_visible: bool,
-    /// Subsampling for this view's on-screen history (§50.1); default `None`.
-    #[serde(default)]
-    pub subsample: Subsample,
 }
 
 /// Recording configuration (§79).
@@ -262,11 +224,6 @@ pub struct RecordingConfig {
     /// Time-based file rotation (§59); `None` = single file (additive, §72.1).
     #[serde(default)]
     pub file_rotation: FileRotationPolicy,
-    /// Subsampling (§50.1). For a `Raw` recording a non-`None` policy makes it a
-    /// message-framed, decimated **`.ssdat`** data file rather than a byte-exact
-    /// `.dat` (raw byte data is never subsampled, §53). Default `None`.
-    #[serde(default)]
-    pub subsample: Subsample,
     /// Disk-space guard for long-running recordings (§56.2, §168); `None` = off.
     #[serde(default)]
     pub disk_guard: Option<DiskGuard>,
@@ -388,8 +345,7 @@ pub struct HighlightStyle {
 /// backstop regardless (§80, retention module).
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RetentionConfig {
-    #[serde(default)]
-    pub message_limit: Option<usize>,
+    /// Stream-scrollback byte limit (replaces the v1 message_limit).
     #[serde(default)]
     pub byte_limit: Option<usize>,
     #[serde(default)]
@@ -403,17 +359,16 @@ pub struct RetentionConfig {
 impl RetentionConfig {
     /// True when no limit is set (would leave retention unbounded).
     pub fn is_unbounded(&self) -> bool {
-        self.message_limit.is_none()
-            && self.byte_limit.is_none()
+        self.byte_limit.is_none()
             && self.event_limit.is_none()
             && self.warning_limit.is_none()
             && self.error_limit.is_none()
     }
 
-    /// A retention config bounded by a message count (a sane template default).
-    pub fn with_message_limit(limit: usize) -> Self {
+    /// A retention config bounded by a byte count (a sane template default).
+    pub fn with_byte_limit(limit: usize) -> Self {
         Self {
-            message_limit: Some(limit),
+            byte_limit: Some(limit),
             ..Self::default()
         }
     }

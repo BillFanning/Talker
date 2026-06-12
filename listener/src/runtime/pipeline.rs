@@ -1,14 +1,14 @@
-//! Per-Channel processing pipeline (spec §102, §99.1, §108).
+//! Per-Channel stream pipeline (spec §102, §99.1, §108).
 //!
-//! Wires one Channel's processing stages: chunk distribution → raw recording
-//! tap (§53) → extraction → metadata → decoding (§107) → fan-out to display,
-//! retention (bounded by count + bytes, §88), and diagnostics. The §152
-//! backpressure invariants are tested against this pipeline.
+//! One stage: each received chunk fans out, non-blocking, to the raw-recording
+//! tap (§53), the stream scrollback (§87), per-view display recording (§54),
+//! find/trigger evaluation (§50.2), and diagnostics. There is no extraction,
+//! metadata, or decoding stage (ADR-010) — the bytes are never reframed.
 //!
-//! Acquisition priority (§5.9, §100): every edge here is non-blocking — display
-//! drops oldest, retention evicts oldest, a recorder faults on overflow. The
-//! only edge permitted to stall the reader is the Transport→Extractor channel
-//! (§97.1), the bounded `tokio::sync::mpsc` that feeds [`run_channel`].
+//! Acquisition priority (§5.9, §100): every edge here is non-blocking — the
+//! scrollback ring drops oldest, a recorder faults on overflow. The only edge
+//! permitted to stall the reader is the Transport→Pipeline channel (§97.1),
+//! the bounded `tokio::sync::mpsc` that feeds [`run_channel`].
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -26,44 +26,29 @@ use super::activity::ActivityMeter;
 use super::snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
 };
-use super::subsample::Subsampler;
 use crate::config::{
     DiskGuard, DiskThreshold, LowDiskAction, MatchAction, MatchRule, RecordControl, RecordTarget,
-    Subsample,
 };
 
-use crate::core::{
-    ChannelId, ChunkTime, DisplayViewId, MatchRuleId, Message, MessageBytes, RecordingState,
-    RuntimeEvent,
-};
+use crate::core::{ChannelId, DisplayViewId, MatchRuleId, RecordingState, RuntimeEvent};
 use crate::diagnostics::{Diagnostic, DiagnosticLog};
-use crate::display::{DisplayView, RenderedOutput, Renderer};
-use crate::extract::MessageExtractor;
+use crate::display::{DisplayView, RenderedOutput};
 use crate::record::{
     start_raw_recording, FileRotationPolicy, OverwritePolicy, RawFileRecorder, Recording,
     RecordingStopReason, RotatingRawRecorder,
 };
-use crate::retention::{ByteSized, MessageRetention, RetentionStore};
-use crate::transport::{ReceivedData, ReceivedPayload, TransportNotice};
+use crate::transport::{ReceivedData, TransportNotice};
 
-use super::metadata::MessageNumbering;
 use super::queue::DropOldestQueue;
 
-/// Bounded capacities for a Channel's fan-out edges (§99, §124). Defaults are
-/// generous; real values come from `RetentionConfig`/`RecordingConfig` later.
+/// Bounded capacities for a Channel's fan-out edges (§99, §124).
 #[derive(Clone, Copy, Debug)]
 pub struct PipelineCapacities {
-    /// The bounded Transport→Extractor queue — the only edge that may stall the
+    /// The bounded Transport→Pipeline queue — the only edge that may stall the
     /// reader (§97.1, §99).
     pub ingest: usize,
-    pub display: usize,
-    /// Retained-Message **count** limit (§88).
-    pub retention: usize,
-    /// Retained-Message total **byte** limit (§88), if any.
-    pub retention_bytes: Option<usize>,
-    /// Verbatim Stream-viewer byte ring (ADR-009, §41 Stream source): how many of
-    /// the most recent pre-extraction bytes to keep. Byte-capped, not count-capped,
-    /// since Stream data has no Message boundaries (§18).
+    /// Stream scrollback (§87): how many of the most recent received bytes to
+    /// keep for display. Byte-capped — there are no Message boundaries (§18).
     pub stream_display: usize,
     pub raw_recording: usize,
     /// Per-type retained-diagnostic limits (§88): events, warnings, errors.
@@ -78,9 +63,6 @@ impl Default for PipelineCapacities {
     fn default() -> Self {
         Self {
             ingest: 256,
-            display: 1024,
-            retention: 1024,
-            retention_bytes: None,
             stream_display: 128 * 1024,
             raw_recording: 1024,
             event_retention: None,
@@ -88,20 +70,6 @@ impl Default for PipelineCapacities {
             error_retention: None,
             events: 256,
         }
-    }
-}
-
-/// An immutable Message as carried through display/retention. (The v1 decoder
-/// annotation is removed, ADR-010; the wrapper stays until the extract step
-/// removes Messages entirely.)
-#[derive(Clone, Debug)]
-pub struct DecodedMessage {
-    pub message: Arc<Message>,
-}
-
-impl ByteSized for DecodedMessage {
-    fn byte_len(&self) -> usize {
-        self.message.bytes.len()
     }
 }
 
@@ -122,8 +90,8 @@ impl DisplayViewHandle {
         }
     }
 
-    /// Pause this view: it stops accumulating new display items. Reception,
-    /// recording, numbering, retention, and *other* views are unaffected (§50).
+    /// Pause this view: it stops accumulating new stream bytes. Reception,
+    /// recording, and *other* views are unaffected (§50).
     pub fn pause(&self) {
         self.paused.store(true, Ordering::Relaxed);
     }
@@ -144,49 +112,30 @@ struct ViewRecorder {
     recording: Recording<RenderedOutput>,
 }
 
-/// A subsampled, message-framed data recording (`.ssdat`, §50.1/§53): each passed
-/// Message's bytes are written, decimated by `subsampler`. It reuses the raw
-/// recording task by feeding it a synthetic per-Message chunk, so no new recorder
-/// type is needed — but it taps the *post-extraction* Message fan-out, not the raw
-/// chunk stream (raw `.dat` byte data is never subsampled).
-struct MessageRecorder {
-    recording: Recording<Arc<ReceivedData>>,
-    subsampler: Subsampler,
-    fault_reported: bool,
-}
-
-/// One Display View's runtime state: pause handle, bounded history (§87), an
-/// optional Display Recording (§54), and an optional subsampler for its history
-/// (§50.1).
+/// One Display View's runtime state: pause handle and an optional Display
+/// Recording (§54). The displayed content itself is the shared stream
+/// scrollback (§87) rendered per view; views hold no per-view history.
 struct PipelineDisplayView {
     handle: DisplayViewHandle,
-    history: DropOldestQueue<DecodedMessage>,
     recorder: Option<ViewRecorder>,
-    subsampler: Subsampler,
 }
 
 impl PipelineDisplayView {
-    fn new(capacity: usize) -> Self {
+    fn new() -> Self {
         Self {
             handle: DisplayViewHandle::new_active(),
-            history: DropOldestQueue::with_capacity(capacity),
             recorder: None,
-            subsampler: Subsampler::new(Subsample::None),
         }
     }
 }
 
-/// One Channel's processing pipeline (§102). Driven synchronously via
+/// One Channel's stream pipeline (§102). Driven synchronously via
 /// [`ChannelPipeline::ingest`]; [`run_channel`] is the async loop around it.
-/// (No `Debug` derive: the boxed `dyn MessageExtractor` is not `Debug`.)
 pub struct ChannelPipeline {
     channel_id: ChannelId,
-    extractor: Box<dyn MessageExtractor + Send>,
-    numbering: MessageNumbering,
     /// Display Views (§48): a Channel may have several, each independently
     /// paused (§11). The first is the default view created by `new`.
     display_views: Vec<PipelineDisplayView>,
-    retention: MessageRetention<DecodedMessage>,
     /// Retained diagnostics, count-limited per type (§88).
     diagnostics: DiagnosticLog,
     /// Raw Recording handle (§53). `None` when recording is disabled or its
@@ -194,9 +143,6 @@ pub struct ChannelPipeline {
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     /// Whether the raw recorder's fault has already been reported.
     recording_fault_reported: bool,
-    /// Subsampled message-framed data recording (`.ssdat`, §50.1); mutually
-    /// exclusive with `raw_recorder` (a Raw recording is one or the other).
-    message_recorder: Option<MessageRecorder>,
     /// Disk-space guard for recording (§56.2, §168): the policy and the path whose
     /// filesystem free space is polled. `None` = no guard.
     disk_guard: Option<(DiskGuard, PathBuf)>,
@@ -205,7 +151,7 @@ pub struct ChannelPipeline {
     /// Per-Channel liveness facts (§91.1): rolling throughput + last-data time.
     activity: ActivityMeter,
     events: Option<Sender<RuntimeEvent>>,
-    /// Compiled Match Rules (§50.2, §165); empty when none are configured.
+    /// Compiled find/trigger rules (§50.2, §165); empty when none are configured.
     match_rules: MatchRuleSet,
     /// Bounded log of recent rule firings, surfaced in the snapshot (§165).
     recent_matches: DropOldestQueue<TriggeredMatch>,
@@ -218,9 +164,8 @@ pub struct ChannelPipeline {
     /// Anchor for the `Idle` condition before any data has arrived (§50.2): idle is
     /// measured from the last data, or from this instant when none has arrived yet.
     created_at: Instant,
-    /// Verbatim pre-extraction byte ring for the Stream display source (ADR-009).
-    /// Trimmed from the front to `stream_cap` bytes; a second pre-extraction tap
-    /// alongside the raw recorder (§53/§99.1), independent of extraction config.
+    /// The stream scrollback (§87): the most recent received bytes, verbatim.
+    /// Trimmed from the front to `stream_cap` bytes.
     stream_buf: VecDeque<u8>,
     stream_cap: usize,
 }
@@ -231,10 +176,10 @@ struct PendingRecord {
     control: RecordControl,
 }
 
-/// Everything needed to lazily build a match-armed Raw/`.ssdat` recording the
-/// first time a `Record { Begin }` fires (§50.2, §165). Mirrors the orchestrator's
+/// Everything needed to lazily build a match-armed Raw recording the first time
+/// a `Record { Begin }` fires (§50.2, §165). Mirrors the orchestrator's
 /// raw-recorder construction so a match-triggered recording uses the Channel's
-/// configured destination, overwrite policy, timestamps, rotation, and subsample.
+/// configured destination, overwrite policy, timestamps, and rotation.
 #[derive(Clone, Debug)]
 pub struct RawRecordArming {
     pub destination: PathBuf,
@@ -242,7 +187,6 @@ pub struct RawRecordArming {
     pub overwrite: OverwritePolicy,
     pub timestamps: bool,
     pub file_rotation: FileRotationPolicy,
-    pub subsample: Subsample,
     pub capacity: usize,
 }
 
@@ -250,17 +194,10 @@ pub struct RawRecordArming {
 const RECENT_MATCHES_CAP: usize = 256;
 
 impl ChannelPipeline {
-    pub fn new(
-        channel_id: ChannelId,
-        extractor: Box<dyn MessageExtractor + Send>,
-        caps: PipelineCapacities,
-    ) -> Self {
+    pub fn new(channel_id: ChannelId, caps: PipelineCapacities) -> Self {
         Self {
             channel_id,
-            extractor,
-            numbering: MessageNumbering::new(),
-            display_views: vec![PipelineDisplayView::new(caps.display)],
-            retention: MessageRetention::new(Some(caps.retention), caps.retention_bytes),
+            display_views: vec![PipelineDisplayView::new()],
             diagnostics: DiagnosticLog::new(
                 caps.event_retention,
                 caps.warning_retention,
@@ -268,7 +205,6 @@ impl ChannelPipeline {
             ),
             raw_recorder: None,
             recording_fault_reported: false,
-            message_recorder: None,
             disk_guard: None,
             disk_low_reported: false,
             activity: ActivityMeter::new(),
@@ -283,8 +219,8 @@ impl ChannelPipeline {
         }
     }
 
-    /// Attach compiled Match Rules (§50.2, §165). Evaluated per-Message after
-    /// decoding and via an idle timer; actions are presentation/control only.
+    /// Attach compiled find/trigger rules (§50.2, §165). `BytePattern` rules are
+    /// evaluated per chunk; `Idle` via a timer. Actions are presentation/control only.
     pub fn with_match_rules(mut self, rules: &[MatchRule]) -> Self {
         self.match_rules = MatchRuleSet::compile(rules);
         self
@@ -305,21 +241,6 @@ impl ChannelPipeline {
         self
     }
 
-    /// Attach a subsampled message-framed data recording (`.ssdat`, §50.1): each
-    /// passed Message's bytes are recorded, decimated by `subsample`.
-    pub fn with_message_recorder(
-        mut self,
-        recorder: Recording<Arc<ReceivedData>>,
-        subsample: Subsample,
-    ) -> Self {
-        self.message_recorder = Some(MessageRecorder {
-            recording: recorder,
-            subsampler: Subsampler::new(subsample),
-            fault_reported: false,
-        });
-        self
-    }
-
     /// Attach a disk-space guard (§56.2, §168): `path`'s filesystem free space is
     /// polled, and on a low condition the guard warns and, per its policy, stops
     /// recording.
@@ -328,34 +249,35 @@ impl ChannelPipeline {
         self
     }
 
-    /// Attach a runtime event sender so each completed Message emits a
-    /// `MessageReceived` event (§137). Events are advisory and high-volume, so
-    /// emission is non-blocking and drops on a full event channel — the
-    /// authoritative record lives in retention/recording, not the event stream.
+    /// Attach a runtime event sender (§137). Events are advisory, so emission is
+    /// non-blocking and drops on a full event channel — the authoritative record
+    /// lives in recording/diagnostics, not the event stream.
     pub fn with_event_sender(mut self, events: Sender<RuntimeEvent>) -> Self {
         self.events = Some(events);
         self
     }
 
-    /// Process one received chunk through the pipeline.
+    /// Process one received chunk through the pipeline (§102).
     ///
     /// Distribution order follows §99.1: the raw recorder is offered the chunk
-    /// first with a non-blocking enqueue, then extraction runs. A `Bytes` chunk
-    /// is framed by the extractor; a `Datagram` is already one complete Message
-    /// and bypasses extraction entirely (§15).
+    /// first with a non-blocking enqueue, then the stream scrollback, display
+    /// recording, and find/trigger evaluation. Every edge is non-blocking.
     pub fn ingest(&mut self, data: ReceivedData) {
         let data = Arc::new(data);
+        // The chunk's start offset in the stream (total bytes before it) — the
+        // anchor for find/trigger firings (§50.2: byte offsets, not numbers).
+        let chunk_offset = self.activity.total_bytes();
 
         // Liveness (§91.1): count received bytes at the chunk's arrival time.
         self.activity
             .record_chunk(data.received_at.monotonic, data.payload.bytes().len());
-        // Data arrived: re-arm any `Idle` Match Rule so it can fire again on the
-        // next quiet episode (§50.2). Cheap no-op when there are no idle rules.
+        // Data arrived: re-arm any `Idle` rule so it can fire again on the next
+        // quiet episode (§50.2). Cheap no-op when there are no idle rules.
         self.match_rules.note_activity();
 
-        // 1. Raw recorder tap (pre-extraction, §53). Non-blocking: a full
-        // recorder queue faults the recording rather than stalling reception
-        // (§56.1). `try_record` updates the handle's state internally.
+        // 1. Raw recorder tap (§53). Non-blocking: a full recorder queue faults
+        // the recording rather than stalling reception (§56.1). `try_record`
+        // updates the handle's state internally.
         let mut recording_just_faulted = false;
         if let Some(recorder) = self.raw_recorder.as_mut() {
             if recorder.state() == RecordingState::Enabled {
@@ -376,18 +298,16 @@ impl ChannelPipeline {
             }
         }
 
-        // 1b. Verbatim Stream-viewer tap (ADR-009, §41 Stream source). Keep the most
-        // recent bytes exactly as received — pre-extraction, so the viewer shows the
-        // wire regardless of framing or read-chunk boundaries. A byte ring, trimmed
-        // from the front (no Message boundaries to count, §18). Honors the default
-        // view's pause (§50): a paused view freezes its stream just like the message
-        // history below, while reception and recording (the raw tap above) keep going.
+        // 2. Stream scrollback (§87): keep the most recent bytes exactly as
+        // received — the wire, regardless of read-chunk boundaries. A byte ring,
+        // trimmed from the front. Honors the default view's pause (§50): a paused
+        // view freezes its display while reception and recording keep going.
+        let bytes = data.payload.bytes();
         if !self
             .display_views
             .first()
             .is_some_and(|v| v.handle.is_paused())
         {
-            let bytes = data.payload.bytes();
             if bytes.len() >= self.stream_cap {
                 // A single chunk already exceeds the cap: keep only its tail.
                 self.stream_buf.clear();
@@ -402,103 +322,25 @@ impl ChannelPipeline {
             }
         }
 
-        // 2. Extraction → metadata → fan-out.
-        match &data.payload {
-            ReceivedPayload::Datagram(bytes) => {
-                let mb = MessageBytes {
-                    bytes: Arc::from(bytes.as_slice()),
-                    first_chunk: data.received_at,
-                    last_chunk: data.received_at,
-                };
-                let msg = Arc::new(self.numbering.build(self.channel_id, mb));
-                self.dispatch(msg);
-            }
-            ReceivedPayload::Bytes(bytes) => {
-                for mb in self.extractor.push_chunk(bytes, data.received_at) {
-                    let msg = Arc::new(self.numbering.build(self.channel_id, mb));
-                    self.dispatch(msg);
-                }
-            }
-        }
-    }
-
-    /// Fan-out the Message to the non-blocking consumer edges (§108).
-    fn dispatch(&mut self, msg: Arc<Message>) {
-        let number = msg.number;
-        // Liveness (§91.1): count completed Messages at their arrival time.
-        self.activity
-            .record_message(msg.metadata.arrival_timestamp.monotonic);
-
-        let decoded = DecodedMessage { message: msg };
-
-        // Match Rules (§50.2, §165): evaluate the data conditions before fan-out,
-        // then apply each fired rule's actions (presentation/control only — never
-        // touching the bytes).
-        if !self.match_rules.is_empty() {
-            let fired = self.match_rules.evaluate_message(&decoded.message.bytes);
-            if !fired.is_empty() {
-                self.apply_fired_rules(fired, Some(number));
-            }
-        }
-
-        // Display fan-out (§48, §108). For each view:
-        //  - Display Recording renders + records the Message regardless of pause
-        //    (§58): pausing presentation never pauses recording.
-        //  - Presentation history accumulates only while Active (§50) and only for
-        //    Messages that pass the view's subsampler (§50.1), dropping oldest on
-        //    overflow (§99), without affecting reception/retention/numbering or
-        //    other views. The subsampler advances over the full stream, so pausing
-        //    does not change which Messages it would pass.
-        let at = decoded.message.metadata.arrival_timestamp.monotonic;
+        // 3. Display Recording (§54, §58): render this chunk per recording view
+        // and record it — regardless of pause (pausing presentation never pauses
+        // recording). Non-blocking; a full queue faults that recording only.
+        let channel_id = self.channel_id;
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.as_mut() {
-                let rendered = rec.renderer.render(&decoded.message);
+                let rendered = rec.renderer.render_stream(channel_id, bytes);
                 rec.recording.try_record(rendered);
-            }
-            if view.subsampler.should_pass(at) && !view.handle.is_paused() {
-                let _ = view.history.push(decoded.clone());
-            }
-        }
-        // Keep the Message (an `Arc`) for the data recorder before retention takes
-        // ownership of `decoded`.
-        let message = Arc::clone(&decoded.message);
-        // Retention: bounded by count and bytes (§88), evicting oldest (§89).
-        // Message Numbers are never rewritten, so survivors keep their numbers.
-        self.retention.push(decoded);
-        // Subsampled data recording (`.ssdat`, §50.1/§53): write passed Messages'
-        // bytes, decimated, by feeding the raw recording task a synthetic
-        // per-Message chunk. Non-blocking and fault-on-overflow like raw (§56.1).
-        let mut message_recording_faulted = false;
-        if let Some(mr) = self.message_recorder.as_mut() {
-            if mr.recording.state() == RecordingState::Enabled && mr.subsampler.should_pass(at) {
-                let chunk = Arc::new(ReceivedData {
-                    channel_id: self.channel_id,
-                    payload: ReceivedPayload::Bytes(message.bytes.to_vec()),
-                    received_at: ChunkTime {
-                        monotonic: message.metadata.arrival_timestamp.monotonic,
-                        wall_clock: message.metadata.arrival_timestamp.wall_clock,
-                    },
-                });
-                mr.recording.try_record(chunk);
-                if mr.recording.state() == RecordingState::Faulted && !mr.fault_reported {
-                    mr.fault_reported = true;
-                    message_recording_faulted = true;
-                }
-            }
-        }
-        if message_recording_faulted {
-            self.diagnostics.record(Diagnostic::error(format!(
-                "subsampled data recording faulted on channel {}",
-                self.channel_id
-            )));
-            if let Some(events) = &self.events {
-                let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
             }
         }
 
-        // Event stream (§137): advisory, non-blocking, drop on full.
-        if let Some(events) = &self.events {
-            let _ = events.try_send(RuntimeEvent::MessageReceived(self.channel_id, number));
+        // 4. Find/triggers (§50.2): evaluate `BytePattern` rules against this
+        // chunk's bytes, anchored at the chunk's stream offset. (Cross-chunk
+        // carry is wired in the find/triggers step.)
+        if !self.match_rules.is_empty() {
+            let fired = self.match_rules.evaluate_message(bytes);
+            if !fired.is_empty() {
+                self.apply_fired_rules(fired, Some(chunk_offset));
+            }
         }
     }
 
@@ -506,12 +348,12 @@ impl ChannelPipeline {
     /// `Notify`, `Mark`, `PauseDisplay`, `Highlight` — take effect immediately;
     /// `Record` actions are queued for asynchronous application (file I/O). Every
     /// firing is observable: it is logged for the snapshot and emits a
-    /// `MatchTriggered` event (§137). `message_number` is `None` for an idle firing.
-    fn apply_fired_rules(&mut self, fired: Vec<FiredRule>, message_number: Option<u64>) {
+    /// `MatchTriggered` event (§137). `byte_offset` is `None` for an idle firing.
+    fn apply_fired_rules(&mut self, fired: Vec<FiredRule>, byte_offset: Option<u64>) {
         for rule in fired {
             self.recent_matches.push(TriggeredMatch {
                 rule_id: rule.id,
-                message_number,
+                byte_offset,
             });
             if let Some(events) = &self.events {
                 let _ = events.try_send(RuntimeEvent::MatchTriggered(self.channel_id, rule.id));
@@ -519,19 +361,19 @@ impl ChannelPipeline {
             for action in &rule.actions {
                 match action {
                     MatchAction::Notify { severity } => {
-                        let where_ = message_number
-                            .map(|n| format!(" (message {n})"))
+                        let where_ = byte_offset
+                            .map(|n| format!(" (stream offset {n})"))
                             .unwrap_or_default();
                         self.diagnostics.record(Diagnostic::new(
                             *severity,
                             format!("match rule fired on channel {}{where_}", self.channel_id),
                         ));
                     }
-                    MatchAction::Mark => self.write_mark(rule.id, message_number),
+                    MatchAction::Mark => self.write_mark(rule.id, byte_offset),
                     MatchAction::PauseDisplay { view } => self.pause_views(*view),
                     // Highlight is presentation-only; the firing is recorded above
                     // (`recent_matches`) and the UI applies the style. Nothing to do
-                    // headless, and it never touches the Message (§50.2).
+                    // headless, and it never touches the bytes (§50.2).
                     MatchAction::Highlight { .. } => {}
                     MatchAction::Record { target, control } => {
                         self.pending_record_controls.push(PendingRecord {
@@ -545,12 +387,12 @@ impl ChannelPipeline {
     }
 
     /// `Mark` action (§50.2): drop a correlation marker into every Display View's
-    /// Display Recording (`.disp`) — **never** the raw `.dat` stream, which stays
+    /// Display Recording (`.disp`) — **never** the raw `.raw` stream, which stays
     /// byte-exact (§5.6/§49). The `MatchTriggered` event and `recent_matches` log
     /// (written by the caller) are the marker's display/event surfaces.
-    fn write_mark(&mut self, rule_id: MatchRuleId, message_number: Option<u64>) {
-        let suffix = message_number
-            .map(|n| format!(" msg={n}"))
+    fn write_mark(&mut self, rule_id: MatchRuleId, byte_offset: Option<u64>) {
+        let suffix = byte_offset
+            .map(|n| format!(" offset={n}"))
             .unwrap_or_default();
         let text = format!("\u{2039}MARK rule={rule_id}{suffix}\u{203a}");
         let channel_id = self.channel_id;
@@ -558,7 +400,6 @@ impl ChannelPipeline {
             if let Some(rec) = view.recorder.as_mut() {
                 rec.recording.try_record(RenderedOutput {
                     channel_id,
-                    message_number,
                     text: text.clone(),
                     timestamp: None,
                 });
@@ -583,7 +424,7 @@ impl ChannelPipeline {
         }
     }
 
-    /// Idle Match Rules (§50.2): fire any whose quiet-time has reached its timeout.
+    /// Idle rules (§50.2): fire any whose quiet-time has reached its timeout.
     /// `now` anchors "time since last data" (or since channel start before any data
     /// arrives). A no-op when no idle rule is configured.
     pub fn evaluate_idle_rules(&mut self, now: Instant) {
@@ -604,8 +445,8 @@ impl ChannelPipeline {
 
     /// Apply queued `Record` actions (§50.2). Called from the async ingest loop,
     /// since recorder creation/finalization is async. Raw/`Both` targets are
-    /// honoured by the byte-exact (or `.ssdat`) recorder; the display portion of
-    /// `Display`/`Both` is deferred (it needs per-view display-recorder arming).
+    /// honoured by the byte-exact recorder; the display portion of `Display`/`Both`
+    /// is deferred (it needs per-view display-recorder arming).
     pub async fn apply_pending_records(&mut self) {
         if self.pending_record_controls.is_empty() {
             return;
@@ -623,19 +464,17 @@ impl ChannelPipeline {
         }
     }
 
-    /// Lazily create the match-armed Raw/`.ssdat` recording on the first `Begin`
-    /// (§50.2): nothing is on disk until now. A no-op if a recording is already
-    /// active or no arming is configured; an open failure warns without faulting
-    /// the Channel (§55).
+    /// Lazily create the match-armed Raw recording on the first `Begin` (§50.2):
+    /// nothing is on disk until now. A no-op if a recording is already active or
+    /// no arming is configured; an open failure warns without faulting the
+    /// Channel (§55).
     async fn begin_armed_recording(&mut self) {
-        if self.raw_recorder.is_some() || self.message_recorder.is_some() {
+        if self.raw_recorder.is_some() {
             return; // already recording — `Begin` is idempotent
         }
         let Some(arm) = self.record_arming.clone() else {
             return; // no destination armed — cannot record
         };
-        let subsampled = arm.subsample != Subsample::None;
-        let ext = if subsampled { ".ssdat" } else { ".dat" };
         let created = if arm.file_rotation == FileRotationPolicy::None {
             RawFileRecorder::create(&arm.destination, arm.overwrite, arm.timestamps)
                 .await
@@ -644,7 +483,7 @@ impl ChannelPipeline {
             RotatingRawRecorder::create(
                 &arm.destination,
                 &arm.channel_name,
-                ext,
+                ".raw",
                 arm.overwrite,
                 arm.timestamps,
                 arm.file_rotation,
@@ -653,13 +492,6 @@ impl ChannelPipeline {
             .map(|r| start_raw_recording(r, arm.capacity))
         };
         match created {
-            Ok(rec) if subsampled => {
-                self.message_recorder = Some(MessageRecorder {
-                    recording: rec,
-                    subsampler: Subsampler::new(arm.subsample),
-                    fault_reported: false,
-                });
-            }
             Ok(rec) => {
                 self.raw_recorder = Some(rec);
                 self.recording_fault_reported = false;
@@ -677,9 +509,6 @@ impl ChannelPipeline {
     async fn stop_armed_recording(&mut self) {
         if let Some(recorder) = self.raw_recorder.take() {
             recorder.finalize(RecordingStopReason::Disabled).await;
-        }
-        if let Some(mr) = self.message_recorder.take() {
-            mr.recording.finalize(RecordingStopReason::Disabled).await;
         }
     }
 
@@ -718,10 +547,7 @@ impl ChannelPipeline {
             return;
         };
         // Only meaningful while a recording is active.
-        if self.raw_recorder.is_none()
-            && self.message_recorder.is_none()
-            && !self.display_views.iter().any(|v| v.recorder.is_some())
-        {
+        if self.raw_recorder.is_none() && !self.display_views.iter().any(|v| v.recorder.is_some()) {
             return;
         }
         let (Ok(free), Ok(total)) = (fs4::available_space(&path), fs4::total_space(&path)) else {
@@ -751,13 +577,10 @@ impl ChannelPipeline {
     }
 
     /// Finalize and drop every recording on this Channel (§56). Reception,
-    /// extraction, display, and retention are unaffected (§96).
+    /// display, and the scrollback are unaffected (§96).
     async fn stop_all_recording(&mut self) {
         if let Some(recorder) = self.raw_recorder.take() {
             recorder.finalize(RecordingStopReason::Disabled).await;
-        }
-        if let Some(mr) = self.message_recorder.take() {
-            mr.recording.finalize(RecordingStopReason::Disabled).await;
         }
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.take() {
@@ -766,17 +589,11 @@ impl ChannelPipeline {
         }
     }
 
-    /// Called at Channel stop (§110, §112): discard any partial Message (§112)
-    /// and finalize the recorder — flush and close (§56).
+    /// Called at Channel stop (§110, §112): finalize the recorders — flush and
+    /// close (§56). In-flight bytes already accepted by a recorder are written.
     pub async fn finish(&mut self) {
-        let _ = self.extractor.finish();
         if let Some(recorder) = self.raw_recorder.take() {
             recorder.finalize(RecordingStopReason::ChannelStopped).await;
-        }
-        if let Some(mr) = self.message_recorder.take() {
-            mr.recording
-                .finalize(RecordingStopReason::ChannelStopped)
-                .await;
         }
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.take() {
@@ -793,30 +610,17 @@ impl ChannelPipeline {
         self.channel_id
     }
 
-    /// The Message Number that will be assigned next (== messages produced + 1).
-    pub fn next_message_number(&self) -> u64 {
-        self.numbering.peek()
-    }
-
     /// Add a Display View and return its pause handle (§48). The caller keeps
     /// the handle to pause/resume the view across the pipeline-task boundary.
-    pub fn add_display_view(&mut self, capacity: usize) -> DisplayViewHandle {
-        let view = PipelineDisplayView::new(capacity);
+    pub fn add_display_view(&mut self) -> DisplayViewHandle {
+        let view = PipelineDisplayView::new();
         let handle = view.handle.clone();
         self.display_views.push(view);
         handle
     }
 
-    /// Set each Display View's subsampling policy (§50.1), in creation order.
-    /// Views without a matching policy keep `Subsample::None`.
-    pub fn set_view_subsamples(&mut self, policies: &[Subsample]) {
-        for (view, &policy) in self.display_views.iter_mut().zip(policies) {
-            view.subsampler = Subsampler::new(policy);
-        }
-    }
-
     /// Attach a Display Recording to the primary (first) Display View (§54),
-    /// rendering each Message with `renderer`. v1 records the primary view;
+    /// rendering each chunk with `renderer`. v1 records the primary view;
     /// per-view display-recording config is deferred (Appendix A).
     pub fn set_display_recorder(
         &mut self,
@@ -839,46 +643,20 @@ impl ChannelPipeline {
             .collect()
     }
 
-    /// The retained history of a specific Display View.
-    pub fn display_view(&self, id: DisplayViewId) -> Option<&DropOldestQueue<DecodedMessage>> {
-        self.display_views
-            .iter()
-            .find(|v| v.handle.id == id)
-            .map(|v| &v.history)
-    }
-
-    /// The default Display View's history (the first view, created by `new`).
-    pub fn display_queue(&self) -> &DropOldestQueue<DecodedMessage> {
-        &self.display_views[0].history
-    }
-
-    pub fn retention(&self) -> &MessageRetention<DecodedMessage> {
-        &self.retention
-    }
-
     pub fn diagnostics(&self) -> &DiagnosticLog {
         &self.diagnostics
     }
 
-    /// Current data-recording state — raw `.dat` or subsampled `.ssdat` (the two
-    /// are mutually exclusive) — or `None` if neither is attached.
+    /// Current raw-recording state (§53), or `None` if no recorder is attached.
     pub fn raw_recording_state(&self) -> Option<RecordingState> {
-        self.raw_recorder
-            .as_ref()
-            .map(|r| r.state())
-            .or_else(|| self.message_recorder.as_ref().map(|m| m.recording.state()))
+        self.raw_recorder.as_ref().map(|r| r.state())
     }
 
-    /// Build an owned, point-in-time snapshot of the observable state (§137,
-    /// ADR-006): retained Messages, per-view display history, diagnostics, and
-    /// recording state. Messages are shared as `Arc`s, so this clones references,
-    /// not payloads.
-    /// Cheap O(1) counters for a multi-channel overview (§91.1) — no Message
+    /// Cheap O(1) counters for a multi-channel overview (§91.1) — no scrollback
     /// cloning, unlike [`snapshot`](Self::snapshot). Polled per-Channel each tick;
     /// the full snapshot is reserved for the Channel actually on screen.
     pub fn stats(&self) -> ChannelStats {
         ChannelStats {
-            next_message_number: self.numbering.peek(),
             activity: self.activity.snapshot(Instant::now()),
             event_count: self.diagnostics.events().count(),
             warning_count: self.diagnostics.warnings().count(),
@@ -887,18 +665,18 @@ impl ChannelPipeline {
         }
     }
 
+    /// Build an owned, point-in-time snapshot of the observable state (§137,
+    /// ADR-006): the stream scrollback tail, per-view pause state, diagnostics,
+    /// recent match firings, and recording state.
     pub fn snapshot(&self) -> ChannelSnapshot {
         ChannelSnapshot {
             channel_id: self.channel_id,
-            next_message_number: self.numbering.peek(),
-            retained: self.retention.iter().cloned().collect(),
             display_views: self
                 .display_views
                 .iter()
                 .map(|v| DisplayViewSnapshot {
                     id: v.handle.id,
                     paused: v.handle.is_paused(),
-                    messages: v.history.iter().cloned().collect(),
                 })
                 .collect(),
             diagnostics: DiagnosticsSnapshot {
@@ -926,10 +704,10 @@ fn disk_is_low(free: u64, total: u64, threshold: DiskThreshold) -> bool {
 
 /// The async ingest loop for one Channel (§102, §110, §111).
 ///
-/// Drains the bounded Transport→Extractor channel until cancelled or the sender
-/// is dropped, then discards partials (§112) and returns the pipeline so the
-/// caller can finalize/inspect it. Cancellation is cooperative and checked
-/// first (`biased`) so shutdown does not depend on draining the queue (§111).
+/// Drains the bounded Transport→Pipeline channel until cancelled or the sender
+/// is dropped, then returns the pipeline so the caller can finalize/inspect it.
+/// Cancellation is cooperative and checked first (`biased`) so shutdown does not
+/// depend on draining the queue (§111).
 ///
 /// Between reads it also serves snapshot/stats requests (§137, ADR-006) and records
 /// transport notices (§95, §101, ADR-007): a requester sends a oneshot reply on
@@ -951,7 +729,7 @@ pub async fn run_channel(
     // guard is configured (the check returns immediately).
     let mut disk_check = tokio::time::interval(Duration::from_secs(5));
     disk_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Idle Match Rule timer (§50.2): a sub-second tick so an `Idle` condition fires
+    // Idle rule timer (§50.2): a sub-second tick so an `Idle` condition fires
     // promptly once the stream goes quiet. Cheap no-op when no idle rule exists.
     let mut idle_check = tokio::time::interval(Duration::from_millis(250));
     idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -980,7 +758,7 @@ pub async fn run_channel(
             maybe = ingest.recv() => match maybe {
                 Some(data) => {
                     pipeline.ingest(data);
-                    // A per-Message `Record` action may have been queued (§50.2).
+                    // A `Record` action may have been queued by a rule (§50.2).
                     pipeline.apply_pending_records().await;
                 }
                 None => break,
@@ -996,14 +774,10 @@ mod tests {
     use super::*;
     use crate::config::MatchCondition;
     use crate::core::ChunkTime;
-    use crate::extract::{DelimiterExtractor, StreamExtractor};
+    use crate::transport::ReceivedPayload;
 
-    fn lf_pipeline(cid: ChannelId, caps: PipelineCapacities) -> ChannelPipeline {
-        ChannelPipeline::new(
-            cid,
-            Box::new(DelimiterExtractor::new(vec![b'\n'], false)),
-            caps,
-        )
+    fn pipeline(cid: ChannelId, caps: PipelineCapacities) -> ChannelPipeline {
+        ChannelPipeline::new(cid, caps)
     }
 
     fn bytes_chunk(cid: ChannelId, data: &[u8]) -> ReceivedData {
@@ -1023,43 +797,12 @@ mod tests {
     }
 
     #[test]
-    fn bytes_are_extracted_numbered_and_fanned_out() {
-        let cid = ChannelId::new();
-        let mut p = lf_pipeline(cid, PipelineCapacities::default());
-        p.ingest(bytes_chunk(cid, b"A\nB\n"));
-        let nums: Vec<u64> = p.retention().iter().map(|d| d.message.number).collect();
-        assert_eq!(nums, vec![1, 2]);
-        assert_eq!(p.display_queue().len(), 2);
-        assert_eq!(p.next_message_number(), 3);
-    }
-
-    #[test]
-    fn datagram_becomes_one_message_bypassing_extraction() {
-        let cid = ChannelId::new();
-        // Stream extractor would never emit; the datagram path must not use it.
-        let mut p = ChannelPipeline::new(
-            cid,
-            Box::new(StreamExtractor::new()),
-            PipelineCapacities::default(),
-        );
-        p.ingest(datagram(cid, b"hello"));
-        assert_eq!(p.retention().len(), 1);
-        let decoded = p.retention().iter().next().unwrap();
-        assert_eq!(decoded.message.number, 1);
-        assert_eq!(&*decoded.message.bytes, b"hello");
-    }
-
-    #[test]
     fn datagram_boundaries_do_not_segment_the_stream() {
         // v2 invariant (§15, §18): UDP datagram boundaries are a reception/recording
         // detail only. The stream concatenates datagram payloads verbatim — nothing
         // is inserted between them and nothing is reframed.
         let cid = ChannelId::new();
-        let mut p = ChannelPipeline::new(
-            cid,
-            Box::new(StreamExtractor::new()),
-            PipelineCapacities::default(),
-        );
+        let mut p = pipeline(cid, PipelineCapacities::default());
         p.ingest(datagram(cid, b"$GPGGA,1*00\r\n"));
         p.ingest(datagram(cid, b"$GPRMC,2*00\r\n"));
         assert_eq!(
@@ -1078,15 +821,13 @@ mod tests {
     #[test]
     fn stream_tail_is_verbatim_across_chunks_and_byte_capped() {
         let cid = ChannelId::new();
-        // Small cap so trimming is observable. The extractor is irrelevant: the tail
-        // is a pre-extraction tap (ADR-009), independent of framing.
+        // Small cap so trimming is observable.
         let caps = PipelineCapacities {
             stream_display: 8,
             ..PipelineCapacities::default()
         };
-        let mut p = lf_pipeline(cid, caps);
-        // Reconstructs the wire across read-chunk boundaries — including the CRLF the
-        // `\n` extractor strips from Messages (the whole point of the Stream source).
+        let mut p = pipeline(cid, caps);
+        // Reconstructs the wire across read-chunk boundaries.
         p.ingest(bytes_chunk(cid, b"$ABC"));
         p.ingest(bytes_chunk(cid, b"\r\n"));
         assert_eq!(&*p.snapshot().stream_tail, &b"$ABC\r\n"[..]);
@@ -1101,12 +842,12 @@ mod tests {
     #[test]
     fn paused_view_freezes_the_stream_tail() {
         let cid = ChannelId::new();
-        let mut p = lf_pipeline(cid, PipelineCapacities::default());
+        let mut p = pipeline(cid, PipelineCapacities::default());
         let view = p.display_view_handles()[0].clone();
         p.ingest(bytes_chunk(cid, b"AB"));
         assert_eq!(&*p.snapshot().stream_tail, &b"AB"[..]);
-        // Pause: the Stream viewer freezes (like the message history, §50), but
-        // reception still counts the bytes — the liveness counter keeps moving.
+        // Pause: the displayed stream freezes (§50), but reception still counts
+        // the bytes — the liveness counter keeps moving.
         view.pause();
         p.ingest(bytes_chunk(cid, b"CD"));
         assert_eq!(&*p.snapshot().stream_tail, &b"AB"[..]);
@@ -1125,7 +866,7 @@ mod tests {
             warning_retention: Some(2),
             ..PipelineCapacities::default()
         };
-        let mut p = ChannelPipeline::new(cid, Box::new(StreamExtractor::new()), caps);
+        let mut p = pipeline(cid, caps);
         // Four warnings recorded, capped at two retained.
         for i in 0..4 {
             p.diagnostics.record(Diagnostic::warning(format!("w{i}")));
@@ -1133,410 +874,314 @@ mod tests {
         assert_eq!(p.diagnostics().warnings().count(), 2);
     }
 
-    #[test]
-    fn display_overflow_does_not_stop_reception() {
-        // §152: a slow/full display must not stall the pipeline.
-        let cid = ChannelId::new();
-        let caps = PipelineCapacities {
-            display: 2,
-            retention: 100,
-            ..PipelineCapacities::default()
-        };
-        let mut p = lf_pipeline(cid, caps);
-        p.ingest(bytes_chunk(cid, b"1\n2\n3\n4\n5\n"));
-        // Reception continued: all five were numbered and retained.
-        assert_eq!(p.next_message_number(), 6);
-        assert_eq!(p.retention().len(), 5);
-        // Display kept only the two newest (dropped oldest).
-        let disp: Vec<u64> = p.display_queue().iter().map(|d| d.message.number).collect();
-        assert_eq!(disp, vec![4, 5]);
-    }
-
-    #[test]
-    fn retention_eviction_preserves_message_numbering() {
-        // §152 / §89: evicted messages are not renumbered.
-        let cid = ChannelId::new();
-        let caps = PipelineCapacities {
-            display: 100,
-            retention: 3,
-            ..PipelineCapacities::default()
-        };
-        let mut p = lf_pipeline(cid, caps);
-        p.ingest(bytes_chunk(cid, b"1\n2\n3\n4\n5\n"));
-        let nums: Vec<u64> = p.retention().iter().map(|d| d.message.number).collect();
-        // Oldest two evicted; survivors keep their original numbers 3,4,5.
-        assert_eq!(nums, vec![3, 4, 5]);
-        assert_eq!(p.next_message_number(), 6);
-    }
-
-    #[test]
-    fn pausing_one_view_does_not_affect_others_or_reception() {
-        // §11/§50: pausing one Display View must not pause reception, numbering,
-        // retention, or the other views.
-        let cid = ChannelId::new();
-        let mut p = lf_pipeline(cid, PipelineCapacities::default());
-        let default_view = p.display_view_handles()[0].clone();
-        let second_view = p.add_display_view(1024);
-
-        default_view.pause();
-        p.ingest(bytes_chunk(cid, b"1\n2\n3\n"));
-
-        // Paused view accumulated nothing; the active view got all three.
-        assert_eq!(p.display_view(default_view.id).unwrap().len(), 0);
-        assert_eq!(p.display_view(second_view.id).unwrap().len(), 3);
-        // Reception, numbering, and retention were unaffected.
-        assert_eq!(p.retention().len(), 3);
-        assert_eq!(p.next_message_number(), 4);
-
-        // Resuming lets the view accumulate again — but only new Messages (no
-        // backfill of what was missed while paused, §55-style live semantics).
-        default_view.resume();
-        p.ingest(bytes_chunk(cid, b"4\n"));
-        assert_eq!(p.display_view(default_view.id).unwrap().len(), 1);
-        assert_eq!(p.display_view(second_view.id).unwrap().len(), 4);
-    }
-
-    #[test]
-    fn retention_byte_limit_evicts_oldest() {
-        // §88: a total-byte limit bounds retention independently of count.
-        let cid = ChannelId::new();
-        let caps = PipelineCapacities {
-            retention: 100,
-            retention_bytes: Some(3),
-            ..PipelineCapacities::default()
-        };
-        let mut p = lf_pipeline(cid, caps);
-        // Five 1-byte messages; a 3-byte budget keeps the newest three.
-        p.ingest(bytes_chunk(cid, b"1\n2\n3\n4\n5\n"));
-        let nums: Vec<u64> = p.retention().iter().map(|d| d.message.number).collect();
-        assert_eq!(nums, vec![3, 4, 5]);
-    }
-
     fn temp_path(tag: &str) -> std::path::PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push(format!("listener-pipe-{tag}-{}.bin", uuid::Uuid::new_v4()));
-        path
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "listener-pipeline-{tag}-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        p
     }
 
     #[tokio::test]
-    async fn raw_recording_captures_pre_extraction_bytes() {
-        use crate::record::{start_raw_recording, OverwritePolicy, RawFileRecorder};
-
-        let path = temp_path("capture");
-        let recorder = RawFileRecorder::create(&path, OverwritePolicy::Overwrite, false)
+    async fn raw_recording_captures_received_bytes() {
+        // §53: the raw tap records every received chunk byte-exact, in order.
+        let cid = ChannelId::new();
+        let path = temp_path("raw");
+        let recorder = RawFileRecorder::create(&path, OverwritePolicy::Refuse, false)
             .await
             .unwrap();
-        let cid = ChannelId::new();
-        let mut p = lf_pipeline(cid, PipelineCapacities::default())
-            .with_raw_recorder(start_raw_recording(recorder, 64));
+        let recording = start_raw_recording(recorder, 64);
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_raw_recorder(recording);
 
-        p.ingest(bytes_chunk(cid, b"$GPGGA,"));
-        p.ingest(bytes_chunk(cid, b"123\r\n"));
-        // Finalize flushes + closes the file (drains the recorder queue).
+        p.ingest(bytes_chunk(cid, b"$GPGLL,1*00\r\n"));
+        p.ingest(datagram(cid, b"$GPGLL,2*00\r\n"));
         p.finish().await;
 
-        // Raw recording is byte-exact and pre-extraction (§53): the CRLF and the
-        // un-split chunk boundary are both present.
-        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"$GPGGA,123\r\n");
+        let written = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(written, b"$GPGLL,1*00\r\n$GPGLL,2*00\r\n");
         let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]
     async fn display_recording_captures_rendered_output() {
-        use crate::display::DisplayView;
-        use crate::record::{start_display_recording, DisplayFileRecorder, OverwritePolicy};
-
-        let path = temp_path("display-rec");
-        let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Overwrite, false)
+        // §54: the display recorder writes each chunk's *rendered* output.
+        use crate::record::{start_display_recording, DisplayFileRecorder};
+        let cid = ChannelId::new();
+        let path = temp_path("disp");
+        let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Refuse, false)
             .await
             .unwrap();
-        let cid = ChannelId::new();
-        let mut p = lf_pipeline(cid, PipelineCapacities::default());
-        p.set_display_recorder(
-            DisplayView::default(),
-            start_display_recording(recorder, 16),
-        );
+        let recording = start_display_recording(recorder, 64);
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        p.set_display_recorder(DisplayView::default(), recording);
 
-        p.ingest(datagram(cid, b"Hi"));
+        p.ingest(bytes_chunk(cid, b"hello"));
         p.finish().await;
 
-        // Raw/Native render of "Hi" → one rendered line in the artifact (§54).
-        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "Hi\n");
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(written.contains("hello"));
         let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]
     async fn display_recording_continues_while_the_view_is_paused() {
-        use crate::display::DisplayView;
-        use crate::record::{start_display_recording, DisplayFileRecorder, OverwritePolicy};
-
-        let path = temp_path("display-paused");
-        let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Overwrite, false)
+        // §58: pausing presentation never pauses recording.
+        use crate::record::{start_display_recording, DisplayFileRecorder};
+        let cid = ChannelId::new();
+        let path = temp_path("disp-paused");
+        let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Refuse, false)
             .await
             .unwrap();
-        let cid = ChannelId::new();
-        let mut p = lf_pipeline(cid, PipelineCapacities::default());
+        let recording = start_display_recording(recorder, 64);
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        p.set_display_recorder(DisplayView::default(), recording);
         let view = p.display_view_handles()[0].clone();
-        p.set_display_recorder(
-            DisplayView::default(),
-            start_display_recording(recorder, 16),
-        );
 
-        // §58: pausing the view's presentation must not pause its recording.
         view.pause();
-        p.ingest(datagram(cid, b"A"));
-        p.ingest(datagram(cid, b"B"));
+        p.ingest(bytes_chunk(cid, b"while-paused"));
         p.finish().await;
 
-        // Presentation history is frozen...
-        assert_eq!(p.display_view(view.id).unwrap().len(), 0);
-        // ...but both Messages were still recorded.
-        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), "A\nB\n");
+        // The paused view's scrollback stayed empty, but the recording captured it.
+        assert!(p.snapshot().stream_tail.is_empty());
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(written.contains("while-paused"));
         let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]
     async fn recording_overflow_faults_emits_event_and_reception_continues() {
-        // §56.1 / §152: a full recorder queue faults recording (emitting
-        // RecordingFaulted) but reception, extraction, and retention continue.
-        use crate::record::{start_raw_recording, OverwritePolicy, RawFileRecorder};
+        // §56.1: a recorder that cannot keep up faults; reception continues.
+        use crate::record::RawRecorder;
+        struct StallingRecorder(tokio::sync::oneshot::Receiver<()>);
+        #[async_trait::async_trait]
+        impl RawRecorder for StallingRecorder {
+            async fn write_chunk(
+                &mut self,
+                _chunk: &ReceivedData,
+            ) -> Result<(), crate::core::RecordError> {
+                // Park forever: the queue backs up and overflows.
+                let _ = (&mut self.0).await;
+                Ok(())
+            }
+            async fn flush(&mut self) -> Result<(), crate::core::RecordError> {
+                Ok(())
+            }
+            async fn finalize(
+                &mut self,
+                _reason: RecordingStopReason,
+            ) -> Result<(), crate::core::RecordError> {
+                Ok(())
+            }
+        }
 
-        let path = temp_path("overflow");
-        let recorder = RawFileRecorder::create(&path, OverwritePolicy::Overwrite, false)
-            .await
-            .unwrap();
         let cid = ChannelId::new();
-        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(16);
-        // Recorder queue capacity 1; two back-to-back sync ingests with no await
-        // between cannot let the recorder task drain, so the second overflows.
-        let mut p = lf_pipeline(cid, PipelineCapacities::default())
-            .with_event_sender(ev_tx)
-            .with_raw_recorder(start_raw_recording(recorder, 1));
+        let (_hold_tx, hold_rx) = tokio::sync::oneshot::channel();
+        let recording = start_raw_recording(StallingRecorder(hold_rx), 1);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let mut p = pipeline(cid, PipelineCapacities::default())
+            .with_raw_recorder(recording)
+            .with_event_sender(event_tx);
 
-        p.ingest(bytes_chunk(cid, b"A\n"));
-        p.ingest(bytes_chunk(cid, b"B\n"));
-
+        // Flood: the 1-slot queue fills while the writer is parked; the recording
+        // faults, reception continues, and the stream keeps accumulating.
+        for _ in 0..8 {
+            p.ingest(bytes_chunk(cid, b"x"));
+            tokio::task::yield_now().await;
+        }
         assert_eq!(p.raw_recording_state(), Some(RecordingState::Faulted));
-        // Reception continued: both messages extracted and retained.
-        assert_eq!(p.retention().len(), 2);
-        // The fault was recorded as an error diagnostic (§94).
-        assert_eq!(p.diagnostics().errors().count(), 1);
-
+        assert_eq!(p.snapshot().activity.total_bytes, 8);
         let mut saw_fault = false;
-        while let Ok(event) = ev_rx.try_recv() {
-            if matches!(event, RuntimeEvent::RecordingFaulted(_)) {
+        while let Ok(ev) = event_rx.try_recv() {
+            if matches!(ev, RuntimeEvent::RecordingFaulted(id) if id == cid) {
                 saw_fault = true;
             }
         }
-        assert!(saw_fault, "RecordingFaulted event must be emitted");
-        let _ = tokio::fs::remove_file(&path).await;
+        assert!(saw_fault);
     }
 
     #[tokio::test]
     async fn run_channel_drains_then_stops_when_sender_drops() {
         let cid = ChannelId::new();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let p = lf_pipeline(cid, PipelineCapacities::default());
-        let (_snap_tx, snap_rx) = tokio::sync::mpsc::channel(4);
-        let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(4);
-        tx.send(bytes_chunk(cid, b"X\nY\n")).await.unwrap();
-        drop(tx); // loop drains the buffered chunk, then sees the channel close
-        let p = run_channel(rx, snap_rx, notice_rx, p, CancellationToken::new()).await;
-        assert_eq!(p.retention().len(), 2);
+        let (_req_tx, req_rx) = tokio::sync::mpsc::channel(1);
+        let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(1);
+        let p = pipeline(cid, PipelineCapacities::default());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_channel(rx, req_rx, notice_rx, p, cancel));
+
+        tx.send(bytes_chunk(cid, b"abc")).await.unwrap();
+        drop(tx);
+        let p = task.await.unwrap();
+        assert_eq!(&*p.snapshot().stream_tail, &b"abc"[..]);
     }
 
     #[tokio::test]
     async fn run_channel_stops_on_cancellation_with_live_sender() {
         let cid = ChannelId::new();
-        let (tx, rx) = tokio::sync::mpsc::channel::<ReceivedData>(8);
-        let p = lf_pipeline(cid, PipelineCapacities::default());
-        let (_snap_tx, snap_rx) = tokio::sync::mpsc::channel(4);
-        let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(4);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (_req_tx, req_rx) = tokio::sync::mpsc::channel(1);
+        let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(1);
+        let p = pipeline(cid, PipelineCapacities::default());
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(run_channel(rx, snap_rx, notice_rx, p, cancel.clone()));
-        cancel.cancel(); // only cancellation can end the loop — tx is still alive
-        let p = handle.await.unwrap();
-        drop(tx);
-        assert_eq!(p.next_message_number(), 1);
+        let task = tokio::spawn(run_channel(rx, req_rx, notice_rx, p, cancel.clone()));
+
+        cancel.cancel();
+        let _p = task.await.unwrap();
+        drop(tx); // sender stayed alive the whole time
     }
 
     #[tokio::test]
     async fn run_channel_serves_snapshots_while_running() {
-        // §137/ADR-006: a snapshot is built on request from live pipeline state,
-        // without stopping the channel.
-        let cid = ChannelId::new();
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        let (snap_tx, snap_rx) = tokio::sync::mpsc::channel(4);
-        let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(4);
-        let p = lf_pipeline(cid, PipelineCapacities::default());
-        let cancel = CancellationToken::new();
-        let handle = tokio::spawn(run_channel(rx, snap_rx, notice_rx, p, cancel.clone()));
-
-        tx.send(bytes_chunk(cid, b"one\ntwo\n")).await.unwrap();
-
-        // Request a snapshot; retry until both Messages are visible (the ingest
-        // and the snapshot race in the select loop).
-        let snapshot = loop {
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            snap_tx
-                .send(PipelineRequest::Snapshot(reply_tx))
-                .await
-                .unwrap();
-            let snap = reply_rx.await.unwrap();
-            if snap.retained.len() == 2 {
-                break snap;
-            }
-            tokio::task::yield_now().await;
-        };
-        assert_eq!(snapshot.channel_id, cid);
-        assert_eq!(snapshot.next_message_number, 3);
-        let nums: Vec<u64> = snapshot.retained.iter().map(|d| d.message.number).collect();
-        assert_eq!(nums, vec![1, 2]);
-        assert_eq!(snapshot.display_views.len(), 1);
-        assert_eq!(snapshot.display_views[0].messages.len(), 2);
-
-        cancel.cancel();
-        let _ = handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn run_channel_serves_cheap_stats_while_running() {
-        // ADR-006: the stats query returns the same counters as a full snapshot
-        // (message number, diagnostic counts) without cloning retained Messages.
         let cid = ChannelId::new();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
-        let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(4);
-        let p = lf_pipeline(cid, PipelineCapacities::default());
+        let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(1);
+        let p = pipeline(cid, PipelineCapacities::default());
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(run_channel(rx, req_rx, notice_rx, p, cancel.clone()));
+        let task = tokio::spawn(run_channel(rx, req_rx, notice_rx, p, cancel.clone()));
 
-        tx.send(bytes_chunk(cid, b"one\ntwo\n")).await.unwrap();
-
-        let stats = loop {
+        tx.send(bytes_chunk(cid, b"live")).await.unwrap();
+        // Poll until the chunk is visible (delivery is async).
+        let snapshot = loop {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            req_tx.send(PipelineRequest::Stats(reply_tx)).await.unwrap();
+            req_tx
+                .send(PipelineRequest::Snapshot(reply_tx))
+                .await
+                .unwrap();
             let s = reply_rx.await.unwrap();
-            if s.next_message_number == 3 {
+            if !s.stream_tail.is_empty() {
                 break s;
             }
             tokio::task::yield_now().await;
         };
-        assert_eq!(stats.error_count, 0);
+        assert_eq!(snapshot.channel_id, cid);
+        assert_eq!(&*snapshot.stream_tail, &b"live"[..]);
 
         cancel.cancel();
-        let _ = handle.await.unwrap();
+        let _ = task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_channel_serves_cheap_stats_while_running() {
+        let cid = ChannelId::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
+        let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(1);
+        let p = pipeline(cid, PipelineCapacities::default());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_channel(rx, req_rx, notice_rx, p, cancel.clone()));
+
+        tx.send(bytes_chunk(cid, b"12345")).await.unwrap();
+        let stats = loop {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            req_tx.send(PipelineRequest::Stats(reply_tx)).await.unwrap();
+            let s = reply_rx.await.unwrap();
+            if s.activity.total_bytes > 0 {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(stats.activity.total_bytes, 5);
+
+        cancel.cancel();
+        let _ = task.await.unwrap();
     }
 
     #[tokio::test]
     async fn run_channel_records_a_transport_notice_as_a_diagnostic() {
-        // ADR-007 seam: a transport notice becomes a retained warning diagnostic
-        // plus a WarningRaised event, both observable without stopping the channel.
         let cid = ChannelId::new();
         let (_tx, rx) = tokio::sync::mpsc::channel(8);
-        let (snap_tx, snap_rx) = tokio::sync::mpsc::channel(4);
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
         let (notice_tx, notice_rx) = tokio::sync::mpsc::channel(4);
-        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(8);
-        let p = lf_pipeline(cid, PipelineCapacities::default()).with_event_sender(ev_tx);
+        let p = pipeline(cid, PipelineCapacities::default());
         let cancel = CancellationToken::new();
-        let handle = tokio::spawn(run_channel(rx, snap_rx, notice_rx, p, cancel.clone()));
+        let task = tokio::spawn(run_channel(rx, req_rx, notice_rx, p, cancel.clone()));
 
         notice_tx
             .send(TransportNotice::ReceptionStalled {
                 channel_id: cid,
-                stalled_for: std::time::Duration::from_millis(500),
+                stalled_for: Duration::from_millis(750),
             })
             .await
             .unwrap();
-
-        // The matching event surfaces (waiting on it also means record_notice ran):
-        // a dedicated ReceptionStalled carrying the stall duration (§137, v1.2).
-        assert_eq!(
-            ev_rx.recv().await.unwrap(),
-            RuntimeEvent::ReceptionStalled(cid, std::time::Duration::from_millis(500))
-        );
-
-        // A live snapshot shows the retained warning naming the stall duration.
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        snap_tx
-            .send(PipelineRequest::Snapshot(reply_tx))
-            .await
-            .unwrap();
-        let snap = reply_rx.await.unwrap();
-        assert_eq!(snap.diagnostics.warnings.len(), 1);
-        assert!(snap.diagnostics.warnings[0]
+        let snapshot = loop {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            req_tx
+                .send(PipelineRequest::Snapshot(reply_tx))
+                .await
+                .unwrap();
+            let s = reply_rx.await.unwrap();
+            if !s.diagnostics.warnings.is_empty() {
+                break s;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(snapshot.diagnostics.warnings[0]
             .message
-            .contains("reception stalled 500 ms"));
+            .contains("reception stalled 750 ms"));
 
         cancel.cancel();
-        let _ = handle.await.unwrap();
+        let _ = task.await.unwrap();
     }
 
     #[test]
     fn disk_is_low_compares_bytes_and_percent_thresholds() {
-        // Bytes: low strictly below the floor.
-        let bytes = DiskThreshold::Bytes { bytes: 1_000 };
-        assert!(disk_is_low(999, 10_000, bytes));
-        assert!(!disk_is_low(1_000, 10_000, bytes));
-        // Percent: low when free is below percent% of total.
-        let pct = DiskThreshold::Percent { percent: 10 };
-        assert!(disk_is_low(999, 10_000, pct)); // 9.99% < 10%
-        assert!(!disk_is_low(1_000, 10_000, pct)); // exactly 10% is not low
-                                                   // A zero/unknown total never reads as low (avoids divide-by-zero panics).
-        assert!(!disk_is_low(0, 0, pct));
+        assert!(disk_is_low(9, 100, DiskThreshold::Bytes { bytes: 10 }));
+        assert!(!disk_is_low(10, 100, DiskThreshold::Bytes { bytes: 10 }));
+        assert!(disk_is_low(4, 100, DiskThreshold::Percent { percent: 5 }));
+        assert!(!disk_is_low(5, 100, DiskThreshold::Percent { percent: 5 }));
+        // A zero-total filesystem is never "low" (avoids division weirdness).
+        assert!(!disk_is_low(0, 0, DiskThreshold::Percent { percent: 5 }));
     }
 
     #[tokio::test]
     async fn disk_guard_stops_recording_once_and_emits_events() {
-        use crate::record::{start_raw_recording, RawFileRecorder};
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        // Unique temp file (coarse Windows clock → use a process-static counter).
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "listener-diskguard-{}-{}.dat",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-
+        // §56.2/§168: an impossible byte threshold (u64::MAX) is always "low", so
+        // the guard warns, stops the recording cleanly, and debounces the report.
         let cid = ChannelId::new();
-        let recorder =
-            RawFileRecorder::create(&path, crate::record::OverwritePolicy::Overwrite, false)
-                .await
-                .unwrap();
-        let recording = start_raw_recording(recorder, 16);
-
-        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(8);
-        // min_free = u64::MAX forces a permanent low-disk condition; StopRecording.
-        let guard = DiskGuard {
-            min_free: DiskThreshold::Bytes { bytes: u64::MAX },
-            on_low: LowDiskAction::StopRecording,
-        };
-        let mut p = lf_pipeline(cid, PipelineCapacities::default())
+        let path = temp_path("guard");
+        let recorder = RawFileRecorder::create(&path, OverwritePolicy::Refuse, false)
+            .await
+            .unwrap();
+        let recording = start_raw_recording(recorder, 64);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let mut p = pipeline(cid, PipelineCapacities::default())
             .with_raw_recorder(recording)
-            .with_event_sender(ev_tx)
-            .with_disk_guard(guard, std::env::temp_dir());
-        assert!(p.raw_recorder.is_some());
+            .with_disk_guard(
+                DiskGuard {
+                    min_free: DiskThreshold::Bytes { bytes: u64::MAX },
+                    on_low: LowDiskAction::StopRecording,
+                },
+                std::env::temp_dir(),
+            )
+            .with_event_sender(event_tx);
 
+        p.ingest(bytes_chunk(cid, b"data"));
         p.check_disk_guard().await;
-
-        // The guard warned, stopped the recording, and announced both (§168).
-        assert!(p.raw_recorder.is_none(), "recording stopped on low disk");
-        assert_eq!(ev_rx.recv().await.unwrap(), RuntimeEvent::DiskSpaceLow(cid));
-        assert_eq!(
-            ev_rx.recv().await.unwrap(),
-            RuntimeEvent::RecordingStoppedLowDisk(cid)
-        );
-
-        // Idempotent within one low episode: a second poll re-emits nothing.
+        // The recording was stopped and finalized; reception continues.
+        assert!(p.raw_recording_state().is_none());
+        let mut low = 0;
+        let mut stopped = 0;
+        while let Ok(ev) = event_rx.try_recv() {
+            match ev {
+                RuntimeEvent::DiskSpaceLow(id) if id == cid => low += 1,
+                RuntimeEvent::RecordingStoppedLowDisk(id) if id == cid => stopped += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((low, stopped), (1, 1));
+        // Debounced: a second poll in the same low episode does not re-report.
         p.check_disk_guard().await;
-        assert!(ev_rx.try_recv().is_err());
-
-        let _ = std::fs::remove_file(&path);
+        assert!(event_rx.try_recv().is_err());
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
-    // --- Match Rules & Triggers (§50.2, §165) ---
+    // --- Find & Triggers (§50.2, §165) ---
 
     fn byte_rule(name: &str, pattern: &[u8], actions: Vec<MatchAction>) -> MatchRule {
         MatchRule {
@@ -1551,203 +1196,165 @@ mod tests {
 
     #[test]
     fn notify_rule_records_a_diagnostic_logs_the_firing_and_emits_an_event() {
-        use crate::diagnostics::DiagnosticSeverity;
         let cid = ChannelId::new();
-        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel(8);
-        let rule = byte_rule(
-            "alarm",
-            b"ALARM",
-            vec![MatchAction::Notify {
-                severity: DiagnosticSeverity::Warning,
-            }],
-        );
-        let mut p = lf_pipeline(cid, PipelineCapacities::default())
-            .with_event_sender(ev_tx)
-            .with_match_rules(&[rule]);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let mut p = pipeline(cid, PipelineCapacities::default())
+            .with_match_rules(&[byte_rule(
+                "gga",
+                b"GGA",
+                vec![MatchAction::Notify {
+                    severity: crate::diagnostics::DiagnosticSeverity::Warning,
+                }],
+            )])
+            .with_event_sender(event_tx);
 
-        // A non-matching Message fires nothing.
-        p.ingest(bytes_chunk(cid, b"normal\n"));
-        assert_eq!(p.snapshot().matches.len(), 0);
-
-        // A matching Message: diagnostic recorded, firing logged, event emitted.
-        p.ingest(bytes_chunk(cid, b"ALARM\n"));
+        p.ingest(bytes_chunk(cid, b"$GPGLL,...")); // no match
+        p.ingest(bytes_chunk(cid, b"$GPGGA,...")); // match at stream offset 10
         assert_eq!(p.diagnostics().warnings().count(), 1);
-        let snap = p.snapshot();
-        assert_eq!(snap.matches.len(), 1);
-        assert_eq!(snap.matches[0].message_number, Some(2));
-
-        // The MessageReceived (#1, #2) and a MatchTriggered are on the stream.
+        let snapshot = p.snapshot();
+        assert_eq!(snapshot.matches.len(), 1);
+        // The firing is anchored at the matching chunk's stream offset (§50.2).
+        assert_eq!(snapshot.matches[0].byte_offset, Some(10));
         let mut saw_match = false;
-        while let Ok(ev) = ev_rx.try_recv() {
-            if let RuntimeEvent::MatchTriggered(c, r) = ev {
-                assert_eq!(c, cid);
-                assert_eq!(r, snap.matches[0].rule_id);
+        while let Ok(ev) = event_rx.try_recv() {
+            if matches!(ev, RuntimeEvent::MatchTriggered(id, _) if id == cid) {
                 saw_match = true;
             }
         }
-        assert!(saw_match, "a MatchTriggered event should have been emitted");
+        assert!(saw_match);
     }
 
     #[test]
     fn pause_display_rule_freezes_the_targeted_view() {
         let cid = ChannelId::new();
-        let rule = byte_rule(
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&[byte_rule(
             "freeze",
             b"STOP",
             vec![MatchAction::PauseDisplay { view: Some(0) }],
-        );
-        let mut p = lf_pipeline(cid, PipelineCapacities::default()).with_match_rules(&[rule]);
+        )]);
         assert!(!p.snapshot().display_views[0].paused);
-
-        p.ingest(bytes_chunk(cid, b"STOP\n"));
-        assert!(
-            p.snapshot().display_views[0].paused,
-            "the matching Message should pause the view (§50.2)"
-        );
+        p.ingest(bytes_chunk(cid, b"...STOP..."));
+        assert!(p.snapshot().display_views[0].paused);
     }
 
     #[test]
     fn idle_rule_fires_once_then_rearms_after_data() {
         let cid = ChannelId::new();
-        let rule = MatchRule {
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&[MatchRule {
             name: "quiet".to_string(),
             condition: MatchCondition::Idle { timeout_ms: 0 },
-            actions: vec![MatchAction::Mark],
+            actions: vec![MatchAction::Notify {
+                severity: crate::diagnostics::DiagnosticSeverity::Event,
+            }],
             enabled: true,
-        };
-        let mut p = lf_pipeline(cid, PipelineCapacities::default()).with_match_rules(&[rule]);
-
-        // Quiet since start (timeout 0): fires once, then latches.
+        }]);
+        // Quiet from creation: the idle rule fires once (offset is None).
+        p.evaluate_idle_rules(Instant::now());
         p.evaluate_idle_rules(Instant::now());
         assert_eq!(p.snapshot().matches.len(), 1);
-        p.evaluate_idle_rules(Instant::now());
-        assert_eq!(p.snapshot().matches.len(), 1, "idle latches — fires once");
-
-        // Data arrives (re-arms), then quiet again: it can fire a second time.
-        p.ingest(bytes_chunk(cid, b"x\n"));
-        p.evaluate_idle_rules(Instant::now());
+        assert_eq!(p.snapshot().matches[0].byte_offset, None);
+        // Data re-arms it; quiet again → a second firing.
+        p.ingest(bytes_chunk(cid, b"x"));
+        p.evaluate_idle_rules(Instant::now() + Duration::from_secs(1));
         assert_eq!(p.snapshot().matches.len(), 2);
     }
 
     #[tokio::test]
     async fn record_action_begins_and_stops_from_the_match_forward() {
-        let path = temp_path("match-record");
+        // §50.2/§158: Record{Begin} creates the armed recording lazily and captures
+        // only data from the match forward; Record{Stop} finalizes it.
         let cid = ChannelId::new();
-        let arming = RawRecordArming {
-            destination: path.clone(),
-            channel_name: "t".to_string(),
-            overwrite: OverwritePolicy::Overwrite,
-            timestamps: false,
-            file_rotation: FileRotationPolicy::None,
-            subsample: Subsample::None,
-            capacity: 16,
-        };
-        let begin = byte_rule(
-            "go",
-            b"GO",
-            vec![MatchAction::Record {
-                target: RecordTarget::Raw,
-                control: RecordControl::Begin,
-            }],
-        );
-        let stop = byte_rule(
-            "stop",
-            b"STOP",
-            vec![MatchAction::Record {
-                target: RecordTarget::Raw,
-                control: RecordControl::Stop,
-            }],
-        );
-        let mut p = lf_pipeline(cid, PipelineCapacities::default())
-            .with_match_rules(&[begin, stop])
-            .with_record_arming(arming);
+        let path = temp_path("armed");
+        let mut p = pipeline(cid, PipelineCapacities::default())
+            .with_match_rules(&[
+                byte_rule(
+                    "begin",
+                    b"BEGIN",
+                    vec![MatchAction::Record {
+                        target: RecordTarget::Raw,
+                        control: RecordControl::Begin,
+                    }],
+                ),
+                byte_rule(
+                    "stop",
+                    b"STOP",
+                    vec![MatchAction::Record {
+                        target: RecordTarget::Raw,
+                        control: RecordControl::Stop,
+                    }],
+                ),
+            ])
+            .with_record_arming(RawRecordArming {
+                destination: path.clone(),
+                channel_name: "armed".to_string(),
+                overwrite: OverwritePolicy::Refuse,
+                timestamps: false,
+                file_rotation: FileRotationPolicy::None,
+                capacity: 64,
+            });
 
-        // Lazy-create: nothing on disk before any match (§50.2 — no pre-match data).
-        assert!(!path.exists());
+        // Before the match: nothing on disk, nothing recorded.
+        p.ingest(bytes_chunk(cid, b"before "));
+        p.apply_pending_records().await;
+        assert!(p.raw_recording_state().is_none());
 
-        // Pre-match data is not recorded and creates no file.
-        p.ingest(bytes_chunk(cid, b"before\n"));
+        // The BEGIN chunk fires the rule; recording starts *from the match forward*
+        // (the BEGIN chunk itself is not backfilled, §158).
+        p.ingest(bytes_chunk(cid, b"BEGIN"));
         p.apply_pending_records().await;
-        assert!(!path.exists());
+        assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
+        p.ingest(bytes_chunk(cid, b"captured"));
 
-        // The match itself arms recording; its own chunk was tapped before the
-        // recorder existed, so capture starts from the next chunk forward.
-        p.ingest(bytes_chunk(cid, b"GO\n"));
+        // STOP finalizes; later data is not written.
+        p.ingest(bytes_chunk(cid, b"STOP"));
         p.apply_pending_records().await;
-        p.ingest(bytes_chunk(cid, b"DATA\n"));
-        p.apply_pending_records().await;
-
-        // The stop match finalizes; data after it is not recorded.
-        p.ingest(bytes_chunk(cid, b"STOP\n"));
-        p.apply_pending_records().await;
-        p.ingest(bytes_chunk(cid, b"after\n"));
-        p.apply_pending_records().await;
+        assert!(p.raw_recording_state().is_none());
+        p.ingest(bytes_chunk(cid, b"after"));
         p.finish().await;
 
-        let contents = String::from_utf8(std::fs::read(&path).unwrap()).unwrap();
-        assert!(contents.contains("DATA"), "data after Begin is captured");
-        assert!(!contents.contains("before"), "no pre-match backfill (§158)");
-        assert!(
-            !contents.contains("GO"),
-            "the arming Message itself is not retro-captured"
-        );
-        assert!(
-            !contents.contains("after"),
-            "nothing after Stop is captured"
-        );
-        let _ = std::fs::remove_file(&path);
+        let written = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(written, b"capturedSTOP");
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]
     async fn mark_action_annotates_the_display_recording_not_the_raw_stream() {
-        use crate::display::DisplayView;
-        use crate::record::{
-            start_display_recording, start_raw_recording, DisplayFileRecorder, RawFileRecorder,
-        };
-
-        let disp_path = temp_path("mark-disp");
-        let raw_path = temp_path("mark-raw");
+        // §50.2: Mark writes a marker into the display recording (`.disp`) but
+        // never the raw byte stream, which stays byte-exact.
+        use crate::record::{start_display_recording, DisplayFileRecorder};
         let cid = ChannelId::new();
-
-        let disp = DisplayFileRecorder::create(&disp_path, OverwritePolicy::Overwrite, false)
+        let raw_path = temp_path("mark-raw");
+        let disp_path = temp_path("mark-disp");
+        let raw = RawFileRecorder::create(&raw_path, OverwritePolicy::Refuse, false)
             .await
             .unwrap();
-        let raw = RawFileRecorder::create(&raw_path, OverwritePolicy::Overwrite, false)
+        let disp = DisplayFileRecorder::create(&disp_path, OverwritePolicy::Refuse, false)
             .await
             .unwrap();
+        let mut p = pipeline(cid, PipelineCapacities::default())
+            .with_raw_recorder(start_raw_recording(raw, 64))
+            .with_match_rules(&[byte_rule("mark", b"HERE", vec![MatchAction::Mark])]);
+        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
 
-        let rule = byte_rule("mark", b"HIT", vec![MatchAction::Mark]);
-        let mut p = lf_pipeline(cid, PipelineCapacities::default())
-            .with_raw_recorder(start_raw_recording(raw, 16))
-            .with_match_rules(&[rule]);
-        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 16));
-
-        p.ingest(bytes_chunk(cid, b"HIT\n"));
+        p.ingest(bytes_chunk(cid, b"data HERE data"));
         p.finish().await;
 
-        // The marker lands in the Display Recording (.disp)…
-        let disp_text = tokio::fs::read_to_string(&disp_path).await.unwrap();
-        assert!(
-            disp_text.contains("MARK"),
-            "mark annotates the .disp stream"
-        );
-        // …but the raw .dat stays byte-exact — no marker bytes injected (§5.6/§49).
-        let raw_bytes = tokio::fs::read(&raw_path).await.unwrap();
-        assert_eq!(raw_bytes, b"HIT\n", "raw .dat is untouched by Mark");
-
-        let _ = tokio::fs::remove_file(&disp_path).await;
+        let raw_written = tokio::fs::read(&raw_path).await.unwrap();
+        assert_eq!(raw_written, b"data HERE data"); // byte-exact, no marker
+        let disp_written = tokio::fs::read_to_string(&disp_path).await.unwrap();
+        assert!(disp_written.contains("MARK rule="));
         let _ = tokio::fs::remove_file(&raw_path).await;
+        let _ = tokio::fs::remove_file(&disp_path).await;
     }
 
     #[tokio::test]
-    async fn transport_to_extractor_queue_is_bounded() {
-        // §97.1: the Transport→Extractor edge is the only one that may stall the
-        // reader. A bounded channel rejects when full; the production path uses
-        // `blocking_send`/`send().await`, which awaits (stalls) instead of erroring.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<u32>(1);
-        tx.try_send(1).unwrap();
-        assert!(tx.try_send(2).is_err()); // full → bounded backpressure
-        assert_eq!(rx.recv().await, Some(1)); // draining frees a slot
-        tx.try_send(2).unwrap();
+    async fn transport_to_pipeline_queue_is_bounded() {
+        // §99: the ingest queue is the bounded backpressure edge; try_send on a
+        // full queue is refused rather than growing without bound.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ReceivedData>(2);
+        let cid = ChannelId::new();
+        assert!(tx.try_send(bytes_chunk(cid, b"1")).is_ok());
+        assert!(tx.try_send(bytes_chunk(cid, b"2")).is_ok());
+        assert!(tx.try_send(bytes_chunk(cid, b"3")).is_err());
     }
 }

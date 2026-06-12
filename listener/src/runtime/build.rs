@@ -1,7 +1,7 @@
 //! Map validated configuration to live runtime objects (spec §128 — the runtime
 //! owns this mapping, not config).
 //!
-//! Pure and synchronous: it constructs extractors and *unopened*
+//! Pure and synchronous: it constructs *unopened*
 //! transports from a [`ChannelConfig`](crate::config::ChannelConfig). Opening /
 //! binding is async and happens at Start in the orchestrator (§8.2, §71). Serial
 //! parameters that `serialport` cannot represent (Mark/Space parity, 1.5 stop
@@ -12,12 +12,11 @@ use std::net::SocketAddr;
 use serialport::{DataBits, FlowControl, Parity, StopBits};
 
 use crate::config::schema::{
-    DataBits as CfgDataBits, DisplayViewConfig, ExtractionConfig, FlowControl as CfgFlowControl,
-    Parity as CfgParity, SerialConfig, StopBits as CfgStopBits, TcpListenerConfig, UdpConfig,
+    DataBits as CfgDataBits, DisplayViewConfig, FlowControl as CfgFlowControl, Parity as CfgParity,
+    SerialConfig, StopBits as CfgStopBits, TcpListenerConfig, UdpConfig,
 };
 use crate::core::ChannelId;
 use crate::display::DisplayView;
-use crate::extract::{DelimiterExtractor, FixedLengthExtractor, MessageExtractor, StreamExtractor};
 use crate::transport::serial::SerialTransport;
 use crate::transport::tcp::TcpListenerTransport;
 use crate::transport::udp::UdpTransport;
@@ -35,24 +34,6 @@ pub enum BuildError {
     InvalidMulticastGroup(String),
     #[error("invalid multicast interface address {0:?}")]
     InvalidMulticastInterface(String),
-}
-
-/// Build the extractor for a Channel (§20).
-pub fn build_extractor(config: &ExtractionConfig) -> Box<dyn MessageExtractor + Send> {
-    match config {
-        ExtractionConfig::Stream => Box::new(StreamExtractor::new()),
-        ExtractionConfig::Delimiter {
-            delimiter,
-            include_delimiter,
-        } => Box::new(DelimiterExtractor::new(
-            delimiter.clone(),
-            *include_delimiter,
-        )),
-        ExtractionConfig::FixedLength {
-            length,
-            sync_marker,
-        } => Box::new(FixedLengthExtractor::new(*length, sync_marker.clone())),
-    }
 }
 
 /// Build a Display View renderer from its config (§47, §78). Visual-only fields
@@ -166,13 +147,7 @@ pub fn build_tcp_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{ChannelId, ChunkTime};
-
-    #[test]
-    fn stream_extractor_emits_nothing() {
-        let mut ex = build_extractor(&ExtractionConfig::Stream);
-        assert!(ex.push_chunk(b"anything", ChunkTime::now()).is_empty());
-    }
+    use crate::core::ChannelId;
 
     #[test]
     fn unsupported_serial_parameters_are_rejected() {

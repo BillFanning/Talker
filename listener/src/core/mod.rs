@@ -8,11 +8,11 @@
 pub mod command;
 pub mod error;
 pub mod ids;
-pub mod message;
 pub mod state;
+pub mod timing;
 
 pub use command::{RuntimeCommand, RuntimeEvent};
 pub use error::{ErrorCategory, RecordError};
 pub use ids::{ChannelId, ChannelName, DisplayViewId, MatchRuleId, StableConfigId};
-pub use message::{ChunkTime, Message, MessageBytes, MessageMetadata, MessageTimestamp};
 pub use state::{ChannelKind, ChannelState, DisplayState, RecordingState};
+pub use timing::{ChunkTime, MessageTimestamp};

@@ -3,7 +3,6 @@ pub mod config;
 pub mod core;
 pub mod diagnostics;
 pub mod display;
-pub mod extract;
 pub mod gui;
 pub mod record;
 pub mod retention;

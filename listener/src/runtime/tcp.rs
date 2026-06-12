@@ -10,8 +10,7 @@
 //!   connection and raises a `ConnectionRejected` warning (§93) without faulting
 //!   the listener;
 //! - emits `TcpClientConnected` / `TcpClientDisconnected` lifecycle events
-//!   (§137), routing every connection's `MessageReceived` into the same shared
-//!   event stream;
+//!   (§137), routing every connection's events into the same shared event stream;
 //! - on stop, stops accepting and then stops every live connection (§110, §13).
 //!
 //! Connection channels are runtime-only and never persisted (§16.3).
@@ -22,9 +21,7 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::Subsample;
 use crate::core::{ChannelId, RuntimeEvent};
-use crate::extract::MessageExtractor;
 use crate::transport::tcp::{BoundTcpListenerTransport, TcpConnectionTransport};
 use crate::transport::{ConnectionAcceptorRunner, NewConnection, TransportOutcome};
 
@@ -59,24 +56,17 @@ impl TcpListenerHandle {
 
 /// Start a TCP listener and supervise its connection channels (§16).
 ///
-/// `make_extractor` builds a fresh extractor per connection, so each accepted
-/// connection inherits the listener's configured extraction with independent
-/// state (§16.2). All events —
-/// lifecycle and per-connection `MessageReceived` — flow into `events`.
+/// All lifecycle events flow into `events`.
 ///
 /// Per-connection **recording** is not wired: each connection would need a
 /// distinct destination file, which depends on filename templating (§59,
 /// deferred). Accepted connections are therefore unrecorded for now.
-pub fn start_tcp_listener<F>(
+pub fn start_tcp_listener(
     bound: BoundTcpListenerTransport,
-    make_extractor: F,
     caps: PipelineCapacities,
     max_connections: Option<u32>,
     events: Sender<RuntimeEvent>,
-) -> TcpListenerHandle
-where
-    F: Fn() -> Box<dyn MessageExtractor + Send> + Send + 'static,
-{
+) -> TcpListenerHandle {
     let listener_id = bound.channel_id();
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
@@ -116,14 +106,12 @@ where
                         let tasks = spawn_channel_tasks(
                             conn_id,
                             transport,
-                            make_extractor(),
                             // Per-connection recording is deferred (distinct files
                             // per connection need §59 filename templates).
                             None,
                             None,
-                            // One default Display View per connection; per-connection
-                            // display subsampling inheritance is deferred (§50.1).
-                            vec![Subsample::None],
+                            // One default Display View per connection.
+                            1,
                             None, // per-connection recording (and its guard) deferred
                             // Per-connection Match Rules are deferred (§50.2): rules
                             // are per-listener config; wiring them per accepted
@@ -193,9 +181,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::{DelimiterExtractor, StreamExtractor};
     use crate::transport::tcp::TcpListenerTransport;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
@@ -207,19 +194,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_lifecycle_emits_connected_message_and_disconnected() {
+    async fn connection_lifecycle_emits_connected_and_disconnected() {
         let bound = bound_listener().await;
         let addr = bound.local_addr().unwrap();
         let listener_id = bound.channel_id();
         let (ev_tx, mut ev_rx) = mpsc::channel(64);
 
-        let handle = start_tcp_listener(
-            bound,
-            || Box::new(DelimiterExtractor::new(vec![b'\n'], false)),
-            PipelineCapacities::default(),
-            None,
-            ev_tx,
-        );
+        let handle = start_tcp_listener(bound, PipelineCapacities::default(), None, ev_tx);
 
         let mut client = TcpStream::connect(addr).await.unwrap();
 
@@ -231,14 +212,10 @@ mod tests {
             other => panic!("expected TcpClientConnected, got {other:?}"),
         };
 
-        client.write_all(b"hello\n").await.unwrap();
-        match ev_rx.recv().await.unwrap() {
-            RuntimeEvent::MessageReceived(id, number) => {
-                assert_eq!(id, conn_id);
-                assert_eq!(number, 1);
-            }
-            other => panic!("expected MessageReceived, got {other:?}"),
-        }
+        // Stream-only (ADR-010): bytes are ingested verbatim and do not raise a
+        // per-message event. Writing exercises the connection channel's ingest
+        // path; the connection stays healthy until the client disconnects.
+        client.write_all(b"hello").await.unwrap();
 
         drop(client); // client disconnects → EOF
         match ev_rx.recv().await.unwrap() {
@@ -256,13 +233,7 @@ mod tests {
         let listener_id = bound.channel_id();
         let (ev_tx, mut ev_rx) = mpsc::channel(64);
 
-        let handle = start_tcp_listener(
-            bound,
-            || Box::new(StreamExtractor::new()),
-            PipelineCapacities::default(),
-            Some(1),
-            ev_tx,
-        );
+        let handle = start_tcp_listener(bound, PipelineCapacities::default(), Some(1), ev_tx);
 
         // First client accepted.
         let _c1 = TcpStream::connect(addr).await.unwrap();
@@ -282,43 +253,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connections_are_independent_with_per_connection_numbering() {
+    async fn connections_are_independent_channels() {
         let bound = bound_listener().await;
         let addr = bound.local_addr().unwrap();
         let (ev_tx, mut ev_rx) = mpsc::channel(128);
 
-        let handle = start_tcp_listener(
-            bound,
-            || Box::new(DelimiterExtractor::new(vec![b'\n'], false)),
-            PipelineCapacities::default(),
-            None,
-            ev_tx,
-        );
+        let handle = start_tcp_listener(bound, PipelineCapacities::default(), None, ev_tx);
 
         let mut c1 = TcpStream::connect(addr).await.unwrap();
         let mut c2 = TcpStream::connect(addr).await.unwrap();
-        c1.write_all(b"a\n").await.unwrap();
-        c2.write_all(b"b\n").await.unwrap();
+        c1.write_all(b"a").await.unwrap();
+        c2.write_all(b"b").await.unwrap();
 
-        // Events from two connections interleave; collect by counts.
+        // Each accepted client becomes its own connection channel (Model A, §16.4):
+        // two clients yield two distinct connection ids.
         let mut connected: HashSet<ChannelId> = HashSet::new();
-        let mut numbers: HashMap<ChannelId, u64> = HashMap::new();
-        while connected.len() < 2 || numbers.len() < 2 {
-            match ev_rx.recv().await.unwrap() {
-                RuntimeEvent::TcpClientConnected(id) => {
-                    connected.insert(id);
-                }
-                RuntimeEvent::MessageReceived(id, number) => {
-                    numbers.insert(id, number);
-                }
-                _ => {}
+        while connected.len() < 2 {
+            if let RuntimeEvent::TcpClientConnected(id) = ev_rx.recv().await.unwrap() {
+                connected.insert(id);
             }
         }
 
         assert_eq!(connected.len(), 2, "two distinct connection channels");
-        assert_eq!(numbers.len(), 2);
-        // Each connection numbers independently from 1 (Model A, §16.2).
-        assert!(numbers.values().all(|&n| n == 1));
 
         handle.stop().await;
     }

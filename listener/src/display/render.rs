@@ -1,12 +1,8 @@
 //! Raw, Rendered, and Hex rendering plus the four character-rendering modes
 //! and wrapping (spec §42–§46), and the configured [`DisplayView`] renderer.
 
-use crate::core::Message;
-
 use super::encoding::decode;
-use super::{
-    CharacterRendering, DisplayEncoding, DisplayMode, RenderedOutput, Renderer, WrappingMode,
-};
+use super::{CharacterRendering, DisplayEncoding, DisplayMode, RenderedOutput, WrappingMode};
 
 /// ASCII control mnemonics for 0x00..=0x1F (index == code point).
 const CONTROL_NAMES: [&str; 32] = [
@@ -202,7 +198,7 @@ impl DisplayView {
         }
     }
 
-    /// Render a Stream-data view: no Message number or timestamp (§18, §41).
+    /// Render a span of stream bytes for this view (§41, §141).
     pub fn render_stream(
         &self,
         channel_id: crate::core::ChannelId,
@@ -210,20 +206,8 @@ impl DisplayView {
     ) -> RenderedOutput {
         RenderedOutput {
             channel_id,
-            message_number: None,
             text: self.render_text(bytes),
             timestamp: None,
-        }
-    }
-}
-
-impl Renderer for DisplayView {
-    fn render(&self, message: &Message) -> RenderedOutput {
-        RenderedOutput {
-            channel_id: message.channel_id,
-            message_number: Some(message.number),
-            text: self.render_text(&message.bytes),
-            timestamp: Some(message.metadata.arrival_timestamp),
         }
     }
 }
@@ -300,25 +284,11 @@ mod tests {
     }
 
     #[test]
-    fn renderer_trait_carries_number_and_channel() {
-        use crate::core::{ChannelId, ChunkTime, MessageMetadata, MessageTimestamp};
-        use std::sync::Arc;
-
+    fn render_stream_carries_channel_and_text() {
+        use crate::core::ChannelId;
         let cid = ChannelId::new();
-        let msg = Message {
-            channel_id: cid,
-            number: 7,
-            bytes: Arc::from(b"hi".as_slice()),
-            metadata: MessageMetadata {
-                total_byte_count: 2,
-                arrival_timestamp: MessageTimestamp::from(ChunkTime::now()),
-                reception_duration: None,
-            },
-        };
-        let out = view(DisplayMode::Raw, CharacterRendering::Native).render(&msg);
+        let out = view(DisplayMode::Raw, CharacterRendering::Native).render_stream(cid, b"hi");
         assert_eq!(out.channel_id, cid);
-        assert_eq!(out.message_number, Some(7));
         assert_eq!(out.text, "hi");
-        assert!(out.timestamp.is_some());
     }
 }
