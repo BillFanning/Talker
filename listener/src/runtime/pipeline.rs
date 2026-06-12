@@ -333,14 +333,14 @@ impl ChannelPipeline {
             }
         }
 
-        // 4. Find/triggers (§50.2): evaluate `BytePattern` rules against this
-        // chunk's bytes, anchored at the chunk's stream offset. Cross-chunk carry
-        // (matching a pattern split across two reads) is not yet wired — the scan
-        // is per-chunk; see listener TODO "v2 feature gaps".
+        // 4. Find/triggers (§50.2): evaluate `BytePattern` rules against this chunk,
+        // matching **across the previous chunk's boundary** via the rule set's
+        // carry. Each firing carries its true match start offset (which may fall in
+        // the prior chunk for a boundary split) and a flag the measurement uses.
         if !self.match_rules.is_empty() {
-            let fired = self.match_rules.evaluate_message(bytes);
+            let fired = self.match_rules.evaluate_stream(bytes, chunk_offset);
             if !fired.is_empty() {
-                self.apply_fired_rules(fired, Some(chunk_offset));
+                self.apply_fired_rules(fired);
             }
         }
     }
@@ -349,15 +349,33 @@ impl ChannelPipeline {
     /// `Notify`, `Mark`, `PauseDisplay`, `Highlight` — take effect immediately;
     /// `Record` actions are queued for asynchronous application (file I/O). Every
     /// firing is observable: it is logged for the snapshot and emits a
-    /// `MatchTriggered` event (§137). `byte_offset` is `None` for an idle firing.
-    fn apply_fired_rules(&mut self, fired: Vec<FiredRule>, byte_offset: Option<u64>) {
+    /// `MatchTriggered` event (§137). Each firing carries its own byte offset
+    /// (`None` for an idle firing); a boundary-split firing also records the
+    /// where/why measurement diagnostic.
+    fn apply_fired_rules(&mut self, fired: Vec<FiredRule>) {
         for rule in fired {
+            let byte_offset = rule.match_offset;
             self.recent_matches.push(TriggeredMatch {
                 rule_id: rule.id,
                 byte_offset,
             });
             if let Some(events) = &self.events {
                 let _ = events.try_send(RuntimeEvent::MatchTriggered(self.channel_id, rule.id));
+            }
+            // Measurement (§50.2): when a match was a cross-chunk boundary split,
+            // record *where* (the stream offset) and *why* (the split) so an
+            // operator can see that read-chunk boundaries are splitting patterns —
+            // and, via `boundary_saves` in the snapshot, *how often*. An info-level
+            // diagnostic: it is a recovered match, not a fault.
+            if rule.boundary_split {
+                let at = byte_offset
+                    .map(|n| format!(" at stream offset {n}"))
+                    .unwrap_or_default();
+                self.diagnostics.record(Diagnostic::event(format!(
+                    "match rule {} on channel {} spanned a read-chunk boundary{at} \
+                     (recovered by cross-chunk carry)",
+                    rule.id, self.channel_id
+                )));
             }
             for action in &rule.actions {
                 match action {
@@ -440,7 +458,7 @@ impl ChannelPipeline {
         let idle_for = now.saturating_duration_since(last);
         let fired = self.match_rules.evaluate_idle(idle_for);
         if !fired.is_empty() {
-            self.apply_fired_rules(fired, None);
+            self.apply_fired_rules(fired);
         }
     }
 
@@ -663,6 +681,7 @@ impl ChannelPipeline {
             warning_count: self.diagnostics.warnings().count(),
             error_count: self.diagnostics.errors().count(),
             raw_recording: self.raw_recording_state(),
+            match_boundary_saves: self.match_rules.boundary_saves(),
         }
     }
 
@@ -688,6 +707,7 @@ impl ChannelPipeline {
             raw_recording: self.raw_recording_state(),
             activity: self.activity.snapshot(Instant::now()),
             matches: self.recent_matches.iter().copied().collect(),
+            match_boundary_saves: self.match_rules.boundary_saves(),
             stream_tail: self.stream_buf.iter().copied().collect(),
         }
     }
@@ -1209,13 +1229,65 @@ mod tests {
             )])
             .with_event_sender(event_tx);
 
-        p.ingest(bytes_chunk(cid, b"$GPGLL,...")); // no match
-        p.ingest(bytes_chunk(cid, b"$GPGGA,...")); // match at stream offset 10
+        p.ingest(bytes_chunk(cid, b"$GPGLL,...")); // no match (10 bytes, offsets 0..9)
+        p.ingest(bytes_chunk(cid, b"$GPGGA,...")); // "GGA" at chunk index 3 → offset 13
         assert_eq!(p.diagnostics().warnings().count(), 1);
         let snapshot = p.snapshot();
         assert_eq!(snapshot.matches.len(), 1);
-        // The firing is anchored at the matching chunk's stream offset (§50.2).
-        assert_eq!(snapshot.matches[0].byte_offset, Some(10));
+        // The firing is anchored at the match's exact stream offset (§50.2): chunk 2
+        // starts at offset 10 and "GGA" begins 3 bytes into it.
+        assert_eq!(snapshot.matches[0].byte_offset, Some(13));
+        // A within-chunk match is not a boundary split.
+        assert_eq!(snapshot.match_boundary_saves, 0);
+        let mut saw_match = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            if matches!(ev, RuntimeEvent::MatchTriggered(id, _) if id == cid) {
+                saw_match = true;
+            }
+        }
+        assert!(saw_match);
+    }
+
+    #[test]
+    fn byte_pattern_spanning_two_chunks_fires_and_is_measured() {
+        // §50.2 cross-chunk carry: a pattern split across two received chunks still
+        // matches, anchors on its true start offset, and is counted + diagnosed as a
+        // boundary save (where / why / how often).
+        let cid = ChannelId::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let mut p = pipeline(cid, PipelineCapacities::default())
+            .with_match_rules(&[byte_rule(
+                "gga",
+                b"GGA",
+                vec![MatchAction::Notify {
+                    severity: crate::diagnostics::DiagnosticSeverity::Warning,
+                }],
+            )])
+            .with_event_sender(event_tx);
+
+        // "GG" ends chunk 1 (offsets 0..4); "A" begins chunk 2 (offset 5). A per-
+        // chunk scan would miss "GGA"; the carry recovers it.
+        p.ingest(bytes_chunk(cid, b"$GPGG"));
+        assert_eq!(
+            p.snapshot().matches.len(),
+            0,
+            "nothing fires within chunk 1"
+        );
+        p.ingest(bytes_chunk(cid, b"A,123"));
+
+        let snap = p.snapshot();
+        assert_eq!(snap.matches.len(), 1, "the split pattern fires on chunk 2");
+        // "GGA" starts at stream offset 3 (inside chunk 1).
+        assert_eq!(snap.matches[0].byte_offset, Some(3));
+        // How often: exactly one boundary save measured.
+        assert_eq!(snap.match_boundary_saves, 1);
+        // Where / why: an event diagnostic records the offset and the cause.
+        let boundary_note = p
+            .diagnostics()
+            .events()
+            .any(|d| d.message.contains("read-chunk boundary") && d.message.contains("offset 3"));
+        assert!(boundary_note, "a where/why diagnostic is recorded");
+        // The recovered match still emits a normal MatchTriggered event.
         let mut saw_match = false;
         while let Ok(ev) = event_rx.try_recv() {
             if matches!(ev, RuntimeEvent::MatchTriggered(id, _) if id == cid) {

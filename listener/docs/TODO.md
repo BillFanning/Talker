@@ -41,8 +41,8 @@ Message-model removal). Everything below this block is verified done:
 - [x] Config schema: drop `extraction`/`decoder`/`subsample`/view `source`/`annotations`;
       byte-based `RetentionConfig`; **bump `schema_version`**, refuse v1 (§72)
 - [x] Re-root Find & Triggers on the stream: `BytePattern` + `Idle`;
-      matches anchored on `byte_offset` (§50.2). _Cross-chunk carry still pending —
-      see feature gaps._
+      matches anchored on `byte_offset` (§50.2). Cross-chunk carry now wired (a
+      pattern split across two reads matches; see below).
 - [x] GUI: remove framing selector, NMEA-decode toggle, Stream↔Messages source switch,
       per-message #/timestamp toggles; the Stream viewer is the only viewer
 - [x] Events: drop `MessageReceived`; liveness stays byte-based (§137, §166)
@@ -54,9 +54,13 @@ Message-model removal). Everything below this block is verified done:
 
 ## v2 feature gaps (after the strip)
 
-- [ ] Find & Triggers runtime: cross-chunk `BytePattern` scanner **with carry** —
-      today the scan is per receive-chunk, so a pattern split across two reads does
-      not match (§50.2). Byte-offset match records already land in the snapshot.
+- [x] Find & Triggers runtime: cross-chunk `BytePattern` scanner **with carry** —
+      a pattern split across two reads now matches (`MatchRuleSet` keeps the prior
+      chunk's tail and scans `carry ++ chunk`, reporting only matches ending in the
+      new chunk). Each firing carries its true `match_offset`. **Measurement:** a
+      boundary-split firing records a where/why event diagnostic and increments
+      `match_boundary_saves`, surfaced in both `ChannelStats` and `ChannelSnapshot`
+      (the how-often). `reset_stream` drops the carry on Stop/Start.
 - [ ] Highlight rendering in the stream view (byte-range styling)
 - [ ] `Mark` markers in display + `.disp` (never `.raw`)
 - [ ] Live `Record` begin/stop via `EnableRecording`/`DisableRecording` (no restart)

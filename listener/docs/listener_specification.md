@@ -908,7 +908,7 @@ enum MatchCondition {
 }
 ```
 
-`BytePattern` scans the live stream and matches **across receive-chunk boundaries** (a pattern split between two reads still matches). `Idle` uses the per-Channel activity monitor (§166): it fires once when the stream has been quiet for `timeout` and re-arms when data resumes. (The former `DecodedField` and `MessageSize` conditions are removed with the decoder/message infrastructure.)
+`BytePattern` scans the live stream and matches **across receive-chunk boundaries** (a pattern split between two reads still matches): the runtime retains the previous chunk's tail (the longest enabled pattern minus one byte) and scans it joined to each new chunk, reporting matches once. A match that only completes because of that carry — its first byte lay in the previous chunk — is a **boundary split**: it is recovered (not lost), its firing anchors on the match's true start offset, and it is **measured** so an operator can see read boundaries splitting their patterns. Each boundary split records an event Diagnostic naming *where* (the stream offset) and *why* (the chunk-boundary split), and increments a monotonic `match_boundary_saves` counter exposed in the Channel's stats and snapshot (*how often*). `Idle` uses the per-Channel activity monitor (§166): it fires once when the stream has been quiet for `timeout` and re-arms when data resumes. (The former `DecodedField` and `MessageSize` conditions are removed with the decoder/message infrastructure.)
 
 **Actions:**
 

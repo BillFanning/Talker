@@ -281,6 +281,7 @@ mod tests {
                 total_bytes,
             },
             matches: vec![],
+            match_boundary_saves: 0,
             stream_tail: Vec::new().into(),
         }
     }

@@ -49,6 +49,11 @@ pub struct ChannelStats {
     pub error_count: usize,
     /// Raw-recording state, or `None` when raw recording isn't attached (§53).
     pub raw_recording: Option<RecordingState>,
+    /// How many `BytePattern` matches were recovered only because a pattern spanned
+    /// a read-chunk boundary (§50.2) — the cross-chunk-carry measurement. A nonzero,
+    /// rising count tells an operator that read boundaries are routinely splitting
+    /// the patterns they search for (the "how often").
+    pub match_boundary_saves: u64,
 }
 
 /// A point-in-time, owned copy of one Channel's observable pipeline state.
@@ -69,8 +74,12 @@ pub struct ChannelSnapshot {
     /// Liveness facts: rolling throughput + last-data time (§91.1, §166).
     pub activity: ChannelActivity,
     /// Recent Match Rule firings, oldest → newest, bounded (§50.2, §165). A GUI
-    /// cross-references these against retained Messages to highlight/annotate.
+    /// cross-references these against the stream tail to highlight/annotate.
     pub matches: Vec<TriggeredMatch>,
+    /// How many `BytePattern` matches were recovered only because a pattern spanned
+    /// a read-chunk boundary (§50.2). The aggregate "how often" of the cross-chunk
+    /// measurement; per-occurrence detail (where/why) is in `diagnostics`.
+    pub match_boundary_saves: u64,
     /// The most recent verbatim **pre-extraction** bytes, oldest → newest, byte-
     /// capped (§88 count-retention doesn't apply — there are no Message boundaries).
     /// Feeds the Stream display source (ADR-009, §18/§41): rendering it reconstructs
