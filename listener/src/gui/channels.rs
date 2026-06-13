@@ -201,10 +201,12 @@ impl ListenerApp {
 
     /// Always prompt for a destination, then save there and remember it as the
     /// current profile path. The picker runs synchronously on the UI thread (a brief
-    /// modal); the actual file write happens off-thread in the driver (§67).
+    /// modal); the actual file write happens off-thread in the driver (§67). Defaults
+    /// to the app's `profiles/` directory (next to the exe) on first use.
     pub(super) fn save_profile_as(&mut self) {
         let mut dialog = rfd::FileDialog::new().add_filter("TOML profile", &["toml"]);
-        // Seed the picker with the current file's name/location if we have one.
+        // Seed the picker with the current file's name/location if we have one;
+        // otherwise default to the app profiles directory.
         dialog = match self.current_profile_path.as_ref() {
             Some(path) => {
                 if let Some(dir) = path.parent() {
@@ -216,7 +218,12 @@ impl ListenerApp {
                     .unwrap_or("listener.toml");
                 dialog.set_file_name(name)
             }
-            None => dialog.set_file_name("listener.toml"),
+            None => {
+                if let Some(dir) = profiles_dir() {
+                    dialog = dialog.set_directory(dir);
+                }
+                dialog.set_file_name("listener.toml")
+            }
         };
         if let Some(path) = dialog.save_file() {
             self.current_profile_path = Some(path.clone());
@@ -226,14 +233,36 @@ impl ListenerApp {
 
     /// Open a native "load profile" dialog and, if the user picks a file, send the
     /// LoadProfile command (which replaces the workspace, §70) and remember the path
-    /// as the current profile.
+    /// as the current profile. Defaults to the app's `profiles/` directory.
     fn load_profile_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("TOML profile", &["toml"])
-            .pick_file()
-        {
+        let mut dialog = rfd::FileDialog::new().add_filter("TOML profile", &["toml"]);
+        // Open in the last-used profile's directory, else the app profiles directory.
+        let start = self
+            .current_profile_path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .or_else(profiles_dir);
+        if let Some(dir) = start {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.pick_file() {
             self.current_profile_path = Some(path.clone());
             self.send(UiCommand::LoadProfile(path));
         }
     }
+}
+
+/// The app's profile directory: `profiles/` beside the running executable. Created
+/// best-effort if absent (it's just the picker's starting folder). Returns `None`
+/// if the exe path can't be resolved or the directory can't be created — e.g. the
+/// app was installed somewhere read-only — in which case the picker opens at the
+/// OS default rather than failing.
+fn profiles_dir() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.join("profiles");
+    // Best-effort: if it exists already this is a no-op; if creation fails, fall back.
+    if !dir.exists() && std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    Some(dir)
 }
