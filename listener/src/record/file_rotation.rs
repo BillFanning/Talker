@@ -226,7 +226,7 @@ impl DisplayRecorder for RotatingDisplayRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{ChannelId, ChunkTime, MessageTimestamp};
+    use crate::core::{ChannelId, ChunkTime, ChunkTimestamp};
     use crate::transport::ReceivedPayload;
     use chrono::TimeZone;
     use std::time::Instant;
@@ -345,7 +345,7 @@ mod tests {
         let render = |text: &str, at: SystemTime| RenderedOutput {
             channel_id: ChannelId::new(),
             text: text.to_string(),
-            timestamp: Some(MessageTimestamp {
+            timestamp: Some(ChunkTimestamp {
                 monotonic: Instant::now(),
                 wall_clock: at,
             }),

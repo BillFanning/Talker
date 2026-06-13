@@ -17,7 +17,7 @@ mod render;
 
 pub use render::DisplayView;
 
-use crate::core::{ChannelId, MessageTimestamp};
+use crate::core::{ChannelId, ChunkTimestamp};
 
 /// Display Mode — how received data is assembled for a view (§42).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -70,5 +70,5 @@ pub struct RenderedOutput {
     /// The rendered text for this view (Raw/Rendered/Hex, §42).
     pub text: String,
     /// Arrival timestamp, if the view writes inline timestamps (§57).
-    pub timestamp: Option<MessageTimestamp>,
+    pub timestamp: Option<ChunkTimestamp>,
 }

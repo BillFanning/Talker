@@ -1,6 +1,6 @@
 [package]
 name        = "listener"
-description = "Receive and decode byte-oriented data from serial and network connections"
+description = "Receive byte-oriented data streams from serial and network connections"
 version.workspace     = true
 edition.workspace     = true
 authors.workspace     = true

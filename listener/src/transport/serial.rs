@@ -309,7 +309,7 @@ impl BlockingReader for SerialReader {
 }
 
 /// The dedicated-thread receive loop (§97.1). Runs until cancelled, the reader
-/// reports a fatal error, or the extractor channel closes.
+/// reports a fatal error, or the pipeline channel closes.
 ///
 /// On the Transport→Pipeline edge — the only one permitted to backpressure the
 /// reader (§99) — the loop *stalls* rather than drops, so it loses nothing in

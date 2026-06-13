@@ -50,7 +50,7 @@ Message-model removal). Everything below this block is verified done:
       recording, rotation, backpressure, control lines, reconnect, liveness. Also
       removed the `Message`/`MessageBytes`/`MessageMetadata` model and
       `MessageRetention`; renamed `core/message.rs` → `core/timing.rs` (keeps the
-      still-needed `ChunkTime` / `MessageTimestamp`).
+      still-needed `ChunkTime` / `ChunkTimestamp`).
 
 ## v2 feature gaps (after the strip)
 
@@ -63,6 +63,13 @@ Message-model removal). Everything below this block is verified done:
       (the how-often). `reset_stream` drops the carry on Stop/Start.
 - [ ] Highlight rendering in the stream view (byte-range styling)
 - [ ] `Mark` markers in display + `.disp` (never `.raw`)
+- [ ] Match-`Record` to a Display/`Both` target: arm the display recorder. The
+      `RecordTarget::Display`/`Both` variants exist and the pipeline accepts them,
+      but only the Raw side is driven today (`apply_pending_records` skips
+      display-only); the display portion needs per-view display-recorder arming.
+- [ ] `DisplayViewConfig.hex_grouping` (spec §1431): the field is documented but
+      not yet in the config schema, so profiles can't round-trip it. Add with
+      `#[serde(default)]` when the Hex-view grouping control is wired.
 - [ ] Live `Record` begin/stop via `EnableRecording`/`DisableRecording` (no restart)
 - [ ] Recording timestamp sidecar for `.raw` (byte-offset keyed, §57)
 - [ ] Match-rule editor UI (rules currently arrive only via profiles)

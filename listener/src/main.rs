@@ -1,6 +1,6 @@
 //! `listener` binary — the **console-subsystem** entry point: terminal CLI and
-//! headless logging, with correct stdout, Ctrl-C, and shell-wait. Receive and
-//! decode byte-oriented data from serial and network connections (see
+//! headless logging, with correct stdout, Ctrl-C, and shell-wait. Receive
+//! byte-oriented data streams from serial and network connections (see
 //! docs/listener_specification.md).
 //!
 //! ===========================================================================

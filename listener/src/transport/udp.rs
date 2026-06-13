@@ -206,7 +206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unicast_receives_each_datagram_as_a_message() {
+    async fn unicast_receives_each_datagram_as_a_chunk() {
         let transport = UdpTransport::new(
             ChannelId::new(),
             "127.0.0.1:0".parse().unwrap(),
