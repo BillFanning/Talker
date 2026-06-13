@@ -391,7 +391,9 @@ not rendered.
   byte count. Match-rule highlighting (message-number-keyed, §50.2/§165) and
   Display-View pause move to the deferred Messages view.
 - The snapshot grows by the tail clone (≤ cap), polled at the ADR-006 cadence (5 Hz)
-  for the selected Channel only — negligible.
+  for the selected Channel only. _(Superseded by ADR-011: at the eventual ~1 MB cap
+  this 5 Hz full-buffer clone was **not** negligible — it is replaced by incremental
+  `StreamDelta` fetches, and the snapshot no longer carries the tail.)_
 - The recently built Messages-based viewer (line-virtualized per-message log) is set
   aside, to return behind the §41 source switch.
 
@@ -423,6 +425,32 @@ Stream-view pause and optional byte/line gutters.
 - Reversible in git; low-regret — the message path was unused in the workflow.
 
 **Build order.** (1) spec rewrite to v2.0 [done]; (2) strip the runtime (remove `extract/`/`decode/`, collapse the pipeline, byte-based retention); (3) trim the config schema + GUI; (4) re-root Find & Triggers on the stream; (5) test cleanup.
+
+## ADR-011 — Live stream delivery is incremental, not bundled in the snapshot
+
+**Status:** Accepted. **Context:** spec §87 (bounded stream scrollback), §100 (reception priority / non-blocking observers), §166 (liveness); ADR-006 (snapshots are the pull surface), ADR-008 (the GUI↔runtime driver polls at ~5 Hz), ADR-009 (the live viewer is fed from the verbatim stream).
+
+**Problem.** ADR-009's `ChannelSnapshot` bundled the whole stream scrollback (`stream_tail: Arc<[u8]>`, capped at the byte-retention limit — ~1 MB by default). The ADR-008 driver polls the selected channel's snapshot at 5 Hz, and the GUI re-rendered the tail into one selectable `egui::Label` each frame. Both costs scaled with the *buffer*, not with new data: at 5 Hz a full-buffer clone shipped continuously, and a non-virtualized ~1 MB selectable label stalled the UI. The symptom (reported) was the GUI becoming unresponsive after a steady low-rate source had run long enough to fill the scrollback (~minutes) — confirming the cost was buffer-fill, not throughput. This is the opposite of what a high-throughput acquisition tool needs.
+
+**Decision.** Split the pull surface so nothing is O(buffer) in steady state:
+- The **snapshot carries only the small, bounded observable state** — diagnostics, recent match firings, view pause, recording state, liveness, and the stream's `stream_end_offset` (a cursor target). It no longer carries the scrollback bytes.
+- The scrollback is read **incrementally** through a new `PipelineRequest::StreamDelta { since }` → `StreamDelta { base_offset, bytes, end_offset }`: only the bytes at/after the consumer's absolute cursor. A cursor behind the (bounded) retained window returns the whole window with `base_offset > since` — a **reset** signal, not an append. The pipeline tracks `stream_dropped` (bytes evicted from the front) so an absolute offset locates a byte in (or past) the ring in O(returned bytes).
+- The **driver** holds a per-selected-channel cursor, polls `stream_delta` alongside the snapshot, pushes only non-empty deltas (a "caught up" empty delta is a no-op, so the UI isn't woken for nothing), and resets the cursor to 0 on `Select` and on `ChannelStarted`/`ChannelReconnected` (a (re)start resets the runtime's stream offset to 0).
+- The **GUI** accumulates delta bytes per channel (capped, with eviction/restart reset), memoizes the line-split render keyed on the cursor + view mode, and **virtualizes the layout** with `ScrollArea::show_rows` so only visible rows are laid out.
+
+End to end the steady-state cost is now: ingest O(chunk), snapshot O(small bounded state), stream delta O(new bytes), GUI render/layout O(new bytes)/O(visible rows). Nothing re-touches the whole buffer.
+
+**Why not the alternatives.**
+- *Keep the tail in the snapshot but cap the rendered region.* Still clones the (capped) region every poll and re-renders a fixed slab each frame — O(slab), not O(new); and it drops scrollback-to-start from the live view. Incremental is strictly cheaper and keeps the full window.
+- *Diff the tail in the GUI against the last snapshot.* The expensive clone (snapshot→GUI, 5 Hz) would remain; only the render would be saved. The waste is on the wire, so the fix belongs at the request boundary.
+- *Virtualization alone.* Fixes the layout stall but leaves the 5 Hz full-buffer clone. Necessary but not sufficient; we do both.
+
+**Consequences.**
+- `ChannelSnapshot.stream_tail` is removed; `stream_end_offset` replaces it. Tests that asserted verbatim bytes now fetch via `stream_delta` (a `#[cfg(test)]` `stream_tail()` accessor remains on the pipeline for unit tests).
+- A new `UiUpdate::StreamDelta` rides beside `Snapshot`/`Stats`; the App folds it into per-channel accumulated bytes.
+- The reset-on-eviction contract (`base_offset > since`) is the consumer's signal to re-seed rather than append; restart is handled by resetting the cursor (offsets restart at 0).
+- This refines ADR-006's pull surface exactly along the "push rich incremental state" axis that ADR-006 left open; no actor/event-loop rewrite was needed.
+- Pinned by tests: `pipeline` (`stream_delta_serves_only_new_bytes_since_a_cursor`, `stream_delta_resets_when_the_cursor_was_evicted`), `gui::state` (`stream_deltas_accumulate_incrementally`, `stream_delta_reset_on_eviction_replaces_rather_than_appends`, `restart_clears_accumulated_stream`).
 
 ## Open questions
 

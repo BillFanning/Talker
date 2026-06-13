@@ -302,7 +302,7 @@ pub(super) fn edit_interface(
 }
 
 /// Edit the channel's recording (§51–§59): write received data to a file. Mode
-/// picks the system — byte-exact Raw `.dat` (§53) or rendered Display `.disp`
+/// picks the system — byte-exact Raw `.raw` (§53) or rendered Display `.disp`
 /// (§54). The rest sets the destination, overwrite handling, and time rotation.
 /// Config-driven: applied via a §13 Reconfigure, so Apply & Restart begins it.
 fn edit_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
@@ -310,8 +310,8 @@ fn edit_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
     ui.horizontal(|ui| {
         ui.label(bold("Recording"));
         ui.radio_value(&mut rec.mode, RecordingMode::Disabled, "Off");
-        ui.radio_value(&mut rec.mode, RecordingMode::Raw, "Raw (.dat)")
-            .on_hover_text("Byte-exact, exactly as received — pre-extraction (§53)");
+        ui.radio_value(&mut rec.mode, RecordingMode::Raw, "Raw (.raw)")
+            .on_hover_text("Byte-exact, exactly as received — verbatim stream (§53)");
         ui.radio_value(&mut rec.mode, RecordingMode::Display, "Display (.disp)")
             .on_hover_text("The rendered view output (§54)");
     });

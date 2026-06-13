@@ -44,7 +44,7 @@ pub enum RuntimeEvent {
     WarningRaised(ChannelId),
     TcpClientConnected(ChannelId),
     TcpClientDisconnected(ChannelId),
-    /// A sustained reader stall on a Channel's Transport→Extractor edge (§101,
+    /// A sustained reader stall on a Channel's Transport→Pipeline edge (§101,
     /// ADR-007): possible transport-specific loss. Carries how long the reader was
     /// stalled. Dedicated variant (v1.2 §137) — replaces the earlier reuse of
     /// `WarningRaised` so observers can distinguish a stall from any other warning.

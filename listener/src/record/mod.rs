@@ -4,8 +4,8 @@
 //! systems** with different inputs, pipeline positions, and guarantees (§51):
 //!
 //! - **Raw Recording** ([`file::RawFileRecorder`]) — byte-oriented; taps the
-//!   received-chunk stream *before* extraction (§53). Byte-exact and contiguous
-//!   up to a known end (§5.6, §56.1).
+//!   received-chunk stream verbatim, exactly as received (§53). Byte-exact and
+//!   contiguous up to a known end (§5.6, §56.1).
 //! - **Display Recording** ([`file::DisplayFileRecorder`]) — consumes a display
 //!   view's rendered output *after* rendering (§54). Not byte-exact.
 //!
@@ -41,14 +41,30 @@ pub enum FileRotationPolicy {
     Daily,
 }
 
-/// Which recording system is active for a Channel (§52). Raw is primary;
-/// Display is optional; a Channel may run both.
+/// Which recording system(s) are active for a Channel (§52). Raw is primary;
+/// Display is optional; `Both` runs the two simultaneously, each with its own
+/// file, queue, and fault status (§52). With single-file destinations the two
+/// files are derived by forcing the `.raw` / `.disp` extensions on the configured
+/// path; with rotation each period file already carries its own extension (§59).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RecordingMode {
     #[default]
     Disabled,
     Raw,
     Display,
+    Both,
+}
+
+impl RecordingMode {
+    /// Whether a Raw Recording should be created in this mode (§53).
+    pub fn records_raw(self) -> bool {
+        matches!(self, RecordingMode::Raw | RecordingMode::Both)
+    }
+
+    /// Whether a Display Recording should be created in this mode (§54).
+    pub fn records_display(self) -> bool {
+        matches!(self, RecordingMode::Display | RecordingMode::Both)
+    }
 }
 
 /// What to do when the destination file already exists (§80.1). Enforced when
@@ -82,10 +98,10 @@ impl RecordingStopReason {
     }
 }
 
-/// Writes received chunks exactly as received, before extraction (§53, §142).
+/// Writes received chunks verbatim, exactly as received (§53, §142).
 #[async_trait::async_trait]
 pub trait RawRecorder: Send {
-    /// Append one received chunk (pre-extraction) exactly as received.
+    /// Append one received chunk verbatim, exactly as received.
     async fn write_chunk(&mut self, chunk: &ReceivedData) -> Result<(), RecordError>;
     async fn flush(&mut self) -> Result<(), RecordError>;
     /// Flush, close, and (for faults) note the truncation point (§56.1).

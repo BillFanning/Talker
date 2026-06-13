@@ -1,17 +1,19 @@
 //! On-demand snapshots of a Channel's observable pipeline state (spec §10, §137;
 //! listener ADR-006).
 //!
-//! The pipeline owns its retained Messages, per-view display history, and
-//! diagnostics by value inside the [`run_channel`](super::pipeline::run_channel)
-//! task, so they are not directly readable while a Channel runs. A
-//! [`ChannelSnapshot`] is a point-in-time, owned copy the pipeline builds on
-//! request and hands back through a oneshot reply.
+//! The pipeline owns its stream scrollback, diagnostics, and recent match firings
+//! by value inside the [`run_channel`](super::pipeline::run_channel) task, so they
+//! are not directly readable while a Channel runs. A [`ChannelSnapshot`] is a
+//! point-in-time, owned copy of the *small* observable state (diagnostics, matches,
+//! liveness, view pause, the stream's end offset); the scrollback bytes themselves
+//! are fetched separately and incrementally via [`StreamDelta`] so a high-throughput
+//! viewer never re-ships the whole ~1 MB buffer (§87, ADR-009).
 //!
 //! This is the *pull* half of the observability surface. The *push* half is the
 //! [`RuntimeEvent`](crate::core::RuntimeEvent) stream, which stays authoritative
 //! for presentation observers (ADR-006): a UI folds events for liveness and
-//! requests a snapshot when it needs the actual retained content. Observers never
-//! own or block the pipeline.
+//! requests a snapshot/stream-delta when it needs the actual retained content.
+//! Observers never own or block the pipeline.
 
 use std::sync::Arc;
 
@@ -25,15 +27,42 @@ use super::activity::ChannelActivity;
 /// A query the pipeline task answers from its current state, replying on a
 /// oneshot. Dropping the reply sender simply yields nothing.
 ///
-/// Two granularities so observers pay only for what they show (listener ADR-006):
-/// - [`Stats`](Self::Stats): O(1) counters — no Message cloning. A multi-channel
-///   overview polls this for *every* Channel to keep per-tab health current.
-/// - [`Snapshot`](Self::Snapshot): the full point-in-time state, including cloned
-///   retained/display Messages. Polled only for the Channel actually on screen, so
-///   a large retention buffer isn't deep-copied for every Channel each tick.
+/// Three granularities so observers pay only for what they show (listener ADR-006):
+/// - [`Stats`](Self::Stats): O(1) counters for per-tab health. A multi-channel
+///   overview polls this for *every* Channel.
+/// - [`Snapshot`](Self::Snapshot): the small observable state (diagnostics, recent
+///   matches, liveness, view pause, the stream end offset) — bounded, so it is cheap
+///   even for the on-screen Channel. It carries **no** scrollback bytes.
+/// - [`StreamDelta`](Self::StreamDelta): the scrollback bytes new since a cursor —
+///   the only O(bytes) reply, and only of the *new* bytes, not the whole buffer.
 pub enum PipelineRequest {
     Snapshot(oneshot::Sender<ChannelSnapshot>),
     Stats(oneshot::Sender<ChannelStats>),
+    /// Incremental stream bytes since the requester's cursor (§87, ADR-009). The
+    /// pipeline returns only what is new (or a reset window if the cursor fell
+    /// behind eviction), so a live high-throughput viewer never re-ships or
+    /// re-renders the whole ~1 MB scrollback each poll.
+    StreamDelta {
+        since: u64,
+        reply: oneshot::Sender<StreamDelta>,
+    },
+}
+
+/// An incremental slice of a Channel's stream scrollback (§87), answering "what
+/// stream bytes exist at or after offset `since`?". Offsets are absolute stream
+/// positions (bytes received since Start, modulo display pause).
+#[derive(Clone, Debug)]
+pub struct StreamDelta {
+    /// Absolute stream offset of `bytes[0]`. Normally equals the requested `since`;
+    /// it is **greater** when the requester's cursor had already been evicted from
+    /// the front of the bounded scrollback — a signal to the consumer to reset its
+    /// view to this window rather than append.
+    pub base_offset: u64,
+    /// The new (or reset-window) bytes, oldest → newest.
+    pub bytes: Arc<[u8]>,
+    /// Absolute offset just past the last retained byte (`base_offset + bytes.len()`
+    /// for a fresh fetch). The consumer stores this as its next cursor.
+    pub end_offset: u64,
 }
 
 /// Cheap, O(1) liveness counters for a Channel — everything a multi-channel
@@ -56,12 +85,14 @@ pub struct ChannelStats {
     pub match_boundary_saves: u64,
 }
 
-/// A point-in-time, owned copy of one Channel's observable pipeline state.
+/// A point-in-time, owned copy of one Channel's *small* observable pipeline state
+/// (diagnostics, recent matches, liveness, view pause, the stream end offset).
 ///
 /// Built by the pipeline task in response to a snapshot request, so reading it
-/// neither blocks reception nor shares mutable pipeline state. Messages are held
-/// as `Arc`s, so a snapshot is cheap to build (reference-count bumps, not deep
-/// copies).
+/// neither blocks reception nor shares mutable pipeline state. Every field is
+/// bounded (§88, §124) — the unbounded scrollback bytes are **not** here; they are
+/// fetched incrementally via [`StreamDelta`] — so a snapshot is always cheap to
+/// build and ship, even at high throughput.
 #[derive(Clone, Debug)]
 pub struct ChannelSnapshot {
     pub channel_id: ChannelId,
@@ -74,17 +105,19 @@ pub struct ChannelSnapshot {
     /// Liveness facts: rolling throughput + last-data time (§91.1, §166).
     pub activity: ChannelActivity,
     /// Recent Match Rule firings, oldest → newest, bounded (§50.2, §165). A GUI
-    /// cross-references these against the stream tail to highlight/annotate.
+    /// cross-references these (by `byte_offset`) against the accumulated stream to
+    /// highlight/annotate.
     pub matches: Vec<TriggeredMatch>,
     /// How many `BytePattern` matches were recovered only because a pattern spanned
     /// a read-chunk boundary (§50.2). The aggregate "how often" of the cross-chunk
     /// measurement; per-occurrence detail (where/why) is in `diagnostics`.
     pub match_boundary_saves: u64,
-    /// The most recent verbatim **pre-extraction** bytes, oldest → newest, byte-
-    /// capped (§88 count-retention doesn't apply — there are no Message boundaries).
-    /// Feeds the Stream display source (ADR-009, §18/§41): rendering it reconstructs
-    /// the wire regardless of framing or read-chunk boundaries.
-    pub stream_tail: Arc<[u8]>,
+    /// Absolute stream offset just past the last received byte (§87): the total
+    /// bytes accepted into the scrollback since Start. The live viewer uses this as
+    /// its cursor target and fetches the bytes themselves incrementally via
+    /// [`PipelineRequest::StreamDelta`] — the big scrollback is **not** bundled into
+    /// every snapshot (that was O(buffer) at 5 Hz).
+    pub stream_end_offset: u64,
 }
 
 /// A single rule firing (§50.2). Records which rule fired and, for a data
@@ -100,7 +133,8 @@ pub struct TriggeredMatch {
 }
 
 /// One Display View's snapshot: its identity and pause state (§50). The viewed
-/// content is the shared `stream_tail`, rendered per view.
+/// content is the shared stream scrollback (fetched via [`StreamDelta`]), rendered
+/// per view.
 #[derive(Clone, Debug)]
 pub struct DisplayViewSnapshot {
     pub id: DisplayViewId,

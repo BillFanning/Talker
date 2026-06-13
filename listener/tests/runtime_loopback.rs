@@ -50,6 +50,16 @@ async fn await_snapshot(
         .expect("timed out waiting for the snapshot condition")
 }
 
+/// Fetch a running channel's full stream scrollback verbatim via the incremental
+/// stream path (§87, ADR-009) — the bytes are no longer bundled into the snapshot.
+async fn stream_bytes(listener: &Listener, id: ChannelId) -> Vec<u8> {
+    listener
+        .stream_delta(id, 0)
+        .await
+        .map(|d| d.bytes.to_vec())
+        .unwrap_or_default()
+}
+
 /// Await the next `TcpClientConnected` event, with a timeout.
 async fn next_connection(events: &mut Receiver<RuntimeEvent>) -> ChannelId {
     let wait = async {
@@ -106,9 +116,9 @@ async fn udp_channel_receives_datagrams_and_stops_cleanly() {
     client.send_to(b"bravo", ("127.0.0.1", port)).await.unwrap();
 
     // The datagrams land in the stream scrollback, concatenated verbatim (§18).
-    let snap = await_snapshot(&listener, id, |s| s.stream_tail.len() >= 10).await;
-    assert_eq!(&*snap.stream_tail, b"alphabravo");
+    let snap = await_snapshot(&listener, id, |s| s.stream_end_offset >= 10).await;
     assert_eq!(snap.activity.total_bytes, 10);
+    assert_eq!(stream_bytes(&listener, id).await, b"alphabravo");
 
     stop(&mut listener, id).await;
     assert_eq!(listener.state(id), Some(ChannelState::Stopped));
@@ -220,15 +230,13 @@ async fn snapshot_exposes_the_verbatim_stream_of_a_running_channel() {
         .await
         .unwrap();
 
+    let expected: &[u8] = b"$GPGLL,4916.45,N,12311.12,W*00$GPHDT,274.07,T*FF";
     let snapshot = await_snapshot(&listener, id, |s| {
-        s.stream_tail.windows(6).any(|w| w == b"$GPHDT")
+        s.stream_end_offset >= expected.len() as u64
     })
     .await;
     assert_eq!(snapshot.channel_id, id);
-    assert_eq!(
-        &*snapshot.stream_tail,
-        b"$GPGLL,4916.45,N,12311.12,W*00$GPHDT,274.07,T*FF"
-    );
+    assert_eq!(stream_bytes(&listener, id).await, expected);
 
     // A stopped channel has no live pipeline to snapshot.
     stop(&mut listener, id).await;
@@ -350,7 +358,8 @@ async fn pausing_a_display_view_freezes_only_the_stream_display() {
     // The byte counter advances even though the scrollback stays frozen/empty.
     let snap = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 10).await;
     assert!(snap.display_views[0].paused);
-    assert!(snap.stream_tail.is_empty());
+    assert_eq!(snap.stream_end_offset, 0); // scrollback frozen while paused
+    assert!(stream_bytes(&listener, id).await.is_empty());
     assert_eq!(snap.activity.total_bytes, 10);
 
     // Resuming accumulates only new data — no backfill of what was missed.
@@ -359,8 +368,8 @@ async fn pausing_a_display_view_freezes_only_the_stream_display() {
         .send_to(b"charlie", ("127.0.0.1", port))
         .await
         .unwrap();
-    let snap = await_snapshot(&listener, id, |s| !s.stream_tail.is_empty()).await;
-    assert_eq!(&*snap.stream_tail, b"charlie"); // only the post-resume data
+    let snap = await_snapshot(&listener, id, |s| s.stream_end_offset > 0).await;
+    assert_eq!(stream_bytes(&listener, id).await, b"charlie"); // only post-resume data
     assert_eq!(snap.activity.total_bytes, 17);
 
     stop(&mut listener, id).await;

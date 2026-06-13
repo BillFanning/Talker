@@ -1,9 +1,10 @@
 //! UDP transport: unicast, broadcast, and multicast (spec §15).
 //!
 //! A UDP transport runs as a Tokio task (ADR-001 — async-native socket I/O, no
-//! dedicated thread). Each received datagram becomes exactly one Message with
-//! its boundary preserved (§15): the transport emits `ReceivedPayload::Datagram`,
-//! which the pipeline turns into a Message without byte extraction.
+//! dedicated thread). Each received datagram is delivered whole by the OS (§15):
+//! the transport emits `ReceivedPayload::Datagram`, which the pipeline appends to
+//! the verbatim stream like any other bytes (ADR-010 — no extraction, the datagram
+//! boundary is a reception detail, not stream structure).
 //!
 //! Binding is separated from the receive loop so resource errors surface at
 //! Channel Start (§71, §8.2): [`UdpTransport::bind`] performs the fallible
@@ -167,8 +168,8 @@ impl DataTransportRunner for BoundUdpTransport {
                                 received_at: ChunkTime::now(),
                             };
                             // Awaiting `send` is the one place this transport may
-                            // stall: a full extractor queue backpressures the recv
-                            // loop, which can drop datagrams at the kernel (§97.1,
+                            // stall: a full Transport→Pipeline queue backpressures the
+                            // recv loop, which can drop datagrams at the kernel (§97.1,
                             // §101). An `Err` means the pipeline is gone.
                             if out.send(data).await.is_err() {
                                 return TransportOutcome::Completed;

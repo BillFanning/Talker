@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use super::activity::ActivityMeter;
 use super::snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
+    StreamDelta,
 };
 use crate::config::{
     DiskGuard, DiskThreshold, LowDiskAction, MatchAction, MatchRule, RecordControl, RecordTarget,
@@ -168,6 +169,12 @@ pub struct ChannelPipeline {
     /// Trimmed from the front to `stream_cap` bytes.
     stream_buf: VecDeque<u8>,
     stream_cap: usize,
+    /// Total bytes evicted from the front of `stream_buf` since Start. The absolute
+    /// stream offset of `stream_buf[0]` is exactly this value, so a consumer holding
+    /// an absolute cursor can ask for "bytes since N" and we can locate N in the ring
+    /// (or tell it its cursor was evicted). `stream_dropped + stream_buf.len()` is the
+    /// absolute end offset.
+    stream_dropped: u64,
 }
 
 /// A `Record` action queued for asynchronous application (§50.2).
@@ -216,6 +223,7 @@ impl ChannelPipeline {
             created_at: Instant::now(),
             stream_buf: VecDeque::new(),
             stream_cap: caps.stream_display,
+            stream_dropped: 0,
         }
     }
 
@@ -309,7 +317,11 @@ impl ChannelPipeline {
             .is_some_and(|v| v.handle.is_paused())
         {
             if bytes.len() >= self.stream_cap {
-                // A single chunk already exceeds the cap: keep only its tail.
+                // A single chunk already exceeds the cap: keep only its tail. Every
+                // currently-buffered byte plus the dropped prefix of this chunk is
+                // evicted; account for all of it in the absolute offset.
+                let dropped = self.stream_buf.len() as u64 + (bytes.len() - self.stream_cap) as u64;
+                self.stream_dropped += dropped;
                 self.stream_buf.clear();
                 self.stream_buf
                     .extend(bytes[bytes.len() - self.stream_cap..].iter().copied());
@@ -318,6 +330,7 @@ impl ChannelPipeline {
                 let overflow = self.stream_buf.len().saturating_sub(self.stream_cap);
                 if overflow > 0 {
                     self.stream_buf.drain(..overflow);
+                    self.stream_dropped += overflow as u64;
                 }
             }
         }
@@ -671,9 +684,12 @@ impl ChannelPipeline {
         self.raw_recorder.as_ref().map(|r| r.state())
     }
 
-    /// Cheap O(1) counters for a multi-channel overview (§91.1) — no scrollback
-    /// cloning, unlike [`snapshot`](Self::snapshot). Polled per-Channel each tick;
-    /// the full snapshot is reserved for the Channel actually on screen.
+    /// Cheap O(1) counters for a multi-channel overview (§91.1): liveness plus
+    /// per-severity diagnostic counts and the boundary-save total. Polled
+    /// per-Channel each tick; [`snapshot`](Self::snapshot) (the full diagnostic/match
+    /// detail) is reserved for the Channel actually on screen, and the scrollback
+    /// bytes come from [`stream_delta`](Self::stream_delta) — neither call clones the
+    /// scrollback.
     pub fn stats(&self) -> ChannelStats {
         ChannelStats {
             activity: self.activity.snapshot(Instant::now()),
@@ -685,9 +701,11 @@ impl ChannelPipeline {
         }
     }
 
-    /// Build an owned, point-in-time snapshot of the observable state (§137,
-    /// ADR-006): the stream scrollback tail, per-view pause state, diagnostics,
-    /// recent match firings, and recording state.
+    /// Build an owned, point-in-time snapshot of the *small* observable state (§137,
+    /// ADR-006): per-view pause state, diagnostics, recent match firings, recording
+    /// state, liveness, and the stream's end offset. The scrollback bytes are **not**
+    /// included — they are fetched incrementally via [`stream_delta`](Self::stream_delta)
+    /// so this stays cheap at high throughput.
     pub fn snapshot(&self) -> ChannelSnapshot {
         ChannelSnapshot {
             channel_id: self.channel_id,
@@ -708,8 +726,45 @@ impl ChannelPipeline {
             activity: self.activity.snapshot(Instant::now()),
             matches: self.recent_matches.iter().copied().collect(),
             match_boundary_saves: self.match_rules.boundary_saves(),
-            stream_tail: self.stream_buf.iter().copied().collect(),
+            // The scrollback bytes are fetched incrementally (StreamDelta), not
+            // bundled here — only the cursor target travels in the snapshot.
+            stream_end_offset: self.stream_dropped + self.stream_buf.len() as u64,
         }
+    }
+
+    /// Absolute stream offset just past the last retained byte (§87): total bytes
+    /// accepted into the scrollback since Start.
+    pub fn stream_end_offset(&self) -> u64 {
+        self.stream_dropped + self.stream_buf.len() as u64
+    }
+
+    /// Incremental scrollback read (§87): the bytes at or after absolute offset
+    /// `since`. Returns only what is new since the consumer's cursor — O(returned
+    /// bytes), not O(buffer) — so the runtime ships just the delta and the consumer
+    /// renders just the delta.
+    ///
+    /// If `since` is at/after the end, the delta is empty. If `since` is behind the
+    /// retained window (its bytes were evicted), the whole window is returned with
+    /// `base_offset > since`, signalling the consumer to reset rather than append.
+    pub fn stream_delta(&self, since: u64) -> StreamDelta {
+        let start = self.stream_dropped; // absolute offset of stream_buf[0]
+        let end = start + self.stream_buf.len() as u64;
+        // Clamp the requested cursor into the retained window.
+        let from = since.clamp(start, end);
+        let skip = (from - start) as usize;
+        let bytes: Arc<[u8]> = self.stream_buf.iter().skip(skip).copied().collect();
+        StreamDelta {
+            base_offset: from,
+            bytes,
+            end_offset: end,
+        }
+    }
+
+    /// Test/diagnostic accessor: the full retained scrollback, verbatim (§87). Live
+    /// consumers use [`stream_delta`](Self::stream_delta) instead.
+    #[cfg(test)]
+    fn stream_tail(&self) -> Vec<u8> {
+        self.stream_buf.iter().copied().collect()
     }
 }
 
@@ -730,11 +785,11 @@ fn disk_is_low(free: u64, total: u64, threshold: DiskThreshold) -> bool {
 /// Cancellation is cooperative and checked first (`biased`) so shutdown does not
 /// depend on draining the queue (§111).
 ///
-/// Between reads it also serves snapshot/stats requests (§137, ADR-006) and records
-/// transport notices (§95, §101, ADR-007): a requester sends a oneshot reply on
-/// `requests` and the loop answers (full snapshot or cheap stats) from current
-/// state; a transport sends a `TransportNotice` on `notices` and the loop records
-/// it as a diagnostic. Both are checked ahead of reads (they are rare and cheap) so
+/// Between reads it also serves snapshot/stats/stream-delta requests (§137, ADR-006,
+/// ADR-011) and records transport notices (§95, §101, ADR-007): a requester sends a
+/// oneshot reply on `requests` and the loop answers (the small snapshot, cheap stats,
+/// or an incremental stream delta) from current state; a transport sends a
+/// `TransportNotice` on `notices` and the loop records it as a diagnostic. Both are checked ahead of reads (they are rare and cheap) so
 /// they are serviced promptly; a closed `requests`/`notices` channel simply stops
 /// being polled.
 pub async fn run_channel(
@@ -764,6 +819,9 @@ pub async fn run_channel(
                 }
                 Some(PipelineRequest::Stats(tx)) => {
                     let _ = tx.send(pipeline.stats());
+                }
+                Some(PipelineRequest::StreamDelta { since, reply }) => {
+                    let _ = reply.send(pipeline.stream_delta(since));
                 }
                 None => requests_open = false, // all requesters gone; keep running
             },
@@ -826,15 +884,12 @@ mod tests {
         let mut p = pipeline(cid, PipelineCapacities::default());
         p.ingest(datagram(cid, b"$GPGGA,1*00\r\n"));
         p.ingest(datagram(cid, b"$GPRMC,2*00\r\n"));
-        assert_eq!(
-            &*p.snapshot().stream_tail,
-            &b"$GPGGA,1*00\r\n$GPRMC,2*00\r\n"[..]
-        );
+        assert_eq!(&p.stream_tail()[..], &b"$GPGGA,1*00\r\n$GPRMC,2*00\r\n"[..]);
         // Mixed chunk kinds (a serial-style Bytes chunk after datagrams) still
         // append verbatim: one stream, regardless of transport read shape.
         p.ingest(bytes_chunk(cid, b"tail"));
         assert_eq!(
-            &*p.snapshot().stream_tail,
+            &p.stream_tail()[..],
             &b"$GPGGA,1*00\r\n$GPRMC,2*00\r\ntail"[..]
         );
     }
@@ -851,13 +906,64 @@ mod tests {
         // Reconstructs the wire across read-chunk boundaries.
         p.ingest(bytes_chunk(cid, b"$ABC"));
         p.ingest(bytes_chunk(cid, b"\r\n"));
-        assert_eq!(&*p.snapshot().stream_tail, &b"$ABC\r\n"[..]);
+        assert_eq!(&p.stream_tail()[..], &b"$ABC\r\n"[..]);
         // Over the cap: keep only the most recent `stream_display` bytes.
         p.ingest(bytes_chunk(cid, b"123456")); // "$ABC\r\n123456" (12) → drop front 4
-        assert_eq!(&*p.snapshot().stream_tail, &b"\r\n123456"[..]);
+        assert_eq!(&p.stream_tail()[..], &b"\r\n123456"[..]);
         // A single chunk larger than the cap keeps just its tail.
         p.ingest(bytes_chunk(cid, b"0123456789"));
-        assert_eq!(&*p.snapshot().stream_tail, &b"23456789"[..]);
+        assert_eq!(&p.stream_tail()[..], &b"23456789"[..]);
+    }
+
+    #[test]
+    fn stream_delta_serves_only_new_bytes_since_a_cursor() {
+        let cid = ChannelId::new();
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        p.ingest(bytes_chunk(cid, b"hello"));
+        // From the start: the whole window.
+        let d0 = p.stream_delta(0);
+        assert_eq!(d0.base_offset, 0);
+        assert_eq!(&*d0.bytes, &b"hello"[..]);
+        assert_eq!(d0.end_offset, 5);
+
+        // From the prior end cursor: only the new bytes (no re-ship of "hello").
+        p.ingest(bytes_chunk(cid, b"world"));
+        let d1 = p.stream_delta(d0.end_offset);
+        assert_eq!(d1.base_offset, 5);
+        assert_eq!(&*d1.bytes, &b"world"[..]);
+        assert_eq!(d1.end_offset, 10);
+
+        // Caught up: an at-end cursor yields nothing.
+        let d2 = p.stream_delta(d1.end_offset);
+        assert!(d2.bytes.is_empty());
+        assert_eq!(d2.base_offset, 10);
+        assert_eq!(d2.end_offset, 10);
+    }
+
+    #[test]
+    fn stream_delta_resets_when_the_cursor_was_evicted() {
+        let cid = ChannelId::new();
+        let caps = PipelineCapacities {
+            stream_display: 4,
+            ..PipelineCapacities::default()
+        };
+        let mut p = pipeline(cid, caps);
+        p.ingest(bytes_chunk(cid, b"AB")); // offsets 0..2
+        let d0 = p.stream_delta(0); // cursor now 2
+        assert_eq!(&*d0.bytes, &b"AB"[..]);
+
+        // Push past the cap so offsets 0..2 are evicted (cap 4): buffer holds 4..8.
+        p.ingest(bytes_chunk(cid, b"CDEF")); // "ABCDEF" → keep "CDEF", dropped 2
+                                             // A stale cursor (2) is behind the window start (2 dropped → start=2);
+                                             // here start==2 so it's still valid. Drop more to force a reset.
+        p.ingest(bytes_chunk(cid, b"GH")); // "CDEFGH" → keep "EFGH", dropped total 4
+
+        // Cursor 2 is now behind the window start (4): the delta resets to the
+        // window with base_offset > since, signalling the consumer to re-seed.
+        let d1 = p.stream_delta(d0.end_offset); // since = 2
+        assert_eq!(d1.base_offset, 4, "cursor was evicted; base jumps forward");
+        assert_eq!(&*d1.bytes, &b"EFGH"[..]);
+        assert_eq!(d1.end_offset, 8);
     }
 
     #[test]
@@ -866,17 +972,17 @@ mod tests {
         let mut p = pipeline(cid, PipelineCapacities::default());
         let view = p.display_view_handles()[0].clone();
         p.ingest(bytes_chunk(cid, b"AB"));
-        assert_eq!(&*p.snapshot().stream_tail, &b"AB"[..]);
+        assert_eq!(&p.stream_tail()[..], &b"AB"[..]);
         // Pause: the displayed stream freezes (§50), but reception still counts
         // the bytes — the liveness counter keeps moving.
         view.pause();
         p.ingest(bytes_chunk(cid, b"CD"));
-        assert_eq!(&*p.snapshot().stream_tail, &b"AB"[..]);
+        assert_eq!(&p.stream_tail()[..], &b"AB"[..]);
         assert_eq!(p.snapshot().activity.total_bytes, 4);
         // Resume: the stream continues from live data (no backfill of the gap).
         view.resume();
         p.ingest(bytes_chunk(cid, b"EF"));
-        assert_eq!(&*p.snapshot().stream_tail, &b"ABEF"[..]);
+        assert_eq!(&p.stream_tail()[..], &b"ABEF"[..]);
     }
 
     #[test]
@@ -968,7 +1074,7 @@ mod tests {
         p.finish().await;
 
         // The paused view's scrollback stayed empty, but the recording captured it.
-        assert!(p.snapshot().stream_tail.is_empty());
+        assert!(p.stream_tail().is_empty());
         let written = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(written.contains("while-paused"));
         let _ = tokio::fs::remove_file(&path).await;
@@ -1038,7 +1144,7 @@ mod tests {
         tx.send(bytes_chunk(cid, b"abc")).await.unwrap();
         drop(tx);
         let p = task.await.unwrap();
-        assert_eq!(&*p.snapshot().stream_tail, &b"abc"[..]);
+        assert_eq!(&p.stream_tail()[..], &b"abc"[..]);
     }
 
     #[tokio::test]
@@ -1067,7 +1173,8 @@ mod tests {
         let task = tokio::spawn(run_channel(rx, req_rx, notice_rx, p, cancel.clone()));
 
         tx.send(bytes_chunk(cid, b"live")).await.unwrap();
-        // Poll until the chunk is visible (delivery is async).
+        // Snapshot reports the channel and the stream end offset (cursor target);
+        // the bytes themselves come via the incremental StreamDelta request.
         let snapshot = loop {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             req_tx
@@ -1075,13 +1182,27 @@ mod tests {
                 .await
                 .unwrap();
             let s = reply_rx.await.unwrap();
-            if !s.stream_tail.is_empty() {
+            if s.stream_end_offset > 0 {
                 break s;
             }
             tokio::task::yield_now().await;
         };
         assert_eq!(snapshot.channel_id, cid);
-        assert_eq!(&*snapshot.stream_tail, &b"live"[..]);
+        assert_eq!(snapshot.stream_end_offset, 4);
+
+        // Fetch the new bytes from offset 0 via the incremental path.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        req_tx
+            .send(PipelineRequest::StreamDelta {
+                since: 0,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let delta = reply_rx.await.unwrap();
+        assert_eq!(delta.base_offset, 0);
+        assert_eq!(&*delta.bytes, &b"live"[..]);
+        assert_eq!(delta.end_offset, 4);
 
         cancel.cancel();
         let _ = task.await.unwrap();

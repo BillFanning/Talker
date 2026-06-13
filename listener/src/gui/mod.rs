@@ -163,6 +163,35 @@ struct ListenerApp {
     /// Available serial port names for the serial port dropdown (§14.4); refreshed
     /// on demand via the ⟳ button.
     serial_ports: Vec<String>,
+    /// Memoized stream-view rows for the detail pane. The scrollback can reach the
+    /// ~1 MB retention cap, so rendering + line-splitting it every frame (even at
+    /// 5 Hz) is wasteful and, with a non-virtualized layout, was stalling the UI
+    /// (regression after the stream-only split). We recompute only when the inputs
+    /// change; `show_rows` then lays out just the visible rows.
+    stream_cache: Option<StreamRenderCache>,
+}
+
+/// Cached, line-split render of a channel's accumulated stream bytes, reused
+/// across frames until one of its inputs changes (see [`StreamRenderKey`]). The
+/// key's `channel` also guards against showing one channel's rows after the
+/// selection moves to another.
+struct StreamRenderCache {
+    key: StreamRenderKey,
+    rows: Vec<String>,
+}
+
+/// The cheap signature that decides whether [`StreamRenderCache`] is still valid.
+/// The stream `cursor` advances as deltas are folded and `len` captures front
+/// eviction, so together they capture "the bytes changed" without hashing the
+/// buffer; `channel` guards a selection change and the render settings a view
+/// change.
+#[derive(Clone, Copy, PartialEq)]
+struct StreamRenderKey {
+    channel: ChannelId,
+    cursor: u64,
+    len: usize,
+    mode: DisplayMode,
+    chars: CharacterRendering,
 }
 
 impl ListenerApp {
@@ -186,6 +215,7 @@ impl ListenerApp {
             show_warn: true,
             show_error: true,
             serial_ports: list_serial_ports(),
+            stream_cache: None,
         }
     }
 

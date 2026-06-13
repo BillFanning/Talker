@@ -300,7 +300,7 @@ pub enum MatchAction {
         control: RecordControl,
     },
     /// Drop a correlation marker into the display, the Display Recording (`.disp`),
-    /// and a tagged event (§137) — **never** into the raw `.dat` stream (§5.6/§49).
+    /// and a tagged event (§137) — **never** into the raw `.raw` stream (§5.6/§49).
     Mark,
     /// Raise a diagnostic event/warning of the given severity (§92–§94).
     Notify { severity: DiagnosticSeverity },

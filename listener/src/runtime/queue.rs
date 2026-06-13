@@ -11,7 +11,7 @@
 //! | Chunk tap → Raw Recording, Fan-out → Display Recording | [`FaultOnFullQueue`] |
 //! | Diagnostics | [`DiagnosticsQueue`] |
 //!
-//! Only the Transport→Extractor edge may stall the reader (§97.1); it is a
+//! Only the Transport→Pipeline edge may stall the reader (§97.1); it is a
 //! bounded `tokio::sync::mpsc` channel wired in [`super::pipeline`], not one of
 //! these types — none of these ever block a producer.
 

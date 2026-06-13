@@ -4,7 +4,8 @@
 //! and the synchronous egui App. The App never touches the runtime directly
 //! (AGENTS §5): it sends [`UiCommand`]s and receives [`UiUpdate`]s over channels,
 //! and the driver translates commands into `Listener` method calls, forwards the
-//! `RuntimeEvent` stream, and pushes periodic [`ChannelSnapshot`]s.
+//! `RuntimeEvent` stream, and pushes periodic [`ChannelSnapshot`]s plus incremental
+//! [`StreamDelta`]s (the scrollback bytes — kept out of the snapshot, ADR-011).
 //!
 //! This module is **egui-free** so it is unit-testable without a display: the only
 //! coupling to the UI is an opaque `repaint` callback the driver invokes after
@@ -16,7 +17,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::config::{ChannelConfig, InterfaceConfig};
 use crate::core::{ChannelId, ChannelName, DisplayViewId, RuntimeEvent};
-use crate::runtime::{ChannelSnapshot, ChannelStats, Listener, PipelineCapacities};
+use crate::runtime::{ChannelSnapshot, ChannelStats, Listener, PipelineCapacities, StreamDelta};
 use crate::transport::udp::UdpMode;
 use crate::transport::SerialControlLines;
 
@@ -53,7 +54,8 @@ pub enum UiCommand {
     SetRts(ChannelId, bool),
     SetDtr(ChannelId, bool),
     /// Tell the driver which channel is on screen (`None` = none). Only the selected
-    /// channel gets a full snapshot polled; the rest get cheap stats (ADR-006).
+    /// channel gets a snapshot + incremental stream delta polled; the rest get cheap
+    /// stats (ADR-006).
     Select(Option<ChannelId>),
     /// Stop all channels and end the driver (the App is closing).
     Shutdown,
@@ -81,14 +83,20 @@ pub enum UiUpdate {
     ChannelError(ChannelId, String),
     /// A forwarded runtime event (the authoritative push surface, ADR-006).
     Event(RuntimeEvent),
-    /// A periodic full snapshot of the *selected* running channel (the pull surface).
+    /// A periodic snapshot of the *selected* running channel's small observable
+    /// state — diagnostics, matches, view pause, recording (the pull surface). The
+    /// stream bytes ride the separate `StreamDelta` channel, not this.
     Snapshot(ChannelId, Box<ChannelSnapshot>),
     /// Periodic cheap liveness stats for a running channel, polled for *every*
-    /// channel to keep per-tab health current without cloning retained Messages.
+    /// channel to keep per-tab health current (no scrollback cloning).
     Stats(ChannelId, Box<ChannelStats>),
     /// Current serial control/status lines for a running serial channel (§161),
     /// polled alongside snapshots.
     ControlLines(ChannelId, SerialControlLines),
+    /// Incremental stream scrollback for the *selected* channel (§87, ADR-009):
+    /// only the bytes new since the GUI's cursor, so the driver never re-ships the
+    /// whole ~1 MB buffer each poll. The App appends them to its live view.
+    StreamDelta(ChannelId, Box<StreamDelta>),
 }
 
 /// A one-line, human-readable description of a channel's interface and endpoint,
@@ -123,8 +131,13 @@ pub struct Driver {
     repaint: Box<dyn Fn() + Send>,
     /// Channels registered so far, polled for stats.
     channels: Vec<ChannelId>,
-    /// The channel currently on screen; only this one gets a full snapshot polled.
+    /// The channel currently on screen; only this one gets a snapshot + stream delta
+    /// polled (the rest get cheap stats).
     selected: Option<ChannelId>,
+    /// The live stream cursor for the selected channel (§87, ADR-009): the next
+    /// absolute offset to fetch via `stream_delta`. Reset to 0 when the selection
+    /// changes (the new channel's bytes are fetched from its current window).
+    stream_cursor: u64,
 }
 
 impl Driver {
@@ -145,6 +158,7 @@ impl Driver {
             repaint,
             channels: Vec::new(),
             selected: None,
+            stream_cursor: 0,
         }
     }
 
@@ -168,7 +182,16 @@ impl Driver {
                     None => break, // the App dropped its command sender — close down
                 },
                 ev = self.events.recv(), if events_open => match ev {
-                    Some(ev) => self.push(UiUpdate::Event(ev)),
+                    Some(ev) => {
+                        // A (re)start resets the channel's stream offset to 0; reset our
+                        // cursor so the new stream's first bytes aren't skipped (§87).
+                        if let RuntimeEvent::ChannelStarted(id) | RuntimeEvent::ChannelReconnected(id) = ev {
+                            if Some(id) == self.selected {
+                                self.stream_cursor = 0;
+                            }
+                        }
+                        self.push(UiUpdate::Event(ev));
+                    }
                     None => events_open = false, // stream closed; keep serving commands
                 },
                 _ = snapshot_tick.tick() => self.poll_snapshots().await,
@@ -241,16 +264,22 @@ impl Driver {
             UiCommand::SetDtr(id, on) => {
                 let _ = self.listener.set_dtr(id, on).await;
             }
-            UiCommand::Select(id) => self.selected = id,
+            UiCommand::Select(id) => {
+                // New selection: restart the live stream cursor so the new channel's
+                // scrollback is fetched from its current window (§87).
+                self.selected = id;
+                self.stream_cursor = 0;
+            }
             UiCommand::Shutdown => return false,
         }
         true
     }
 
     /// Poll channels for the UI's pull surface. Every channel gets cheap **stats**
-    /// (per-tab health); only the **selected** channel gets a full snapshot, so a
-    /// large retention buffer isn't deep-copied for every channel each tick (the
-    /// load fix — ADR-006). Stopped/unknown channels yield `None`.
+    /// (per-tab health); the **selected** channel additionally gets a snapshot (its
+    /// bounded diagnostic/match detail) and an incremental **stream delta** (only the
+    /// scrollback bytes new since our cursor — never the whole buffer, §87/ADR-009).
+    /// Stopped/unknown channels yield `None`.
     ///
     /// Takes `&mut self` (not `&self`) so the `run` future stays `Send` — a shared
     /// `&Driver` held across the await would require `Driver: Sync`, which the mpsc
@@ -261,6 +290,16 @@ impl Driver {
             if Some(id) == self.selected {
                 if let Some(snap) = self.listener.snapshot(id).await {
                     self.push(UiUpdate::Snapshot(id, Box::new(snap)));
+                }
+                // Incremental live stream (§87, ADR-009): fetch only the bytes new
+                // since our cursor, so we never re-ship the whole scrollback. Always
+                // advance the cursor, but only push (and wake the UI) when there are
+                // actually new bytes — a "caught up" empty delta is a no-op.
+                if let Some(delta) = self.listener.stream_delta(id, self.stream_cursor).await {
+                    self.stream_cursor = delta.end_offset;
+                    if !delta.bytes.is_empty() {
+                        self.push(UiUpdate::StreamDelta(id, Box::new(delta)));
+                    }
                 }
             } else if let Some(stats) = self.listener.channel_stats(id).await {
                 self.push(UiUpdate::Stats(id, Box::new(stats)));
@@ -398,16 +437,20 @@ mod tests {
         // get cheap stats only).
         cmd_tx.send(UiCommand::Select(Some(id))).await.unwrap();
 
-        // Lifecycle event is forwarded…
+        // Lifecycle event is forwarded; the small snapshot and the incremental
+        // stream delta both arrive for the selected channel.
         let mut started = false;
         let mut got_snapshot = false;
-        // Send a datagram so the snapshot has stream content.
+        let mut got_stream = false;
+        // Send a datagram so the stream delta has content.
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        // Drain updates until we've seen both a start event and a snapshot.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !(started && got_snapshot) {
+        while !(started && got_snapshot && got_stream) {
             if tokio::time::Instant::now() >= deadline {
-                panic!("did not observe start + snapshot (started={started}, snap={got_snapshot})");
+                panic!(
+                    "did not observe start + snapshot + stream \
+                     (started={started}, snap={got_snapshot}, stream={got_stream})"
+                );
             }
             // Keep poking the channel so a datagram arrives after Start.
             let _ = client.send_to(b"hi", ("127.0.0.1", port)).await;
@@ -416,6 +459,14 @@ mod tests {
                     started = true;
                 }
                 Ok(Some(UiUpdate::Snapshot(sid, _))) if sid == id => got_snapshot = true,
+                // The scrollback bytes ride the incremental delta, not the snapshot.
+                Ok(Some(UiUpdate::StreamDelta(sid, delta))) if sid == id => {
+                    assert!(
+                        !delta.bytes.is_empty(),
+                        "a non-empty delta carries the bytes"
+                    );
+                    got_stream = true;
+                }
                 Ok(Some(_)) => {}
                 Ok(None) => panic!("update stream closed early"),
                 Err(_) => {} // tick again

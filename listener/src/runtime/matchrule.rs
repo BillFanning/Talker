@@ -5,8 +5,8 @@
 //! and commands can name it) and then evaluated against received data. Evaluation
 //! is **pure and side-effect-free** — it reports *which* rules fired and *what
 //! actions* they carry; the pipeline owns applying those actions (recording,
-//! display, diagnostics, events). Rules never modify Messages, bytes, recordings,
-//! or metadata (§40, §103, §116).
+//! display, diagnostics, events). Rules never modify the received bytes or the
+//! recordings — the stream stays verbatim (§40, §103, §116).
 //!
 //! Two evaluation paths, per §50.2:
 //! - **stream** ([`evaluate_stream`](MatchRuleSet::evaluate_stream)) for

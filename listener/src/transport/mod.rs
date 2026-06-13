@@ -37,8 +37,9 @@ pub use udp::{BoundUdpTransport, UdpMode, UdpTransport};
 /// One unit of received data emitted by a data-bearing transport (§104, §138).
 ///
 /// Each chunk carries its payload and the [`ChunkTime`] captured when it was
-/// read. Chunk boundaries are an implementation detail, never a user-visible
-/// concept (§24); the extractor decides Message boundaries.
+/// read. In the stream-only design (ADR-010) chunk/datagram boundaries are a
+/// reception detail only — the pipeline concatenates payloads into one verbatim
+/// stream and never reframes them (§17–18).
 #[derive(Clone, Debug)]
 pub struct ReceivedData {
     pub channel_id: ChannelId,
@@ -46,12 +47,14 @@ pub struct ReceivedData {
     pub received_at: ChunkTime,
 }
 
-/// The two payload shapes a transport can deliver (§138).
+/// The two payload shapes a transport can deliver (§138). Both are appended to the
+/// stream verbatim; the distinction only reflects how the OS delivered the bytes.
 #[derive(Clone, Debug)]
 pub enum ReceivedPayload {
-    /// A stream chunk; framing is decided by the extractor (Serial, TCP).
+    /// A stream chunk whose boundaries track OS buffering, not content (Serial, TCP).
     Bytes(Vec<u8>),
-    /// Already one complete Message; no byte extraction is applied (UDP, §15).
+    /// One datagram delivered whole by the OS (UDP, §15); appended to the stream
+    /// like any other bytes — the boundary is not preserved as structure.
     Datagram(Vec<u8>),
 }
 
@@ -104,7 +107,7 @@ pub enum TransportOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransportNotice {
-    /// The reader stalled on the Transport→Extractor edge — the only edge that may
+    /// The reader stalled on the Transport→Pipeline edge — the only edge that may
     /// backpressure the reader (§97.1, §99) — for `stalled_for`. Long enough to
     /// risk a UART/driver overrun: possible transport-specific loss, unquantifiable
     /// from userland (§101). `stalled_for` is the observable proxy for "how bad".

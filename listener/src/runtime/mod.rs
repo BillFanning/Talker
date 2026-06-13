@@ -7,13 +7,16 @@
 //!
 //! Layers:
 //! - [`queue`] — the §99 bounded-queue backpressure policies.
-//! - [`metadata`] — the §106 Message Numbering / metadata stage.
-//! - [`pipeline`] — the §102 per-Channel processing pipeline + async ingest loop.
+//! - [`pipeline`] — the §102 per-Channel stream pipeline + async ingest loop
+//!   (raw recorder, scrollback, display recording, find/triggers, diagnostics).
+//! - [`activity`] — the §166 per-Channel liveness/throughput meter.
+//! - [`matchrule`] — §50.2 Find & Triggers evaluation (BytePattern / Idle).
 //! - [`channel`]/[`tcp`] — per-Channel and TCP-listener task orchestration.
-//! - [`build`] — maps validated config to live transports/extractors.
+//! - [`build`] — maps validated config to live transports.
 //! - [`listener`] — the [`Listener`] orchestrator: registry, §9 state machine,
 //!   start/stop/apply-pending in the [`crate::core::RuntimeCommand`] vocabulary.
-//! - [`snapshot`] — on-demand, pull-side readout of a running Channel's state.
+//! - [`snapshot`] — on-demand, pull-side readout: the small [`snapshot::ChannelSnapshot`]
+//!   plus incremental [`snapshot::StreamDelta`] scrollback reads (ADR-011).
 
 pub mod activity;
 pub mod build;
@@ -36,6 +39,6 @@ pub use queue::{
 };
 pub use snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
-    TriggeredMatch,
+    StreamDelta, TriggeredMatch,
 };
 pub use tcp::{start_tcp_listener, TcpListenerHandle};

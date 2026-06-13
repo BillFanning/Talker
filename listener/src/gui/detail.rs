@@ -4,7 +4,7 @@
 
 use std::time::SystemTime;
 
-use crate::core::RecordingState;
+use crate::core::{ChannelId, RecordingState};
 use crate::diagnostics::DiagnosticSeverity;
 use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, DisplayView, WrappingMode};
 
@@ -295,6 +295,9 @@ impl ListenerApp {
             counts: (usize, usize, usize),
             entries: Vec<(SystemTime, DiagnosticSeverity, String)>,
             matches: Vec<(Option<u64>, String)>,
+            /// How many matches were recovered across a read-chunk boundary (§50.2):
+            /// the cross-chunk-carry measurement (where/why land in the diag log).
+            boundary_saves: u64,
         }
         let diag_view = self
             .state
@@ -322,6 +325,7 @@ impl ListenerApp {
                         .take(20)
                         .map(|m| (m.byte_offset, short_id(&m.rule_id.to_string()).to_string()))
                         .collect(),
+                    boundary_saves: s.match_boundary_saves,
                 }
             });
         if let Some(dv) = diag_view {
@@ -380,10 +384,24 @@ impl ListenerApp {
                             }
                         });
                 });
-            if !dv.matches.is_empty() {
+            if !dv.matches.is_empty() || dv.boundary_saves > 0 {
                 egui::CollapsingHeader::new(format!("Match firings ({})", dv.matches.len()))
                     .id_salt("matches")
                     .show(ui, |ui| {
+                        // Cross-chunk measurement (§50.2): how often a pattern was
+                        // recovered across a read boundary. The where/why per
+                        // occurrence is in the Diagnostics log above.
+                        if dv.boundary_saves > 0 {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(150, 100, 0),
+                                format!(
+                                    "⮧ {} match{} spanned a read-chunk boundary \
+                                     (recovered; see Diagnostics for where)",
+                                    dv.boundary_saves,
+                                    if dv.boundary_saves == 1 { "" } else { "es" },
+                                ),
+                            );
+                        }
                         for (offset, rule) in &dv.matches {
                             let on = offset
                                 .map(|n| format!("@{n}"))
@@ -432,18 +450,38 @@ impl ListenerApp {
             hex_separator: " ".to_string(),
             hex_bytes_per_line: 16,
         };
-        let stream_bytes = self
+        let stream_len = self
             .state
             .channel(id)
-            .and_then(|v| v.snapshot.as_ref())
-            .map(|s| s.stream_tail.len())
+            .map(|v| v.stream_bytes.len())
             .unwrap_or(0);
-        ui.label(format!("Stream ({}):", human_bytes(stream_bytes as u64)));
+        ui.label(format!("Stream ({}):", human_bytes(stream_len as u64)));
+
+        // Verbatim received bytes (§17–18, §41): line breaks come only from the
+        // data — Rendered honors real CR/LF (§44), Raw shows control pictures, Hex
+        // is a byte run. Serial and UDP render identically (no reframing).
+        //
+        // Performance (§100): the scrollback can reach the ~1 MB cap. The bytes
+        // arrive incrementally (StreamDelta) so the driver never re-ships the whole
+        // buffer; here we (a) memoize the split rows, re-rendering only when data
+        // arrives or the view mode changes — keyed on the stream cursor — and (b)
+        // virtualize the layout with `show_rows`, laying out only visible rows. Both
+        // matter: a non-virtualized selectable Label over ~1 MB stalled the UI.
+        self.refresh_stream_rows(id, &renderer);
+        let font = egui::FontId::new(font_size, mono_family.clone());
+        let row_h = ui.fonts_mut(|f| f.row_height(&font));
+        let rows: &[String] = self
+            .stream_cache
+            .as_ref()
+            .filter(|c| c.key.channel == id)
+            .map(|c| c.rows.as_slice())
+            .unwrap_or(&[]);
+
         egui::Frame::new()
             .fill(bg)
             .inner_margin(4.0)
             .show(ui, |ui| {
-                if stream_bytes == 0 {
+                if stream_len == 0 {
                     let note = if has_snapshot {
                         "no data received yet"
                     } else {
@@ -452,29 +490,63 @@ impl ListenerApp {
                     ui.label(egui::RichText::new(note).weak());
                     return;
                 }
-                // Verbatim received bytes (§17–18, §41): line breaks come only from the
-                // data — Rendered honors real CR/LF (§44), Raw shows control pictures,
-                // Hex is a byte run. The Label soft-wraps so the stream reflows; serial
-                // and UDP render identically (no reframing).
-                let text = match self.state.channel(id).and_then(|v| v.snapshot.as_ref()) {
-                    None => String::new(),
-                    Some(snapshot) => renderer.render_text(&snapshot.stream_tail),
-                };
                 egui::ScrollArea::vertical()
                     .id_salt("stream")
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(text)
-                                    .font(egui::FontId::new(font_size, mono_family.clone()))
-                                    .color(fg),
-                            )
-                            .wrap()
-                            .selectable(true),
-                        );
+                    .show_rows(ui, row_h, rows.len().max(1), |ui, range| {
+                        for row in &rows[range] {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(row).font(font.clone()).color(fg),
+                                )
+                                .wrap()
+                                .selectable(true),
+                            );
+                        }
                     });
             });
     }
+
+    /// Refresh the memoized stream-view rows for `id` if the accumulated bytes or
+    /// the render settings changed. Keyed on the view's stream cursor (advances as
+    /// deltas are folded) plus the view mode/character rendering, so we re-render
+    /// the scrollback only when something actually changed — not every frame.
+    fn refresh_stream_rows(&mut self, id: ChannelId, renderer: &DisplayView) {
+        let Some(view) = self.state.channel_mut(id) else {
+            self.stream_cache = None;
+            return;
+        };
+        let key = super::StreamRenderKey {
+            channel: id,
+            cursor: view.stream_cursor,
+            len: view.stream_bytes.len(),
+            mode: self.msg_mode,
+            chars: self.msg_chars,
+        };
+        if self.stream_cache.as_ref().is_some_and(|c| c.key == key) {
+            return; // still valid — reuse the cached rows
+        }
+        let rows = split_stream_rows(&renderer.render_text(view.stream_contiguous()));
+        self.stream_cache = Some(super::StreamRenderCache { key, rows });
+    }
+}
+
+/// Split rendered stream text into virtualization rows: one row per data line,
+/// with any line lacking an LF (e.g. raw binary / UDP) hard-wrapped to a bounded
+/// width so a single row never becomes pathologically long to lay out.
+fn split_stream_rows(text: &str) -> Vec<String> {
+    const MAX_ROW_CHARS: usize = 4096;
+    let mut rows: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        if line.chars().count() <= MAX_ROW_CHARS {
+            rows.push(line.to_string());
+        } else {
+            let chars: Vec<char> = line.chars().collect();
+            for chunk in chars.chunks(MAX_ROW_CHARS) {
+                rows.push(chunk.iter().collect());
+            }
+        }
+    }
+    rows
 }

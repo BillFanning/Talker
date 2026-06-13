@@ -25,8 +25,9 @@ pub enum ChannelStatus {
     Reconnecting,
 }
 
-/// One Channel's view-model: identity, derived status, and the latest cheap
-/// liveness facts, plus the most recent full snapshot for detail panes.
+/// One Channel's view-model: identity, derived status, the latest cheap liveness
+/// facts, the most recent snapshot (diagnostics/matches) for detail panes, and the
+/// incrementally-accumulated stream scrollback for the live viewer.
 pub struct ChannelView {
     pub id: ChannelId,
     pub name: String,
@@ -49,15 +50,34 @@ pub struct ChannelView {
     /// The reason the last command on this Channel failed (e.g. a bind conflict),
     /// cleared on a successful (re)start. `None` when there's nothing to report.
     pub last_error: Option<String>,
-    /// The most recent full snapshot, for detail panes (retained Messages, hex,
-    /// diagnostics, match firings). `None` until the first poll arrives.
+    /// The most recent snapshot, for detail panes (diagnostics, match firings,
+    /// view pause, recording state). The stream bytes are *not* here — they
+    /// accumulate separately in `stream_bytes` from incremental deltas. `None` until
+    /// the first poll arrives.
     pub snapshot: Option<ChannelSnapshot>,
     /// Live serial control/status lines (§161) while running; `None` otherwise.
     pub control_lines: Option<SerialControlLines>,
     /// Raw-recording state from the latest snapshot/stats (§53), or `None` when no
     /// recorder is attached. Drives the recording indicator in the detail pane.
     pub recording: Option<RecordingState>,
+    /// How many `BytePattern` matches were recovered across a read-chunk boundary
+    /// (§50.2) — the cross-chunk-carry measurement. From the latest snapshot/stats;
+    /// shown per-tab so it's visible even when the channel isn't selected.
+    pub boundary_saves: u64,
+    /// Accumulated stream scrollback bytes for the live viewer (§87, ADR-009),
+    /// grown incrementally from [`UiUpdate::StreamDelta`] so the driver never
+    /// re-ships the whole ~1 MB buffer each poll. Capped to `STREAM_VIEW_CAP`
+    /// (oldest dropped) to match the runtime's bounded scrollback.
+    pub stream_bytes: std::collections::VecDeque<u8>,
+    /// Next absolute stream offset to request — the cursor handed to
+    /// `Listener::stream_delta`. Advances as deltas are folded.
+    pub stream_cursor: u64,
 }
+
+/// GUI-side scrollback cap (§87, §124): bounds the accumulated live-view bytes
+/// independent of the runtime cap, so a long-lived selection can't grow the view
+/// model without bound. Matches the default runtime byte retention.
+pub const STREAM_VIEW_CAP: usize = 1 << 20;
 
 impl ChannelView {
     fn new(id: ChannelId, name: String, details: String, config: ChannelConfig) -> Self {
@@ -76,7 +96,32 @@ impl ChannelView {
             snapshot: None,
             control_lines: None,
             recording: None,
+            boundary_saves: 0,
+            stream_bytes: std::collections::VecDeque::new(),
+            stream_cursor: 0,
         }
+    }
+
+    /// Fold an incremental stream delta (§87, ADR-009) into the accumulated view
+    /// bytes. Appends new bytes; if the runtime's window had evicted past our cursor
+    /// (`base_offset` jumped ahead), reset to the returned window. Caps the buffer.
+    fn apply_stream_delta(&mut self, base_offset: u64, bytes: &[u8], end_offset: u64) {
+        // A base ahead of our cursor means our cursor was evicted: reset the view to
+        // the returned window rather than appending a gap.
+        if base_offset > self.stream_cursor {
+            self.stream_bytes.clear();
+        }
+        self.stream_bytes.extend(bytes.iter().copied());
+        self.stream_cursor = end_offset;
+        let overflow = self.stream_bytes.len().saturating_sub(STREAM_VIEW_CAP);
+        if overflow > 0 {
+            self.stream_bytes.drain(..overflow);
+        }
+    }
+
+    /// The accumulated stream bytes as a contiguous slice for rendering.
+    pub fn stream_contiguous(&mut self) -> &[u8] {
+        self.stream_bytes.make_contiguous()
     }
 }
 
@@ -96,6 +141,12 @@ impl AppState {
     /// Look up one Channel's view-model.
     pub fn channel(&self, id: ChannelId) -> Option<&ChannelView> {
         self.views.get(&id)
+    }
+
+    /// Mutable access to a Channel's view — used by the detail pane to make its
+    /// accumulated stream bytes contiguous for rendering (and to memoize rows).
+    pub fn channel_mut(&mut self, id: ChannelId) -> Option<&mut ChannelView> {
+        self.views.get_mut(&id)
     }
 
     /// The Channel adjacent to `id` in list order: the one above it, or — if `id` is
@@ -181,10 +232,11 @@ impl AppState {
                     view.warnings = snapshot.diagnostics.warnings.len();
                     view.errors = snapshot.diagnostics.errors.len();
                     view.recording = snapshot.raw_recording;
+                    view.boundary_saves = snapshot.match_boundary_saves;
                     view.snapshot = Some(*snapshot);
                 }
             }
-            // Cheap per-tab health for non-selected channels (no message history).
+            // Cheap per-tab health for non-selected channels (no scrollback bytes).
             UiUpdate::Stats(id, stats) => {
                 if let Some(view) = self.views.get_mut(&id) {
                     view.bytes_total = stats.activity.total_bytes;
@@ -193,11 +245,17 @@ impl AppState {
                     view.warnings = stats.warning_count;
                     view.errors = stats.error_count;
                     view.recording = stats.raw_recording;
+                    view.boundary_saves = stats.match_boundary_saves;
                 }
             }
             UiUpdate::ControlLines(id, lines) => {
                 if let Some(view) = self.views.get_mut(&id) {
                     view.control_lines = Some(lines);
+                }
+            }
+            UiUpdate::StreamDelta(id, delta) => {
+                if let Some(view) = self.views.get_mut(&id) {
+                    view.apply_stream_delta(delta.base_offset, &delta.bytes, delta.end_offset);
                 }
             }
         }
@@ -212,6 +270,11 @@ impl AppState {
                 self.set_status(id, ChannelStatus::Running);
                 if let Some(view) = self.views.get_mut(&id) {
                     view.last_error = None; // a successful start clears the prior error
+                                            // A fresh Start resets the runtime's stream offset to 0, so drop
+                                            // any accumulated bytes/cursor from a previous run to avoid mixing
+                                            // old and new streams (§8.5).
+                    view.stream_bytes.clear();
+                    view.stream_cursor = 0;
                 }
             }
             RuntimeEvent::ChannelStopped(id) => {
@@ -282,7 +345,7 @@ mod tests {
             },
             matches: vec![],
             match_boundary_saves: 0,
-            stream_tail: Vec::new().into(),
+            stream_end_offset: total_bytes,
         }
     }
 
@@ -334,6 +397,70 @@ mod tests {
         assert_eq!(view.bytes_per_sec, 42.0);
         assert_eq!(view.warnings, 2);
         assert!(view.snapshot.is_some());
+    }
+
+    #[test]
+    fn snapshot_surfaces_cross_chunk_boundary_saves() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+
+        // The cross-chunk measurement (§50.2) folds through to the per-tab view.
+        let mut snap = snapshot_with(id, 100, 0.0, 0);
+        snap.match_boundary_saves = 3;
+        state.apply(UiUpdate::Snapshot(id, Box::new(snap)));
+        assert_eq!(state.channel(id).unwrap().boundary_saves, 3);
+    }
+
+    fn delta(base: u64, bytes: &[u8], end: u64) -> crate::runtime::StreamDelta {
+        crate::runtime::StreamDelta {
+            base_offset: base,
+            bytes: bytes.to_vec().into(),
+            end_offset: end,
+        }
+    }
+
+    #[test]
+    fn stream_deltas_accumulate_incrementally() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(0, b"alpha", 5))));
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(5, b"bravo", 10))));
+        let view = state.channel_mut(id).unwrap();
+        assert_eq!(view.stream_contiguous(), b"alphabravo");
+        assert_eq!(view.stream_cursor, 10);
+    }
+
+    #[test]
+    fn stream_delta_reset_on_eviction_replaces_rather_than_appends() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(0, b"old", 3))));
+        // base_offset (10) jumped ahead of our cursor (3): the window was evicted, so
+        // the view resets to the new window instead of leaving a gap.
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(10, b"new", 13))));
+        let view = state.channel_mut(id).unwrap();
+        assert_eq!(view.stream_contiguous(), b"new");
+        assert_eq!(view.stream_cursor, 13);
+    }
+
+    #[test]
+    fn restart_clears_accumulated_stream() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(0, b"before", 6))));
+        // A fresh Start resets the runtime offset to 0; the view must drop the old
+        // stream so post-restart bytes don't concatenate onto pre-restart ones.
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(id)));
+        let view = state.channel_mut(id).unwrap();
+        assert!(view.stream_contiguous().is_empty());
+        assert_eq!(view.stream_cursor, 0);
     }
 
     #[test]

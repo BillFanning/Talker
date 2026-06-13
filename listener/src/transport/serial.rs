@@ -4,8 +4,8 @@
 //! blocking receive loop runs on a **dedicated OS thread** that owns the port
 //! handle (ADR-001 / §97.1). That thread hands data to the async runtime via
 //! `Sender::blocking_send` — the one edge permitted to stall the reader (§97.2,
-//! §99): a full extractor queue backpressures the read loop, which can cause a
-//! UART/driver overrun reported as transport-specific loss (§101).
+//! §99): a full Transport→Pipeline queue backpressures the read loop, which can
+//! cause a UART/driver overrun reported as transport-specific loss (§101).
 //!
 //! Cancellation is cooperative (§111): the port is opened with a bounded read
 //! timeout, so the loop periodically returns from a blocking read to observe the
@@ -66,15 +66,16 @@ pub struct SerialControlHooks {
     pub events: Sender<RuntimeEvent>,
 }
 
-/// Read buffer size for one blocking read (a serial chunk; framing is the
-/// extractor's job, §105).
+/// Read buffer size for one blocking read. A serial read returns whatever bytes
+/// are available; the chunk boundary is a reception detail, not stream structure
+/// (ADR-010 — the stream is never reframed).
 const READ_BUFFER: usize = 4096;
 
 /// Default bounded read timeout. Caps how long a blocking read parks before the
 /// loop re-checks cancellation (§111).
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// How long the reader must be stalled on the Transport→Extractor edge before it
+/// How long the reader must be stalled on the Transport→Pipeline edge before it
 /// emits a [`TransportNotice::ReceptionStalled`] (§99, §101; listener ADR-007). A
 /// stall this long means the OS/UART receive buffer has had ample time to overrun.
 /// Heuristic: momentary backpressure that drains quickly is normal and must not
@@ -310,7 +311,7 @@ impl BlockingReader for SerialReader {
 /// The dedicated-thread receive loop (§97.1). Runs until cancelled, the reader
 /// reports a fatal error, or the extractor channel closes.
 ///
-/// On the Transport→Extractor edge — the only one permitted to backpressure the
+/// On the Transport→Pipeline edge — the only one permitted to backpressure the
 /// reader (§99) — the loop *stalls* rather than drops, so it loses nothing in
 /// process. A stall longer than `stall_warning` means the OS/UART buffer has had
 /// time to overrun, so it sends a `ReceptionStalled` notice through `notices`
@@ -612,7 +613,7 @@ mod tests {
         });
 
         // The reader stalls rather than dropping: all three arrive, in order
-        // (§97.1 — the Transport→Extractor edge stalls instead of losing data).
+        // (§97.1 — the Transport→Pipeline edge stalls instead of losing data).
         // This is the §101 in-process boundary: zero loss inside our queues; any
         // loss would be a UART overrun upstream, outside what we can count.
         assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");

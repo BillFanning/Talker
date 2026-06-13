@@ -29,8 +29,8 @@ use super::{
     TransportJoinHandle, TransportOutcome,
 };
 
-/// Read buffer size for one stream read (a chunk; framing is the extractor's
-/// job, §105).
+/// Read buffer size for one stream read. The chunk boundary tracks OS buffering,
+/// not content; the stream is appended verbatim and never reframed (ADR-010).
 const READ_BUFFER: usize = 8192;
 
 /// An unbound TCP listener description (§16.1, §76). Call [`bind`](Self::bind)

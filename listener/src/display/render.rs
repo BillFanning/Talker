@@ -130,6 +130,14 @@ fn render_rendered(bytes: &[u8], encoding: DisplayEncoding) -> String {
                 }
                 col += spaces;
             }
+            // A space is an ordinary printable character in terminal output — it
+            // must pass through. (`is_special` treats 0x20 as special only so Raw
+            // mode's Token/Glyph/HexEscape can *make it visible*; that does not
+            // apply here.) Guard it before the control-dropping arm below.
+            ' ' => {
+                out.push(' ');
+                col += 1;
+            }
             c if is_special(c) => {} // other controls are not printed
             c => {
                 out.push(c);
@@ -281,6 +289,19 @@ mod tests {
         assert_eq!(v.render_text(b"a\tb"), "a       b");
         // Other controls are not printed.
         assert_eq!(v.render_text(b"a\x07b"), "ab");
+    }
+
+    #[test]
+    fn rendered_preserves_literal_spaces() {
+        // Regression: a space (0x20) is printable in terminal output and must not be
+        // dropped as a "special" control (it is visible in Raw/Hex but was vanishing
+        // in Rendered).
+        let v = view(DisplayMode::Rendered, CharacterRendering::Native);
+        assert_eq!(v.render_text(b"a b  c"), "a b  c");
+        assert_eq!(v.render_text(b"$GPGGA, 123, 45"), "$GPGGA, 123, 45");
+        // Tab-stop column accounting still tracks spaces: after "ab " (col 3) a tab
+        // advances to column 8 → 5 spaces.
+        assert_eq!(v.render_text(b"ab \tX"), "ab      X");
     }
 
     #[test]

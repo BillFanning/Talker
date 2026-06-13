@@ -1,16 +1,16 @@
 //! The runtime orchestrator (spec §10, §13, §97.1, §113).
 //!
 //! [`Listener`] owns the Channel registry and drives the [`ChannelState`]
-//! lifecycle (§8/§9): it builds live transports/extractors/decoders from
-//! validated config (via [`super::build`]), opens/binds them at Start (resource
-//! failures → `Faulted`, §71/§8.2), wires the pipeline, and stops them on
-//! request. All channels share one [`RuntimeEvent`] stream (§137).
+//! lifecycle (§8/§9): it builds live transports from validated config (via
+//! [`super::build`]), opens/binds them at Start (resource failures → `Faulted`,
+//! §71/§8.2), wires the stream pipeline, and stops them on request. All channels
+//! share one [`RuntimeEvent`] stream (§137).
 //!
 //! Commands are exposed as async methods (`start`/`stop`/`apply_pending`),
 //! the vocabulary of [`crate::core::RuntimeCommand`]. Raw recording is wired for
 //! serial/UDP channels from `RecordingConfig`; a recording-enable failure
 //! surfaces a warning without faulting the Channel (§55). Accepted TCP
-//! **connection** channels inherit the listener's extraction and decoder (§16.2);
+//! **connection** channels run the same stream pipeline as their listener (§16.2);
 //! per-connection recording and snapshots remain deferred (§59 filename
 //! templates; the supervisor keeps no per-connection handle).
 
@@ -39,7 +39,7 @@ use super::channel::{
     spawn_monitored_channel, DataRecorder, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES,
 };
 use super::pipeline::{DisplayViewHandle, PipelineCapacities, RawRecordArming};
-use super::snapshot::{ChannelSnapshot, ChannelStats};
+use super::snapshot::{ChannelSnapshot, ChannelStats, StreamDelta};
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
 
 /// How many Display Views a Channel runs (§48): one per configured view, at
@@ -196,12 +196,13 @@ impl Listener {
         self.channels.get(&id).map(|c| &c.config)
     }
 
-    /// Request an on-demand snapshot of a running Channel's pipeline state (§137,
-    /// ADR-006): retained Messages with decoder annotations, per-view display
-    /// history, diagnostics, and recording state. Returns `None` when the Channel
-    /// is unknown, not running, or a TCP listener (its connections are snapshot
-    /// targets in their own right; per-connection snapshots are deferred). The
-    /// `RuntimeEvent` stream stays the authoritative liveness signal.
+    /// Request an on-demand snapshot of a running Channel's *small* observable state
+    /// (§137, ADR-006): diagnostics, recent match firings, per-view pause state,
+    /// recording state, liveness, and the stream end offset. The scrollback bytes
+    /// come separately via [`stream_delta`](Self::stream_delta). Returns `None` when
+    /// the Channel is unknown, not running, or a TCP listener (its connections are
+    /// snapshot targets in their own right; per-connection snapshots are deferred).
+    /// The `RuntimeEvent` stream stays the authoritative liveness signal.
     pub async fn snapshot(&self, id: ChannelId) -> Option<ChannelSnapshot> {
         match self.channels.get(&id)?.handle.as_ref()? {
             ChannelHandle::Data(tasks) => tasks.snapshot().await,
@@ -210,11 +211,21 @@ impl Listener {
     }
 
     /// Cheap O(1) liveness stats for a running data Channel (§91.1, ADR-006) — the
-    /// counters a multi-channel overview shows per tab, without cloning retained
-    /// Messages. `None` when unknown, not running, or a TCP listener.
+    /// counters a multi-channel overview shows per tab, without cloning the
+    /// scrollback. `None` when unknown, not running, or a TCP listener.
     pub async fn channel_stats(&self, id: ChannelId) -> Option<ChannelStats> {
         match self.channels.get(&id)?.handle.as_ref()? {
             ChannelHandle::Data(tasks) => tasks.stats().await,
+            ChannelHandle::TcpListener(_) => None,
+        }
+    }
+
+    /// Incremental stream bytes since the consumer's cursor (§87, ADR-009): only
+    /// what is new, so a live viewer never re-ships the whole ~1 MB scrollback each
+    /// poll. `None` when unknown, not running, or a TCP listener.
+    pub async fn stream_delta(&self, id: ChannelId, since: u64) -> Option<StreamDelta> {
+        match self.channels.get(&id)?.handle.as_ref()? {
+            ChannelHandle::Data(tasks) => tasks.stream_delta(since).await,
             ChannelHandle::TcpListener(_) => None,
         }
     }

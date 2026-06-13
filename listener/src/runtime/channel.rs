@@ -3,7 +3,7 @@
 //!
 //! [`start_data_channel`] is the runtime's per-Channel setup for a single
 //! data-bearing transport (Serial, UDP, or a standalone TCP connection): it
-//! creates the bounded Transport→Extractor queue (§97.2), spawns the pipeline
+//! creates the bounded Transport→Pipeline queue (§97.2), spawns the pipeline
 //! task, and hands the transport its `out` sender. The returned
 //! [`RunningChannel`] owns the cancellation tokens and join handles for
 //! shutdown, plus its own event receiver.
@@ -38,7 +38,7 @@ use crate::transport::{
 use super::pipeline::{
     run_channel, ChannelPipeline, DisplayViewHandle, PipelineCapacities, RawRecordArming,
 };
-use super::snapshot::{ChannelSnapshot, ChannelStats, PipelineRequest};
+use super::snapshot::{ChannelSnapshot, ChannelStats, PipelineRequest, StreamDelta};
 
 /// Match Rule wiring for a Channel (§50.2, §165): the compiled-from rules plus the
 /// optional arming a `Record` action needs to lazily create a recording. Bundled
@@ -203,6 +203,21 @@ impl MonitoredChannel {
         reply_rx.await.ok()
     }
 
+    /// Incremental stream bytes since `since` (§87, ADR-009): only what is new, so
+    /// a live viewer never re-ships the whole scrollback. `None` if the pipeline
+    /// task has already ended.
+    pub(crate) async fn stream_delta(&self, since: u64) -> Option<StreamDelta> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.requests
+            .send(PipelineRequest::StreamDelta {
+                since,
+                reply: reply_tx,
+            })
+            .await
+            .ok()?;
+        reply_rx.await.ok()
+    }
+
     /// Graceful stop (§110): stop reception; the transport's sender drops, the
     /// pipeline drains the accepted backlog and returns, and the monitor ends.
     pub(crate) async fn stop(self) -> ChannelPipeline {
@@ -325,6 +340,12 @@ impl RunningChannel {
         self.tasks.stats().await
     }
 
+    /// Incremental stream bytes since `since` (§87, ADR-009). `None` once the
+    /// pipeline has ended.
+    pub async fn stream_delta(&self, since: u64) -> Option<StreamDelta> {
+        self.tasks.stream_delta(since).await
+    }
+
     /// The runtime→UI event stream for this Channel (§137).
     pub fn events(&mut self) -> &mut mpsc::Receiver<RuntimeEvent> {
         &mut self.events
@@ -429,12 +450,13 @@ mod tests {
         client.send_to(b"alpha", server_addr).await.unwrap();
         client.send_to(b"bravo", server_addr).await.unwrap();
 
-        // Poll the live snapshot until both datagrams land in the stream scrollback,
-        // concatenated verbatim in receive order (no reframing, §18).
+        // Poll until both datagrams land in the stream scrollback, then fetch them
+        // verbatim via the incremental stream path — concatenated in receive order
+        // (no reframing, §18).
         let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(s) = running.snapshot().await {
-                    if s.stream_tail.len() >= 10 {
+                    if s.stream_end_offset >= 10 {
                         break s;
                     }
                 }
@@ -444,8 +466,10 @@ mod tests {
         .await
         .expect("datagrams did not arrive");
         assert_eq!(snapshot.channel_id, channel_id);
-        assert_eq!(&*snapshot.stream_tail, b"alphabravo");
         assert_eq!(snapshot.activity.total_bytes, 10);
+        let delta = running.stream_delta(0).await.unwrap();
+        assert_eq!(&*delta.bytes, b"alphabravo");
+        assert_eq!(delta.end_offset, 10);
 
         let _ = running.stop().await;
     }

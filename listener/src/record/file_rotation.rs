@@ -36,7 +36,7 @@ pub(crate) fn period_key(policy: FileRotationPolicy, at: SystemTime) -> Option<S
     }
 }
 
-/// `<channel>_<key><ext>` (§59), e.g. `GPS_2026-06-03_08.dat`.
+/// `<channel>_<key><ext>` (§59), e.g. `GPS_2026-06-03_08.raw`.
 fn rotation_filename(channel: &str, key: &str, ext: &str) -> String {
     format!("{channel}_{key}{ext}")
 }
@@ -68,8 +68,8 @@ pub fn is_filesystem_safe(name: &str) -> bool {
     !RESERVED.contains(&stem.as_str())
 }
 
-/// Raw Recording with time-based rotation (§59). Writes `.dat` (or `.ssdat`) files
-/// into `dir`, one per calendar period.
+/// Raw Recording with time-based rotation (§59). Writes `.raw` files into `dir`,
+/// one per calendar period.
 pub struct RotatingRawRecorder {
     dir: PathBuf,
     channel: String,
