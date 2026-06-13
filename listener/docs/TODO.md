@@ -67,9 +67,13 @@ Message-model removal). Everything below this block is verified done:
       `RecordTarget::Display`/`Both` variants exist and the pipeline accepts them,
       but only the Raw side is driven today (`apply_pending_records` skips
       display-only); the display portion needs per-view display-recorder arming.
-- [ ] `DisplayViewConfig.hex_grouping` (spec §1431): the field is documented but
-      not yet in the config schema, so profiles can't round-trip it. Add with
-      `#[serde(default)]` when the Hex-view grouping control is wired.
+- [x] `DisplayViewConfig.hex_grouping` schema field (spec §1431) — `HexGrouping
+      { bytes_per_group, groups_per_line }` added with `#[serde(default)]`, so
+      profiles round-trip it (`b8960a1`). Pinned by `hex_grouping_round_trips_through_
+      a_profile` + `a_profile_without_hex_grouping_loads_with_the_default`.
+- [ ] Consume `hex_grouping` in the Hex renderer: `display::DisplayView` still uses
+      its own `hex_bytes_per_line`/`hex_separator`; map the config field onto them so
+      the persisted grouping actually drives the Hex view (with a GUI control).
 - [ ] Live `Record` begin/stop without a restart. The `RuntimeCommand::Enable`/
       `DisableRecording` variants exist but are **constructed nowhere** and have no
       runtime handler; recording is wired only from `RecordingConfig` at channel
@@ -81,10 +85,13 @@ Message-model removal). Everything below this block is verified done:
       `apply_pending`) per `runtime/listener.rs`. Either route the GUI/CLI through
       the command enum (a real command channel) or narrow the enum to match the
       method surface. Until then the §136 vocabulary is aspirational, not load-bearing.
-- [ ] Profiles: finish wiring save/load against the v2 schema (§67–§71). The
-      `Config::{from_toml,to_toml,load,save}` round-trip exists and the CLI save
-      path calls `profile.save(..)`; the **GUI** has no load/save call site yet
-      (no picker → `Config::load`, no "save profile" → `Config::save`).
+- [x] Profiles: save/load wired end-to-end against the v2 schema (§67–§71)
+      (`6b17021`). The GUI Profile menu (Save / Save As… / Load) routes through
+      `UiCommand::{SaveProfile,LoadProfile}`; the driver gathers configs from the
+      authoritative `Listener` for save, and on load parses+validates first then
+      swaps the channel set (§70 — channels restore Stopped). Pinned by
+      `save_then_load_round_trips_the_workspace_through_the_driver` +
+      `loading_a_missing_profile_errors_without_touching_the_workspace`.
 - [ ] Export (stream scrollback → file, §60–§63) — after GUI settles
 
 ## Carried over (still valid under v2)
