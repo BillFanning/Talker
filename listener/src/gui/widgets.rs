@@ -9,7 +9,7 @@ use crate::config::{
     templates, ChannelConfig, DataBits, FlowControl, InterfaceConfig, Parity, StopBits,
 };
 use crate::core::ChannelId;
-use crate::record::{FileRotationPolicy, OverwritePolicy, RecordingMode};
+use crate::record::{FileRotationPolicy, OverwritePolicy};
 use crate::transport::udp::UdpMode;
 
 use super::fonts::bold;
@@ -296,36 +296,28 @@ pub(super) fn edit_interface(
             radio_row(ui, "Flow", &mut serial.flow_control, FLOW_CONTROL);
         }
     }
-    ui.separator();
-    edit_recording(ui, config);
     refresh
 }
 
-/// Edit the channel's recording (§51–§59): write received data to a file. Mode
-/// picks the system — byte-exact Raw `.raw` (§53) or rendered Display `.disp`
-/// (§54). The rest sets the destination, overwrite handling, and time rotation.
-/// Config-driven: applied via a §13 Reconfigure, so Apply & Restart begins it.
-fn edit_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
-    let rec = &mut config.recording;
-    ui.horizontal(|ui| {
-        ui.label(bold("Recording"));
-        ui.radio_value(&mut rec.mode, RecordingMode::Disabled, "Off");
-        ui.radio_value(&mut rec.mode, RecordingMode::Raw, "Raw (.raw)")
-            .on_hover_text("Byte-exact, exactly as received — verbatim stream (§53)");
-        ui.radio_value(&mut rec.mode, RecordingMode::Display, "Display (.disp)")
-            .on_hover_text("The rendered view output (§54)");
-    });
-    if rec.mode == RecordingMode::Disabled {
-        return;
-    }
+/// The shared destination / overwrite / rotation / timestamp controls for a recording
+/// (§55–§59), used by both the Raw and Display editors (their config structs carry the
+/// same fields; ADR-013). `ext` is the file extension shown in hints (".raw"/".disp").
+#[allow(clippy::too_many_arguments)]
+fn recording_file_fields(
+    ui: &mut egui::Ui,
+    ext: &str,
+    destination: &mut Option<PathBuf>,
+    overwrite_policy: &mut OverwritePolicy,
+    file_rotation: &mut FileRotationPolicy,
+    timestamp_enabled: &mut bool,
+) {
     // A single file when not rotating; a directory of <channel>_<period> files
-    // otherwise (§59). `rotating` reflects this frame's start — a one-frame lag
-    // when the user flips rotation below is harmless.
-    let rotating = rec.file_rotation != FileRotationPolicy::None;
+    // otherwise (§59). `rotating` reflects this frame's start — a one-frame lag when
+    // the user flips rotation below is harmless.
+    let rotating = *file_rotation != FileRotationPolicy::None;
     ui.horizontal(|ui| {
         ui.label(if rotating { "Folder" } else { "File" });
-        let mut path = rec
-            .destination
+        let mut path = destination
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
@@ -334,7 +326,7 @@ fn edit_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
             .changed()
         {
             let trimmed = path.trim();
-            rec.destination = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed));
+            *destination = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed));
         }
         if ui.button("Browse…").clicked() {
             let picked = if rotating {
@@ -343,11 +335,11 @@ fn edit_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
                 rfd::FileDialog::new().save_file()
             };
             if let Some(p) = picked {
-                rec.destination = Some(p);
+                *destination = Some(p);
             }
         }
     });
-    if rec.destination.is_none() {
+    if destination.is_none() {
         ui.label(
             egui::RichText::new("⚠ set a destination — recording won't start without one")
                 .color(egui::Color32::from_rgb(150, 100, 0)),
@@ -355,30 +347,61 @@ fn edit_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
     }
     ui.horizontal(|ui| {
         ui.label("On exists");
-        ui.radio_value(&mut rec.overwrite_policy, OverwritePolicy::Refuse, "Refuse");
-        ui.radio_value(
-            &mut rec.overwrite_policy,
-            OverwritePolicy::Overwrite,
-            "Overwrite",
-        );
-        ui.radio_value(
-            &mut rec.overwrite_policy,
-            OverwritePolicy::AppendIfExists,
-            "Append",
-        );
+        ui.radio_value(overwrite_policy, OverwritePolicy::Refuse, "Refuse");
+        ui.radio_value(overwrite_policy, OverwritePolicy::Overwrite, "Overwrite");
+        ui.radio_value(overwrite_policy, OverwritePolicy::AppendIfExists, "Append");
     });
     ui.horizontal(|ui| {
         ui.label("Rotate");
-        ui.radio_value(&mut rec.file_rotation, FileRotationPolicy::None, "None");
-        ui.radio_value(&mut rec.file_rotation, FileRotationPolicy::Hourly, "Hourly");
-        ui.radio_value(&mut rec.file_rotation, FileRotationPolicy::Daily, "Daily")
+        ui.radio_value(file_rotation, FileRotationPolicy::None, "None");
+        ui.radio_value(file_rotation, FileRotationPolicy::Hourly, "Hourly");
+        ui.radio_value(file_rotation, FileRotationPolicy::Daily, "Daily")
             .on_hover_text(
                 "Rotating files are named <channel>_<period> — keep the channel name \
                  filesystem-safe (§59)",
             );
     });
-    ui.checkbox(&mut rec.timestamp_enabled, "Record timestamps")
+    ui.checkbox(timestamp_enabled, format!("Record timestamps ({ext})"))
         .on_hover_text("Sidecar index for Raw; inline for Display (§57)");
+}
+
+/// Edit the channel's **Raw** recording setup (§53): destination, overwrite,
+/// rotation, timestamps, and the "record at start" flag. The byte-exact verbatim
+/// stream (§53) — a separate pipeline tap from Display (ADR-013). Config-driven:
+/// applied via a §13 Reconfigure. The live Record toggle (ADR-012) begins/stops it at
+/// runtime without a restart, as long as a destination is set.
+pub(super) fn edit_raw_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
+    let rec = &mut config.raw_recording;
+    ui.checkbox(&mut rec.enabled, "Record at start")
+        .on_hover_text("Begin Raw recording when the channel starts (§53)");
+    recording_file_fields(
+        ui,
+        ".raw",
+        &mut rec.destination,
+        &mut rec.overwrite_policy,
+        &mut rec.file_rotation,
+        &mut rec.timestamp_enabled,
+    );
+}
+
+/// Edit the channel's **Display** recording setup (§54): records the rendered view
+/// output (`.disp`) — a separate pipeline tap from Raw (ADR-013). Config-driven:
+/// applied via a §13 Reconfigure.
+pub(super) fn edit_display_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
+    let rec = &mut config.display_recording;
+    ui.checkbox(&mut rec.enabled, "Record display output (.disp)")
+        .on_hover_text("Record the rendered view, not the raw bytes (§54)");
+    if !rec.enabled {
+        return;
+    }
+    recording_file_fields(
+        ui,
+        ".disp",
+        &mut rec.destination,
+        &mut rec.overwrite_policy,
+        &mut rec.file_rotation,
+        &mut rec.timestamp_enabled,
+    );
 }
 
 /// The available serial port names, sorted (§14.4). Empty if enumeration fails.

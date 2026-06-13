@@ -12,8 +12,9 @@ use super::bridge::{self, UiCommand};
 use super::fonts::{bold, MonoFont};
 use super::state::ChannelStatus;
 use super::widgets::{
-    edit_interface, human_bytes, latest_diagnostic, line_indicator, line_toggle, short_id,
-    status_color, status_label, truncate, vsep, ColorScheme, LifecycleAction, MSG_FONT_SIZES,
+    edit_display_recording, edit_interface, edit_raw_recording, human_bytes, latest_diagnostic,
+    line_indicator, line_toggle, short_id, status_color, status_label, truncate, vsep, ColorScheme,
+    LifecycleAction, MSG_FONT_SIZES,
 };
 use super::ListenerApp;
 
@@ -33,7 +34,7 @@ impl ListenerApp {
                     v.bytes_per_sec,
                     v.last_error.clone(),
                     v.recording,
-                    v.config.recording.destination.clone(),
+                    v.config.raw_recording.destination.clone(),
                 )
             })
         else {
@@ -90,28 +91,8 @@ impl ListenerApp {
             "Received: {}    Throughput: {bps:.0} B/s",
             human_bytes(bytes_total)
         ));
-        // Recording indicator (§53): live state from the snapshot, destination from
-        // the config. Off/None shows nothing — only Configure surfaces the setting.
-        match recording {
-            Some(RecordingState::Enabled) => {
-                let dest = rec_dest
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "(no destination)".to_string());
-                ui.colored_label(
-                    egui::Color32::from_rgb(200, 40, 40),
-                    format!("\u{25CF} Recording \u{2192} {dest}"),
-                );
-            }
-            Some(RecordingState::Faulted) => {
-                ui.colored_label(
-                    egui::Color32::from_rgb(170, 30, 30),
-                    "\u{26A0} Recording faulted — see Diagnostics",
-                );
-            }
-            Some(RecordingState::Disabled) | None => {}
-        }
-        // Lifecycle actions, below the stats line (#6); bigger so Stop/Remove stand out.
+        // Lifecycle actions, below the stats line (#6); bigger so Stop/Remove stand
+        // out. Recording controls live in the Recording panel below, not here.
         ui.horizontal(|ui| {
             let size = egui::vec2(86.0, 30.0);
             // Primary action + label both derived from state (tested in widgets).
@@ -130,21 +111,6 @@ impl ListenerApp {
                     LifecycleAction::Start => self.try_start(id),
                 }
             }
-            // Live Raw-recording toggle (§50.2, ADR-012): begin/stop without a
-            // restart. Only for a running channel with a destination configured (no
-            // destination = nothing to record to). A Faulted recording is left to the
-            // diagnostics path, not toggled here.
-            if status == ChannelStatus::Running && rec_dest.is_some() {
-                let recording_now = matches!(recording, Some(RecordingState::Enabled));
-                let label = if recording_now {
-                    "\u{25A0} Stop rec"
-                } else {
-                    "\u{25CF} Record"
-                };
-                if ui.add_sized(size, egui::Button::new(label)).clicked() {
-                    self.send(UiCommand::SetRecording(id, !recording_now));
-                }
-            }
             if ui.add_sized(size, egui::Button::new("Remove")).clicked() {
                 // Confirm first — removal is destructive and can't be undone (#1).
                 self.confirm_remove = Some(id);
@@ -157,6 +123,57 @@ impl ListenerApp {
                  the other channel on that port) then Retry, or Remove this channel.",
             );
         }
+
+        // Recording panel (§53, ADR-013) — Raw recording, above Configure. The
+        // collapsing header summarizes live state (●/■ + on/off); inside are the live
+        // Record/Stop toggle (begins/stops without a restart, ADR-012) and the Raw
+        // setup (destination/rotation/overwrite/timestamps), committed via Apply.
+        // Display (.disp) recording lives under Configure (it's display config).
+        let rec_header = match recording {
+            Some(RecordingState::Enabled) => "Recording  ●  on",
+            Some(RecordingState::Faulted) => "Recording  ⚠  faulted",
+            Some(RecordingState::Disabled) | None => "Recording  ■  off",
+        };
+        egui::CollapsingHeader::new(rec_header)
+            .id_salt(("recording_panel", id))
+            .default_open(false)
+            .show(ui, |ui| {
+                // Live toggle: only for a running channel with a destination set (no
+                // destination = nothing to record to).
+                if status == ChannelStatus::Running && rec_dest.is_some() {
+                    let recording_now = matches!(recording, Some(RecordingState::Enabled));
+                    let label = if recording_now {
+                        "\u{25A0} Stop recording"
+                    } else {
+                        "\u{25CF} Record now"
+                    };
+                    if ui.button(label).clicked() {
+                        self.send(UiCommand::SetRecording(id, !recording_now));
+                    }
+                }
+                if let Some(RecordingState::Enabled) = recording {
+                    let dest = rec_dest
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(no destination)".to_string());
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 40, 40),
+                        format!("\u{25CF} Recording \u{2192} {dest}"),
+                    );
+                } else if let Some(RecordingState::Faulted) = recording {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(170, 30, 30),
+                        "\u{26A0} Recording faulted — see Diagnostics",
+                    );
+                }
+                ui.separator();
+                if let Some((_, config)) = &mut self.edit_draft {
+                    edit_raw_recording(ui, config);
+                    if ui.button("Apply & Restart raw recording").clicked() {
+                        self.apply_and_restart(id);
+                    }
+                }
+            });
 
         // Configure: edit the full interface config on a working copy, then commit
         // with one click — "Apply & Restart" installs it and brings the channel up
@@ -184,6 +201,12 @@ impl ListenerApp {
                     refresh = ui
                         .push_id("edit_iface", |ui| edit_interface(ui, id, config, &ports))
                         .inner;
+                    // Display (.disp) recording is part of display config, so it lives
+                    // here under Configure — Raw recording is the separate panel above
+                    // (ADR-013).
+                    ui.separator();
+                    ui.label(bold("Display record"));
+                    edit_display_recording(ui, config);
                     apply = ui.button(apply_label).clicked();
                 });
         }

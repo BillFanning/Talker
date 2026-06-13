@@ -249,8 +249,8 @@ async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
     // <channel>_<period>.raw into the destination directory, driven through the
     // orchestrator. Boundary-crossing across periods is unit-tested in
     // record::file_rotation with crafted timestamps; here we prove wiring + naming.
-    use listener::config::RecordingConfig;
-    use listener::record::{FileRotationPolicy, OverwritePolicy, RecordingMode};
+    use listener::config::RawRecordingConfig;
+    use listener::record::{FileRotationPolicy, OverwritePolicy};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -267,8 +267,8 @@ async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
         udp.bind_address = "127.0.0.1".to_string();
         udp.port = port;
     }
-    config.recording = RecordingConfig {
-        mode: RecordingMode::Raw,
+    config.raw_recording = RawRecordingConfig {
+        enabled: true,
         destination: Some(dir.clone()),
         timestamp_enabled: false,
         overwrite_policy: OverwritePolicy::Overwrite,
@@ -306,10 +306,11 @@ async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
 async fn set_recording_toggles_raw_recording_live_through_the_orchestrator() {
     // ADR-012: a running channel records nothing until set_recording(true), then a
     // .raw file captures from that point, and set_recording(false) finalizes it —
-    // no restart. The channel is configured with a destination but mode=Disabled, so
-    // it does not auto-record at Start; the arming is present for the live toggle.
-    use listener::config::RecordingConfig;
-    use listener::record::{FileRotationPolicy, OverwritePolicy, RecordingMode};
+    // no restart. The channel has a destination but enabled=false, so it does not
+    // auto-record at Start; the arming is present (from the destination) for the live
+    // toggle (ADR-013).
+    use listener::config::RawRecordingConfig;
+    use listener::record::{FileRotationPolicy, OverwritePolicy};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -325,8 +326,8 @@ async fn set_recording_toggles_raw_recording_live_through_the_orchestrator() {
         udp.bind_address = "127.0.0.1".to_string();
         udp.port = port;
     }
-    config.recording = RecordingConfig {
-        mode: RecordingMode::Disabled, // no auto-record; armed by the destination
+    config.raw_recording = RawRecordingConfig {
+        enabled: false, // no auto-record; armed by the destination for the live toggle
         destination: Some(path.clone()),
         timestamp_enabled: false,
         overwrite_policy: OverwritePolicy::Overwrite,
@@ -368,6 +369,68 @@ async fn set_recording_toggles_raw_recording_live_through_the_orchestrator() {
     // The file holds only the bytes received while recording was on.
     assert_eq!(std::fs::read(&path).unwrap(), b"DURING");
     let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn raw_and_display_recording_run_to_independent_destinations() {
+    // ADR-013: Raw and Display recording are independently configured and run
+    // simultaneously to *different* files — the "Both" case the merged config could
+    // not express. Raw captures verbatim bytes (.raw); Display captures the rendered
+    // view (.disp). Here the view renders ASCII as-is, so both hold the same text.
+    use listener::config::{DisplayRecordingConfig, RawRecordingConfig};
+    use listener::record::{FileRotationPolicy, OverwritePolicy};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let raw_path =
+        std::env::temp_dir().join(format!("listener-both-raw-{}-{n}.raw", std::process::id()));
+    let disp_path = std::env::temp_dir().join(format!(
+        "listener-both-disp-{}-{n}.disp",
+        std::process::id()
+    ));
+
+    let port = free_udp_port();
+    let mut config = listener::config::templates::udp_template();
+    if let InterfaceConfig::Udp(udp) = &mut config.interface {
+        udp.bind_address = "127.0.0.1".to_string();
+        udp.port = port;
+    }
+    config.raw_recording = RawRecordingConfig {
+        enabled: true,
+        destination: Some(raw_path.clone()),
+        timestamp_enabled: false,
+        overwrite_policy: OverwritePolicy::Overwrite,
+        file_rotation: FileRotationPolicy::None,
+        disk_guard: None,
+    };
+    config.display_recording = DisplayRecordingConfig {
+        enabled: true,
+        destination: Some(disp_path.clone()),
+        timestamp_enabled: false,
+        overwrite_policy: OverwritePolicy::Overwrite,
+        file_rotation: FileRotationPolicy::None,
+    };
+
+    let mut listener = Listener::with_default_capacities();
+    let id = listener.add_channel(config);
+    listener.start(id).await.unwrap();
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client.send_to(b"HELLO", ("127.0.0.1", port)).await.unwrap();
+    let _ = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 5).await;
+
+    stop(&mut listener, id).await; // finalizes both recordings
+
+    // Both files exist, at their own destinations, holding the data.
+    assert_eq!(std::fs::read(&raw_path).unwrap(), b"HELLO");
+    let disp = std::fs::read(&disp_path).unwrap();
+    assert!(
+        disp.windows(5).any(|w| w == b"HELLO"),
+        "display recording holds the rendered text, got {disp:?}"
+    );
+    let _ = std::fs::remove_file(&raw_path);
+    let _ = std::fs::remove_file(&disp_path);
 }
 
 #[tokio::test]

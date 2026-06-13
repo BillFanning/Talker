@@ -61,6 +61,12 @@ Message-model removal). Everything below this block is verified done:
       boundary-split firing records a where/why event diagnostic and increments
       `match_boundary_saves`, surfaced in both `ChannelStats` and `ChannelSnapshot`
       (the how-often). `reset_stream` drops the carry on Stop/Start.
+- [x] Independent Raw/Display recording config (ADR-013, spec §79 → schema v3).
+      `RecordingConfig`/`RecordingMode` split into `RawRecordingConfig` +
+      `DisplayRecordingConfig`, each with its own destination/rotation/overwrite/
+      timestamps; a channel can run both at once. GUI: Raw panel above Configure
+      (live on/off + setup), Display under Configure. Pinned by
+      `raw_and_display_recording_run_to_independent_destinations`.
 - [ ] Highlight rendering in the stream view (byte-range styling)
 - [ ] `Mark` markers in display + `.disp` (never `.raw`)
 - [ ] Match-`Record` to a Display/`Both` target: arm the display recorder. The
@@ -78,8 +84,8 @@ Message-model removal). Everything below this block is verified done:
       → `PipelineRequest::SetRecording` into `run_channel` → the pipeline's lazy
       begin / clean finalize path (shared with the match-rule `Record` action); GUI
       Record/Stop-recording button on the detail pane (`UiCommand::SetRecording`).
-      A channel with a destination but `mode = Disabled` is armed but not auto-
-      recording, so the toggle controls it. Pinned by
+      A channel with a destination but `raw_recording.enabled = false` is armed but
+      not auto-recording, so the toggle controls it. Pinned by
       `set_recording_begins_and_stops_raw_recording_live` (pipeline) +
       `set_recording_toggles_raw_recording_live_through_the_orchestrator` (loopback).
 - [ ] Recording timestamp sidecar for `.raw` (byte-offset keyed, §57)

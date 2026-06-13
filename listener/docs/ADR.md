@@ -477,6 +477,31 @@ A second, parallel command enum on top of a working method API + a GUI transport
 - **Supersedes** the ADR-008 note that the bridge would "align `RuntimeCommand` with §136 and dispatch it." It won't; `UiCommand` is that bridge.
 - Spec §136 is amended to document the method-API command surface in place of the enum (version-bumped with a revision note, per the workspace versioning rule).
 
+## ADR-013 — Raw and Display recording are independently configured
+
+**Status:** Accepted. **Context:** spec §53 (Raw recording), §54 (Display recording), §79 (Recording Configuration), ADR-010 (the v2.0 stream-only strip), ADR-012 (live recording via `set_recording`).
+
+**Problem.** `.raw` and `.disp` recording were always **architecturally separate**: Raw taps the verbatim received byte stream (before the old `extract()`), while Display records the *rendered* view output downstream. In `ChannelPipeline::ingest` they are still **separate fan-out taps** to this day. But the v2.0 strip, collapsing `extract()`/decode away, left a single `RecordingConfig` with one `mode: RecordingMode` (Disabled/Raw/Display/Both) and **one shared** `destination`/`file_rotation`/`overwrite`/`timestamps`. So a user could not, e.g., record Raw to one file and Display to another, and the GUI had to cram both behind one mode radio. The merge was only ever in the *config*, never the data path.
+
+**Decision.** Split the config to match the data path. `ChannelConfig.recording: RecordingConfig` becomes two independent fields:
+- `raw_recording: RawRecordingConfig` — `enabled` + its own `destination`/`overwrite`/`rotation`/`timestamps` + the `disk_guard` (the guard protects long Raw captures, §168).
+- `display_recording: DisplayRecordingConfig` — `enabled` + its own `destination`/`overwrite`/`rotation`/`timestamps`.
+
+`RecordingMode` (Disabled/Raw/Display/Both) is retired — its four states are now two independent `enabled` bools, and "Both" is just both enabled (to two destinations), which the old single-destination config could never express.
+
+**Enabled vs. armed.** `raw_recording.enabled` controls *auto-start at channel Start*. The live Record toggle (ADR-012) is **armed by the presence of a destination**, independent of `enabled` — so a channel can be set up to record-on-demand (destination set, `enabled = false`) and toggled at runtime with no restart.
+
+**GUI placement (the change's user-facing intent).** Raw recording gets its own collapsing panel **above** Configure: the header summarizes live state (●/■ + on/off), and inside are the live Record/Stop toggle plus the Raw setup. Display recording lives **under** Configure as "Display record" (it is display configuration).
+
+**Why not the alternatives.**
+- *Keep one shared config.* Cannot express independent Raw/Display destinations, contradicts the separate taps, and forces the awkward single mode radio. The split is what the architecture always implied.
+- *Migrate old profiles.* A serde shim mapping the old `[recording]`/`mode` table onto the new fields. Rejected for a **clean break** (bump `schema_version` 2 → 3; old profiles refused with "recreate the profile"), consistent with the v1→v2 precedent (ADR-003) — profiles are dev-only today, so no migration code to carry.
+
+**Consequences.**
+- `schema_version` bumped to **3**; v1/v2 profiles refused. Spec §79 rewritten (version-bumped with a revision note, per the versioning rule).
+- Runtime `build_raw_recorder`/`build_display_recorder`/`record_arming`/disk-guard read their own config; the pipeline data path is unchanged (taps already separate).
+- A channel can now run **both** recordings to two destinations at once — pinned by `raw_and_display_recording_run_to_independent_destinations`. Existing rotation, live-record, and enable-failure tests updated to the split config.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

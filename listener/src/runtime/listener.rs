@@ -28,7 +28,7 @@ use crate::core::{ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
 use crate::display::{DisplayView, RenderedOutput};
 use crate::record::{
     start_display_recording, start_raw_recording, DisplayFileRecorder, FileRotationPolicy,
-    RawFileRecorder, Recording, RecordingMode, RotatingDisplayRecorder, RotatingRawRecorder,
+    RawFileRecorder, Recording, RotatingDisplayRecorder, RotatingRawRecorder,
 };
 use crate::transport::{
     DataTransportRunner, SerialControlCommand, SerialControlHooks, SerialControlLines,
@@ -747,12 +747,12 @@ impl Listener {
             display_recorder,
             // One runtime Display View per configured view (§48); at least one.
             view_count(config),
-            // Disk-space guard (§56.2, §168): only when both a guard and a
-            // recording destination are configured.
+            // Disk-space guard (§56.2, §168): only when both a guard and a Raw
+            // recording destination are configured (the guard protects Raw, §168).
             config
-                .recording
+                .raw_recording
                 .disk_guard
-                .zip(config.recording.destination.clone()),
+                .zip(config.raw_recording.destination.clone()),
             // Match Rules (§50.2, §165) plus arming for any match-triggered `Record`
             // (lazy-create from the configured destination — nothing until a match).
             MatchSetup {
@@ -766,24 +766,23 @@ impl Listener {
         )
     }
 
-    /// Arming for a match-triggered `Record` action (§50.2): the bits needed to
-    /// lazily build the Channel's Raw recording on a `Begin`, present only when a
-    /// recording destination is configured. Mirrors `build_raw_recorder`'s
-    /// destination/overwrite/timestamp/rotation choices so a rule-armed recording
-    /// matches what static recording would have produced.
+    /// Arming for a match-triggered or live (ADR-012) `Record` action (§50.2): the
+    /// bits to lazily build the Channel's Raw recording on a `Begin`, present
+    /// whenever a Raw destination is configured — **independent of
+    /// `raw_recording.enabled`**, so the live Record toggle works even when
+    /// auto-start recording is off. Mirrors `build_raw_recorder`'s
+    /// destination/overwrite/timestamp/rotation choices so an armed recording matches
+    /// what auto-start recording would have produced.
     fn record_arming(&self, config: &ChannelConfig) -> Option<RawRecordArming> {
-        config
-            .recording
-            .destination
-            .clone()
-            .map(|destination| RawRecordArming {
-                destination,
-                channel_name: config.name.as_str().to_string(),
-                overwrite: config.recording.overwrite_policy,
-                timestamps: config.recording.timestamp_enabled,
-                file_rotation: config.recording.file_rotation,
-                capacity: self.caps.raw_recording,
-            })
+        let raw = &config.raw_recording;
+        raw.destination.clone().map(|destination| RawRecordArming {
+            destination,
+            channel_name: config.name.as_str().to_string(),
+            overwrite: raw.overwrite_policy,
+            timestamps: raw.timestamp_enabled,
+            file_rotation: raw.file_rotation,
+            capacity: self.caps.raw_recording,
+        })
     }
 
     /// Create the Raw Recording handle for a Channel if enabled (§53). Per §55,
@@ -795,12 +794,12 @@ impl Listener {
         id: ChannelId,
         config: &ChannelConfig,
     ) -> Option<DataRecorder> {
-        let recording = &config.recording;
-        if recording.mode != RecordingMode::Raw {
+        let recording = &config.raw_recording;
+        if !recording.enabled {
             return None;
         }
         let Some(destination) = &recording.destination else {
-            // Mode is Raw but no destination — cannot record; surface a warning.
+            // Enabled but no destination — cannot record; surface a warning.
             let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
             return None;
         };
@@ -842,8 +841,8 @@ impl Listener {
         id: ChannelId,
         config: &ChannelConfig,
     ) -> Option<(DisplayView, Recording<RenderedOutput>)> {
-        let recording = &config.recording;
-        if recording.mode != RecordingMode::Display {
+        let recording = &config.display_recording;
+        if !recording.enabled {
             return None;
         }
         let Some(destination) = &recording.destination else {
@@ -1214,8 +1213,8 @@ mod tests {
 
     #[tokio::test]
     async fn recording_enable_failure_does_not_fault_the_channel() {
-        use crate::config::schema::RecordingConfig;
-        use crate::record::{OverwritePolicy, RecordingMode};
+        use crate::config::schema::RawRecordingConfig;
+        use crate::record::OverwritePolicy;
 
         // Pre-create the destination so a Refuse policy makes enabling fail
         // (§55/§121).
@@ -1226,8 +1225,8 @@ mod tests {
         let mut listener = Listener::with_default_capacities();
         let mut events = listener.take_events().unwrap();
         let mut config = udp_channel();
-        config.recording = RecordingConfig {
-            mode: RecordingMode::Raw,
+        config.raw_recording = RawRecordingConfig {
+            enabled: true,
             destination: Some(path.clone()),
             timestamp_enabled: false,
             overwrite_policy: OverwritePolicy::Refuse,

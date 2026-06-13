@@ -1,9 +1,17 @@
-# Listener Specification v2.0.1
+# Listener Specification v2.0.2
 
 Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
+
+Revision v2.0.2 (independent Raw/Display recording config):
+
+§79 replaces the single `RecordingConfig`/`RecordingMode` with independent
+`RawRecordingConfig` and `DisplayRecordingConfig` — Raw and Display recording tap the
+pipeline separately and are now configured separately (each with its own destination),
+so a Channel may run both at once. `schema_version` bumps to 3 (clean break; v1/v2
+profiles refused). See listener ADR-013.
 
 Revision v2.0.1 (command-surface reconciliation):
 
@@ -1445,18 +1453,37 @@ timestamps (§49), and no subsampling (§50.1).
 
 ## 79. Recording Configuration
 
+Raw (§53) and Display (§54) recording are **independently configured** — they tap the
+pipeline at different points (Raw the verbatim byte stream, Display the rendered view)
+and were always separate (listener ADR-013). Each has its own destination and options,
+so a Channel may run both at once to two different files.
+
 ```rust
-struct RecordingConfig {
-    mode: RecordingMode,            // Disabled / Raw (.raw) / Display (.disp)
-    destination: Option<PathBuf>,   // a file when rotation = None; a directory otherwise (§59)
-    timestamp_enabled: bool,        // §57: sidecar index for Raw, inline for Display
+struct RawRecordingConfig {            // §53 — the verbatim byte stream (.raw)
+    enabled: bool,                     // begin at channel Start; the live Record
+                                       //   toggle (§50.2, ADR-012) begins/stops at
+                                       //   runtime whenever a destination is set
+    destination: Option<PathBuf>,      // a file when rotation = None; a directory otherwise (§59)
+    timestamp_enabled: bool,           // §57: sidecar index
     overwrite_policy: OverwritePolicy,
     file_rotation: FileRotationPolicy, // §59; default None
-    disk_guard: Option<DiskGuard>,  // §56.2
+    disk_guard: Option<DiskGuard>,     // §56.2 — guards long Raw captures
+}
+
+struct DisplayRecordingConfig {        // §54 — the rendered view output (.disp)
+    enabled: bool,
+    destination: Option<PathBuf>,
+    timestamp_enabled: bool,           // §57: inline
+    overwrite_policy: OverwritePolicy,
+    file_rotation: FileRotationPolicy, // §59; default None
 }
 ```
 
-The `subsample` field is removed in v2.0 (§50.1); raw recording is byte-exact-or-off.
+The single `RecordingConfig`/`RecordingMode` (Disabled/Raw/Display/Both) of v2.0 is
+removed: the four modes are now two `enabled` bools, and "Both" is simply both enabled
+to their own destinations. The `subsample` field is removed (§50.1); raw recording is
+byte-exact-or-off. Splitting the config bumps `schema_version` to 3 (a clean break —
+v1/v2 profiles are refused, ADR-013).
 
 ## 80. Retention Configuration
 

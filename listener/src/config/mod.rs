@@ -16,13 +16,15 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::core::ChannelKind;
-use crate::record::{is_filesystem_safe, FileRotationPolicy, RecordingMode};
+use crate::record::{is_filesystem_safe, FileRotationPolicy};
 use crate::transport::udp::UdpMode;
 
 /// The schema version this build understands (§72.1). Bumped to 2 for the v2.0
-/// stream-only schema (extraction/decoder/subsample fields removed — ADR-010);
-/// v1 profiles are refused.
-pub const CURRENT_VERSION: u32 = 2;
+/// stream-only schema (extraction/decoder/subsample fields removed — ADR-010), then
+/// to 3 when the single `recording` table was split into independent
+/// `raw_recording` / `display_recording` (ADR-013) — a clean break, so v1/v2 profiles
+/// are refused with a "recreate the profile" error.
+pub const CURRENT_VERSION: u32 = 3;
 
 fn current_version() -> u32 {
     CURRENT_VERSION
@@ -144,13 +146,15 @@ pub fn validate_channel(
         }
     }
 
-    // When recording rotates, the channel name becomes part of generated filenames
-    // (§59), so it must be filesystem-safe (§71). Non-rotating recordings use a
-    // fixed destination path and do not constrain the name.
-    if channel.recording.mode != RecordingMode::Disabled
-        && channel.recording.file_rotation != FileRotationPolicy::None
-        && !is_filesystem_safe(channel.name.as_str())
-    {
+    // When a recording rotates, the channel name becomes part of generated filenames
+    // (§59), so it must be filesystem-safe (§71). Non-rotating recordings use a fixed
+    // destination path and do not constrain the name. Either recording can rotate
+    // (they are independent now — ADR-013), so check both.
+    let raw_rotates = channel.raw_recording.enabled
+        && channel.raw_recording.file_rotation != FileRotationPolicy::None;
+    let display_rotates = channel.display_recording.enabled
+        && channel.display_recording.file_rotation != FileRotationPolicy::None;
+    if (raw_rotates || display_rotates) && !is_filesystem_safe(channel.name.as_str()) {
         errors.push(ChannelConfigError::InvalidChannelName);
     }
 

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::{ChannelKind, ChannelName, StableConfigId};
 use crate::diagnostics::DiagnosticSeverity;
 use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, WrappingMode};
-use crate::record::{FileRotationPolicy, OverwritePolicy, RecordingMode};
+use crate::record::{FileRotationPolicy, OverwritePolicy};
 use crate::transport::udp::UdpMode;
 
 /// One configured Channel (§72). Carries only configuration; runtime objects
@@ -27,8 +27,14 @@ pub struct ChannelConfig {
     pub interface: InterfaceConfig,
     #[serde(default)]
     pub display: DisplayConfig,
+    /// Raw recording (§53) — taps the verbatim byte stream. Independent of display
+    /// recording (ADR-013).
     #[serde(default)]
-    pub recording: RecordingConfig,
+    pub raw_recording: RawRecordingConfig,
+    /// Display recording (§54) — records the rendered view (`.disp`). Independent of
+    /// raw recording (ADR-013).
+    #[serde(default)]
+    pub display_recording: DisplayRecordingConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
     /// Opt-in auto-reconnect after a fault (§9.1, §162); default disabled.
@@ -231,13 +237,20 @@ impl Default for HexGrouping {
     }
 }
 
-/// Recording configuration (§79).
+/// Raw recording configuration (§53, §79). Raw recording taps the **verbatim byte
+/// stream** — exactly as received, before any rendering — and is configured
+/// independently of Display recording (they branch at different points in the
+/// pipeline and were always separate; the v2.0 strip merged them in config only).
+/// Listener ADR-013.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
-pub struct RecordingConfig {
+pub struct RawRecordingConfig {
+    /// Whether to begin Raw recording automatically when the Channel starts. The
+    /// live Record toggle (ADR-012) can begin/stop it at runtime regardless, as long
+    /// as a `destination` is set (the destination arms the toggle).
     #[serde(default)]
-    pub mode: RecordingMode,
-    /// A single file when `rotation` is `None`; the output **directory** otherwise
-    /// (§59), into which `<channel>_<period><ext>` files are written.
+    pub enabled: bool,
+    /// A single `.raw` file when `rotation` is `None`; the output **directory**
+    /// otherwise (§59), into which `<channel>_<period>.raw` files are written.
     #[serde(default)]
     pub destination: Option<PathBuf>,
     #[serde(default)]
@@ -250,6 +263,27 @@ pub struct RecordingConfig {
     /// Disk-space guard for long-running recordings (§56.2, §168); `None` = off.
     #[serde(default)]
     pub disk_guard: Option<DiskGuard>,
+}
+
+/// Display recording configuration (§54, §79). Display recording records the
+/// **rendered view** output (`.disp`) — a separate pipeline tap from Raw recording
+/// (ADR-013), with its own destination and options.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub struct DisplayRecordingConfig {
+    /// Whether to begin Display recording automatically when the Channel starts.
+    #[serde(default)]
+    pub enabled: bool,
+    /// A single `.disp` file when `rotation` is `None`; the output **directory**
+    /// otherwise (§59).
+    #[serde(default)]
+    pub destination: Option<PathBuf>,
+    #[serde(default)]
+    pub timestamp_enabled: bool,
+    #[serde(default)]
+    pub overwrite_policy: OverwritePolicy,
+    /// Time-based file rotation (§59); `None` = single file.
+    #[serde(default)]
+    pub file_rotation: FileRotationPolicy,
 }
 
 /// Disk-space guard for a recording (§56.2, §168). When free space on the
