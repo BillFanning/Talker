@@ -14,7 +14,7 @@
 //! - [`channel`]/[`tcp`] — per-Channel and TCP-listener task orchestration.
 //! - [`build`] — maps validated config to live transports.
 //! - [`listener`] — the [`Listener`] orchestrator: registry, §9 state machine,
-//!   start/stop/apply-pending in the [`crate::core::RuntimeCommand`] vocabulary.
+//!   start/stop/apply-pending exposed as async methods (the command surface; ADR-012).
 //! - [`snapshot`] — on-demand, pull-side readout: the small [`snapshot::ChannelSnapshot`]
 //!   plus incremental [`snapshot::StreamDelta`] scrollback reads (ADR-011).
 

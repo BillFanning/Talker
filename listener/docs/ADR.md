@@ -310,10 +310,12 @@ adapted to listener's Tokio model:
 - Channels carry **owned** snapshots/events, so the UI never shares mutable pipeline
   state and a slow UI can never stall reception (the driver's pushes are advisory,
   `try_send`/drop-newest like the other observer edges, §99).
-- This bridge is also where the `RuntimeCommand` enum finally gets aligned with §136
-  and dispatched for real (today it is vestigial — commands are direct `Listener`
-  methods); and where the missing **command channel into `run_channel`** is built,
-  unblocking the deferred §165 live actions.
+- The GUI's `UiCommand` is the command surface from the App's side; the driver
+  translates it into direct `Listener` async method calls. _(Superseded in part by
+  ADR-012: there is no separate `core::RuntimeCommand` enum to "align with §136" — the
+  method API is the command surface. The missing **command channel into `run_channel`**
+  is still the seam that unblocks the deferred §165 live actions, built as `Listener`
+  methods + an internal pipeline command, not a top-level command enum.)_
 - GUI-only state (window geometry, last layout) uses eframe's built-in persistence,
   never the profile schema (mirrors the talker rule).
 
@@ -451,6 +453,29 @@ End to end the steady-state cost is now: ingest O(chunk), snapshot O(small bound
 - The reset-on-eviction contract (`base_offset > since`) is the consumer's signal to re-seed rather than append; restart is handled by resetting the cursor (offsets restart at 0).
 - This refines ADR-006's pull surface exactly along the "push rich incremental state" axis that ADR-006 left open; no actor/event-loop rewrite was needed.
 - Pinned by tests: `pipeline` (`stream_delta_serves_only_new_bytes_since_a_cursor`, `stream_delta_resets_when_the_cursor_was_evicted`), `gui::state` (`stream_deltas_accumulate_incrementally`, `stream_delta_reset_on_eviction_replaces_rather_than_appends`, `restart_clears_accumulated_stream`).
+
+## ADR-012 — The command surface is the `Listener` method API; no `RuntimeCommand` enum
+
+**Status:** Accepted. **Context:** spec §136 (Runtime Commands), §3 (UI owns no runtime state), ADR-006 (events are the push surface; commands are direct method calls), ADR-008 (the GUI↔runtime driver translates `UiCommand` into `Listener` calls).
+
+**Problem.** `core::RuntimeCommand` was defined (spec §136) as the UI→runtime command vocabulary, mirroring `RuntimeEvent`. But it was never constructed or matched anywhere — ADR-008 itself called it "vestigial … commands are direct `Listener` methods," anticipating a future where the GUI bridge would "finally align it with §136 and dispatch it for real." That future did not arrive, and the architecture that *did* land makes it redundant:
+
+- The runtime exposes commands as **async `Listener` methods** (`start`/`stop`/`apply_pending`/`pause_display`/`set_rts`/…). They take `&mut self` and `.await`; this is the real, tested command API used by both the CLI and the GUI driver.
+- The GUI has its **own** `UiCommand` enum (`gui::bridge`) — its on-the-wire form across the App↔driver channel — which the driver translates into those method calls. `UiCommand` is already *richer* than `RuntimeCommand` ever was (`AddChannel`, `RemoveChannel`, `Rename`, `Reconfigure`, `Select`, `SaveProfile`/`LoadProfile`), so `RuntimeCommand` is not even a superset to grow into.
+
+A second, parallel command enum on top of a working method API + a GUI transport enum is a layer with no callers — exactly the kind of spec-vs-code drift the project guards against.
+
+**Decision.** Remove `core::RuntimeCommand`. The **command surface is the `Listener` async method API**; the GUI's `UiCommand` is the presentation-layer transport the driver maps onto it (ADR-008). `RuntimeEvent` is unaffected — it is genuinely the push surface (ADR-006) and stays in `core::command`.
+
+**Why not the alternatives.**
+- *Keep the enum and wire it for real (the original §136 intent).* Would add a dispatch layer parallel to the working method API and the GUI's `UiCommand`, for no capability gain — two enums and a method API all expressing the same operations. The deferred live actions (`SetMatchRuleEnabled`, `MarkNow`, mid-run record toggle) need a **command channel into `run_channel`** (ADR-008), not a top-level orchestrator enum; that seam is where they will land, as new `Listener` methods + an internal pipeline command.
+- *Keep it as documentation only.* Leaves an exported, untested type that reads as load-bearing and re-accretes the drift on the next audit.
+
+**Consequences.**
+- `core::RuntimeCommand` and its `pub use` are gone; `DisplayViewId` is no longer imported by `core::command` (only `RuntimeEvent`'s `MatchRuleId` remains). No functional change — nothing referenced the enum (160 lib + 6 profile + 7 integration tests, clippy `-D warnings`, fmt all unchanged-green after removal).
+- The deferred live-control work (§165, mid-run recording) is now unambiguously specified: add `Listener` methods + the `run_channel` command channel — not a `RuntimeCommand` variant.
+- **Supersedes** the ADR-008 note that the bridge would "align `RuntimeCommand` with §136 and dispatch it." It won't; `UiCommand` is that bridge.
+- Spec §136 is amended to document the method-API command surface in place of the enum (version-bumped with a revision note, per the workspace versioning rule).
 
 ## Open questions
 

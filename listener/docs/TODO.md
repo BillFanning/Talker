@@ -74,17 +74,17 @@ Message-model removal). Everything below this block is verified done:
 - [ ] Consume `hex_grouping` in the Hex renderer: `display::DisplayView` still uses
       its own `hex_bytes_per_line`/`hex_separator`; map the config field onto them so
       the persisted grouping actually drives the Hex view (with a GUI control).
-- [ ] Live `Record` begin/stop without a restart. The `RuntimeCommand::Enable`/
-      `DisableRecording` variants exist but are **constructed nowhere** and have no
-      runtime handler; recording is wired only from `RecordingConfig` at channel
-      start. Needs an emitter (GUI/CLI) and a runtime dispatch path.
+- [ ] Live `Record` begin/stop without a restart. Recording is wired only from
+      `RecordingConfig` at channel start. Per ADR-012 the path is a new `Listener`
+      method (e.g. `enable_recording`/`disable_recording`) plus the internal command
+      channel into `run_channel` (ADR-008) — not a top-level command enum — with a
+      GUI emitter (`UiCommand`) on top.
 - [ ] Recording timestamp sidecar for `.raw` (byte-offset keyed, §57)
 - [ ] Match-rule editor UI (rules currently arrive only via profiles)
-- [ ] Decide `RuntimeCommand`'s role (§136). The enum is defined but constructed
-      nowhere; the runtime is driven by async methods (`start`/`stop`/
-      `apply_pending`) per `runtime/listener.rs`. Either route the GUI/CLI through
-      the command enum (a real command channel) or narrow the enum to match the
-      method surface. Until then the §136 vocabulary is aspirational, not load-bearing.
+- [x] `RuntimeCommand`'s role (§136) — resolved by ADR-012: removed the vestigial
+      `core::RuntimeCommand` enum; the command surface is the `Listener` async method
+      API (the GUI's `UiCommand` is the bridge transport). Spec §136 rewritten to
+      match (v2.0.1).
 - [x] Profiles: save/load wired end-to-end against the v2 schema (§67–§71)
       (`6b17021`). The GUI Profile menu (Save / Save As… / Load) routes through
       `UiCommand::{SaveProfile,LoadProfile}`; the driver gathers configs from the

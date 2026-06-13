@@ -1,33 +1,15 @@
-//! Runtime command and event vocabulary exchanged between the presentation
-//! layers and the runtime orchestrator (spec §136, §137).
+//! Runtime event vocabulary the runtime orchestrator reports to the presentation
+//! layers (spec §137).
 //!
-//! Commands flow UI → runtime; events flow runtime → UI. The UI issues commands
-//! and observes events; it never owns transport, recording, or pipeline state
-//! (§3).
+//! Events flow runtime → UI; the UI observes them and never owns transport,
+//! recording, or pipeline state (§3). The *command* direction (UI → runtime) is
+//! the [`Listener`](crate::runtime::Listener)'s async method API directly — there is
+//! no separate runtime-command enum (ADR-012). The GUI's own `UiCommand`
+//! (`gui::bridge`) is the on-the-wire form the driver translates into those calls.
 
 use std::time::Duration;
 
-use super::ids::{ChannelId, DisplayViewId, MatchRuleId};
-
-/// A command directed at the runtime (§136).
-///
-/// `#[non_exhaustive]`: the v1.2 command surface is still growing (live serial
-/// control, network adjustment, and match-rule commands land as the GUI's command
-/// channel is built), so consumers must keep a wildcard arm.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum RuntimeCommand {
-    StartChannel(ChannelId),
-    StopChannel(ChannelId),
-    /// Apply pending restart-required configuration via one coordinated
-    /// stop/apply/start cycle (§13).
-    ApplyPendingConfig(ChannelId),
-    EnableRecording(ChannelId),
-    DisableRecording(ChannelId),
-    /// Pause a single Display View; other views keep running (§11).
-    PauseDisplay(ChannelId, DisplayViewId),
-    ResumeDisplay(ChannelId, DisplayViewId),
-}
+use super::ids::{ChannelId, MatchRuleId};
 
 /// Something the runtime reports happened (§137).
 ///

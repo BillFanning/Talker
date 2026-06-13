@@ -1,9 +1,16 @@
-# Listener Specification v2.0
+# Listener Specification v2.0.1
 
 Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
+
+Revision v2.0.1 (command-surface reconciliation):
+
+§136 no longer defines a `RuntimeCommand` enum. The command surface (UI → runtime)
+is the `Listener`'s async method API directly; the GUI's own `UiCommand` is the
+presentation-layer transport the driver maps onto those calls. See listener ADR-012.
+`RuntimeEvent` (§137) is unchanged.
 
 Revision v2.0 (architecture pivot — **stream-only**):
 
@@ -2348,28 +2355,19 @@ _Removed in v2.0 (see §28, §134)._
 
 ## 136. Runtime Commands
 
-```rust
-#[non_exhaustive]
-pub enum RuntimeCommand {
-    StartChannel(ChannelId),
-    StopChannel(ChannelId),
-    ApplyPendingConfig(ChannelId),
-    EnableRecording(ChannelId),
-    DisableRecording(ChannelId),
-    PauseDisplay(ChannelId, DisplayViewId),
-    ResumeDisplay(ChannelId, DisplayViewId),
-    // v1.2 — serial control lines (§14.3)
-    SetRts(ChannelId, bool),
-    SetDtr(ChannelId, bool),
-    // v1.2 — network live adjustment (§76.1)
-    JoinMulticast(ChannelId, String /*group*/, Option<String> /*interface*/),
-    LeaveMulticast(ChannelId, String /*group*/),
-    SetReceiveBuffer(ChannelId, usize),
-    // v1.2 — match rules & triggers (§50.2)
-    SetMatchRuleEnabled(ChannelId, MatchRuleId, bool),
-    MarkNow(ChannelId),                       // manual correlation marker
-}
-```
+Commands flow UI → runtime as direct `Listener` async method calls — there is no
+`RuntimeCommand` enum (listener ADR-012). The orchestrator exposes one method per
+operation: `start` / `stop` / `apply_pending` (§13), `enable_recording` /
+`disable_recording`, `pause_display` / `resume_display` (§11), and the v1.2 live
+controls `set_rts` / `set_dtr` (§14.3). Network live-adjustment (§76.1 — multicast
+join/leave, receive-buffer) and match-rule commands (`SetMatchRuleEnabled`, `MarkNow`,
+§50.2) land as further methods plus an internal command channel into the per-Channel
+pipeline (deferred, ADR-008).
+
+The GUI's `UiCommand` (`gui::bridge`) is the on-the-wire command form across the
+App↔driver channel; the driver translates each into the matching `Listener` call
+(ADR-008). It is richer than the orchestrator API where the GUI needs it
+(`AddChannel`, `RemoveChannel`, `Rename`, `Reconfigure`, `Select`, profile save/load).
 
 ## 137. Runtime Events
 

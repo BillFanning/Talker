@@ -6,8 +6,9 @@
 //! §71/§8.2), wires the stream pipeline, and stops them on request. All channels
 //! share one [`RuntimeEvent`] stream (§137).
 //!
-//! Commands are exposed as async methods (`start`/`stop`/`apply_pending`),
-//! the vocabulary of [`crate::core::RuntimeCommand`]. Raw recording is wired for
+//! Commands are exposed as async methods (`start`/`stop`/`apply_pending`, …) —
+//! this method API *is* the command surface (there is no separate command enum;
+//! ADR-012). Raw recording is wired for
 //! serial/UDP channels from `RecordingConfig`; a recording-enable failure
 //! surfaces a warning without faulting the Channel (§55). Accepted TCP
 //! **connection** channels run the same stream pipeline as their listener (§16.2);

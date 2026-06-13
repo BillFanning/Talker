@@ -28,8 +28,10 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
 /// driver ticks it, exactly as the CLI does.
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
 
-/// A command from the GUI to the runtime (§136). Only commands with a backing
-/// `Listener` method are modelled today; the dynamic in-pipeline commands
+/// A command from the GUI to the runtime — the GUI's on-the-wire command form, which
+/// the driver translates into [`Listener`] async method calls (the command surface;
+/// ADR-012). There is no separate `core::RuntimeCommand` enum. Each variant here has
+/// a backing `Listener` method today; the dynamic in-pipeline actions
 /// (`SetMatchRuleEnabled`, `MarkNow`, mid-run recording enable/disable) wait on the
 /// command channel into `run_channel` (deferred, ADR-008).
 #[derive(Debug)]
