@@ -48,6 +48,22 @@ impl ListenerApp {
                     ui.close();
                 }
             });
+            ui.menu_button("Profile", |ui| {
+                // "Save" writes to the current file (or prompts if there is none);
+                // "Save As…" always prompts and re-points the current file.
+                if ui.button("Save").clicked() {
+                    self.save_profile();
+                    ui.close();
+                }
+                if ui.button("Save As…").clicked() {
+                    self.save_profile_as();
+                    ui.close();
+                }
+                if ui.button("Load…").clicked() {
+                    self.load_profile_dialog();
+                    ui.close();
+                }
+            });
             if ui.button("Start all").clicked() {
                 for cid in self.state.channel_ids() {
                     // Route through the same guard: complete channels start; each
@@ -61,6 +77,10 @@ impl ListenerApp {
                 }
             }
         });
+        // The last Save/Load outcome (e.g. "Saved foo.toml" or an error), if any.
+        if let Some(status) = self.state.workspace_status() {
+            ui.label(egui::RichText::new(status).weak());
+        }
         ui.separator();
 
         // Snapshot the rows first so the list isn't borrowing `state` while a click
@@ -168,5 +188,52 @@ impl ListenerApp {
                 ui.add_space(6.0);
             }
         });
+    }
+
+    /// Save to the current profile path silently; if none is set yet, fall through to
+    /// "Save As…" so the first save still names a file (§67).
+    pub(super) fn save_profile(&mut self) {
+        match self.current_profile_path.clone() {
+            Some(path) => self.send(UiCommand::SaveProfile(path)),
+            None => self.save_profile_as(),
+        }
+    }
+
+    /// Always prompt for a destination, then save there and remember it as the
+    /// current profile path. The picker runs synchronously on the UI thread (a brief
+    /// modal); the actual file write happens off-thread in the driver (§67).
+    pub(super) fn save_profile_as(&mut self) {
+        let mut dialog = rfd::FileDialog::new().add_filter("TOML profile", &["toml"]);
+        // Seed the picker with the current file's name/location if we have one.
+        dialog = match self.current_profile_path.as_ref() {
+            Some(path) => {
+                if let Some(dir) = path.parent() {
+                    dialog = dialog.set_directory(dir);
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("listener.toml");
+                dialog.set_file_name(name)
+            }
+            None => dialog.set_file_name("listener.toml"),
+        };
+        if let Some(path) = dialog.save_file() {
+            self.current_profile_path = Some(path.clone());
+            self.send(UiCommand::SaveProfile(path));
+        }
+    }
+
+    /// Open a native "load profile" dialog and, if the user picks a file, send the
+    /// LoadProfile command (which replaces the workspace, §70) and remember the path
+    /// as the current profile.
+    fn load_profile_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("TOML profile", &["toml"])
+            .pick_file()
+        {
+            self.current_profile_path = Some(path.clone());
+            self.send(UiCommand::LoadProfile(path));
+        }
     }
 }

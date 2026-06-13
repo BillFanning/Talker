@@ -169,6 +169,10 @@ struct ListenerApp {
     /// (regression after the stream-only split). We recompute only when the inputs
     /// change; `show_rows` then lays out just the visible rows.
     stream_cache: Option<StreamRenderCache>,
+    /// The profile file the workspace is currently associated with (last saved or
+    /// loaded). `Save` writes here silently; `Save As…` always re-prompts. `None`
+    /// until the first save/load, so the first `Save` falls through to a picker.
+    current_profile_path: Option<std::path::PathBuf>,
 }
 
 /// Cached, line-split render of a channel's accumulated stream bytes, reused
@@ -216,6 +220,7 @@ impl ListenerApp {
             show_error: true,
             serial_ports: list_serial_ports(),
             stream_cache: None,
+            current_profile_path: None,
         }
     }
 

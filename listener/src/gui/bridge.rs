@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::config::{ChannelConfig, InterfaceConfig};
+use crate::config::{ChannelConfig, InterfaceConfig, Profile};
 use crate::core::{ChannelId, ChannelName, DisplayViewId, RuntimeEvent};
 use crate::runtime::{ChannelSnapshot, ChannelStats, Listener, PipelineCapacities, StreamDelta};
 use crate::transport::udp::UdpMode;
@@ -57,6 +57,17 @@ pub enum UiCommand {
     /// channel gets a snapshot + incremental stream delta polled; the rest get cheap
     /// stats (ADR-006).
     Select(Option<ChannelId>),
+    /// Save the current workspace (every registered channel's config) to a TOML
+    /// profile at `path` (§67–§71). The driver replies with `ProfileSaved` or, on an
+    /// I/O/serialization error, `ProfileError`.
+    SaveProfile(std::path::PathBuf),
+    /// Replace the current workspace with the profile loaded from `path` (§70): every
+    /// existing channel is stopped and removed, then the profile's channels are
+    /// registered Stopped (load never starts a channel). The driver emits the usual
+    /// `ChannelRemoved`/`ChannelAdded` updates so the UI folds the change, then
+    /// `ProfileLoaded`; a load/parse error yields `ProfileError` and leaves the
+    /// workspace untouched.
+    LoadProfile(std::path::PathBuf),
     /// Stop all channels and end the driver (the App is closing).
     Shutdown,
 }
@@ -97,6 +108,14 @@ pub enum UiUpdate {
     /// only the bytes new since the GUI's cursor, so the driver never re-ships the
     /// whole ~1 MB buffer each poll. The App appends them to its live view.
     StreamDelta(ChannelId, Box<StreamDelta>),
+    /// The workspace was saved to a profile file (the path, for a confirmation).
+    ProfileSaved(std::path::PathBuf),
+    /// A profile was loaded (its name); the channel set has been replaced via the
+    /// preceding `ChannelRemoved`/`ChannelAdded` updates.
+    ProfileLoaded(String),
+    /// A profile save or load failed; carries a human-readable reason. The current
+    /// workspace is unchanged.
+    ProfileError(String),
 }
 
 /// A one-line, human-readable description of a channel's interface and endpoint,
@@ -118,6 +137,15 @@ fn describe_interface(config: &ChannelConfig) -> String {
             format!("Serial · {} @ {} baud", serial.port, serial.baud_rate)
         }
     }
+}
+
+/// Derive a profile name from its file path: the file stem, or a fallback. The
+/// schema requires a `name`; the filename is the natural default for a Save.
+fn profile_name_from_path(path: &std::path::Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "workspace".to_string())
 }
 
 /// The background driver: owns the `Listener`, drains commands, forwards events,
@@ -270,9 +298,60 @@ impl Driver {
                 self.selected = id;
                 self.stream_cursor = 0;
             }
+            UiCommand::SaveProfile(path) => self.save_profile(path),
+            UiCommand::LoadProfile(path) => self.load_profile(path).await,
             UiCommand::Shutdown => return false,
         }
         true
+    }
+
+    /// Save every registered channel's config to a TOML profile (§67). Gathers
+    /// configs from the authoritative `Listener` in `self.channels` order; a missing
+    /// config (a channel removed mid-flight) is skipped. Non-fatal: an I/O or
+    /// serialization error is reported via `ProfileError`, not a panic.
+    fn save_profile(&mut self, path: std::path::PathBuf) {
+        let mut profile = Profile::new(profile_name_from_path(&path));
+        profile.channels = self
+            .channels
+            .iter()
+            .filter_map(|id| self.listener.config(*id).cloned())
+            .collect();
+        match profile.save(&path) {
+            Ok(()) => self.push(UiUpdate::ProfileSaved(path)),
+            Err(err) => self.push(UiUpdate::ProfileError(format!("save failed: {err}"))),
+        }
+    }
+
+    /// Replace the workspace with a loaded profile (§70). Parse + schema-check
+    /// first, so a bad file leaves the current channels untouched; only on success
+    /// do we stop/remove every existing channel and register the loaded ones
+    /// (Stopped — load never starts a channel). Each removal/addition emits the
+    /// usual update so the App folds the swap with no special-casing.
+    async fn load_profile(&mut self, path: std::path::PathBuf) {
+        let profile = match Profile::load(&path) {
+            Ok(p) => p,
+            Err(err) => {
+                self.push(UiUpdate::ProfileError(format!("load failed: {err}")));
+                return;
+            }
+        };
+        // Tear down the old workspace (stops live channels first, §8.5).
+        for id in std::mem::take(&mut self.channels) {
+            let _ = self.listener.remove_channel(id).await;
+            self.push(UiUpdate::ChannelRemoved(id));
+        }
+        self.selected = None;
+        self.stream_cursor = 0;
+        // Register the loaded channels Stopped.
+        for config in profile.channels {
+            let name = config.name.as_str().to_string();
+            let details = describe_interface(&config);
+            let echo = config.clone();
+            let id = self.listener.add_channel(config);
+            self.channels.push(id);
+            self.push(UiUpdate::ChannelAdded(id, name, details, Box::new(echo)));
+        }
+        self.push(UiUpdate::ProfileLoaded(profile.name));
     }
 
     /// Poll channels for the UI's pull surface. Every channel gets cheap **stats**
@@ -540,6 +619,145 @@ mod tests {
             }
         };
         assert!(!reason.is_empty(), "the bind conflict reason is reported");
+
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// A unique temp profile path per call (parallel tests must not collide).
+    fn temp_profile_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "listener-bridge-profile-{}-{n}.toml",
+            std::process::id()
+        ))
+    }
+
+    /// Save the workspace through the driver, then load it into a fresh driver: the
+    /// channels reappear (ChannelAdded), and the load reports the profile name. The
+    /// round-trip proves SaveProfile/LoadProfile are wired end to end.
+    #[tokio::test]
+    async fn save_then_load_round_trips_the_workspace_through_the_driver() {
+        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("driver update timed out")
+                .expect("update stream closed")
+        }
+
+        let path = temp_profile_path();
+
+        // First driver: add two channels, then save.
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let handle =
+            tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
+
+        cmd_tx
+            .send(UiCommand::AddChannel(Box::new(udp_config(free_udp_port()))))
+            .await
+            .unwrap();
+        cmd_tx
+            .send(UiCommand::AddChannel(Box::new(udp_config(free_udp_port()))))
+            .await
+            .unwrap();
+        // Drain the two ChannelAdded acks.
+        let mut added = 0;
+        while added < 2 {
+            if let UiUpdate::ChannelAdded(..) = next(&mut upd_rx).await {
+                added += 1;
+            }
+        }
+        cmd_tx
+            .send(UiCommand::SaveProfile(path.clone()))
+            .await
+            .unwrap();
+        let saved = loop {
+            match next(&mut upd_rx).await {
+                UiUpdate::ProfileSaved(p) => break p,
+                UiUpdate::ProfileError(e) => panic!("save errored: {e}"),
+                _ => {}
+            }
+        };
+        assert_eq!(saved, path);
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+        // Second, fresh driver: load the saved profile; the channels come back.
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let handle =
+            tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
+
+        cmd_tx
+            .send(UiCommand::LoadProfile(path.clone()))
+            .await
+            .unwrap();
+        let mut loaded_channels = 0;
+        let name = loop {
+            match next(&mut upd_rx).await {
+                UiUpdate::ChannelAdded(..) => loaded_channels += 1,
+                UiUpdate::ProfileLoaded(name) => break name,
+                UiUpdate::ProfileError(e) => panic!("load errored: {e}"),
+                _ => {}
+            }
+        };
+        assert_eq!(loaded_channels, 2, "both saved channels were re-registered");
+        assert_eq!(name, path.file_stem().unwrap().to_str().unwrap());
+
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A LoadProfile of a missing/invalid file reports ProfileError and leaves the
+    /// existing workspace untouched (no channels removed).
+    #[tokio::test]
+    async fn loading_a_missing_profile_errors_without_touching_the_workspace() {
+        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("driver update timed out")
+                .expect("update stream closed")
+        }
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let handle =
+            tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
+
+        cmd_tx
+            .send(UiCommand::AddChannel(Box::new(udp_config(free_udp_port()))))
+            .await
+            .unwrap();
+        loop {
+            if let UiUpdate::ChannelAdded(..) = next(&mut upd_rx).await {
+                break;
+            }
+        }
+
+        let missing = std::env::temp_dir().join("listener-no-such-profile.toml");
+        let _ = std::fs::remove_file(&missing);
+        cmd_tx.send(UiCommand::LoadProfile(missing)).await.unwrap();
+
+        // We get a ProfileError, and crucially no ChannelRemoved beforehand.
+        loop {
+            match next(&mut upd_rx).await {
+                UiUpdate::ProfileError(_) => break,
+                UiUpdate::ChannelRemoved(_) => {
+                    panic!("a failed load must not tear down the workspace")
+                }
+                _ => {}
+            }
+        }
 
         cmd_tx.send(UiCommand::Shutdown).await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;

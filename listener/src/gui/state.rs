@@ -130,6 +130,9 @@ impl ChannelView {
 pub struct AppState {
     order: Vec<ChannelId>,
     views: HashMap<ChannelId, ChannelView>,
+    /// A transient workspace-level status line — the result of the last profile
+    /// Save/Load (e.g. "Saved profile.toml" or an error). `None` until one happens.
+    workspace_status: Option<String>,
 }
 
 impl AppState {
@@ -258,7 +261,25 @@ impl AppState {
                     view.apply_stream_delta(delta.base_offset, &delta.bytes, delta.end_offset);
                 }
             }
+            UiUpdate::ProfileSaved(path) => {
+                let file = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("profile");
+                self.workspace_status = Some(format!("Saved {file}"));
+            }
+            UiUpdate::ProfileLoaded(name) => {
+                self.workspace_status = Some(format!("Loaded “{name}”"));
+            }
+            UiUpdate::ProfileError(message) => {
+                self.workspace_status = Some(message);
+            }
         }
+    }
+
+    /// The last profile Save/Load status line, if any (shown in the UI).
+    pub fn workspace_status(&self) -> Option<&str> {
+        self.workspace_status.as_deref()
     }
 
     /// Fold a forwarded `RuntimeEvent`. Events for Channels we have not registered
