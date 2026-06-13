@@ -206,6 +206,29 @@ pub struct DisplayViewConfig {
     #[serde(default)]
     pub background_color: Option<String>,
     pub wrapping: WrappingMode,
+    /// Byte grouping/spacing for the Hex view (§45). Ignored by the other display
+    /// modes. `#[serde(default)]` so profiles written before this field round-trip.
+    #[serde(default)]
+    pub hex_grouping: HexGrouping,
+}
+
+/// Hex-view byte grouping (§45): how many bytes share a group (separated by
+/// spaces) and how many groups fill a line. `groups_per_line == 0` means "fit to
+/// the display width" rather than a fixed count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HexGrouping {
+    pub bytes_per_group: u8,
+    pub groups_per_line: u8,
+}
+
+impl Default for HexGrouping {
+    /// The conventional hexdump default: one byte per group, fit to width (§45).
+    fn default() -> Self {
+        Self {
+            bytes_per_group: 1,
+            groups_per_line: 0,
+        }
+    }
 }
 
 /// Recording configuration (§79).

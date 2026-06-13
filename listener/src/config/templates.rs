@@ -19,6 +19,7 @@ fn view(mode: DisplayMode) -> DisplayViewConfig {
         foreground_color: None,
         background_color: None,
         wrapping: WrappingMode::NoWrap,
+        hex_grouping: HexGrouping::default(),
     }
 }
 

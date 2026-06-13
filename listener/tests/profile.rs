@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use listener::config::{templates, Profile, RetentionConfig};
+use listener::config::{templates, HexGrouping, Profile, RetentionConfig};
 use listener::core::{ChannelKind, ChannelState};
 use listener::runtime::Listener;
 
@@ -57,6 +57,57 @@ fn loading_a_profile_does_not_start_channels() {
     }
 
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn hex_grouping_round_trips_through_a_profile() {
+    // §45/§1431: a per-view Hex grouping survives a save/load cycle, so a profile
+    // can express it (the gap this closes — the field was documented but absent).
+    let mut channel = templates::udp_template();
+    if let Some(view) = channel
+        .display
+        .views
+        .iter_mut()
+        .find(|v| matches!(v.mode, listener::display::DisplayMode::Hex))
+    {
+        view.hex_grouping = HexGrouping {
+            bytes_per_group: 4,
+            groups_per_line: 4,
+        };
+    }
+    let mut profile = Profile::new("workspace");
+    profile.channels = vec![channel];
+
+    let path = temp_profile_path();
+    profile.save(&path).unwrap();
+    let loaded = Profile::load(&path).unwrap();
+    assert_eq!(loaded, profile);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_profile_without_hex_grouping_loads_with_the_default() {
+    // The field is `#[serde(default)]`, so a profile written before it existed
+    // (its TOML omits `hex_grouping`) must still load, defaulting the field.
+    let mut profile = Profile::new("workspace");
+    profile.channels = vec![templates::udp_template()];
+    let mut toml = profile.to_toml().unwrap();
+    // Strip every `hex_grouping` table to simulate a pre-field profile.
+    toml = toml
+        .lines()
+        .filter(|l| {
+            !l.contains("hex_grouping")
+                && !l.contains("bytes_per_group")
+                && !l.contains("groups_per_line")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let loaded = Profile::from_toml(&toml).expect("loads without the field");
+    for view in &loaded.channels[0].display.views {
+        assert_eq!(view.hex_grouping, HexGrouping::default());
+    }
 }
 
 #[test]
