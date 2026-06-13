@@ -490,18 +490,28 @@ impl ListenerApp {
                     ui.label(egui::RichText::new(note).weak());
                     return;
                 }
+                // Select text across the (non-interactive) row labels without giving
+                // each row its own interaction box — this is what selects the stream.
+                ui.style_mut().interaction.selectable_labels = true;
                 egui::ScrollArea::vertical()
                     .id_salt("stream")
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
                     .show_rows(ui, row_h, rows.len().max(1), |ui, range| {
+                        // Text selection is handled globally for plain labels (set
+                        // below); per-row `Label::selectable(true)` would instead make
+                        // every row its own interactive widget, and under `show_rows`
+                        // (which recycles widget ids by scroll position) that drew a
+                        // hover/selection box that flickered between rows while
+                        // scrolling. Plain, non-interactive labels select cleanly with
+                        // no per-row box. Tighten row spacing so wrapped runs don't gap.
+                        ui.spacing_mut().item_spacing.y = 0.0;
                         for row in &rows[range] {
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(row).font(font.clone()).color(fg),
                                 )
-                                .wrap()
-                                .selectable(true),
+                                .wrap(),
                             );
                         }
                     });
