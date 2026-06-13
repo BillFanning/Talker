@@ -46,6 +46,15 @@ pub enum PipelineRequest {
         since: u64,
         reply: oneshot::Sender<StreamDelta>,
     },
+    /// Begin or stop Raw recording on a running Channel without a restart (§50.2,
+    /// ADR-012): the live counterpart of the match-rule `Record` action, driven by
+    /// the same lazy begin/finalize path. `enabled = true` begins (idempotent if
+    /// already recording); `false` stops and finalizes. Fire-and-forget — the
+    /// outcome surfaces through the recording state in the next snapshot and, on a
+    /// begin failure, a `WarningRaised` event (§55).
+    SetRecording {
+        enabled: bool,
+    },
 }
 
 /// An incremental slice of a Channel's stream scrollback (§87), answering "what

@@ -496,6 +496,20 @@ impl ChannelPipeline {
         }
     }
 
+    /// Begin or stop Raw recording live, without a restart (§50.2, ADR-012). The
+    /// manual counterpart of the match-rule `Record` action: it drives the same
+    /// lazy begin / clean finalize path, so a user-toggled recording and a
+    /// rule-armed one are byte-identical and share the idempotency rules. Requires
+    /// a destination armed from `RecordingConfig` (the no-arming case is a no-op,
+    /// same as a `Begin` with nothing configured).
+    pub async fn set_recording(&mut self, enabled: bool) {
+        if enabled {
+            self.begin_armed_recording().await;
+        } else {
+            self.stop_armed_recording().await;
+        }
+    }
+
     /// Lazily create the match-armed Raw recording on the first `Begin` (§50.2):
     /// nothing is on disk until now. A no-op if a recording is already active or
     /// no arming is configured; an open failure warns without faulting the
@@ -822,6 +836,9 @@ pub async fn run_channel(
                 }
                 Some(PipelineRequest::StreamDelta { since, reply }) => {
                     let _ = reply.send(pipeline.stream_delta(since));
+                }
+                Some(PipelineRequest::SetRecording { enabled }) => {
+                    pipeline.set_recording(enabled).await;
                 }
                 None => requests_open = false, // all requesters gone; keep running
             },
@@ -1508,6 +1525,49 @@ mod tests {
 
         let written = tokio::fs::read(&path).await.unwrap();
         assert_eq!(written, b"capturedSTOP");
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn set_recording_begins_and_stops_raw_recording_live() {
+        // ADR-012: live Record begin/stop without a restart, driven by set_recording
+        // (no match rules). Shares the lazy begin / clean finalize path with the
+        // match-rule Record action, so capture starts from the toggle forward and a
+        // Stop finalizes byte-exactly.
+        let cid = ChannelId::new();
+        let path = temp_path("live");
+        let mut p =
+            pipeline(cid, PipelineCapacities::default()).with_record_arming(RawRecordArming {
+                destination: path.clone(),
+                channel_name: "live".to_string(),
+                overwrite: OverwritePolicy::Refuse,
+                timestamps: false,
+                file_rotation: FileRotationPolicy::None,
+                capacity: 64,
+            });
+
+        // Before enabling: nothing on disk, nothing recorded.
+        p.ingest(bytes_chunk(cid, b"before "));
+        assert!(p.raw_recording_state().is_none());
+
+        // Live Begin: recording starts from here forward.
+        p.set_recording(true).await;
+        assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
+        p.ingest(bytes_chunk(cid, b"captured"));
+
+        // Begin is idempotent — a second enable while recording is a no-op.
+        p.set_recording(true).await;
+        assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
+        p.ingest(bytes_chunk(cid, b"more"));
+
+        // Live Stop finalizes; later data is not written.
+        p.set_recording(false).await;
+        assert!(p.raw_recording_state().is_none());
+        p.ingest(bytes_chunk(cid, b"after"));
+        p.finish().await;
+
+        let written = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(written, b"capturedmore");
         let _ = tokio::fs::remove_file(&path).await;
     }
 

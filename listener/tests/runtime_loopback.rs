@@ -303,6 +303,74 @@ async fn rotation_writes_a_named_period_file_through_the_orchestrator() {
 }
 
 #[tokio::test]
+async fn set_recording_toggles_raw_recording_live_through_the_orchestrator() {
+    // ADR-012: a running channel records nothing until set_recording(true), then a
+    // .raw file captures from that point, and set_recording(false) finalizes it —
+    // no restart. The channel is configured with a destination but mode=Disabled, so
+    // it does not auto-record at Start; the arming is present for the live toggle.
+    use listener::config::RecordingConfig;
+    use listener::record::{FileRotationPolicy, OverwritePolicy, RecordingMode};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "listener-liverec-it-{}-{}.raw",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let port = free_udp_port();
+    let mut config = listener::config::templates::udp_template();
+    if let InterfaceConfig::Udp(udp) = &mut config.interface {
+        udp.bind_address = "127.0.0.1".to_string();
+        udp.port = port;
+    }
+    config.recording = RecordingConfig {
+        mode: RecordingMode::Disabled, // no auto-record; armed by the destination
+        destination: Some(path.clone()),
+        timestamp_enabled: false,
+        overwrite_policy: OverwritePolicy::Overwrite,
+        file_rotation: FileRotationPolicy::None,
+        disk_guard: None,
+    };
+
+    let mut listener = Listener::with_default_capacities();
+    let id = listener.add_channel(config);
+    listener.start(id).await.unwrap();
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // Data before enabling recording: received, but not recorded.
+    client
+        .send_to(b"before", ("127.0.0.1", port))
+        .await
+        .unwrap();
+    let _ = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 6).await;
+    assert!(listener.snapshot(id).await.unwrap().raw_recording.is_none());
+
+    // Live Begin, then data that should be captured.
+    assert!(listener.set_recording(id, true).await);
+    let _ = await_snapshot(&listener, id, |s| s.raw_recording.is_some()).await;
+    client
+        .send_to(b"DURING", ("127.0.0.1", port))
+        .await
+        .unwrap();
+    let _ = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 12).await;
+
+    // Live Stop finalizes; later data is not written.
+    assert!(listener.set_recording(id, false).await);
+    let _ = await_snapshot(&listener, id, |s| s.raw_recording.is_none()).await;
+    client.send_to(b"after", ("127.0.0.1", port)).await.unwrap();
+    let _ = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 17).await;
+
+    stop(&mut listener, id).await;
+
+    // The file holds only the bytes received while recording was on.
+    assert_eq!(std::fs::read(&path).unwrap(), b"DURING");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn snapshot_surfaces_channel_liveness() {
     // §166: a running channel's snapshot reports byte-based liveness — throughput
     // and total bytes registered, and the last-data time set once data arrives.

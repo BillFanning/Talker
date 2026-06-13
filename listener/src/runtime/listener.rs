@@ -235,6 +235,20 @@ impl Listener {
         self.channels.keys().copied().collect()
     }
 
+    /// Begin or stop Raw recording on a running data Channel live, without a restart
+    /// (§50.2, ADR-012) — the manual counterpart of the match-rule `Record` action,
+    /// sharing the pipeline's lazy begin / clean finalize path. `enabled = true`
+    /// begins (a no-op if already recording, or if no destination is configured);
+    /// `false` stops and finalizes. Returns `false` when the Channel is unknown, not
+    /// running, or a TCP listener. The outcome is observed via the snapshot's
+    /// recording state, and a begin failure raises a `WarningRaised` event (§55).
+    pub async fn set_recording(&self, id: ChannelId, enabled: bool) -> bool {
+        match self.channels.get(&id).and_then(|c| c.handle.as_ref()) {
+            Some(ChannelHandle::Data(tasks)) => tasks.set_recording(enabled).await,
+            _ => false,
+        }
+    }
+
     /// Drive the RTS output line of a running serial Channel (§161).
     pub async fn set_rts(&self, id: ChannelId, on: bool) -> Result<(), OrchestratorError> {
         self.serial_command(id, SerialControlCommand::SetRts(on))

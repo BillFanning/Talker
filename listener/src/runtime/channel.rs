@@ -218,6 +218,17 @@ impl MonitoredChannel {
         reply_rx.await.ok()
     }
 
+    /// Begin/stop Raw recording live, without a restart (§50.2, ADR-012). Fire-and-
+    /// forget: returns `true` if the command reached the pipeline, `false` if the
+    /// task has already ended. The outcome is observed via the next snapshot's
+    /// recording state (and a `WarningRaised` event on a begin failure, §55).
+    pub(crate) async fn set_recording(&self, enabled: bool) -> bool {
+        self.requests
+            .send(PipelineRequest::SetRecording { enabled })
+            .await
+            .is_ok()
+    }
+
     /// Graceful stop (§110): stop reception; the transport's sender drops, the
     /// pipeline drains the accepted backlog and returns, and the monitor ends.
     pub(crate) async fn stop(self) -> ChannelPipeline {
@@ -344,6 +355,12 @@ impl RunningChannel {
     /// pipeline has ended.
     pub async fn stream_delta(&self, since: u64) -> Option<StreamDelta> {
         self.tasks.stream_delta(since).await
+    }
+
+    /// Begin/stop Raw recording live, without a restart (§50.2, ADR-012). `false`
+    /// once the pipeline has ended.
+    pub async fn set_recording(&self, enabled: bool) -> bool {
+        self.tasks.set_recording(enabled).await
     }
 
     /// The runtime→UI event stream for this Channel (§137).

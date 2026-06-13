@@ -74,11 +74,14 @@ Message-model removal). Everything below this block is verified done:
 - [ ] Consume `hex_grouping` in the Hex renderer: `display::DisplayView` still uses
       its own `hex_bytes_per_line`/`hex_separator`; map the config field onto them so
       the persisted grouping actually drives the Hex view (with a GUI control).
-- [ ] Live `Record` begin/stop without a restart. Recording is wired only from
-      `RecordingConfig` at channel start. Per ADR-012 the path is a new `Listener`
-      method (e.g. `enable_recording`/`disable_recording`) plus the internal command
-      channel into `run_channel` (ADR-008) — not a top-level command enum — with a
-      GUI emitter (`UiCommand`) on top.
+- [x] Live `Record` begin/stop without a restart (ADR-012). `Listener::set_recording`
+      → `PipelineRequest::SetRecording` into `run_channel` → the pipeline's lazy
+      begin / clean finalize path (shared with the match-rule `Record` action); GUI
+      Record/Stop-recording button on the detail pane (`UiCommand::SetRecording`).
+      A channel with a destination but `mode = Disabled` is armed but not auto-
+      recording, so the toggle controls it. Pinned by
+      `set_recording_begins_and_stops_raw_recording_live` (pipeline) +
+      `set_recording_toggles_raw_recording_live_through_the_orchestrator` (loopback).
 - [ ] Recording timestamp sidecar for `.raw` (byte-offset keyed, §57)
 - [ ] Match-rule editor UI (rules currently arrive only via profiles)
 - [x] `RuntimeCommand`'s role (§136) — resolved by ADR-012: removed the vestigial

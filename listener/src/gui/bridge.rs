@@ -55,6 +55,10 @@ pub enum UiCommand {
     ResumeDisplay(ChannelId, DisplayViewId),
     SetRts(ChannelId, bool),
     SetDtr(ChannelId, bool),
+    /// Begin (`true`) or stop (`false`) Raw recording on a running channel live,
+    /// without a restart (§50.2, ADR-012). Requires a recording destination on the
+    /// channel config; the outcome shows up in the next snapshot's recording state.
+    SetRecording(ChannelId, bool),
     /// Tell the driver which channel is on screen (`None` = none). Only the selected
     /// channel gets a snapshot + incremental stream delta polled; the rest get cheap
     /// stats (ADR-006).
@@ -293,6 +297,9 @@ impl Driver {
             }
             UiCommand::SetDtr(id, on) => {
                 let _ = self.listener.set_dtr(id, on).await;
+            }
+            UiCommand::SetRecording(id, enabled) => {
+                let _ = self.listener.set_recording(id, enabled).await;
             }
             UiCommand::Select(id) => {
                 // New selection: restart the live stream cursor so the new channel's

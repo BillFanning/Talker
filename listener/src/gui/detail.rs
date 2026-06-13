@@ -130,6 +130,21 @@ impl ListenerApp {
                     LifecycleAction::Start => self.try_start(id),
                 }
             }
+            // Live Raw-recording toggle (§50.2, ADR-012): begin/stop without a
+            // restart. Only for a running channel with a destination configured (no
+            // destination = nothing to record to). A Faulted recording is left to the
+            // diagnostics path, not toggled here.
+            if status == ChannelStatus::Running && rec_dest.is_some() {
+                let recording_now = matches!(recording, Some(RecordingState::Enabled));
+                let label = if recording_now {
+                    "\u{25A0} Stop rec"
+                } else {
+                    "\u{25CF} Record"
+                };
+                if ui.add_sized(size, egui::Button::new(label)).clicked() {
+                    self.send(UiCommand::SetRecording(id, !recording_now));
+                }
+            }
             if ui.add_sized(size, egui::Button::new("Remove")).clicked() {
                 // Confirm first — removal is destructive and can't be undone (#1).
                 self.confirm_remove = Some(id);
