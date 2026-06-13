@@ -70,10 +70,21 @@ Message-model removal). Everything below this block is verified done:
 - [ ] `DisplayViewConfig.hex_grouping` (spec §1431): the field is documented but
       not yet in the config schema, so profiles can't round-trip it. Add with
       `#[serde(default)]` when the Hex-view grouping control is wired.
-- [ ] Live `Record` begin/stop via `EnableRecording`/`DisableRecording` (no restart)
+- [ ] Live `Record` begin/stop without a restart. The `RuntimeCommand::Enable`/
+      `DisableRecording` variants exist but are **constructed nowhere** and have no
+      runtime handler; recording is wired only from `RecordingConfig` at channel
+      start. Needs an emitter (GUI/CLI) and a runtime dispatch path.
 - [ ] Recording timestamp sidecar for `.raw` (byte-offset keyed, §57)
 - [ ] Match-rule editor UI (rules currently arrive only via profiles)
-- [ ] Profiles: save/load wired end-to-end against the v2 schema (§67–§71)
+- [ ] Decide `RuntimeCommand`'s role (§136). The enum is defined but constructed
+      nowhere; the runtime is driven by async methods (`start`/`stop`/
+      `apply_pending`) per `runtime/listener.rs`. Either route the GUI/CLI through
+      the command enum (a real command channel) or narrow the enum to match the
+      method surface. Until then the §136 vocabulary is aspirational, not load-bearing.
+- [ ] Profiles: finish wiring save/load against the v2 schema (§67–§71). The
+      `Config::{from_toml,to_toml,load,save}` round-trip exists and the CLI save
+      path calls `profile.save(..)`; the **GUI** has no load/save call site yet
+      (no picker → `Config::load`, no "save profile" → `Config::save`).
 - [ ] Export (stream scrollback → file, §60–§63) — after GUI settles
 
 ## Carried over (still valid under v2)
