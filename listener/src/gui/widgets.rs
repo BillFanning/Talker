@@ -310,6 +310,9 @@ fn recording_file_fields(
     overwrite_policy: &mut OverwritePolicy,
     file_rotation: &mut FileRotationPolicy,
     timestamp_enabled: &mut bool,
+    // When `Some`, a "Record at start" checkbox is shown on the same line, left of the
+    // "Record timestamps" checkbox (Raw uses this; Display has its own enable above).
+    record_at_start: Option<&mut bool>,
 ) {
     // A single file when not rotating; a directory of <channel>_<period> files
     // otherwise (§59). `rotating` reflects this frame's start — a one-frame lag when
@@ -361,8 +364,14 @@ fn recording_file_fields(
                  filesystem-safe (§59)",
             );
     });
-    ui.checkbox(timestamp_enabled, format!("Record timestamps ({ext})"))
-        .on_hover_text("Sidecar index for Raw; inline for Display (§57)");
+    ui.horizontal(|ui| {
+        if let Some(enabled) = record_at_start {
+            ui.checkbox(enabled, "Record at start")
+                .on_hover_text("Begin recording when the channel starts (§53)");
+        }
+        ui.checkbox(timestamp_enabled, format!("Record timestamps ({ext})"))
+            .on_hover_text("Sidecar index for Raw; inline for Display (§57)");
+    });
 }
 
 /// Edit the channel's **Raw** recording setup (§53): destination, overwrite,
@@ -372,8 +381,6 @@ fn recording_file_fields(
 /// runtime without a restart, as long as a destination is set.
 pub(super) fn edit_raw_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
     let rec = &mut config.raw_recording;
-    ui.checkbox(&mut rec.enabled, "Record at start")
-        .on_hover_text("Begin Raw recording when the channel starts (§53)");
     recording_file_fields(
         ui,
         ".raw",
@@ -381,6 +388,7 @@ pub(super) fn edit_raw_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) 
         &mut rec.overwrite_policy,
         &mut rec.file_rotation,
         &mut rec.timestamp_enabled,
+        Some(&mut rec.enabled), // "Record at start", shown left of "Record timestamps"
     );
 }
 
@@ -401,6 +409,7 @@ pub(super) fn edit_display_recording(ui: &mut egui::Ui, config: &mut ChannelConf
         &mut rec.overwrite_policy,
         &mut rec.file_rotation,
         &mut rec.timestamp_enabled,
+        None, // Display has its own enable checkbox above
     );
 }
 

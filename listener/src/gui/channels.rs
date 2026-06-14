@@ -50,9 +50,12 @@ impl ListenerApp {
             });
             ui.menu_button("Profile", |ui| {
                 // Recent profiles at the top: one click reloads (replaces the
-                // workspace, §70). Most-recent-first.
-                if !self.recent_profiles.is_empty() {
-                    ui.label(egui::RichText::new("Recent").weak());
+                // workspace, §70). Most-recent-first. The header always shows (with a
+                // placeholder when empty) so the section is visibly present.
+                ui.label(egui::RichText::new("Recent").weak());
+                if self.recent_profiles.is_empty() {
+                    ui.add_enabled(false, egui::Button::new("(none yet)"));
+                } else {
                     let recents = self.recent_profiles.clone();
                     for path in recents {
                         let label = path
@@ -68,8 +71,8 @@ impl ListenerApp {
                             ui.close();
                         }
                     }
-                    ui.separator();
                 }
+                ui.separator();
                 // "Save" writes to the current file (or prompts if there is none);
                 // "Save As…" always prompts and re-points the current file.
                 if ui.button("Save").clicked() {

@@ -798,14 +798,16 @@ impl Listener {
         raw: &crate::config::RawRecordingConfig,
         channel_name: &str,
     ) -> Option<RawRecordingSettings> {
-        raw.destination.clone().map(|destination| RawRecordingSettings {
-            destination,
-            channel_name: channel_name.to_string(),
-            overwrite: raw.overwrite_policy,
-            timestamps: raw.timestamp_enabled,
-            file_rotation: raw.file_rotation,
-            capacity: self.caps.raw_recording,
-        })
+        raw.destination
+            .clone()
+            .map(|destination| RawRecordingSettings {
+                destination,
+                channel_name: channel_name.to_string(),
+                overwrite: raw.overwrite_policy,
+                timestamps: raw.timestamp_enabled,
+                file_rotation: raw.file_rotation,
+                capacity: self.caps.raw_recording,
+            })
     }
 
     /// Create the Raw Recording handle for a Channel if enabled (§53). Per §55,

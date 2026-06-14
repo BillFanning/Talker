@@ -542,9 +542,13 @@ impl ChannelPipeline {
             return;
         };
         let created = if settings.file_rotation == FileRotationPolicy::None {
-            RawFileRecorder::create(&settings.destination, settings.overwrite, settings.timestamps)
-                .await
-                .map(|r| start_raw_recording(r, settings.capacity))
+            RawFileRecorder::create(
+                &settings.destination,
+                settings.overwrite,
+                settings.timestamps,
+            )
+            .await
+            .map(|r| start_raw_recording(r, settings.capacity))
         } else {
             RotatingRawRecorder::create(
                 &settings.destination,
@@ -1565,15 +1569,16 @@ mod tests {
         // Stop finalizes byte-exactly.
         let cid = ChannelId::new();
         let path = temp_path("live");
-        let mut p =
-            pipeline(cid, PipelineCapacities::default()).with_recording_settings(RawRecordingSettings {
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_recording_settings(
+            RawRecordingSettings {
                 destination: path.clone(),
                 channel_name: "live".to_string(),
                 overwrite: OverwritePolicy::Refuse,
                 timestamps: false,
                 file_rotation: FileRotationPolicy::None,
                 capacity: 64,
-            });
+            },
+        );
 
         // Before enabling: nothing on disk, nothing recorded.
         p.ingest(bytes_chunk(cid, b"before "));
