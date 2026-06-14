@@ -49,6 +49,27 @@ impl ListenerApp {
                 }
             });
             ui.menu_button("Profile", |ui| {
+                // Recent profiles at the top: one click reloads (replaces the
+                // workspace, §70). Most-recent-first.
+                if !self.recent_profiles.is_empty() {
+                    ui.label(egui::RichText::new("Recent").weak());
+                    let recents = self.recent_profiles.clone();
+                    for path in recents {
+                        let label = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_else(|| path.to_str().unwrap_or("profile"));
+                        if ui
+                            .button(label)
+                            .on_hover_text(path.display().to_string())
+                            .clicked()
+                        {
+                            self.load_profile_path(path);
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                }
                 // "Save" writes to the current file (or prompts if there is none);
                 // "Save As…" always prompts and re-points the current file.
                 if ui.button("Save").clicked() {
@@ -124,64 +145,80 @@ impl ListenerApp {
                         frame.fill = visuals.selection.bg_fill;
                         frame.stroke = egui::Stroke::new(1.5, visuals.selection.stroke.color);
                     }
-                    let response = frame
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            // Line 1: status dot + name.
-                            let mut line1 = egui::text::LayoutJob::default();
-                            line1.append(
-                                "\u{25CF}",
-                                0.0,
-                                egui::TextFormat {
-                                    font_id: egui::FontId::proportional(base * 1.4),
-                                    color: status_color(row.status),
-                                    valign: egui::Align::Center,
-                                    ..Default::default()
-                                },
-                            );
-                            line1.append(
-                                &format!("  {}", row.name),
-                                0.0,
-                                egui::TextFormat {
-                                    font_id: egui::FontId::proportional(base * 1.1),
-                                    color: ui.visuals().text_color(),
-                                    valign: egui::Align::Center,
-                                    ..Default::default()
-                                },
-                            );
-                            ui.label(line1);
-                            // Line 2: connection details.
-                            ui.label(egui::RichText::new(&row.details).weak());
-                            // Line 3: live stats.
+                    let inner = frame.show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        // Line 1: status dot + name.
+                        let mut line1 = egui::text::LayoutJob::default();
+                        line1.append(
+                            "\u{25CF}",
+                            0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::proportional(base * 1.4),
+                                color: status_color(row.status),
+                                valign: egui::Align::Center,
+                                ..Default::default()
+                            },
+                        );
+                        line1.append(
+                            &format!("  {}", row.name),
+                            0.0,
+                            egui::TextFormat {
+                                font_id: egui::FontId::proportional(base * 1.1),
+                                color: ui.visuals().text_color(),
+                                valign: egui::Align::Center,
+                                ..Default::default()
+                            },
+                        );
+                        ui.label(line1);
+                        // Line 2: connection details.
+                        ui.label(egui::RichText::new(&row.details).weak());
+                        // Line 3: live stats.
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}  ·  {:.0} B/s",
+                                human_bytes(row.bytes_total),
+                                row.bytes_per_sec
+                            ))
+                            .weak(),
+                        );
+                        // Line 4: per-severity diagnostic counts, color-coded (#8).
+                        ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "{}  ·  {:.0} B/s",
-                                    human_bytes(row.bytes_total),
-                                    row.bytes_per_sec
-                                ))
-                                .weak(),
+                                egui::RichText::new(format!("{} info", row.info))
+                                    .weak()
+                                    .color(egui::Color32::from_gray(110)),
                             );
-                            // Line 4: per-severity diagnostic counts, color-coded (#8).
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("{} info", row.info))
-                                        .weak()
-                                        .color(egui::Color32::from_gray(110)),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!("{} warn", row.warnings))
-                                        .color(egui::Color32::from_rgb(150, 100, 0)),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!("{} err", row.errors))
-                                        .color(egui::Color32::from_rgb(170, 30, 30)),
-                                );
-                            });
-                        })
-                        .response;
-                    // The whole box is display-only and selects on click (#8). It is
-                    // interactable as a unit since it holds no inner buttons now.
-                    if response.interact(egui::Sense::click()).clicked() {
+                            ui.label(
+                                egui::RichText::new(format!("{} warn", row.warnings))
+                                    .color(egui::Color32::from_rgb(150, 100, 0)),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("{} err", row.errors))
+                                    .color(egui::Color32::from_rgb(170, 30, 30)),
+                            );
+                        });
+                    });
+                    // Box-select: sense a click on the whole box first.
+                    let box_resp = inner.response.interact(egui::Sense::click());
+                    // The ✕ remove button is placed ON TOP, in the box's top-right
+                    // corner, AFTER the box interaction — so it's last in z-order and
+                    // wins the click instead of the box stealing it (the earlier
+                    // structure had the box's `interact` swallow the button's click).
+                    let btn_size = egui::vec2(20.0, 20.0);
+                    let btn_rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            box_resp.rect.right() - btn_size.x - 6.0,
+                            box_resp.rect.top() + 6.0,
+                        ),
+                        btn_size,
+                    );
+                    let remove_resp = ui
+                        .put(btn_rect, egui::Button::new("\u{2715}").small())
+                        .on_hover_text("Remove channel");
+                    if remove_resp.clicked() {
+                        self.confirm_remove = Some(id);
+                    } else if box_resp.clicked() {
+                        // A box click that wasn't the ✕ selects the channel (#8).
                         self.selected = Some(id);
                     }
                 });
@@ -227,13 +264,13 @@ impl ListenerApp {
         };
         if let Some(path) = dialog.save_file() {
             self.current_profile_path = Some(path.clone());
+            self.remember_recent_profile(path.clone());
             self.send(UiCommand::SaveProfile(path));
         }
     }
 
-    /// Open a native "load profile" dialog and, if the user picks a file, send the
-    /// LoadProfile command (which replaces the workspace, §70) and remember the path
-    /// as the current profile. Defaults to the app's `profiles/` directory.
+    /// Open a native "load profile" dialog and, if the user picks a file, load it.
+    /// Defaults to the app's `profiles/` directory.
     fn load_profile_dialog(&mut self) {
         let mut dialog = rfd::FileDialog::new().add_filter("TOML profile", &["toml"]);
         // Open in the last-used profile's directory, else the app profiles directory.
@@ -246,9 +283,17 @@ impl ListenerApp {
             dialog = dialog.set_directory(dir);
         }
         if let Some(path) = dialog.pick_file() {
-            self.current_profile_path = Some(path.clone());
-            self.send(UiCommand::LoadProfile(path));
+            self.load_profile_path(path);
         }
+    }
+
+    /// Load a profile from a known path (used by both the picker and the recent-files
+    /// menu): replace the workspace (§70), remember it as current, and bump it to the
+    /// top of the recents list.
+    pub(super) fn load_profile_path(&mut self, path: std::path::PathBuf) {
+        self.current_profile_path = Some(path.clone());
+        self.remember_recent_profile(path.clone());
+        self.send(UiCommand::LoadProfile(path));
     }
 }
 

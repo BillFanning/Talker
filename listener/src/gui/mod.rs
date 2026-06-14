@@ -75,7 +75,7 @@ pub fn run() -> anyhow::Result<()> {
                     format!("failed to start the runtime bridge: {e}").into()
                 },
             )?;
-            Ok(Box::new(ListenerApp::new(bridge)))
+            Ok(Box::new(ListenerApp::new(bridge, cc.storage)))
         }),
     )
     .map_err(|e| anyhow!("{e}"))
@@ -173,7 +173,13 @@ struct ListenerApp {
     /// loaded). `Save` writes here silently; `Save As…` always re-prompts. `None`
     /// until the first save/load, so the first `Save` falls through to a picker.
     current_profile_path: Option<std::path::PathBuf>,
+    /// Recently saved/loaded profile paths, most-recent-first (capped). Listed at the
+    /// top of the Profile menu for one-click reload. Session-scoped for now.
+    recent_profiles: Vec<std::path::PathBuf>,
 }
+
+/// How many recent profiles to keep in the Profile menu.
+pub(super) const MAX_RECENT_PROFILES: usize = 8;
 
 /// Cached, line-split render of a channel's accumulated stream bytes, reused
 /// across frames until one of its inputs changes (see [`StreamRenderKey`]). The
@@ -196,10 +202,27 @@ struct StreamRenderKey {
     len: usize,
     mode: DisplayMode,
     chars: CharacterRendering,
+    /// Wrap width in monospace columns. The cache rows are pre-wrapped to this so each
+    /// row is exactly one visual line (uniform height) — that lets the viewer both
+    /// soft-wrap *and* virtualize with `show_rows`. Re-split when the width changes.
+    wrap_cols: usize,
 }
 
+/// eframe storage key for the persisted recent-profiles list (newline-joined paths).
+const RECENT_PROFILES_KEY: &str = "recent_profiles";
+
 impl ListenerApp {
-    fn new(bridge: BridgeHandle) -> Self {
+    fn new(bridge: BridgeHandle, storage: Option<&dyn eframe::Storage>) -> Self {
+        // Restore the recent-profiles list from eframe storage (survives restarts).
+        let recent_profiles = storage
+            .and_then(|s| s.get_string(RECENT_PROFILES_KEY))
+            .map(|s| {
+                s.lines()
+                    .filter(|l| !l.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             bridge,
             state: AppState::default(),
@@ -221,7 +244,16 @@ impl ListenerApp {
             serial_ports: list_serial_ports(),
             stream_cache: None,
             current_profile_path: None,
+            recent_profiles,
         }
+    }
+
+    /// Record a profile path as recently used: move/insert it at the front, dedup, and
+    /// cap the list. Called on every save/load so the Profile menu's recents are live.
+    pub(super) fn remember_recent_profile(&mut self, path: std::path::PathBuf) {
+        self.recent_profiles.retain(|p| p != &path);
+        self.recent_profiles.insert(0, path);
+        self.recent_profiles.truncate(MAX_RECENT_PROFILES);
     }
 
     pub(super) fn refresh_serial_ports(&mut self) {
@@ -301,20 +333,31 @@ impl ListenerApp {
         }
     }
 
-    /// Start a channel, but refuse (and complain) if its config is incomplete — e.g.
-    /// a UDP channel with no port would otherwise bind an ephemeral port and silently
-    /// "run" (#3, #6). The complaint is folded in as a per-channel error so it shows
-    /// inline (the red ⚠ recourse line) — no status bar needed.
+    /// Start a channel, applying any pending config edits first (the unified "go"
+    /// action). Start always reflects what's in the editor: it commits the edit draft
+    /// via the §13 Reconfigure path and then Starts, so there is no way to start on a
+    /// stale config. Refuses (with an inline complaint) if the config is incomplete —
+    /// e.g. a UDP channel with no port would otherwise bind an ephemeral port and
+    /// silently "run" (#3, #6). Edits commit only here (or via Apply & Restart), never
+    /// on every keystroke — a running channel keeps its config until you act.
     pub(super) fn try_start(&mut self, id: ChannelId) {
-        let incomplete = self
-            .state
-            .channel(id)
-            .map(|v| config_incomplete(&v.config))
-            .unwrap_or(false);
-        if incomplete {
+        // Prefer the edit draft (what the user sees in the editor); fall back to the
+        // committed config if no draft is loaded for this channel.
+        let config = match &self.edit_draft {
+            Some((eid, cfg)) if *eid == id => cfg.clone(),
+            _ => match self.state.channel(id) {
+                Some(v) => v.config.clone(),
+                None => return,
+            },
+        };
+        if config_incomplete(&config) {
             self.complain_unconfigured(id);
             return;
         }
+        // Reconfigure to the (possibly edited) config, then Start — so Start picks up
+        // pending edits. Reconfiguring a Stopped channel just swaps the config in for
+        // the upcoming Start (§13); no restart of a live channel happens here.
+        self.send(UiCommand::Reconfigure(id, Box::new(config)));
         self.send(UiCommand::Start(id));
     }
 
@@ -376,7 +419,12 @@ impl ListenerApp {
                     close = true;
                 }
                 if ui
-                    .add(egui::Button::new("Remove").fill(egui::Color32::from_rgb(170, 30, 30)))
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Remove").color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(170, 30, 30)),
+                    )
                     .clicked()
                 {
                     self.send(UiCommand::RemoveChannel(id));
@@ -392,6 +440,18 @@ impl ListenerApp {
 }
 
 impl eframe::App for ListenerApp {
+    /// Persist the recent-profiles list (eframe calls this periodically and on exit),
+    /// so the Profile menu's recents survive a restart. Paths are newline-joined.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let joined = self
+            .recent_profiles
+            .iter()
+            .filter_map(|p| p.to_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        storage.set_string(RECENT_PROFILES_KEY, joined);
+    }
+
     // This workspace's eframe surfaces a `Ui` directly (App::ui), like talker's GUI.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_updates();

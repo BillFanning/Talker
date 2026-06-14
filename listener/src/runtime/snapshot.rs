@@ -23,6 +23,7 @@ use crate::core::{ChannelId, DisplayViewId, MatchRuleId, RecordingState};
 use crate::diagnostics::Diagnostic;
 
 use super::activity::ChannelActivity;
+use super::pipeline::RawRecordingSettings;
 
 /// A query the pipeline task answers from its current state, replying on a
 /// oneshot. Dropping the reply sender simply yields nothing.
@@ -49,11 +50,14 @@ pub enum PipelineRequest {
     /// Begin or stop Raw recording on a running Channel without a restart (§50.2,
     /// ADR-012): the live counterpart of the match-rule `Record` action, driven by
     /// the same lazy begin/finalize path. `enabled = true` begins (idempotent if
-    /// already recording); `false` stops and finalizes. Fire-and-forget — the
-    /// outcome surfaces through the recording state in the next snapshot and, on a
-    /// begin failure, a `WarningRaised` event (§55).
+    /// already recording); `false` stops and finalizes. `settings`, when present,
+    /// apply the recording config the caller read at click time first — so a
+    /// destination set *after* the channel started still records live, no restart
+    /// needed. Fire-and-forget — the outcome surfaces through the next snapshot's
+    /// recording state and, on a begin failure, a `RecordingFaulted` event (§55).
     SetRecording {
         enabled: bool,
+        settings: Option<RawRecordingSettings>,
     },
 }
 

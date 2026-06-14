@@ -12,9 +12,9 @@ use super::bridge::{self, UiCommand};
 use super::fonts::{bold, MonoFont};
 use super::state::ChannelStatus;
 use super::widgets::{
-    edit_display_recording, edit_interface, edit_raw_recording, human_bytes, latest_diagnostic,
-    line_indicator, line_toggle, short_id, status_color, status_label, truncate, vsep, ColorScheme,
-    LifecycleAction, MSG_FONT_SIZES,
+    config_differs_ignoring_name, edit_display_recording, edit_interface, edit_raw_recording,
+    human_bytes, latest_diagnostic, line_indicator, line_toggle, short_id, status_color,
+    status_label, truncate, vsep, ColorScheme, MSG_FONT_SIZES,
 };
 use super::ListenerApp;
 
@@ -91,66 +91,124 @@ impl ListenerApp {
             "Received: {}    Throughput: {bps:.0} B/s",
             human_bytes(bytes_total)
         ));
-        // Lifecycle actions, below the stats line (#6); bigger so Stop/Remove stand
-        // out. Recording controls live in the Recording panel below, not here.
+        // Lifecycle on row 1, recording on row 2 (below it); Remove lives on the
+        // channel tab in the left list, not here. Uniform button height + min width;
+        // text wider than the min grows the button (so "Start Channel" doesn't clip).
+        let size = egui::vec2(96.0, 32.0);
+        // Globally-stable id so the expander toggle and its body (different ui scopes)
+        // read one flag.
+        let open_id = egui::Id::new(("raw_rec_open", id));
+        // Does the edit draft differ from the channel's committed config? (Name is
+        // excluded — it renames live, not via restart.) Drives the Start button label.
+        let config_changed = match (&self.edit_draft, self.state.channel(id)) {
+            (Some((eid, draft)), Some(view)) if *eid == id => {
+                config_differs_ignoring_name(draft, &view.config)
+            }
+            _ => false,
+        };
+        // Row 1 — channel lifecycle: [Start/Apply&Restart/Retry] [Stop]. Both always
+        // present; Stop is disabled unless Running; Start's label/enabled reflects state
+        // (disabled when Running with no pending edits). Remove lives on the channel tab.
         ui.horizontal(|ui| {
-            let size = egui::vec2(86.0, 30.0);
-            // Primary action + label both derived from state (tested in widgets).
-            let action = LifecycleAction::from_status(status);
+            let (start_label, start_enabled): (&str, bool) = match status {
+                ChannelStatus::Running if config_changed => ("Apply & Restart", true),
+                ChannelStatus::Running => ("Start Channel", false),
+                ChannelStatus::Faulted => ("Retry Channel", true),
+                _ => ("Start Channel", true),
+            };
             if ui
-                .add_sized(size, egui::Button::new(action.label()))
+                .add_enabled(start_enabled, egui::Button::new(start_label).min_size(size))
                 .clicked()
             {
-                match action {
-                    LifecycleAction::Stop => self.send(UiCommand::Stop(id)),
-                    // Faulted can't go straight to Starting (§8.5): Retry = Stop + Start.
-                    LifecycleAction::Retry => {
-                        self.send(UiCommand::Stop(id));
-                        self.try_start(id);
+                if status == ChannelStatus::Running {
+                    self.apply_and_restart(id); // one coherent restart onto the new config
+                } else {
+                    if status == ChannelStatus::Faulted {
+                        self.send(UiCommand::Stop(id)); // §8.5: Faulted -> Stop first
                     }
-                    LifecycleAction::Start => self.try_start(id),
+                    self.try_start(id); // applies pending edits, then starts
                 }
             }
-            if ui.add_sized(size, egui::Button::new("Remove")).clicked() {
-                // Confirm first — removal is destructive and can't be undone (#1).
-                self.confirm_remove = Some(id);
+            if ui
+                .add_enabled(
+                    status == ChannelStatus::Running,
+                    egui::Button::new("Stop Channel").min_size(size),
+                )
+                .clicked()
+            {
+                self.send(UiCommand::Stop(id));
             }
         });
-        if let Some(err) = &last_error {
-            ui.colored_label(egui::Color32::from_rgb(170, 30, 30), format!("⚠ {err}"));
-            ui.label(
-                "Recourse: change the port below and Apply, free the resource (Stop \
-                 the other channel on that port) then Retry, or Remove this channel.",
-            );
-        }
-
-        // Recording panel (§53, ADR-013) — Raw recording, above Configure. The
-        // collapsing header summarizes live state (●/■ + on/off); inside are the live
-        // Record/Stop toggle (begins/stops without a restart, ADR-012) and the Raw
-        // setup (destination/rotation/overwrite/timestamps), committed via Apply.
-        // Display (.disp) recording lives under Configure (it's display config).
-        let rec_header = match recording {
-            Some(RecordingState::Enabled) => "Recording  ●  on",
-            Some(RecordingState::Faulted) => "Recording  ⚠  faulted",
-            Some(RecordingState::Disabled) | None => "Recording  ■  off",
-        };
-        egui::CollapsingHeader::new(rec_header)
-            .id_salt(("recording_panel", id))
-            .default_open(false)
-            .show(ui, |ui| {
-                // Live toggle: only for a running channel with a destination set (no
-                // destination = nothing to record to).
-                if status == ChannelStatus::Running && rec_dest.is_some() {
-                    let recording_now = matches!(recording, Some(RecordingState::Enabled));
-                    let label = if recording_now {
-                        "\u{25A0} Stop recording"
-                    } else {
-                        "\u{25CF} Record now"
-                    };
-                    if ui.button(label).clicked() {
-                        self.send(UiCommand::SetRecording(id, !recording_now));
-                    }
+        // Row 2 — recording, under Start/Stop: [▸] Record Raw Data  ●/■ <state>
+        // [Record now]. The ▸ expands the Raw recording setup below.
+        ui.horizontal(|ui| {
+            let mut open = ui
+                .ctx()
+                .data_mut(|d| d.get_temp::<bool>(open_id))
+                .unwrap_or(false);
+            let arrow = if open { "\u{25BE}" } else { "\u{25B8}" }; // ▾ / ▸
+            if ui
+                .button(arrow)
+                .on_hover_text("Raw recording setup")
+                .clicked()
+            {
+                open = !open;
+                ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
+            }
+            ui.label(bold("Record Raw Data"));
+            let (dot, color, text) = match recording {
+                Some(RecordingState::Enabled) => (
+                    "\u{25CF}",
+                    egui::Color32::from_rgb(200, 40, 40),
+                    "recording",
+                ),
+                Some(RecordingState::Faulted) => {
+                    ("\u{26A0}", egui::Color32::from_rgb(170, 30, 30), "faulted")
                 }
+                Some(RecordingState::Disabled) | None => {
+                    ("\u{25A0}", egui::Color32::from_gray(120), "off")
+                }
+            };
+            ui.colored_label(color, format!("{dot} {text}"));
+            // Live recording toggle, for a running channel. Reads the recording
+            // settings from the editor *at click time* and sends them with the command,
+            // so it records to exactly what's on screen — no Apply, no restart
+            // (ADR-012). Enabled when the on-screen settings have a destination.
+            if status == ChannelStatus::Running {
+                let draft_raw = self
+                    .edit_draft
+                    .as_ref()
+                    .filter(|(eid, _)| *eid == id)
+                    .map(|(_, cfg)| cfg.raw_recording.clone());
+                let has_dest = draft_raw.as_ref().is_some_and(|r| r.destination.is_some());
+                let recording_now = matches!(recording, Some(RecordingState::Enabled));
+                let label = if recording_now {
+                    "\u{25A0} Stop recording"
+                } else {
+                    "\u{25CF} Record now"
+                };
+                let resp = ui.add_enabled(
+                    has_dest || recording_now,
+                    egui::Button::new(label).min_size(size),
+                );
+                let resp = if !has_dest && !recording_now {
+                    resp.on_hover_text("Set a destination in the Raw recording setup (▸) first")
+                } else {
+                    resp
+                };
+                if resp.clicked() {
+                    let raw = draft_raw.unwrap_or_default();
+                    self.send(UiCommand::SetRecording(id, !recording_now, Box::new(raw)));
+                }
+            }
+        });
+        // Raw recording setup body, shown when expanded.
+        let raw_open = ui
+            .ctx()
+            .data_mut(|d| d.get_temp::<bool>(open_id))
+            .unwrap_or(false);
+        if raw_open {
+            ui.group(|ui| {
                 if let Some(RecordingState::Enabled) = recording {
                     let dest = rec_dest
                         .as_ref()
@@ -160,20 +218,25 @@ impl ListenerApp {
                         egui::Color32::from_rgb(200, 40, 40),
                         format!("\u{25CF} Recording \u{2192} {dest}"),
                     );
-                } else if let Some(RecordingState::Faulted) = recording {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(170, 30, 30),
-                        "\u{26A0} Recording faulted — see Diagnostics",
-                    );
                 }
-                ui.separator();
                 if let Some((_, config)) = &mut self.edit_draft {
                     edit_raw_recording(ui, config);
-                    if ui.button("Apply & Restart raw recording").clicked() {
-                        self.apply_and_restart(id);
-                    }
+                    // No Apply button here: these fields are part of the channel's edit
+                    // draft, committed by the Start / Apply & Restart button above.
+                    // "Record now" begins/stops recording live without applying them.
+                    ui.label(egui::RichText::new("Applied by Start / Apply & Restart.").weak());
+                } else {
+                    ui.label(egui::RichText::new("(select the channel to edit)").weak());
                 }
             });
+        }
+        if let Some(err) = &last_error {
+            ui.colored_label(egui::Color32::from_rgb(170, 30, 30), format!("⚠ {err}"));
+            ui.label(
+                "Recourse: change the port below and Apply, free the resource (Stop \
+                 the other channel on that port) then Retry, or Remove this channel.",
+            );
+        }
 
         // Configure: edit the full interface config on a working copy, then commit
         // with one click — "Apply & Restart" installs it and brings the channel up
@@ -182,14 +245,9 @@ impl ListenerApp {
         // Force the section open for one frame when focus moved to a needy channel
         // (task 1); `None` afterwards so the user can still collapse it.
         let force_open = self.force_config_open.then_some(true);
-        let mut apply = false;
         let mut refresh = false;
-        // "Restart" only when it's actually up; otherwise it's coming up = "Start".
-        let apply_label = if status == ChannelStatus::Running {
-            "Apply & Restart"
-        } else {
-            "Apply & Start"
-        };
+        // Configure is edit-only: there's no Apply button here. Edits commit via the
+        // Start / Apply & Restart button at the top, which applies the pending draft.
         if let Some((_, config)) = &mut self.edit_draft {
             egui::CollapsingHeader::new("Configure")
                 // Per-channel id so each channel remembers its own open/closed state
@@ -207,15 +265,11 @@ impl ListenerApp {
                     ui.separator();
                     ui.label(bold("Display record"));
                     edit_display_recording(ui, config);
-                    apply = ui.button(apply_label).clicked();
                 });
         }
         self.force_config_open = false;
         if refresh {
             self.refresh_serial_ports();
-        }
-        if apply {
-            self.apply_and_restart(id);
         }
 
         // Live serial control/status lines (§161): green = high, grey = low.
@@ -505,9 +559,18 @@ impl ListenerApp {
         // arrives or the view mode changes — keyed on the stream cursor — and (b)
         // virtualize the layout with `show_rows`, laying out only visible rows. Both
         // matter: a non-virtualized selectable Label over ~1 MB stalled the UI.
-        self.refresh_stream_rows(id, &renderer);
         let font = egui::FontId::new(font_size, mono_family.clone());
-        let row_h = ui.fonts_mut(|f| f.row_height(&font));
+        // Monospace metrics: row height and the width of one glyph ('0' as a stand-in),
+        // so we can convert the available pixel width into a column count for wrapping.
+        let (row_h, char_w) =
+            ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0').max(1.0)));
+        // Columns that fit in the current viewer width (minus the frame margin + a
+        // little slack for the scrollbar). Pre-wrapping to this keeps every cached row
+        // exactly one visual line — uniform height — so we can soft-wrap *and*
+        // virtualize with `show_rows`. Re-wrap only when this column count changes.
+        let avail_w = (ui.available_width() - 24.0).max(char_w);
+        let wrap_cols = (avail_w / char_w).floor().max(8.0) as usize;
+        self.refresh_stream_rows(id, &renderer, wrap_cols);
         let rows: &[String] = self
             .stream_cache
             .as_ref()
@@ -528,28 +591,42 @@ impl ListenerApp {
                     ui.label(egui::RichText::new(note).weak());
                     return;
                 }
-                // Select text across the (non-interactive) row labels without giving
-                // each row its own interaction box — this is what selects the stream.
+                // Text selection across the (non-interactive) row labels.
                 ui.style_mut().interaction.selectable_labels = true;
+                // Suppress the per-widget hover/active visuals egui paints on selectable
+                // labels (they drew a flickering box around the rows near the pointer).
+                {
+                    let w = &mut ui.visuals_mut().widgets;
+                    for s in [
+                        &mut w.hovered,
+                        &mut w.active,
+                        &mut w.inactive,
+                        &mut w.noninteractive,
+                    ] {
+                        s.bg_stroke = egui::Stroke::NONE;
+                        s.weak_bg_fill = egui::Color32::TRANSPARENT;
+                        s.bg_fill = egui::Color32::TRANSPARENT;
+                    }
+                }
+                // Soft-wrapped AND virtualized: rows are pre-wrapped to `wrap_cols`
+                // (above) so each is one uniform-height visual line, which lets
+                // `show_rows` lay out only the visible rows. This is what keeps the UI
+                // responsive — the earlier "render everything" approaches (N labels or
+                // one giant galley) re-laid-out the whole buffer every frame and made
+                // resizing/the whole UI sluggish. Rows don't wrap again here (they're
+                // already wrapped); they just extend if anything slipped through.
                 egui::ScrollArea::vertical()
                     .id_salt("stream")
                     .stick_to_bottom(true)
                     .auto_shrink([false, false])
                     .show_rows(ui, row_h, rows.len().max(1), |ui, range| {
-                        // Text selection is handled globally for plain labels (set
-                        // below); per-row `Label::selectable(true)` would instead make
-                        // every row its own interactive widget, and under `show_rows`
-                        // (which recycles widget ids by scroll position) that drew a
-                        // hover/selection box that flickered between rows while
-                        // scrolling. Plain, non-interactive labels select cleanly with
-                        // no per-row box. Tighten row spacing so wrapped runs don't gap.
                         ui.spacing_mut().item_spacing.y = 0.0;
                         for row in &rows[range] {
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(row).font(font.clone()).color(fg),
                                 )
-                                .wrap(),
+                                .wrap_mode(egui::TextWrapMode::Extend),
                             );
                         }
                     });
@@ -560,7 +637,7 @@ impl ListenerApp {
     /// the render settings changed. Keyed on the view's stream cursor (advances as
     /// deltas are folded) plus the view mode/character rendering, so we re-render
     /// the scrollback only when something actually changed — not every frame.
-    fn refresh_stream_rows(&mut self, id: ChannelId, renderer: &DisplayView) {
+    fn refresh_stream_rows(&mut self, id: ChannelId, renderer: &DisplayView, wrap_cols: usize) {
         let Some(view) = self.state.channel_mut(id) else {
             self.stream_cache = None;
             return;
@@ -571,29 +648,33 @@ impl ListenerApp {
             len: view.stream_bytes.len(),
             mode: self.msg_mode,
             chars: self.msg_chars,
+            wrap_cols,
         };
         if self.stream_cache.as_ref().is_some_and(|c| c.key == key) {
             return; // still valid — reuse the cached rows
         }
-        let rows = split_stream_rows(&renderer.render_text(view.stream_contiguous()));
+        let rows = split_stream_rows(&renderer.render_text(view.stream_contiguous()), wrap_cols);
         self.stream_cache = Some(super::StreamRenderCache { key, rows });
     }
 }
 
-/// Split rendered stream text into virtualization rows: one row per data line,
-/// with any line lacking an LF (e.g. raw binary / UDP) hard-wrapped to a bounded
-/// width so a single row never becomes pathologically long to lay out.
-fn split_stream_rows(text: &str) -> Vec<String> {
-    const MAX_ROW_CHARS: usize = 4096;
+/// Split rendered stream text into virtualization rows, soft-wrapping each data line
+/// to `wrap_cols` monospace columns so every row is exactly one visual line (uniform
+/// height — required by `show_rows`). A data line shorter than `wrap_cols` is one row;
+/// a longer one (or a line with no LF, e.g. raw binary / UDP) is wrapped into several.
+fn split_stream_rows(text: &str, wrap_cols: usize) -> Vec<String> {
+    let cols = wrap_cols.max(8);
     let mut rows: Vec<String> = Vec::new();
     for line in text.split('\n') {
-        if line.chars().count() <= MAX_ROW_CHARS {
-            rows.push(line.to_string());
-        } else {
-            let chars: Vec<char> = line.chars().collect();
-            for chunk in chars.chunks(MAX_ROW_CHARS) {
-                rows.push(chunk.iter().collect());
-            }
+        if line.is_empty() {
+            rows.push(String::new());
+            continue;
+        }
+        // Wrap by character count (monospace, so columns == chars). Char-based, not
+        // byte-based, so multi-byte UTF-8 isn't split mid-codepoint.
+        let chars: Vec<char> = line.chars().collect();
+        for chunk in chars.chunks(cols) {
+            rows.push(chunk.iter().collect());
         }
     }
     rows

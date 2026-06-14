@@ -159,9 +159,10 @@ pub struct ChannelPipeline {
     /// `Record` actions queued by rule evaluation, applied asynchronously by
     /// [`apply_pending_records`](Self::apply_pending_records) (file I/O is async).
     pending_record_controls: Vec<PendingRecord>,
-    /// What a match-armed `Record` recording needs to be built on demand (§50.2,
-    /// lazy-create: nothing on disk until a `Begin` fires). `None` = no arming.
-    record_arming: Option<RawRecordArming>,
+    /// The Raw recording settings used to build the recording on demand (§50.2,
+    /// lazy-create: nothing on disk until a `Begin` fires). `None` = no destination
+    /// set, so a `Begin` can't record.
+    recording_settings: Option<RawRecordingSettings>,
     /// Anchor for the `Idle` condition before any data has arrived (§50.2): idle is
     /// measured from the last data, or from this instant when none has arrived yet.
     created_at: Instant,
@@ -183,12 +184,13 @@ struct PendingRecord {
     control: RecordControl,
 }
 
-/// Everything needed to lazily build a match-armed Raw recording the first time
-/// a `Record { Begin }` fires (§50.2, §165). Mirrors the orchestrator's
-/// raw-recorder construction so a match-triggered recording uses the Channel's
-/// configured destination, overwrite policy, timestamps, and rotation.
+/// The Raw recording settings needed to build the recording when a `Record { Begin }`
+/// fires (§50.2, §165) — the destination/overwrite/timestamps/rotation, packaged so
+/// they can be sent to the pipeline task (which runs on its own async task and can't
+/// read the config directly). Built from the channel's recording config, either at
+/// channel start or — for a live toggle — read from the editor at click time (ADR-012).
 #[derive(Clone, Debug)]
-pub struct RawRecordArming {
+pub struct RawRecordingSettings {
     pub destination: PathBuf,
     pub channel_name: String,
     pub overwrite: OverwritePolicy,
@@ -219,7 +221,7 @@ impl ChannelPipeline {
             match_rules: MatchRuleSet::compile(&[]),
             recent_matches: DropOldestQueue::with_capacity(RECENT_MATCHES_CAP),
             pending_record_controls: Vec::new(),
-            record_arming: None,
+            recording_settings: None,
             created_at: Instant::now(),
             stream_buf: VecDeque::new(),
             stream_cap: caps.stream_display,
@@ -234,10 +236,10 @@ impl ChannelPipeline {
         self
     }
 
-    /// Arm a match-triggered Raw recording (§50.2): the recorder is created only
-    /// when a `Record { Begin }` action fires, so nothing is written before a match.
-    pub fn with_record_arming(mut self, arming: RawRecordArming) -> Self {
-        self.record_arming = Some(arming);
+    /// Provide the Raw recording settings (§50.2): the recorder is created only when a
+    /// `Record { Begin }` action fires, so nothing is written before then.
+    pub fn with_recording_settings(mut self, settings: RawRecordingSettings) -> Self {
+        self.recording_settings = Some(settings);
         self
     }
 
@@ -478,7 +480,7 @@ impl ChannelPipeline {
     /// Apply queued `Record` actions (§50.2). Called from the async ingest loop,
     /// since recorder creation/finalization is async. Raw/`Both` targets are
     /// honoured by the byte-exact recorder; the display portion of `Display`/`Both`
-    /// is deferred (it needs per-view display-recorder arming).
+    /// is deferred (it needs per-view display-recorder wiring).
     pub async fn apply_pending_records(&mut self) {
         if self.pending_record_controls.is_empty() {
             return;
@@ -490,69 +492,96 @@ impl ChannelPipeline {
                 continue; // Display-only target: deferred (no raw recorder to drive)
             }
             match req.control {
-                RecordControl::Begin => self.begin_armed_recording().await,
-                RecordControl::Stop => self.stop_armed_recording().await,
+                RecordControl::Begin => self.begin_recording().await,
+                RecordControl::Stop => self.stop_recording().await,
             }
         }
     }
 
     /// Begin or stop Raw recording live, without a restart (§50.2, ADR-012). The
-    /// manual counterpart of the match-rule `Record` action: it drives the same
-    /// lazy begin / clean finalize path, so a user-toggled recording and a
-    /// rule-armed one are byte-identical and share the idempotency rules. Requires
-    /// a destination armed from `RecordingConfig` (the no-arming case is a no-op,
-    /// same as a `Begin` with nothing configured).
-    pub async fn set_recording(&mut self, enabled: bool) {
+    /// manual counterpart of the match-rule `Record` action: it drives the same lazy
+    /// begin / clean finalize path, so a user-toggled recording and a rule-triggered
+    /// one are byte-identical and share the idempotency rules.
+    ///
+    /// `settings`, when present, replace the pipeline's recording settings first — so
+    /// the live toggle records to whatever the editor showed at click time, with no
+    /// restart. They're only swapped in while not actively recording, so a begin can't
+    /// change the destination out from under an open file.
+    pub async fn set_recording(&mut self, enabled: bool, settings: Option<RawRecordingSettings>) {
+        if let Some(settings) = settings {
+            if self.raw_recorder.is_none() {
+                self.recording_settings = Some(settings);
+            }
+        }
         if enabled {
-            self.begin_armed_recording().await;
+            self.begin_recording().await;
         } else {
-            self.stop_armed_recording().await;
+            self.stop_recording().await;
         }
     }
 
-    /// Lazily create the match-armed Raw recording on the first `Begin` (§50.2):
-    /// nothing is on disk until now. A no-op if a recording is already active or
-    /// no arming is configured; an open failure warns without faulting the
+    /// Lazily create the Raw recording on a `Begin` (§50.2): nothing is on disk until
+    /// now. A no-op if a recording is already active; if no destination is set it
+    /// reports a fault rather than silently doing nothing; an open failure (e.g. an
+    /// existing file under a Refuse policy) reports the reason without faulting the
     /// Channel (§55).
-    async fn begin_armed_recording(&mut self) {
+    async fn begin_recording(&mut self) {
         if self.raw_recorder.is_some() {
             return; // already recording — `Begin` is idempotent
         }
-        let Some(arm) = self.record_arming.clone() else {
-            return; // no destination armed — cannot record
+        let Some(settings) = self.recording_settings.clone() else {
+            // No destination set — a Begin can't record. Surface it instead of a
+            // silent no-op (the live toggle would otherwise appear to do nothing).
+            self.diagnostics.record(Diagnostic::error(
+                "can't begin Raw recording: no destination is set — set one in the Raw \
+                 recording setup, then press Record again",
+            ));
+            if let Some(events) = &self.events {
+                let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+            }
+            return;
         };
-        let created = if arm.file_rotation == FileRotationPolicy::None {
-            RawFileRecorder::create(&arm.destination, arm.overwrite, arm.timestamps)
+        let created = if settings.file_rotation == FileRotationPolicy::None {
+            RawFileRecorder::create(&settings.destination, settings.overwrite, settings.timestamps)
                 .await
-                .map(|r| start_raw_recording(r, arm.capacity))
+                .map(|r| start_raw_recording(r, settings.capacity))
         } else {
             RotatingRawRecorder::create(
-                &arm.destination,
-                &arm.channel_name,
+                &settings.destination,
+                &settings.channel_name,
                 ".raw",
-                arm.overwrite,
-                arm.timestamps,
-                arm.file_rotation,
+                settings.overwrite,
+                settings.timestamps,
+                settings.file_rotation,
             )
             .await
-            .map(|r| start_raw_recording(r, arm.capacity))
+            .map(|r| start_raw_recording(r, settings.capacity))
         };
         match created {
             Ok(rec) => {
                 self.raw_recorder = Some(rec);
                 self.recording_fault_reported = false;
             }
-            Err(_err) => {
+            Err(err) => {
+                // Record *why* the begin failed (e.g. Refuse over an existing file) in
+                // the diagnostic log, and signal it as a recording fault so the GUI can
+                // surface it — a silent no-op left the user clicking "Record now" with
+                // no feedback (§55).
+                self.diagnostics.record(Diagnostic::error(format!(
+                    "could not begin Raw recording to {}: {err} (check the destination \
+                     and the on-exists policy — Refuse will not overwrite)",
+                    settings.destination.display(),
+                )));
                 if let Some(events) = &self.events {
-                    let _ = events.try_send(RuntimeEvent::WarningRaised(self.channel_id));
+                    let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
                 }
             }
         }
     }
 
-    /// Stop and finalize the match-armed recording on a `Record { Stop }` (§50.2,
-    /// §56): a clean finalize, reception continues. A no-op if none is active.
-    async fn stop_armed_recording(&mut self) {
+    /// Stop and finalize the Raw recording on a `Record { Stop }` (§50.2, §56): a
+    /// clean finalize, reception continues. A no-op if none is active.
+    async fn stop_recording(&mut self) {
         if let Some(recorder) = self.raw_recorder.take() {
             recorder.finalize(RecordingStopReason::Disabled).await;
         }
@@ -837,8 +866,8 @@ pub async fn run_channel(
                 Some(PipelineRequest::StreamDelta { since, reply }) => {
                     let _ = reply.send(pipeline.stream_delta(since));
                 }
-                Some(PipelineRequest::SetRecording { enabled }) => {
-                    pipeline.set_recording(enabled).await;
+                Some(PipelineRequest::SetRecording { enabled, settings }) => {
+                    pipeline.set_recording(enabled, settings).await;
                 }
                 None => requests_open = false, // all requesters gone; keep running
             },
@@ -1472,8 +1501,8 @@ mod tests {
 
     #[tokio::test]
     async fn record_action_begins_and_stops_from_the_match_forward() {
-        // §50.2/§158: Record{Begin} creates the armed recording lazily and captures
-        // only data from the match forward; Record{Stop} finalizes it.
+        // §50.2/§158: Record{Begin} creates the recording lazily and captures only
+        // data from the match forward; Record{Stop} finalizes it.
         let cid = ChannelId::new();
         let path = temp_path("armed");
         let mut p = pipeline(cid, PipelineCapacities::default())
@@ -1495,7 +1524,7 @@ mod tests {
                     }],
                 ),
             ])
-            .with_record_arming(RawRecordArming {
+            .with_recording_settings(RawRecordingSettings {
                 destination: path.clone(),
                 channel_name: "armed".to_string(),
                 overwrite: OverwritePolicy::Refuse,
@@ -1537,7 +1566,7 @@ mod tests {
         let cid = ChannelId::new();
         let path = temp_path("live");
         let mut p =
-            pipeline(cid, PipelineCapacities::default()).with_record_arming(RawRecordArming {
+            pipeline(cid, PipelineCapacities::default()).with_recording_settings(RawRecordingSettings {
                 destination: path.clone(),
                 channel_name: "live".to_string(),
                 overwrite: OverwritePolicy::Refuse,
@@ -1551,17 +1580,17 @@ mod tests {
         assert!(p.raw_recording_state().is_none());
 
         // Live Begin: recording starts from here forward.
-        p.set_recording(true).await;
+        p.set_recording(true, None).await;
         assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
         p.ingest(bytes_chunk(cid, b"captured"));
 
         // Begin is idempotent — a second enable while recording is a no-op.
-        p.set_recording(true).await;
+        p.set_recording(true, None).await;
         assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
         p.ingest(bytes_chunk(cid, b"more"));
 
         // Live Stop finalizes; later data is not written.
-        p.set_recording(false).await;
+        p.set_recording(false, None).await;
         assert!(p.raw_recording_state().is_none());
         p.ingest(bytes_chunk(cid, b"after"));
         p.finish().await;

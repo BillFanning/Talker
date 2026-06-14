@@ -76,8 +76,15 @@ pub struct ChannelView {
 
 /// GUI-side scrollback cap (§87, §124): bounds the accumulated live-view bytes
 /// independent of the runtime cap, so a long-lived selection can't grow the view
-/// model without bound. Matches the default runtime byte retention.
-pub const STREAM_VIEW_CAP: usize = 1 << 20;
+/// model without bound.
+///
+/// This is **display-only** — the live scroll-back window. It feeds nothing else
+/// (recording is a separate pipeline tap; match rules and diagnostics don't read it),
+/// so it only governs how far back you can scroll in the viewer. Kept small (~128 KB,
+/// roughly 1000+ typical lines) so the viewer can soft-wrap every line each frame
+/// without virtualization and still stay cheap; the full history lives in the `.raw`
+/// recording, not here.
+pub const STREAM_VIEW_CAP: usize = 128 * 1024;
 
 impl ChannelView {
     fn new(id: ChannelId, name: String, details: String, config: ChannelConfig) -> Self {
@@ -310,12 +317,24 @@ impl AppState {
             }
             RuntimeEvent::ChannelReconnected(id) => self.set_status(id, ChannelStatus::Running),
             RuntimeEvent::ChannelReconnectGaveUp(id) => self.set_status(id, ChannelStatus::Faulted),
+            // A recording fault (e.g. a begin that couldn't open the file — Refuse over
+            // an existing file) surfaces inline so "Record now" gives feedback instead
+            // of silently doing nothing. The specific reason is in the diagnostics log.
+            RuntimeEvent::RecordingFaulted(id) => {
+                if let Some(view) = self.views.get_mut(&id) {
+                    view.last_error = Some(
+                        "recording could not start — see Diagnostics (check the \
+                         destination and on-exists policy)"
+                            .to_string(),
+                    );
+                }
+            }
             // `MessageReceived` no longer drives the list: liveness is byte-based now
             // (ADR-009), refreshed by the periodic snapshot/stats poll like throughput.
-            // Warnings, recording, disk, control-line, match, and TCP-connection
-            // events are reflected through the periodic snapshot (or land in later
-            // panes); the list view does not need them directly. `RuntimeEvent` is
-            // `#[non_exhaustive]`, so this wildcard also keeps us forward-compatible.
+            // Other warning, disk, control-line, match, and TCP-connection events are
+            // reflected through the periodic snapshot (or land in later panes); the list
+            // view does not need them directly. `RuntimeEvent` is `#[non_exhaustive]`,
+            // so this wildcard also keeps us forward-compatible.
             _ => {}
         }
     }

@@ -474,32 +474,17 @@ pub(super) fn plan_config_commit(
     Some(steps)
 }
 
-/// The primary lifecycle action offered for a channel in its current state — the
-/// label and meaning of the big action button. `Retry` is Stop-then-Start (a
-/// Faulted channel can't Start directly, §8.5). Pure, so it's unit-tested.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum LifecycleAction {
-    Stop,
-    Retry,
-    Start,
-}
-
-impl LifecycleAction {
-    pub(super) fn from_status(status: ChannelStatus) -> Self {
-        match status {
-            ChannelStatus::Running => LifecycleAction::Stop,
-            ChannelStatus::Faulted => LifecycleAction::Retry,
-            _ => LifecycleAction::Start,
-        }
-    }
-
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            LifecycleAction::Stop => "Stop",
-            LifecycleAction::Retry => "Retry",
-            LifecycleAction::Start => "Start",
-        }
-    }
+/// Whether an edited config draft differs from the channel's committed config in any
+/// way that needs an Apply & Restart — i.e. everything **except** the name, which
+/// renames live without a restart (§6). Used to switch the Start button to
+/// "Apply & Restart" while a running channel has pending edits. Pure / unit-tested.
+pub(super) fn config_differs_ignoring_name(
+    draft: &ChannelConfig,
+    committed: &ChannelConfig,
+) -> bool {
+    let mut a = draft.clone();
+    a.name = committed.name.clone(); // neutralize the name before comparing
+    &a != committed
 }
 
 /// The headline diagnostic for the real-time status line: the most recent error,
@@ -682,26 +667,18 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_action_maps_state_to_button() {
-        assert_eq!(
-            LifecycleAction::from_status(ChannelStatus::Running),
-            LifecycleAction::Stop
-        );
-        assert_eq!(
-            LifecycleAction::from_status(ChannelStatus::Faulted),
-            LifecycleAction::Retry
-        );
-        assert_eq!(
-            LifecycleAction::from_status(ChannelStatus::Stopped),
-            LifecycleAction::Start
-        );
-        assert_eq!(
-            LifecycleAction::from_status(ChannelStatus::Reconnecting),
-            LifecycleAction::Start
-        );
-        assert_eq!(LifecycleAction::Stop.label(), "Stop");
-        assert_eq!(LifecycleAction::Retry.label(), "Retry");
-        assert_eq!(LifecycleAction::Start.label(), "Start");
+    fn config_change_detection_ignores_the_name() {
+        let base = templates::udp_template();
+        // Identical config = no change.
+        assert!(!config_differs_ignoring_name(&base, &base));
+        // A name-only difference is NOT a restart-worthy change (renames live, §6).
+        let mut renamed = base.clone();
+        renamed.name = crate::core::ChannelName::new("different");
+        assert!(!config_differs_ignoring_name(&renamed, &base));
+        // A real config edit (recording destination) IS a change.
+        let mut edited = base.clone();
+        edited.raw_recording.destination = Some(std::path::PathBuf::from("/tmp/x.raw"));
+        assert!(config_differs_ignoring_name(&edited, &base));
     }
 
     #[test]

@@ -326,8 +326,11 @@ async fn set_recording_toggles_raw_recording_live_through_the_orchestrator() {
         udp.bind_address = "127.0.0.1".to_string();
         udp.port = port;
     }
-    config.raw_recording = RawRecordingConfig {
-        enabled: false, // no auto-record; armed by the destination for the live toggle
+    // No destination in the start config — the live toggle supplies the recording
+    // settings at call time (ADR-012: read settings when Record is pressed), proving a
+    // destination set after start records with no restart.
+    let live_raw = RawRecordingConfig {
+        enabled: false,
         destination: Some(path.clone()),
         timestamp_enabled: false,
         overwrite_policy: OverwritePolicy::Overwrite,
@@ -349,8 +352,8 @@ async fn set_recording_toggles_raw_recording_live_through_the_orchestrator() {
     let _ = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 6).await;
     assert!(listener.snapshot(id).await.unwrap().raw_recording.is_none());
 
-    // Live Begin, then data that should be captured.
-    assert!(listener.set_recording(id, true).await);
+    // Live Begin with the settings supplied now (no restart), then data to capture.
+    assert!(listener.set_recording(id, true, live_raw.clone()).await);
     let _ = await_snapshot(&listener, id, |s| s.raw_recording.is_some()).await;
     client
         .send_to(b"DURING", ("127.0.0.1", port))
@@ -359,7 +362,7 @@ async fn set_recording_toggles_raw_recording_live_through_the_orchestrator() {
     let _ = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 12).await;
 
     // Live Stop finalizes; later data is not written.
-    assert!(listener.set_recording(id, false).await);
+    assert!(listener.set_recording(id, false, live_raw).await);
     let _ = await_snapshot(&listener, id, |s| s.raw_recording.is_none()).await;
     client.send_to(b"after", ("127.0.0.1", port)).await.unwrap();
     let _ = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 17).await;

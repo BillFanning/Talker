@@ -39,7 +39,7 @@ use super::build::{build_display_view, build_serial, build_tcp_listener, build_u
 use super::channel::{
     spawn_monitored_channel, DataRecorder, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES,
 };
-use super::pipeline::{DisplayViewHandle, PipelineCapacities, RawRecordArming};
+use super::pipeline::{DisplayViewHandle, PipelineCapacities, RawRecordingSettings};
 use super::snapshot::{ChannelSnapshot, ChannelStats, StreamDelta};
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
 
@@ -242,9 +242,22 @@ impl Listener {
     /// `false` stops and finalizes. Returns `false` when the Channel is unknown, not
     /// running, or a TCP listener. The outcome is observed via the snapshot's
     /// recording state, and a begin failure raises a `WarningRaised` event (§55).
-    pub async fn set_recording(&self, id: ChannelId, enabled: bool) -> bool {
-        match self.channels.get(&id).and_then(|c| c.handle.as_ref()) {
-            Some(ChannelHandle::Data(tasks)) => tasks.set_recording(enabled).await,
+    pub async fn set_recording(
+        &self,
+        id: ChannelId,
+        enabled: bool,
+        raw: crate::config::RawRecordingConfig,
+    ) -> bool {
+        // Use the settings the caller read at click time (the editor's current
+        // values), not committed config — so Record records to exactly what's on
+        // screen, with no Apply/restart (ADR-012). The channel name comes from the
+        // committed config (it's a live rename, not part of the recording settings).
+        let Some(channel) = self.channels.get(&id) else {
+            return false;
+        };
+        let settings = self.settings_from(&raw, channel.config.name.as_str());
+        match channel.handle.as_ref() {
+            Some(ChannelHandle::Data(tasks)) => tasks.set_recording(enabled, settings).await,
             _ => false,
         }
     }
@@ -753,11 +766,12 @@ impl Listener {
                 .raw_recording
                 .disk_guard
                 .zip(config.raw_recording.destination.clone()),
-            // Match Rules (§50.2, §165) plus arming for any match-triggered `Record`
-            // (lazy-create from the configured destination — nothing until a match).
+            // Match Rules (§50.2, §165) plus the Raw recording settings a match-
+            // triggered `Record` needs (lazy-create from the destination — nothing
+            // until a match fires).
             MatchSetup {
                 rules: config.match_rules.clone(),
-                arming: self.record_arming(config),
+                recording_settings: self.recording_settings(config),
             },
             self.channel_caps(config),
             self.events_tx.clone(),
@@ -766,18 +780,27 @@ impl Listener {
         )
     }
 
-    /// Arming for a match-triggered or live (ADR-012) `Record` action (§50.2): the
-    /// bits to lazily build the Channel's Raw recording on a `Begin`, present
-    /// whenever a Raw destination is configured — **independent of
-    /// `raw_recording.enabled`**, so the live Record toggle works even when
-    /// auto-start recording is off. Mirrors `build_raw_recorder`'s
-    /// destination/overwrite/timestamp/rotation choices so an armed recording matches
-    /// what auto-start recording would have produced.
-    fn record_arming(&self, config: &ChannelConfig) -> Option<RawRecordArming> {
-        let raw = &config.raw_recording;
-        raw.destination.clone().map(|destination| RawRecordArming {
+    /// The Raw recording settings for a `Record` action (§50.2): present whenever a
+    /// Raw destination is configured — **independent of `raw_recording.enabled`**, so
+    /// a match-triggered `Record` works even when auto-start recording is off. Mirrors
+    /// `build_raw_recorder`'s destination/overwrite/timestamp/rotation choices so a
+    /// match-triggered recording matches what auto-start recording would produce.
+    fn recording_settings(&self, config: &ChannelConfig) -> Option<RawRecordingSettings> {
+        self.settings_from(&config.raw_recording, config.name.as_str())
+    }
+
+    /// Build [`RawRecordingSettings`] from a Raw recording config + channel name — used
+    /// by both the build-time path (`recording_settings`) and the live `set_recording`
+    /// path, which passes the settings read from the editor at click time (ADR-012).
+    /// `None` when no destination is set.
+    fn settings_from(
+        &self,
+        raw: &crate::config::RawRecordingConfig,
+        channel_name: &str,
+    ) -> Option<RawRecordingSettings> {
+        raw.destination.clone().map(|destination| RawRecordingSettings {
             destination,
-            channel_name: config.name.as_str().to_string(),
+            channel_name: channel_name.to_string(),
             overwrite: raw.overwrite_policy,
             timestamps: raw.timestamp_enabled,
             file_rotation: raw.file_rotation,

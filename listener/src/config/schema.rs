@@ -242,7 +242,7 @@ impl Default for HexGrouping {
 /// independently of Display recording (they branch at different points in the
 /// pipeline and were always separate; the v2.0 strip merged them in config only).
 /// Listener ADR-013.
-#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RawRecordingConfig {
     /// Whether to begin Raw recording automatically when the Channel starts. The
     /// live Record toggle (ADR-012) can begin/stop it at runtime regardless, as long
@@ -263,6 +263,22 @@ pub struct RawRecordingConfig {
     /// Disk-space guard for long-running recordings (§56.2, §168); `None` = off.
     #[serde(default)]
     pub disk_guard: Option<DiskGuard>,
+}
+
+impl Default for RawRecordingConfig {
+    /// Defaults to **Append** on-exists (not the global `Refuse`): re-recording to the
+    /// same `.raw` file extends it rather than failing, which is the friendly default
+    /// for a capture tool. Everything else is off/none.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            destination: None,
+            timestamp_enabled: false,
+            overwrite_policy: OverwritePolicy::AppendIfExists,
+            file_rotation: FileRotationPolicy::None,
+            disk_guard: None,
+        }
+    }
 }
 
 /// Display recording configuration (§54, §79). Display recording records the

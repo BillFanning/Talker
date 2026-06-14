@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::config::{ChannelConfig, InterfaceConfig, Profile};
+use crate::config::{ChannelConfig, InterfaceConfig, Profile, RawRecordingConfig};
 use crate::core::{ChannelId, ChannelName, DisplayViewId, RuntimeEvent};
 use crate::runtime::{ChannelSnapshot, ChannelStats, Listener, PipelineCapacities, StreamDelta};
 use crate::transport::udp::UdpMode;
@@ -56,9 +56,12 @@ pub enum UiCommand {
     SetRts(ChannelId, bool),
     SetDtr(ChannelId, bool),
     /// Begin (`true`) or stop (`false`) Raw recording on a running channel live,
-    /// without a restart (§50.2, ADR-012). Requires a recording destination on the
-    /// channel config; the outcome shows up in the next snapshot's recording state.
-    SetRecording(ChannelId, bool),
+    /// without a restart (§50.2, ADR-012). Carries the recording settings read from
+    /// the editor **at the moment Record was pressed** — destination/overwrite/
+    /// rotation/timestamps — so it records to exactly what's on screen, no separate
+    /// Apply. The driver arms the running pipeline from these. The outcome shows up in
+    /// the next snapshot's recording state.
+    SetRecording(ChannelId, bool, Box<RawRecordingConfig>),
     /// Tell the driver which channel is on screen (`None` = none). Only the selected
     /// channel gets a snapshot + incremental stream delta polled; the rest get cheap
     /// stats (ADR-006).
@@ -298,8 +301,18 @@ impl Driver {
             UiCommand::SetDtr(id, on) => {
                 let _ = self.listener.set_dtr(id, on).await;
             }
-            UiCommand::SetRecording(id, enabled) => {
-                let _ = self.listener.set_recording(id, enabled).await;
+            UiCommand::SetRecording(id, enabled, raw_config) => {
+                // Arm from the settings read at click time (passed from the editor), so
+                // recording goes exactly where the controls say — no Apply needed. A
+                // `false` return means the command didn't reach a running data channel;
+                // a begin that reaches the pipeline but can't open the file reports
+                // separately via RecordingFaulted (§55).
+                if !self.listener.set_recording(id, enabled, *raw_config).await {
+                    self.push(UiUpdate::ChannelError(
+                        id,
+                        "can't change recording — channel isn't running".to_string(),
+                    ));
+                }
             }
             UiCommand::Select(id) => {
                 // New selection: restart the live stream cursor so the new channel's

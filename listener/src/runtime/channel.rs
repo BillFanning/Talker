@@ -36,16 +36,16 @@ use crate::transport::{
 };
 
 use super::pipeline::{
-    run_channel, ChannelPipeline, DisplayViewHandle, PipelineCapacities, RawRecordArming,
+    run_channel, ChannelPipeline, DisplayViewHandle, PipelineCapacities, RawRecordingSettings,
 };
 use super::snapshot::{ChannelSnapshot, ChannelStats, PipelineRequest, StreamDelta};
 
-/// Match Rule wiring for a Channel (§50.2, §165): the compiled-from rules plus the
-/// optional arming a `Record` action needs to lazily create a recording. Bundled
-/// so the long `spawn_*` signatures gain one parameter, not two.
+/// Match Rule wiring for a Channel (§50.2, §165): the compiled rules plus the
+/// optional Raw recording settings a `Record` action needs to lazily create a
+/// recording. Bundled so the long `spawn_*` signatures gain one parameter, not two.
 pub(crate) struct MatchSetup {
     pub(crate) rules: Vec<MatchRule>,
-    pub(crate) arming: Option<RawRecordArming>,
+    pub(crate) recording_settings: Option<RawRecordingSettings>,
 }
 
 impl MatchSetup {
@@ -53,7 +53,7 @@ impl MatchSetup {
     pub(crate) fn none() -> Self {
         Self {
             rules: Vec::new(),
-            arming: None,
+            recording_settings: None,
         }
     }
 }
@@ -115,11 +115,11 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     let (ingest_tx, ingest_rx) = mpsc::channel(caps.ingest);
 
     let mut pipeline = ChannelPipeline::new(channel_id, caps).with_event_sender(events);
-    // Match Rules (§50.2, §165): compile the rules and arm any match-triggered
-    // recording before the pipeline starts processing.
+    // Match Rules (§50.2, §165): compile the rules and supply any Raw recording
+    // settings a match-triggered `Record` needs before the pipeline starts.
     pipeline = pipeline.with_match_rules(&match_setup.rules);
-    if let Some(arming) = match_setup.arming {
-        pipeline = pipeline.with_record_arming(arming);
+    if let Some(settings) = match_setup.recording_settings {
+        pipeline = pipeline.with_recording_settings(settings);
     }
     if let Some(DataRecorder::Raw(r)) = data_recorder {
         pipeline = pipeline.with_raw_recorder(r);
@@ -222,9 +222,13 @@ impl MonitoredChannel {
     /// forget: returns `true` if the command reached the pipeline, `false` if the
     /// task has already ended. The outcome is observed via the next snapshot's
     /// recording state (and a `WarningRaised` event on a begin failure, §55).
-    pub(crate) async fn set_recording(&self, enabled: bool) -> bool {
+    pub(crate) async fn set_recording(
+        &self,
+        enabled: bool,
+        settings: Option<RawRecordingSettings>,
+    ) -> bool {
         self.requests
-            .send(PipelineRequest::SetRecording { enabled })
+            .send(PipelineRequest::SetRecording { enabled, settings })
             .await
             .is_ok()
     }
@@ -357,10 +361,14 @@ impl RunningChannel {
         self.tasks.stream_delta(since).await
     }
 
-    /// Begin/stop Raw recording live, without a restart (§50.2, ADR-012). `false`
-    /// once the pipeline has ended.
-    pub async fn set_recording(&self, enabled: bool) -> bool {
-        self.tasks.set_recording(enabled).await
+    /// Begin/stop Raw recording live, without a restart (§50.2, ADR-012); `settings`
+    /// apply the on-screen recording config first. `false` once the pipeline has ended.
+    pub async fn set_recording(
+        &self,
+        enabled: bool,
+        settings: Option<RawRecordingSettings>,
+    ) -> bool {
+        self.tasks.set_recording(enabled, settings).await
     }
 
     /// The runtime→UI event stream for this Channel (§137).
