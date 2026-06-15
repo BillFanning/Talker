@@ -13,10 +13,14 @@ use super::fonts::{bold, MonoFont};
 use super::state::ChannelStatus;
 use super::widgets::{
     config_differs_ignoring_name, edit_display_recording, edit_interface, edit_raw_recording,
-    human_bytes, latest_diagnostic, line_indicator, line_toggle, short_id, status_color,
-    status_label, truncate, vsep, ColorScheme, MSG_FONT_SIZES,
+    human_bytes, latest_diagnostic, line_indicator, line_toggle, recording_indicator, short_id,
+    start_button, status_color, status_label, truncate, vsep, ColorScheme, MSG_FONT_SIZES,
 };
 use super::ListenerApp;
+
+/// Uniform size for the lifecycle / recording control buttons. Text wider than the
+/// min grows the button (so "Apply & Restart" doesn't clip).
+const CONTROL_BUTTON_SIZE: egui::Vec2 = egui::vec2(96.0, 32.0);
 
 impl ListenerApp {
     pub(super) fn show_detail(&mut self, ui: &mut egui::Ui) {
@@ -91,13 +95,6 @@ impl ListenerApp {
             "Received: {}    Throughput: {bps:.0} B/s",
             human_bytes(bytes_total)
         ));
-        // Lifecycle on row 1, recording on row 2 (below it); Remove lives on the
-        // channel tab in the left list, not here. Uniform button height + min width;
-        // text wider than the min grows the button (so "Start Channel" doesn't clip).
-        let size = egui::vec2(96.0, 32.0);
-        // Globally-stable id so the expander toggle and its body (different ui scopes)
-        // read one flag.
-        let open_id = egui::Id::new(("raw_rec_open", id));
         // Does the edit draft differ from the channel's committed config? (Name is
         // excluded — it renames live, not via restart.) Drives the Start button label.
         let config_changed = match (&self.edit_draft, self.state.channel(id)) {
@@ -106,130 +103,11 @@ impl ListenerApp {
             }
             _ => false,
         };
-        // Row 1 — channel lifecycle: [Start/Apply&Restart/Retry] [Stop]. Both always
-        // present; Stop is disabled unless Running; Start's label/enabled reflects state
-        // (disabled when Running with no pending edits). Remove lives on the channel tab.
-        ui.horizontal(|ui| {
-            let (start_label, start_enabled): (&str, bool) = match status {
-                ChannelStatus::Running if config_changed => ("Apply & Restart", true),
-                ChannelStatus::Running => ("Start Channel", false),
-                ChannelStatus::Faulted => ("Retry Channel", true),
-                _ => ("Start Channel", true),
-            };
-            if ui
-                .add_enabled(start_enabled, egui::Button::new(start_label).min_size(size))
-                .clicked()
-            {
-                if status == ChannelStatus::Running {
-                    self.apply_and_restart(id); // one coherent restart onto the new config
-                } else {
-                    if status == ChannelStatus::Faulted {
-                        self.send(UiCommand::Stop(id)); // §8.5: Faulted -> Stop first
-                    }
-                    self.try_start(id); // applies pending edits, then starts
-                }
-            }
-            if ui
-                .add_enabled(
-                    status == ChannelStatus::Running,
-                    egui::Button::new("Stop Channel").min_size(size),
-                )
-                .clicked()
-            {
-                self.send(UiCommand::Stop(id));
-            }
-        });
-        // Row 2 — recording, under Start/Stop: [▸] Record Raw Data  ●/■ <state>
-        // [Record now]. The ▸ expands the Raw recording setup below.
-        ui.horizontal(|ui| {
-            let mut open = ui
-                .ctx()
-                .data_mut(|d| d.get_temp::<bool>(open_id))
-                .unwrap_or(false);
-            let arrow = if open { "\u{25BE}" } else { "\u{25B8}" }; // ▾ / ▸
-            if ui
-                .button(arrow)
-                .on_hover_text("Raw recording setup")
-                .clicked()
-            {
-                open = !open;
-                ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
-            }
-            ui.label(bold("Record Raw Data"));
-            let (dot, color, text) = match recording {
-                Some(RecordingState::Enabled) => (
-                    "\u{25CF}",
-                    egui::Color32::from_rgb(200, 40, 40),
-                    "recording",
-                ),
-                Some(RecordingState::Faulted) => {
-                    ("\u{26A0}", egui::Color32::from_rgb(170, 30, 30), "faulted")
-                }
-                Some(RecordingState::Disabled) | None => {
-                    ("\u{25A0}", egui::Color32::from_gray(120), "off")
-                }
-            };
-            ui.colored_label(color, format!("{dot} {text}"));
-            // Live recording toggle, for a running channel. Reads the recording
-            // settings from the editor *at click time* and sends them with the command,
-            // so it records to exactly what's on screen — no Apply, no restart
-            // (ADR-012). Enabled when the on-screen settings have a destination.
-            if status == ChannelStatus::Running {
-                let draft_raw = self
-                    .edit_draft
-                    .as_ref()
-                    .filter(|(eid, _)| *eid == id)
-                    .map(|(_, cfg)| cfg.raw_recording.clone());
-                let has_dest = draft_raw.as_ref().is_some_and(|r| r.destination.is_some());
-                let recording_now = matches!(recording, Some(RecordingState::Enabled));
-                let label = if recording_now {
-                    "\u{25A0} Stop recording"
-                } else {
-                    "\u{25CF} Record now"
-                };
-                let resp = ui.add_enabled(
-                    has_dest || recording_now,
-                    egui::Button::new(label).min_size(size),
-                );
-                let resp = if !has_dest && !recording_now {
-                    resp.on_hover_text("Set a destination in the Raw recording setup (▸) first")
-                } else {
-                    resp
-                };
-                if resp.clicked() {
-                    let raw = draft_raw.unwrap_or_default();
-                    self.send(UiCommand::SetRecording(id, !recording_now, Box::new(raw)));
-                }
-            }
-        });
-        // Raw recording setup body, shown when expanded.
-        let raw_open = ui
-            .ctx()
-            .data_mut(|d| d.get_temp::<bool>(open_id))
-            .unwrap_or(false);
-        if raw_open {
-            ui.group(|ui| {
-                if let Some(RecordingState::Enabled) = recording {
-                    let dest = rec_dest
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(no destination)".to_string());
-                    ui.colored_label(
-                        egui::Color32::from_rgb(200, 40, 40),
-                        format!("\u{25CF} Recording \u{2192} {dest}"),
-                    );
-                }
-                if let Some((_, config)) = &mut self.edit_draft {
-                    edit_raw_recording(ui, config);
-                    // No Apply button here: these fields are part of the channel's edit
-                    // draft, committed by the Start / Apply & Restart button above.
-                    // "Record now" begins/stops recording live without applying them.
-                    ui.label(egui::RichText::new("Applied by Start / Apply & Restart.").weak());
-                } else {
-                    ui.label(egui::RichText::new("(select the channel to edit)").weak());
-                }
-            });
-        }
+        // Stacked: channel lifecycle row, then the recording block. Each is its own
+        // method (readability) — moving the layout is moving these calls. (Two-column
+        // side-by-side was tried and reverted; it broke the panel. Keep it stacked.)
+        self.show_channel_controls(ui, id, status, config_changed);
+        self.show_recording_block(ui, id, status, recording, &rec_dest);
         if let Some(err) = &last_error {
             ui.colored_label(egui::Color32::from_rgb(170, 30, 30), format!("⚠ {err}"));
             ui.label(
@@ -631,6 +509,135 @@ impl ListenerApp {
                         }
                     });
             });
+    }
+
+    /// Channel lifecycle row: [Start / Apply & Restart / Retry] [Stop]. Both buttons
+    /// always present; Stop disabled unless Running; the Start side's label/enabled is
+    /// the pure `start_button` decision. Layout is one `horizontal` row — extracted for
+    /// readability, not changed.
+    fn show_channel_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: ChannelId,
+        status: ChannelStatus,
+        config_changed: bool,
+    ) {
+        let size = CONTROL_BUTTON_SIZE;
+        ui.horizontal(|ui| {
+            let (start_label, start_enabled) = start_button(status, config_changed);
+            if ui
+                .add_enabled(start_enabled, egui::Button::new(start_label).min_size(size))
+                .clicked()
+            {
+                if status == ChannelStatus::Running {
+                    self.apply_and_restart(id); // one coherent restart onto the new config
+                } else {
+                    if status == ChannelStatus::Faulted {
+                        self.send(UiCommand::Stop(id)); // §8.5: Faulted -> Stop first
+                    }
+                    self.try_start(id); // applies pending edits, then starts
+                }
+            }
+            if ui
+                .add_enabled(
+                    status == ChannelStatus::Running,
+                    egui::Button::new("Stop Channel").min_size(size),
+                )
+                .clicked()
+            {
+                self.send(UiCommand::Stop(id));
+            }
+        });
+    }
+
+    /// Raw recording block: the "[▸] Record Raw Data  ●/■ state  [Start/Stop
+    /// recording]" line and the expandable setup. The live toggle reads the recording
+    /// settings from the editor at click time (ADR-012). Extracted for readability;
+    /// the layout (a header row + an optional setup group) is unchanged.
+    fn show_recording_block(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: ChannelId,
+        status: ChannelStatus,
+        recording: Option<RecordingState>,
+        rec_dest: &Option<std::path::PathBuf>,
+    ) {
+        let size = CONTROL_BUTTON_SIZE;
+        // Globally-stable id so the expander toggle and its body read one flag.
+        let open_id = egui::Id::new(("raw_rec_open", id));
+        ui.horizontal(|ui| {
+            let mut open = ui
+                .ctx()
+                .data_mut(|d| d.get_temp::<bool>(open_id))
+                .unwrap_or(false);
+            let arrow = if open { "\u{25BE}" } else { "\u{25B8}" }; // ▾ / ▸
+            if ui
+                .button(arrow)
+                .on_hover_text("Raw recording setup")
+                .clicked()
+            {
+                open = !open;
+                ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
+            }
+            ui.label(bold("Record Raw Data"));
+            let (dot, color, text) = recording_indicator(recording);
+            ui.colored_label(color, format!("{dot} {text}"));
+            // Live recording toggle, for a running channel. Reads the recording settings
+            // from the editor *at click time* and sends them with the command, so it
+            // records to exactly what's on screen — no Apply, no restart (ADR-012).
+            // Enabled when the on-screen settings have a destination.
+            if status == ChannelStatus::Running {
+                let draft_raw = self
+                    .edit_draft
+                    .as_ref()
+                    .filter(|(eid, _)| *eid == id)
+                    .map(|(_, cfg)| cfg.raw_recording.clone());
+                let has_dest = draft_raw.as_ref().is_some_and(|r| r.destination.is_some());
+                let recording_now = matches!(recording, Some(RecordingState::Enabled));
+                let label = if recording_now {
+                    "\u{25A0} Stop recording"
+                } else {
+                    "\u{25CF} Start recording"
+                };
+                let resp = ui.add_enabled(
+                    has_dest || recording_now,
+                    egui::Button::new(label).min_size(size),
+                );
+                let resp = if !has_dest && !recording_now {
+                    resp.on_hover_text("Set a destination in the Raw recording setup (▸) first")
+                } else {
+                    resp
+                };
+                if resp.clicked() {
+                    let raw = draft_raw.unwrap_or_default();
+                    self.send(UiCommand::SetRecording(id, !recording_now, Box::new(raw)));
+                }
+            }
+        });
+        // Raw recording setup body, shown when expanded.
+        let raw_open = ui
+            .ctx()
+            .data_mut(|d| d.get_temp::<bool>(open_id))
+            .unwrap_or(false);
+        if raw_open {
+            ui.group(|ui| {
+                if let Some(RecordingState::Enabled) = recording {
+                    let dest = rec_dest
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(no destination)".to_string());
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 40, 40),
+                        format!("\u{25CF} Recording \u{2192} {dest}"),
+                    );
+                }
+                if let Some((_, config)) = &mut self.edit_draft {
+                    edit_raw_recording(ui, config);
+                } else {
+                    ui.label(egui::RichText::new("(select the channel to edit)").weak());
+                }
+            });
+        }
     }
 
     /// Refresh the memoized stream-view rows for `id` if the accumulated bytes or

@@ -496,6 +496,42 @@ pub(super) fn config_differs_ignoring_name(
     &a != committed
 }
 
+/// The Start/Apply/Retry button's label and enabled state, from the channel status
+/// and whether the edit draft has pending changes (§8.5). Pure decision, unit-tested;
+/// the detail pane just renders the result and dispatches on click:
+/// - Stopped/Reconnecting → "Start Channel", enabled
+/// - Running + pending edits → "Apply & Restart", enabled (a coordinated restart)
+/// - Running + no edits → "Start Channel", **disabled** (nothing to do)
+/// - Faulted → "Retry Channel", enabled (Stop then Start, §8.5)
+pub(super) fn start_button(status: ChannelStatus, config_changed: bool) -> (&'static str, bool) {
+    match status {
+        ChannelStatus::Running if config_changed => ("Apply & Restart", true),
+        ChannelStatus::Running => ("Start Channel", false),
+        ChannelStatus::Faulted => ("Retry Channel", true),
+        _ => ("Start Channel", true),
+    }
+}
+
+/// The recording-state indicator: glyph, color, and label for a channel's raw
+/// recording state (§53). Pure, unit-tested; the detail pane renders it as a colored
+/// label. `None`/`Disabled` read as "off".
+pub(super) fn recording_indicator(
+    recording: Option<crate::core::RecordingState>,
+) -> (&'static str, egui::Color32, &'static str) {
+    use crate::core::RecordingState;
+    match recording {
+        Some(RecordingState::Enabled) => (
+            "\u{25CF}",
+            egui::Color32::from_rgb(200, 40, 40),
+            "recording",
+        ),
+        Some(RecordingState::Faulted) => {
+            ("\u{26A0}", egui::Color32::from_rgb(170, 30, 30), "faulted")
+        }
+        Some(RecordingState::Disabled) | None => ("\u{25A0}", egui::Color32::from_gray(120), "off"),
+    }
+}
+
 /// The headline diagnostic for the real-time status line: the most recent error,
 /// else the most recent warning, else the most recent event, with its display color.
 /// Errors win so a fault stays visible in the collapsed header while troubleshooting.
@@ -641,6 +677,54 @@ mod tests {
         // A fresh serial template has no port selected → incomplete.
         let serial = templates::serial_template();
         assert!(config_incomplete(&serial));
+    }
+
+    #[test]
+    fn start_button_reflects_state_and_pending_edits() {
+        // Stopped → plain Start, enabled.
+        assert_eq!(
+            start_button(ChannelStatus::Stopped, false),
+            ("Start Channel", true)
+        );
+        // Running with no edits → disabled (nothing to apply).
+        assert_eq!(
+            start_button(ChannelStatus::Running, false),
+            ("Start Channel", false)
+        );
+        // Running with pending edits → Apply & Restart, enabled.
+        assert_eq!(
+            start_button(ChannelStatus::Running, true),
+            ("Apply & Restart", true)
+        );
+        // Faulted → Retry, enabled (config_changed irrelevant).
+        assert_eq!(
+            start_button(ChannelStatus::Faulted, false),
+            ("Retry Channel", true)
+        );
+        assert_eq!(
+            start_button(ChannelStatus::Faulted, true),
+            ("Retry Channel", true)
+        );
+        // Reconnecting falls through to Start.
+        assert_eq!(
+            start_button(ChannelStatus::Reconnecting, false),
+            ("Start Channel", true)
+        );
+    }
+
+    #[test]
+    fn recording_indicator_maps_state_to_label() {
+        use crate::core::RecordingState;
+        assert_eq!(
+            recording_indicator(Some(RecordingState::Enabled)).2,
+            "recording"
+        );
+        assert_eq!(
+            recording_indicator(Some(RecordingState::Faulted)).2,
+            "faulted"
+        );
+        assert_eq!(recording_indicator(Some(RecordingState::Disabled)).2, "off");
+        assert_eq!(recording_indicator(None).2, "off");
     }
 
     #[test]
