@@ -703,18 +703,6 @@ pub(super) fn short_id(id: &str) -> &str {
     id.split('-').next().unwrap_or(id)
 }
 
-/// A vertical divider at the standard control height. Unlike `ui.separator()` (which
-/// stretches to the row height), this stays a fixed length, so a row containing an
-/// over-tall element — e.g. the enlarged `␊` glyph — doesn't get a taller divider
-/// than every other row.
-pub(super) fn vsep(ui: &mut egui::Ui) {
-    let h = ui.spacing().interact_size.y;
-    let width = ui.spacing().item_spacing.x.max(6.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
-    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
-    ui.painter().vline(rect.center().x, rect.y_range(), stroke);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

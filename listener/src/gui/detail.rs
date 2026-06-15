@@ -16,7 +16,7 @@ use super::widgets::{
     config_differs_ignoring_name, edit_display_recording, edit_interface, edit_raw_recording,
     human_bytes, latest_diagnostic, line_indicator, line_toggle, paint_glyph, recording_glyph_size,
     recording_indicator, short_id, start_button, status_color, status_glyph, status_label,
-    stop_enabled, truncate, vsep, ColorScheme, MSG_FONT_SIZES,
+    stop_enabled, truncate, ColorScheme, MSG_FONT_SIZES,
 };
 use super::ListenerApp;
 
@@ -56,21 +56,29 @@ impl ListenerApp {
             }
             _ => false,
         };
-        // Two columns: the channel block (name, status, stats, lifecycle) on the LEFT,
-        // the recording block on the RIGHT. `columns` keeps each side height-bounded so
-        // the stream view rendered *after* this block spans full width and sits under
-        // both (an earlier `horizontal_top`/`group` nesting collapsed the panel).
-        ui.columns(2, |cols| {
-            self.show_channel_controls(
-                &mut cols[0],
-                id,
-                status,
-                config_changed,
-                &details,
-                bytes_total,
-                bps,
-            );
-            self.show_recording_block(&mut cols[1], id, status, recording, &rec_dest);
+        // Channel block (name, status, stats, lifecycle) on the LEFT, recording block on
+        // the RIGHT, as two columns — but the whole columns area is capped to a FIXED
+        // width (`set_max_width`), so each column has a constant width and the recording
+        // block's left edge stays put when the window's right edge is resized (with a
+        // free 50/50 `columns` the right column widened with the pane, dragging the block
+        // sideways). The cap is scoped to just the columns; the View config + stream view
+        // render after on the full-width `ui` — `columns` is the only side-by-side layout
+        // that has reliably kept the stream view (horizontal_top variants collapsed it).
+        const CONTROLS_WIDTH: f32 = 670.0;
+        ui.scope(|ui| {
+            ui.set_max_width(CONTROLS_WIDTH);
+            ui.columns(2, |cols| {
+                self.show_channel_controls(
+                    &mut cols[0],
+                    id,
+                    status,
+                    config_changed,
+                    &details,
+                    bytes_total,
+                    bps,
+                );
+                self.show_recording_block(&mut cols[1], id, status, recording, &rec_dest);
+            });
         });
         if let Some(err) = &last_error {
             ui.colored_label(theme::FAULT_RED, format!("⚠ {err}"));
@@ -140,19 +148,19 @@ impl ListenerApp {
             });
         }
 
+        let base = egui::TextStyle::Body.resolve(ui.style()).size;
         ui.horizontal(|ui| {
-            let base = egui::TextStyle::Body.resolve(ui.style()).size;
             ui.label(bold("View"));
             ui.radio_value(&mut self.msg_mode, DisplayMode::Hex, "Hex");
             ui.radio_value(&mut self.msg_mode, DisplayMode::Rendered, "Rendered");
             ui.radio_value(&mut self.msg_mode, DisplayMode::Raw, "Raw");
-            // Fixed-height dividers so the enlarged ␊ below doesn't stretch them.
-            vsep(ui);
-            // Control-character rendering (§46) — applies to Raw mode. Three styles,
-            // matching talker (glyph / token / hex; LF shown as the example). The
-            // control-picture glyph is a compact 2-letter design, so it's bumped up to
-            // visually match the full-size [LF]/<0A> neighbours.
-            ui.add_enabled_ui(self.msg_mode == DisplayMode::Raw, |ui| {
+        });
+        // Control-character rendering (§46) — applies to Raw mode. Three styles, matching
+        // talker (glyph / token / hex; LF shown as the example). Its own row so the label
+        // and its radios never wrap apart from each other. The control-picture glyph is a
+        // compact 2-letter design, bumped up to match the full-size [LF]/<0A> neighbours.
+        ui.add_enabled_ui(self.msg_mode == DisplayMode::Raw, |ui| {
+            ui.horizontal(|ui| {
                 ui.label(bold("ctrl-chars"));
                 ui.radio_value(
                     &mut self.msg_chars,
@@ -624,29 +632,28 @@ impl ListenerApp {
                 }
             }
         });
-        // Raw recording setup body, shown when expanded.
+        // Raw recording setup body, shown when expanded. No surrounding `group` box —
+        // it reads as part of the recording block, not a separate framed panel.
         let raw_open = ui
             .ctx()
             .data_mut(|d| d.get_temp::<bool>(open_id))
             .unwrap_or(false);
         if raw_open {
-            ui.group(|ui| {
-                if let Some(RecordingState::Enabled) = recording {
-                    let dest = rec_dest
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(no destination)".to_string());
-                    ui.colored_label(
-                        theme::FAULT_RED,
-                        format!("\u{25CF} Recording \u{2192} {dest}"),
-                    );
-                }
-                if let Some((_, config)) = &mut self.edit_draft {
-                    edit_raw_recording(ui, config);
-                } else {
-                    ui.label(egui::RichText::new("(select the channel to edit)").weak());
-                }
-            });
+            if let Some(RecordingState::Enabled) = recording {
+                let dest = rec_dest
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(no destination)".to_string());
+                ui.colored_label(
+                    theme::FAULT_RED,
+                    format!("\u{25CF} Recording \u{2192} {dest}"),
+                );
+            }
+            if let Some((_, config)) = &mut self.edit_draft {
+                edit_raw_recording(ui, config);
+            } else {
+                ui.label(egui::RichText::new("(select the channel to edit)").weak());
+            }
         }
     }
 

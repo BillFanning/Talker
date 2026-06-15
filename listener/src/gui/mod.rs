@@ -101,6 +101,26 @@ fn apply_style(ctx: &egui::Context) {
     // More visible dividers (#6): `ui.separator()` draws with the noninteractive
     // bg_stroke, which defaults to a very faint grey — darken and thicken it.
     light.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.5, egui::Color32::from_gray(120));
+    // Make buttons read as raised, interactive objects in every state (not flat
+    // labels). egui's light defaults give buttons almost no fill or border; give the
+    // resting (`inactive`), `hovered`, and `active` states a filled face + a visible
+    // border + a little rounding, brightening on hover and darkening on press, so a
+    // button looks clickable whether enabled or disabled. Disabled buttons use
+    // `noninteractive` (flat/dim), so the enabled↔disabled distinction is preserved.
+    let btn_border = egui::Stroke::new(1.0, egui::Color32::from_gray(150));
+    let btn_round = egui::CornerRadius::same(4);
+    light.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(236);
+    light.widgets.inactive.bg_fill = egui::Color32::from_gray(236);
+    light.widgets.inactive.bg_stroke = btn_border;
+    light.widgets.inactive.corner_radius = btn_round;
+    light.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(248);
+    light.widgets.hovered.bg_fill = egui::Color32::from_gray(248);
+    light.widgets.hovered.bg_stroke = egui::Stroke::new(1.2, egui::Color32::from_gray(110));
+    light.widgets.hovered.corner_radius = btn_round;
+    light.widgets.active.weak_bg_fill = egui::Color32::from_gray(214);
+    light.widgets.active.bg_fill = egui::Color32::from_gray(214);
+    light.widgets.active.bg_stroke = egui::Stroke::new(1.2, egui::Color32::from_gray(90));
+    light.widgets.active.corner_radius = btn_round;
     ctx.set_visuals_of(egui::Theme::Light, light);
     ctx.set_theme(egui::ThemePreference::Light);
 
