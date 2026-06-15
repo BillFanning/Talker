@@ -4,7 +4,8 @@ use crate::core::ChannelId;
 
 use super::bridge::UiCommand;
 use super::state::ChannelStatus;
-use super::widgets::{human_bytes, status_color, AddKind, BOX_STROKE};
+use super::theme;
+use super::widgets::{human_bytes, status_color, status_glyph, AddKind};
 use super::ListenerApp;
 
 /// One channel's row data, snapshotted before rendering so the list isn't borrowing
@@ -146,20 +147,21 @@ impl ListenerApp {
                     let mut frame = egui::Frame::group(ui.style())
                         .inner_margin(8.0)
                         .corner_radius(egui::CornerRadius::same(6))
-                        .stroke(egui::Stroke::new(1.5, BOX_STROKE));
+                        .stroke(egui::Stroke::new(1.5, theme::BOX_STROKE));
                     if selected {
                         frame.fill = visuals.selection.bg_fill;
                         frame.stroke = egui::Stroke::new(1.5, visuals.selection.stroke.color);
                     }
                     let inner = frame.show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        // Line 1: status dot + name.
+                        // Line 1: status glyph + name.
                         let mut line1 = egui::text::LayoutJob::default();
+                        let (glyph, scale) = status_glyph(row.status);
                         line1.append(
-                            "\u{25CF}",
+                            glyph,
                             0.0,
                             egui::TextFormat {
-                                font_id: egui::FontId::proportional(base * 1.4),
+                                font_id: egui::FontId::proportional(base * scale),
                                 color: status_color(row.status),
                                 valign: egui::Align::Center,
                                 ..Default::default()
@@ -192,15 +194,15 @@ impl ListenerApp {
                             ui.label(
                                 egui::RichText::new(format!("{} info", row.info))
                                     .weak()
-                                    .color(egui::Color32::from_gray(110)),
+                                    .color(theme::COUNT_INFO_GREY),
                             );
                             ui.label(
                                 egui::RichText::new(format!("{} warn", row.warnings))
-                                    .color(egui::Color32::from_rgb(150, 100, 0)),
+                                    .color(theme::WARNING_AMBER),
                             );
                             ui.label(
                                 egui::RichText::new(format!("{} err", row.errors))
-                                    .color(egui::Color32::from_rgb(170, 30, 30)),
+                                    .color(theme::FAULT_RED),
                             );
                         });
                     });

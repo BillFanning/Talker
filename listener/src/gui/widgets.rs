@@ -14,9 +14,7 @@ use crate::transport::udp::UdpMode;
 
 use super::fonts::bold;
 use super::state::ChannelStatus;
-
-/// The stroke for a channel box border — talker's connection-card color.
-pub(super) const BOX_STROKE: egui::Color32 = egui::Color32::from_rgb(140, 160, 200);
+use super::theme;
 
 /// Which interface a new channel uses, in the add-channel form.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -345,7 +343,7 @@ fn recording_file_fields(
     if destination.is_none() {
         ui.label(
             egui::RichText::new("⚠ set a destination — recording won't start without one")
-                .color(egui::Color32::from_rgb(150, 100, 0)),
+                .color(theme::WARNING_AMBER),
         );
     }
     ui.horizontal(|ui| {
@@ -526,22 +524,19 @@ pub(super) fn stop_enabled(status: ChannelStatus) -> bool {
 }
 
 /// The recording-state indicator: glyph, color, and label for a channel's raw
-/// recording state (§53). Pure, unit-tested; the detail pane renders it as a colored
-/// label. `None`/`Disabled` read as "off".
+/// recording state (§53). Uses the **same symbol set as channel status**
+/// ([`status_glyph`]) — `■` off, `●` recording, `⚠` faulted — so the two read
+/// consistently; only the colors differ (recording uses its own red). Pure,
+/// unit-tested; the detail pane renders it as a colored label sized via
+/// [`recording_glyph_size`].
 pub(super) fn recording_indicator(
     recording: Option<crate::core::RecordingState>,
 ) -> (&'static str, egui::Color32, &'static str) {
     use crate::core::RecordingState;
     match recording {
-        Some(RecordingState::Enabled) => (
-            "\u{25CF}",
-            egui::Color32::from_rgb(200, 40, 40),
-            "recording",
-        ),
-        Some(RecordingState::Faulted) => {
-            ("\u{26A0}", egui::Color32::from_rgb(170, 30, 30), "faulted")
-        }
-        Some(RecordingState::Disabled) | None => ("\u{25A0}", egui::Color32::from_gray(120), "off"),
+        Some(RecordingState::Enabled) => ("\u{25CF}", theme::FAULT_RED, "recording"),
+        Some(RecordingState::Faulted) => ("\u{26A0}", theme::FAULT_RED, "faulted"),
+        Some(RecordingState::Disabled) | None => ("\u{25A0}", theme::IDLE_GREY, "off"),
     }
 }
 
@@ -552,13 +547,13 @@ pub(super) fn latest_diagnostic(
     diag: &crate::runtime::snapshot::DiagnosticsSnapshot,
 ) -> (String, egui::Color32) {
     if let Some(d) = diag.errors.last() {
-        (d.message.clone(), egui::Color32::from_rgb(170, 30, 30))
+        (d.message.clone(), theme::FAULT_RED)
     } else if let Some(d) = diag.warnings.last() {
-        (d.message.clone(), egui::Color32::from_rgb(150, 100, 0))
+        (d.message.clone(), theme::WARNING_AMBER)
     } else if let Some(d) = diag.events.last() {
-        (d.message.clone(), egui::Color32::from_gray(60))
+        (d.message.clone(), theme::EVENT_GREY)
     } else {
-        ("no activity yet".to_string(), egui::Color32::from_gray(120))
+        ("no activity yet".to_string(), theme::IDLE_GREY)
     }
 }
 
@@ -604,9 +599,9 @@ pub(super) fn status_label(status: ChannelStatus) -> &'static str {
 /// line is high (asserted), grey when low, with a hover tooltip.
 pub(super) fn line_indicator(ui: &mut egui::Ui, name: &str, high: bool) {
     let color = if high {
-        egui::Color32::from_rgb(30, 150, 30)
+        theme::LINE_HIGH_GREEN
     } else {
-        egui::Color32::from_gray(150)
+        theme::LINE_LOW_GREY
     };
     ui.colored_label(color, name)
         .on_hover_text(if high { "high" } else { "low" });
@@ -617,7 +612,7 @@ pub(super) fn line_indicator(ui: &mut egui::Ui, name: &str, high: bool) {
 /// response so the caller can send the matching Set command.
 pub(super) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Response {
     let color = if high {
-        egui::Color32::from_rgb(30, 150, 30)
+        theme::LINE_HIGH_GREEN
     } else {
         ui.visuals().weak_text_color()
     };
@@ -629,15 +624,78 @@ pub(super) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Re
         ))
 }
 
-/// The color for a status glyph: green running, grey stopped, red faulted, amber
-/// reconnecting.
+/// The color for a status glyph. Running is a bright blue-green and Reconnecting a
+/// yellower amber, both chosen to read distinctly from the red fault for red-green
+/// color blindness (the distinct glyphs ●/■/⚠ are the primary signal; color reinforces).
+/// All values live in [`super::theme`].
 pub(super) fn status_color(status: ChannelStatus) -> egui::Color32 {
     match status {
-        ChannelStatus::Running => egui::Color32::from_rgb(30, 150, 30),
-        ChannelStatus::Stopped => egui::Color32::from_gray(120),
-        ChannelStatus::Faulted => egui::Color32::from_rgb(190, 40, 40),
-        ChannelStatus::Reconnecting => egui::Color32::from_rgb(200, 140, 0),
+        ChannelStatus::Running => theme::RUNNING_GREEN,
+        ChannelStatus::Stopped => theme::IDLE_GREY,
+        ChannelStatus::Faulted => theme::FAULT_RED,
+        ChannelStatus::Reconnecting => theme::RECONNECTING_AMBER,
     }
+}
+
+/// The base size multiplier for status indicator glyphs (relative to body size). The
+/// square (`■`) is the reference at this size; the dot and triangle are enlarged by
+/// [`glyph_scale`] to match the square's apparent size.
+pub(super) const STATUS_GLYPH_SCALE: f32 = 1.5;
+
+/// Per-glyph optical correction: `●`/`■`/`⚠` have different bounding boxes, so at one
+/// font size they look different sizes. The square is the reference (1.0); the dot and
+/// triangle are enlarged so all three read the same size. Multiply into
+/// [`STATUS_GLYPH_SCALE`].
+fn glyph_scale(glyph: &str) -> f32 {
+    match glyph {
+        "\u{25A0}" => 1.0,  // ■ square — the reference
+        "\u{25CF}" => 1.34, // ● dot — enlarge up to the square
+        "\u{26A0}" => 1.30, // ⚠ triangle — enlarge up to the square
+        _ => 1.0,
+    }
+}
+
+/// The shared status symbol set + its size, used for BOTH channel-lifecycle and raw-
+/// recording state so the two read consistently:
+/// - Stopped / recording-off → `■`
+/// - Running / recording-on → `●`
+/// - Faulted (channel or recording) → `⚠`
+/// - Reconnecting → `●`
+///
+/// Returns the glyph and the body-relative size (base scale × optical correction), so
+/// every call site renders the same symbol at the same apparent size. Pair with
+/// [`status_color`] (channel) or the recording color from [`recording_indicator`].
+pub(super) fn status_glyph(status: ChannelStatus) -> (&'static str, f32) {
+    let glyph = match status {
+        ChannelStatus::Stopped => "\u{25A0}", // ■ square
+        ChannelStatus::Faulted => "\u{26A0}", // ⚠ triangle
+        ChannelStatus::Running | ChannelStatus::Reconnecting => "\u{25CF}", // ● dot
+    };
+    (glyph, STATUS_GLYPH_SCALE * glyph_scale(glyph))
+}
+
+/// The size for a recording-indicator glyph, matching [`status_glyph`]'s optical
+/// sizing for the same symbol.
+pub(super) fn recording_glyph_size(glyph: &str) -> f32 {
+    STATUS_GLYPH_SCALE * glyph_scale(glyph)
+}
+
+/// Paint a status/recording `glyph` into a **fixed-size, non-interactive cell**,
+/// centered. Painting (rather than adding a sized label) keeps the glyph from driving
+/// the row height — a taller glyph otherwise shifts the line beside it. `allocate_space`
+/// reserves only layout space with no widget id, so there's no stray hover/focus
+/// rectangle. `scale` is the body-relative glyph size (from [`status_glyph`] /
+/// [`recording_glyph_size`]); the cell is sized to the largest glyph.
+pub(super) fn paint_glyph(ui: &mut egui::Ui, glyph: &str, scale: f32, color: egui::Color32) {
+    let base = egui::TextStyle::Body.resolve(ui.style()).size;
+    let (_id, rect) = ui.allocate_space(egui::vec2(base * 1.5, base));
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(base * scale),
+        color,
+    );
 }
 
 /// Shorten a UUID string to its first segment, enough to disambiguate at a glance.

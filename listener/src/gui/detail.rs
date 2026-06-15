@@ -11,11 +11,12 @@ use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, DisplayVi
 use super::bridge::{self, UiCommand};
 use super::fonts::{bold, MonoFont};
 use super::state::ChannelStatus;
+use super::theme;
 use super::widgets::{
     config_differs_ignoring_name, edit_display_recording, edit_interface, edit_raw_recording,
-    human_bytes, latest_diagnostic, line_indicator, line_toggle, recording_indicator, short_id,
-    start_button, status_color, status_label, stop_enabled, truncate, vsep, ColorScheme,
-    MSG_FONT_SIZES,
+    human_bytes, latest_diagnostic, line_indicator, line_toggle, paint_glyph, recording_glyph_size,
+    recording_indicator, short_id, start_button, status_color, status_glyph, status_label,
+    stop_enabled, truncate, vsep, ColorScheme, MSG_FONT_SIZES,
 };
 use super::ListenerApp;
 
@@ -47,55 +48,6 @@ impl ListenerApp {
             return;
         };
 
-        // Top line: status dot + an editable optional name (#6). The name is part of
-        // the config draft; Apply commits it (and the list row mirrors it).
-        ui.horizontal(|ui| {
-            let base = egui::TextStyle::Body.resolve(ui.style()).size;
-            ui.label(
-                egui::RichText::new("\u{25CF}")
-                    .size(base * 1.3)
-                    .color(status_color(status)),
-            );
-            ui.label(bold("Name"));
-            // Editing the name renames the channel in place — instant, no restart
-            // (the name is a label only, §6). Keep the draft in step so a later
-            // Apply of other edits doesn't carry a stale name.
-            let mut renamed = None;
-            if let Some((_, config)) = &mut self.edit_draft {
-                let mut name = config.name.as_str().to_string();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut name).desired_width(200.0))
-                    .changed()
-                {
-                    config.name = crate::core::ChannelName::new(name.clone());
-                    renamed = Some(name);
-                }
-            }
-            if let Some(name) = renamed {
-                // Tell the runtime, AND fold the change into the view-model locally.
-                // The runtime→UI confirmation (`ChannelRenamed`) is an advisory,
-                // lossy push (§99) and can be dropped under load — relying on it
-                // left the list row and the re-seeded draft stale (#5). The optimistic
-                // local apply makes the rename authoritative on the UI side; the
-                // echoed update, if it survives, is idempotent.
-                self.send(UiCommand::Rename(
-                    id,
-                    crate::core::ChannelName::new(name.clone()),
-                ));
-                self.state.apply(bridge::UiUpdate::ChannelRenamed(id, name));
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label(status_label(status));
-            ui.label("·");
-            ui.label(egui::RichText::new(&details).weak());
-        });
-        // Byte-based liveness for the Stream viewer (§18: Stream Mode has no Message
-        // count). Total received + rolling throughput; warnings live in Diagnostics.
-        ui.label(format!(
-            "Received: {}    Throughput: {bps:.0} B/s",
-            human_bytes(bytes_total)
-        ));
         // Does the edit draft differ from the channel's committed config? (Name is
         // excluded — it renames live, not via restart.) Drives the Start button label.
         let config_changed = match (&self.edit_draft, self.state.channel(id)) {
@@ -104,13 +56,24 @@ impl ListenerApp {
             }
             _ => false,
         };
-        // Stacked: channel lifecycle row, then the recording block. Each is its own
-        // method (readability) — moving the layout is moving these calls. (Two-column
-        // side-by-side was tried and reverted; it broke the panel. Keep it stacked.)
-        self.show_channel_controls(ui, id, status, config_changed);
-        self.show_recording_block(ui, id, status, recording, &rec_dest);
+        // Two columns: the channel block (name, status, stats, lifecycle) on the LEFT,
+        // the recording block on the RIGHT. `columns` keeps each side height-bounded so
+        // the stream view rendered *after* this block spans full width and sits under
+        // both (an earlier `horizontal_top`/`group` nesting collapsed the panel).
+        ui.columns(2, |cols| {
+            self.show_channel_controls(
+                &mut cols[0],
+                id,
+                status,
+                config_changed,
+                &details,
+                bytes_total,
+                bps,
+            );
+            self.show_recording_block(&mut cols[1], id, status, recording, &rec_dest);
+        });
         if let Some(err) = &last_error {
-            ui.colored_label(egui::Color32::from_rgb(170, 30, 30), format!("⚠ {err}"));
+            ui.colored_label(theme::FAULT_RED, format!("⚠ {err}"));
             ui.label(
                 "Recourse: change the port below and Apply, free the resource (Stop \
                  the other channel on that port) then Retry, or Remove this channel.",
@@ -129,9 +92,12 @@ impl ListenerApp {
         // Start / Apply & Restart button at the top, which applies the pending draft.
         if let Some((_, config)) = &mut self.edit_draft {
             egui::CollapsingHeader::new("Configure")
-                // Per-channel id so each channel remembers its own open/closed state
-                // — closing it on a running channel stays closed on return (#1).
-                .id_salt(("configure", id))
+                // A STABLE id (not per-channel) so switching channels doesn't create a
+                // "new" header each time — that re-triggered a focus/animation highlight
+                // that flashed a rectangle around the label on every channel switch. The
+                // open/closed state is now shared across channels (consistent), with a
+                // one-frame force-open when a needy channel needs attention.
+                .id_salt("configure")
                 .open(force_open)
                 .default_open(true)
                 .show(ui, |ui| {
@@ -325,18 +291,14 @@ impl ListenerApp {
                             for (t, sev, msg) in dv.entries.iter().rev() {
                                 let (enabled, color, level) = match sev {
                                     DiagnosticSeverity::Event => {
-                                        (self.show_info, egui::Color32::from_gray(80), "INFO ")
+                                        (self.show_info, theme::INFO_GREY, "INFO ")
                                     }
-                                    DiagnosticSeverity::Warning => (
-                                        self.show_warn,
-                                        egui::Color32::from_rgb(150, 100, 0),
-                                        "WARN ",
-                                    ),
-                                    DiagnosticSeverity::Error => (
-                                        self.show_error,
-                                        egui::Color32::from_rgb(170, 30, 30),
-                                        "ERROR",
-                                    ),
+                                    DiagnosticSeverity::Warning => {
+                                        (self.show_warn, theme::WARNING_AMBER, "WARN ")
+                                    }
+                                    DiagnosticSeverity::Error => {
+                                        (self.show_error, theme::FAULT_RED, "ERROR")
+                                    }
                                 };
                                 if !enabled {
                                     continue;
@@ -364,7 +326,7 @@ impl ListenerApp {
                         // occurrence is in the Diagnostics log above.
                         if dv.boundary_saves > 0 {
                             ui.colored_label(
-                                egui::Color32::from_rgb(150, 100, 0),
+                                theme::WARNING_AMBER,
                                 format!(
                                     "⮧ {} match{} spanned a read-chunk boundary \
                                      (recovered; see Diagnostics for where)",
@@ -512,17 +474,61 @@ impl ListenerApp {
             });
     }
 
-    /// Channel lifecycle row: [Start / Apply & Restart / Retry] [Stop]. Both buttons
-    /// always present; Stop disabled unless Running; the Start side's label/enabled is
-    /// the pure `start_button` decision. Layout is one `horizontal` row — extracted for
-    /// readability, not changed.
+    /// The channel block (left column): name (live rename), status·details, byte
+    /// stats, and the [Start / Apply & Restart / Retry] [Stop] lifecycle row. Both
+    /// buttons always present; Stop disabled unless stoppable; the Start side's
+    /// label/enabled is the pure `start_button` decision.
+    #[allow(clippy::too_many_arguments)]
     fn show_channel_controls(
         &mut self,
         ui: &mut egui::Ui,
         id: ChannelId,
         status: ChannelStatus,
         config_changed: bool,
+        details: &str,
+        bytes_total: u64,
+        bps: f64,
     ) {
+        // Name row: status glyph + editable name (renames live, §6).
+        ui.horizontal(|ui| {
+            // Painted into a fixed cell so the glyph never drives the row height (the
+            // name line stayed put across status changes only once this stopped using a
+            // sized label).
+            let (glyph, scale) = status_glyph(status);
+            paint_glyph(ui, glyph, scale, status_color(status));
+            ui.label(bold("Name"));
+            let mut renamed = None;
+            if let Some((_, config)) = &mut self.edit_draft {
+                let mut name = config.name.as_str().to_string();
+                if ui
+                    .add(egui::TextEdit::singleline(&mut name).desired_width(180.0))
+                    .changed()
+                {
+                    config.name = crate::core::ChannelName::new(name.clone());
+                    renamed = Some(name);
+                }
+            }
+            if let Some(name) = renamed {
+                // Tell the runtime AND fold locally — the echoed ChannelRenamed is
+                // advisory/lossy (§99), so the optimistic local apply keeps the list row
+                // and re-seeded draft authoritative (#5).
+                self.send(UiCommand::Rename(
+                    id,
+                    crate::core::ChannelName::new(name.clone()),
+                ));
+                self.state.apply(bridge::UiUpdate::ChannelRenamed(id, name));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(status_label(status));
+            ui.label("·");
+            ui.label(egui::RichText::new(details).weak());
+        });
+        // Byte-based liveness (§18): total received + rolling throughput.
+        ui.label(format!(
+            "Received: {}    Throughput: {bps:.0} B/s",
+            human_bytes(bytes_total)
+        ));
         let size = CONTROL_BUTTON_SIZE;
         ui.horizontal(|ui| {
             let (start_label, start_enabled) = start_button(status, config_changed);
@@ -581,8 +587,11 @@ impl ListenerApp {
                 ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
             }
             ui.label(bold("Record Raw Data"));
-            let (dot, color, text) = recording_indicator(recording);
-            ui.colored_label(color, format!("{dot} {text}"));
+            // Same painted-glyph technique + symbol set as channel status, then the
+            // label text at body size.
+            let (glyph, color, text) = recording_indicator(recording);
+            paint_glyph(ui, glyph, recording_glyph_size(glyph), color);
+            ui.colored_label(color, text);
             // Live recording toggle, for a running channel. Reads the recording settings
             // from the editor *at click time* and sends them with the command, so it
             // records to exactly what's on screen — no Apply, no restart (ADR-012).
@@ -596,9 +605,9 @@ impl ListenerApp {
                 let has_dest = draft_raw.as_ref().is_some_and(|r| r.destination.is_some());
                 let recording_now = matches!(recording, Some(RecordingState::Enabled));
                 let label = if recording_now {
-                    "\u{25A0} Stop recording"
+                    "Stop recording"
                 } else {
-                    "\u{25CF} Start recording"
+                    "Start recording"
                 };
                 let resp = ui.add_enabled(
                     has_dest || recording_now,
@@ -628,7 +637,7 @@ impl ListenerApp {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "(no destination)".to_string());
                     ui.colored_label(
-                        egui::Color32::from_rgb(200, 40, 40),
+                        theme::FAULT_RED,
                         format!("\u{25CF} Recording \u{2192} {dest}"),
                     );
                 }

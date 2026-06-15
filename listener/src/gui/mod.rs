@@ -13,6 +13,7 @@ mod channels;
 mod detail;
 mod fonts;
 pub mod state;
+mod theme;
 mod widgets;
 
 use anyhow::anyhow;
@@ -25,8 +26,8 @@ use bridge::{BridgeHandle, UiCommand};
 use fonts::{install_fonts, MonoFont};
 use state::{AppState, ChannelStatus};
 use widgets::{
-    config_incomplete, list_serial_ports, plan_config_commit, status_color, template_for, AddKind,
-    ColorScheme, CommitStep,
+    config_incomplete, list_serial_ports, plan_config_commit, status_color, status_glyph,
+    template_for, AddKind, ColorScheme, CommitStep,
 };
 
 /// Detach the inherited console when going graphical. The binary is a
@@ -423,7 +424,7 @@ impl ListenerApp {
                         egui::Button::new(
                             egui::RichText::new("Remove").color(egui::Color32::WHITE),
                         )
-                        .fill(egui::Color32::from_rgb(170, 30, 30)),
+                        .fill(theme::FAULT_RED),
                     )
                     .clicked()
                 {
@@ -478,8 +479,9 @@ impl eframe::App for ListenerApp {
                     let base = egui::TextStyle::Body.resolve(ui.style()).size;
                     for (cid, status, name) in mini {
                         let selected = self.selected == Some(cid);
-                        let dot = egui::RichText::new("\u{25CF}")
-                            .size(base * 1.5)
+                        let (glyph, scale) = status_glyph(status);
+                        let dot = egui::RichText::new(glyph)
+                            .size(base * scale)
                             .color(status_color(status));
                         if ui
                             .selectable_label(selected, dot)
