@@ -198,6 +198,42 @@ impl AppState {
         self.order.clone()
     }
 
+    /// Channels that can be **started** right now — i.e. Stopped. Used by "Start all"
+    /// so it skips channels already Running/Reconnecting (whose Start would be an
+    /// illegal Running→Starting transition). Faulted is excluded here: clearing a
+    /// fault is the per-channel "Retry" (Stop+Start), not a bulk start.
+    pub fn startable_channel_ids(&self) -> Vec<ChannelId> {
+        self.order
+            .iter()
+            .filter(|id| {
+                self.views
+                    .get(id)
+                    .is_some_and(|v| v.status == ChannelStatus::Stopped)
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Channels that can be **stopped** right now — Running, Faulted, or Reconnecting.
+    /// Used by "Stop all" so it skips already-Stopped channels (whose Stop would be an
+    /// illegal Stopped→Stopped transition — the bug this fixes).
+    pub fn stoppable_channel_ids(&self) -> Vec<ChannelId> {
+        self.order
+            .iter()
+            .filter(|id| {
+                self.views.get(id).is_some_and(|v| {
+                    matches!(
+                        v.status,
+                        ChannelStatus::Running
+                            | ChannelStatus::Faulted
+                            | ChannelStatus::Reconnecting
+                    )
+                })
+            })
+            .copied()
+            .collect()
+    }
+
     /// Fold one update into the model.
     pub fn apply(&mut self, update: UiUpdate) {
         match update {

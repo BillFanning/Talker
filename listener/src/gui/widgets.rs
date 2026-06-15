@@ -499,17 +499,30 @@ pub(super) fn config_differs_ignoring_name(
 /// The Start/Apply/Retry button's label and enabled state, from the channel status
 /// and whether the edit draft has pending changes (§8.5). Pure decision, unit-tested;
 /// the detail pane just renders the result and dispatches on click:
-/// - Stopped/Reconnecting → "Start Channel", enabled
+/// - Stopped → "Start Channel", enabled (Stopped→Starting is legal)
 /// - Running + pending edits → "Apply & Restart", enabled (a coordinated restart)
 /// - Running + no edits → "Start Channel", **disabled** (nothing to do)
 /// - Faulted → "Retry Channel", enabled (Stop then Start, §8.5)
+/// - Reconnecting → "Start Channel", **disabled** — a Start would be an illegal
+///   Reconnecting→Starting transition; Stop is the only valid action mid-reconnect.
 pub(super) fn start_button(status: ChannelStatus, config_changed: bool) -> (&'static str, bool) {
     match status {
+        ChannelStatus::Stopped => ("Start Channel", true),
         ChannelStatus::Running if config_changed => ("Apply & Restart", true),
         ChannelStatus::Running => ("Start Channel", false),
         ChannelStatus::Faulted => ("Retry Channel", true),
-        _ => ("Start Channel", true),
+        ChannelStatus::Reconnecting => ("Start Channel", false),
     }
+}
+
+/// Whether the Stop button is enabled: a Stop is legal from Running, Faulted, or
+/// Reconnecting (it returns any of those to Stopped, §8.5/§10.2), and illegal from
+/// Stopped. Pure, unit-tested.
+pub(super) fn stop_enabled(status: ChannelStatus) -> bool {
+    matches!(
+        status,
+        ChannelStatus::Running | ChannelStatus::Faulted | ChannelStatus::Reconnecting
+    )
 }
 
 /// The recording-state indicator: glyph, color, and label for a channel's raw
@@ -705,11 +718,20 @@ mod tests {
             start_button(ChannelStatus::Faulted, true),
             ("Retry Channel", true)
         );
-        // Reconnecting falls through to Start.
+        // Reconnecting → disabled: a Start would be an illegal Reconnecting→Starting.
         assert_eq!(
             start_button(ChannelStatus::Reconnecting, false),
-            ("Start Channel", true)
+            ("Start Channel", false)
         );
+    }
+
+    #[test]
+    fn stop_enabled_only_for_stoppable_states() {
+        // Stop is legal from Running/Faulted/Reconnecting, illegal from Stopped.
+        assert!(stop_enabled(ChannelStatus::Running));
+        assert!(stop_enabled(ChannelStatus::Faulted));
+        assert!(stop_enabled(ChannelStatus::Reconnecting));
+        assert!(!stop_enabled(ChannelStatus::Stopped));
     }
 
     #[test]

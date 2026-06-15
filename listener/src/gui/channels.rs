@@ -89,14 +89,17 @@ impl ListenerApp {
                 }
             });
             if ui.button("Start all").clicked() {
-                for cid in self.state.channel_ids() {
-                    // Route through the same guard: complete channels start; each
-                    // unconfigured one gets an inline complaint instead (#3, #6).
+                // Only Stopped channels — starting an already-Running one would be an
+                // illegal Running→Starting transition. Each still routes through the
+                // try_start guard (an unconfigured one gets an inline complaint, #3/#6).
+                for cid in self.state.startable_channel_ids() {
                     self.try_start(cid);
                 }
             }
             if ui.button("Stop all").clicked() {
-                for cid in self.state.channel_ids() {
+                // Only channels that can be stopped — sending Stop to an already-Stopped
+                // channel was the "illegal Stopped→Stopped transition" error.
+                for cid in self.state.stoppable_channel_ids() {
                     self.send(UiCommand::Stop(cid));
                 }
             }

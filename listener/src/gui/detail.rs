@@ -14,7 +14,8 @@ use super::state::ChannelStatus;
 use super::widgets::{
     config_differs_ignoring_name, edit_display_recording, edit_interface, edit_raw_recording,
     human_bytes, latest_diagnostic, line_indicator, line_toggle, recording_indicator, short_id,
-    start_button, status_color, status_label, truncate, vsep, ColorScheme, MSG_FONT_SIZES,
+    start_button, status_color, status_label, stop_enabled, truncate, vsep, ColorScheme,
+    MSG_FONT_SIZES,
 };
 use super::ListenerApp;
 
@@ -540,7 +541,7 @@ impl ListenerApp {
             }
             if ui
                 .add_enabled(
-                    status == ChannelStatus::Running,
+                    stop_enabled(status),
                     egui::Button::new("Stop Channel").min_size(size),
                 )
                 .clicked()
