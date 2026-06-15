@@ -61,7 +61,7 @@ the same as talker's ADR-001.
 
 **Context:** Spec §127 originally sketched a twelve-crate split (`listener-core`, `listener-runtime`, `listener-transport`, `listener-extract`, `listener-decode`, `listener-display`, `listener-record`, `listener-retention`, `listener-config`, `listener-diagnostics`, `listener-cli`, `listener-gui`) and nested `nmea0183` inside `listener`. The crate actually exists as a single `listener` crate alongside `talker` and `nmea0183`.
 
-**Decision:** Keep **one `listener` crate**. The twelve `listener-*` units are realized as modules under `src/` (`core/`, `transport/`, `extract/`, …), preserving the §128 boundaries and dependency direction; only the packaging is collapsed. `nmea0183` is a top-level workspace sibling (shared with `talker`), referenced as an ordinary dependency — not nested. The `lib.rs` + thin-`main.rs` shape follows talker ADR-014, keeping module APIs unit-testable.
+**Decision:** Keep **one `listener` crate**. The twelve `listener-*` units are realized as modules under `src/` (`core/`, `transport/`, `display/`, `record/`, `runtime/`, …; `extract/` and `decode/` were later removed by ADR-010), preserving the §128 boundaries and dependency direction; only the packaging is collapsed. `nmea0183` is a top-level workspace sibling (shared with `talker`), referenced as an ordinary dependency — not nested. The `lib.rs` + thin-`main.rs` shape follows talker ADR-014, keeping module APIs unit-testable.
 
 **Consequences:**
 - §127 is the literal `src/` module map; §128 boundaries are normative whether a unit is a module (now) or a crate (later).
@@ -103,8 +103,9 @@ reason about. A downstream decoder marks an empty/`$`-less Message as it sees fi
 
 ## ADR-006 — Runtime observability & fault-state ownership
 
-**Authoritative context:** spec §94/§101 (transport fault reporting), §136–§137
-(`RuntimeCommand` / `RuntimeEvent`), §8/§9 (state machine).
+**Authoritative context:** spec §94/§101 (transport fault reporting), §137
+(`RuntimeEvent`; the §136 `RuntimeCommand` enum was later removed by ADR-012 — the
+command surface is the `Listener` method API), §8/§9 (state machine).
 
 **Context:** A spontaneously-faulting transport (a read/accept error, not a
 commanded stop) is detected by a per-channel **fault monitor** — a detached
@@ -218,7 +219,8 @@ Duration)` event** (§137) and marked the enum `#[non_exhaustive]`, so the overl
 is retired: the stall now emits `ReceptionStalled` carrying the duration. The
 retained §95 `Diagnostic` remains the **rich detail surface** (channel, time,
 human text); the event is the lightweight signal. *Implemented:* the seam emits
-`ReceptionStalled`, and both `RuntimeEvent`/`RuntimeCommand` are `#[non_exhaustive]`.
+`ReceptionStalled`, and `RuntimeEvent` is `#[non_exhaustive]`. *(The sibling
+`RuntimeCommand` enum mentioned in the original was removed by ADR-012.)*
 
 **The transport→diagnostics seam (implements tier 2's record).** A transport states
 *what happened* via a `TransportNotice` (in `transport/`, with no dependency on the
@@ -473,7 +475,7 @@ A second, parallel command enum on top of a working method API + a GUI transport
 
 **Consequences.**
 - `core::RuntimeCommand` and its `pub use` are gone; `DisplayViewId` is no longer imported by `core::command` (only `RuntimeEvent`'s `MatchRuleId` remains). No functional change — nothing referenced the enum (160 lib + 6 profile + 7 integration tests, clippy `-D warnings`, fmt all unchanged-green after removal).
-- The deferred live-control work (§165, mid-run recording) is now unambiguously specified: add `Listener` methods + the `run_channel` command channel — not a `RuntimeCommand` variant.
+- The live-control work (§165, mid-run recording) is unambiguously specified by this ADR: add `Listener` methods + the `run_channel` command channel — not a `RuntimeCommand` variant. *(Mid-run recording shipped this way: `Listener::set_recording` → `PipelineRequest::SetRecording`, commit `ae7e541`. Live match-rule toggle / `MarkNow` remain to do.)*
 - **Supersedes** the ADR-008 note that the bridge would "align `RuntimeCommand` with §136 and dispatch it." It won't; `UiCommand` is that bridge.
 - Spec §136 is amended to document the method-API command surface in place of the enum (version-bumped with a revision note, per the workspace versioning rule).
 

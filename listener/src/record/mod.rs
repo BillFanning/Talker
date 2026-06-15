@@ -41,32 +41,6 @@ pub enum FileRotationPolicy {
     Daily,
 }
 
-/// Which recording system(s) are active for a Channel (§52). Raw is primary;
-/// Display is optional; `Both` runs the two simultaneously, each with its own
-/// file, queue, and fault status (§52). With single-file destinations the two
-/// files are derived by forcing the `.raw` / `.disp` extensions on the configured
-/// path; with rotation each period file already carries its own extension (§59).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub enum RecordingMode {
-    #[default]
-    Disabled,
-    Raw,
-    Display,
-    Both,
-}
-
-impl RecordingMode {
-    /// Whether a Raw Recording should be created in this mode (§53).
-    pub fn records_raw(self) -> bool {
-        matches!(self, RecordingMode::Raw | RecordingMode::Both)
-    }
-
-    /// Whether a Display Recording should be created in this mode (§54).
-    pub fn records_display(self) -> bool {
-        matches!(self, RecordingMode::Display | RecordingMode::Both)
-    }
-}
-
 /// What to do when the destination file already exists (§80.1). Enforced when
 /// recording is enabled (§55, §121); `Refuse` is the default and never clobbers.
 ///

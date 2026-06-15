@@ -1,9 +1,17 @@
-# Listener Specification v2.0.2
+# Listener Specification v2.0.3
 
 Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
+
+Revision v2.0.3 (recording-config reconciliation):
+
+§52 and §72 are reconciled to the §79 independent Raw/Display recording config
+(v2.0.2, ADR-013): §52 no longer defines a `RecordingMode` enum, and §72's
+`ChannelConfig` carries `raw_recording` + `display_recording` instead of a single
+`recording` field. No behavior change — these sections were stale after the v2.0.2
+edit only updated §79.
 
 Revision v2.0.2 (independent Raw/Display recording config):
 
@@ -983,16 +991,11 @@ reception (§100).
 
 ## 52. Recording Modes
 
-```rust
-enum RecordingMode {
-    Disabled,
-    Raw,
-    Display,
-}
-```
-
-Raw Recording is primary; Display Recording is optional. A Channel may run both
-at once; each has its own state, queue, file, and fault status.
+Raw Recording (§53) and Display Recording (§54) are configured **independently** —
+each is enabled or disabled on its own, with its own destination and options (§79,
+ADR-013). There is no single `RecordingMode` enum: a Channel runs neither, either, or
+both at once, and each has its own state, queue, file, and fault status. Raw is the
+primary recording; Display is optional.
 
 ## 53. Raw Recording
 
@@ -1321,7 +1324,8 @@ struct ChannelConfig {
     kind: ChannelKind,
     interface: InterfaceConfig,
     display: DisplayConfig,
-    recording: RecordingConfig,
+    raw_recording: RawRecordingConfig,         // §79 (ADR-013) — verbatim .raw
+    display_recording: DisplayRecordingConfig, // §79 (ADR-013) — rendered .disp
     retention: RetentionConfig,
     match_rules: Vec<MatchRule>,   // §50.2 find/triggers; default empty
     reconnect: ReconnectPolicy,    // §9.1; default disabled
@@ -2879,6 +2883,6 @@ this specification**, not agent advice, and remain in their authoritative locati
   no CSV/JSON export, no TCP client mode) — Appendix A.
 - *Immutable received chunks, GUI out of core* — §103 and listener [`ADR.md`](ADR.md)
   ADR-010 (decoders and Messages are removed in v2.0).
-- *Display formatting must not affect Raw Recording* — §5.6 / §1185 ff.
+- *Display formatting must not affect Raw Recording* — §5.6 / §53–§54.
 - *Runtime TCP Connection Channels are not persisted* — the TCP transport sections.
 
