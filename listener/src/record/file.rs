@@ -129,8 +129,8 @@ impl RawRecorder for RawFileRecorder {
     }
 }
 
-/// Display Recording to a file: writes a view's rendered text, one Message per
-/// line, optionally prefixed with an inline timestamp (§54, §57). Not byte-exact.
+/// Display Recording to a file: writes a view's rendered text, one rendered chunk per
+/// write, optionally prefixed with an inline timestamp (§54, §57). Not byte-exact.
 pub struct DisplayFileRecorder {
     file: BufWriter<File>,
     timestamps: bool,

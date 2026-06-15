@@ -104,7 +104,7 @@ fn apply_style(ctx: &egui::Context) {
     ctx.set_visuals_of(egui::Theme::Light, light);
     ctx.set_theme(egui::ThemePreference::Light);
 
-    // Match talker's text size (+0.5 to non-monospace; the message dump keeps its
+    // Match talker's text size (+0.5 to non-monospace; the stream view keeps its
     // monospace size). Button sizing stays at the egui default.
     ctx.all_styles_mut(|style| {
         for font in style.text_styles.values_mut() {
@@ -134,16 +134,16 @@ struct ListenerApp {
     /// Last selection sent to the driver, so we only send `Select` on change. The
     /// driver full-snapshots only the selected channel (the rest get cheap stats).
     last_selected_sent: Option<ChannelId>,
-    /// How the message view renders bytes (§42): Hex / Rendered / Raw, plus the
+    /// How the stream view renders bytes (§42): Hex / Rendered / Raw, plus the
     /// control-character style used in Raw mode (§46).
     msg_mode: DisplayMode,
     msg_chars: CharacterRendering,
-    /// Message-view font size and color scheme.
+    /// Stream-view font size and color scheme.
     msg_font_size: f32,
     /// Editable text backing the font-size combo, so a typed size persists across
     /// frames while it's being entered (#7).
     font_text: String,
-    /// Selected monospace face for the message view.
+    /// Selected monospace face for the stream view.
     msg_font: MonoFont,
     msg_colors: ColorScheme,
     /// A working copy of the selected channel's config, edited in the Configure

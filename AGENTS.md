@@ -106,16 +106,19 @@ Three crates in a Cargo workspace:
 - **`nmea0183/`** — library crate; no dependency on `talker` or `listener`; intended for
   independent crates.io publication. Handles NMEA 0183 sentence construction, parsing,
   checksum, talker IDs, proprietary sentences (`$PRDID`, `$PASHR`, arbitrary `$P`), and
-  AIS sentences (`!AIVDM`/`!AIVDO` with 6-bit payload armoring). Shared equally by
-  `talker` and `listener`.
+  AIS sentences (`!AIVDM`/`!AIVDO` with 6-bit payload armoring). Used by `talker`;
+  `listener` **dropped** its `nmea0183` dependency in the v2.0 stream-only strip
+  (ADR-010 — no decoding), so today only `talker` consumes it.
 - **`talker/`** — library plus a thin binary (ADR-014). Sends/schedules data out over
   serial and network interfaces. All application logic lives in `core/`; `cli/` and
   `gui/` are thin interface layers that contain no business logic. `main.rs` only
   dispatches; `lib.rs` exports the modules so `core`'s API is unit-testable and the
   default dead-code lint stays active.
-- **`listener/`** — receives and decodes byte-oriented data from serial and network
-  sources (the inbound counterpart to `talker`). Single crate with modular internals
-  (listener ADR-004 / spec §127); `lib.rs` + thin `main.rs`, same shape as `talker`.
+- **`listener/`** — receives byte-oriented data **streams** from serial and network
+  sources (the inbound counterpart to `talker`). v2.0 is stream-only (ADR-010): it
+  displays/records the verbatim byte stream — no decoding, no `nmea0183` dependency.
+  Single crate with modular internals (listener ADR-004 / spec §127); `lib.rs` + thin
+  `main.rs`, same shape as `talker`.
 
 ```
 talker/src/

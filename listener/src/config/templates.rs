@@ -59,7 +59,8 @@ pub fn serial_template() -> ChannelConfig {
     }
 }
 
-/// UDP channel (§84): bind 0.0.0.0, unicast, each datagram a Message, Raw + Hex.
+/// UDP channel (§84): bind 0.0.0.0, unicast; datagrams append to the verbatim stream
+/// (boundaries are a reception detail only, §18). Raw + Hex display views.
 pub fn udp_template() -> ChannelConfig {
     ChannelConfig {
         id: None,

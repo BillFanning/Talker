@@ -24,7 +24,7 @@ An ADR captures *why* a significant decision was made, not just *what* was decid
 
 **Context:** The NMEA 0183 module was identified early as reusable across other projects. The question was whether to keep it as a module inside the `talker` binary or make it a separate library crate.
 
-**Decision:** The project is structured as a Cargo workspace, initially with `talker` (binary) and `nmea0183` (library). The `nmea0183` crate has no dependency on `talker` and no knowledge of its internals. The workspace now also contains `listener`, a sibling receive/decode crate that shares `nmea0183`.
+**Decision:** The project is structured as a Cargo workspace, initially with `talker` (binary) and `nmea0183` (library). The `nmea0183` crate has no dependency on `talker` and no knowledge of its internals. The workspace now also contains `listener`, a sibling receive crate; it originally shared `nmea0183` but **dropped that dependency in its v2.0 stream-only pivot** (listener ADR-010 — no decoding), so today `nmea0183` is consumed only by `talker`.
 
 **Alternatives considered:**
 - Single crate with `nmea0183` as an internal module: simpler initially, but makes future extraction painful — splitting a module into a crate after it has grown requires touching import paths throughout the codebase.

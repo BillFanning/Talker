@@ -21,16 +21,17 @@ The strip is complete and the workspace builds clean (`cargo test -p listener`,
 Message-model removal). Everything below this block is verified done:
 
 - [x] Write the v2 invariant tests first (spec §150):
-  - [x] byte-pattern find across receive-chunk boundaries (§50.2) — see note in
-        the feature gaps below: the **scan still operates per-chunk**, so a pattern
-        split across two reads is not yet matched; the test asserts within-chunk.
+  - [x] byte-pattern find across receive-chunk boundaries (§50.2) — cross-chunk carry
+        is now wired (see the feature-gaps entry below); a pattern split across two
+        reads matches.
   - [x] idle-rule firing and re-arming
   - [x] UDP datagram boundary preserved as a reception/recording detail only
   - [x] raw recording byte-exactness (`.raw`)
   - [x] display recording reflects the rendered view (`.disp`)
   - [x] pause affects neither reception nor recording
   - [x] fan-out overflow: single backpressure edge (Transport→Pipeline), consumers drop/fault
-  - [x] schema v1 profile refused (`CURRENT_VERSION = 2`)
+  - [x] older-schema profile refused (`CURRENT_VERSION = 3` — bumped to 2 by the v2
+        strip, then to 3 by the Raw/Display split, ADR-013)
 - [x] Remove `extract/` (and the `MessageExtractor` seam in the pipeline)
 - [x] Remove `decode/`; drop the `nmea0183` dependency from `listener/Cargo.toml`
 - [x] Collapse the pipeline: transport → bounded queue → non-blocking fan-out
@@ -73,13 +74,15 @@ Message-model removal). Everything below this block is verified done:
       `RecordTarget::Display`/`Both` variants exist and the pipeline accepts them,
       but only the Raw side is driven today (`apply_pending_records` skips
       display-only); the display portion needs per-view display-recorder arming.
-- [x] `DisplayViewConfig.hex_grouping` schema field (spec §1431) — `HexGrouping
+- [x] `DisplayViewConfig.hex_grouping` schema field (spec §45/§78) — `HexGrouping
       { bytes_per_group, groups_per_line }` added with `#[serde(default)]`, so
       profiles round-trip it (`b8960a1`). Pinned by `hex_grouping_round_trips_through_
       a_profile` + `a_profile_without_hex_grouping_loads_with_the_default`.
-- [ ] Consume `hex_grouping` in the Hex renderer: `display::DisplayView` still uses
-      its own `hex_bytes_per_line`/`hex_separator`; map the config field onto them so
-      the persisted grouping actually drives the Hex view (with a GUI control).
+- [ ] Consume `hex_grouping` in the Hex renderer: `hex_bytes_per_line` is hardcoded to
+      16 in both `build_display_view` (`build.rs`) and the GUI stream renderer
+      (`detail.rs`); map the config `HexGrouping` onto `hex_bytes_per_line`/
+      `hex_separator` at both sites so the persisted grouping drives the Hex view
+      (with a GUI control).
 - [x] Live `Record` begin/stop without a restart (ADR-012). `Listener::set_recording`
       → `PipelineRequest::SetRecording` into `run_channel` → the pipeline's lazy
       begin / clean finalize path (shared with the match-rule `Record` action); GUI
@@ -109,6 +112,15 @@ Message-model removal). Everything below this block is verified done:
 - [ ] Per-connection recording for TCP connection channels (§16.2, deferred §59 naming)
 - [ ] RS-422/485 phases (§14.4)
 - [ ] CLI parity with GUI for the v2 surface
+- [ ] TCP `recv_buffer_bytes` is persisted + specified (§76) but **ignored at runtime**.
+      UDP maps it (`build_udp` → `with_recv_buffer`, `build.rs`); `build_tcp_listener`
+      passes only the address and `TcpListenerTransport` stores no buffer, so SO_RCVBUF
+      is never applied to accepted connections. Wire it through accept (socket2), like UDP.
+- [ ] Multi-view pause is only real for the **first** view. There is one shared stream
+      buffer; scrollback retention gates on `display_views.first()`'s pause
+      (`pipeline.rs`) and the GUI only surfaces the first snapshot view (`detail.rs`).
+      A non-primary view can be marked paused but has no per-view stream state to freeze.
+      Needs a decision: per-view render state, or document pause as stream-wide (one view).
 
 ## Future work — deferred (spec Appendix A)
 

@@ -19,6 +19,11 @@ Cross off items as they are completed. Add new ones inline as they come up.
 - [ ] Write `nmea0183/README.md`.
 - [ ] Resolve OQ-4 (library MSRV policy) in a new ADR.
 - [ ] Update `talker/Cargo.toml`: `nmea0183 = { path = "../nmea0183", version = "0.1" }` (per OQ-1), so downstream builds against the published crate resolve while in-workspace builds use the local source.
+- [ ] Flesh out `nmea0183_specification.md` — it is still a **placeholder** that defers
+      behavior to rustdoc/tests/ADRs. AGENTS §1 ranks a crate's spec **above** its ADR,
+      so an empty spec weakens that precedence for this crate. Either write the spec
+      (sentence set, checksum, talker-id, armoring rules) or amend AGENTS §1 to note
+      nmea0183's behavior is rustdoc/test-defined by design.
 
 `#[non_exhaustive]` on `NmeaError` and the public enums (per ADR-004 / ADR-009) is already done.
 

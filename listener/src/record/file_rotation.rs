@@ -200,7 +200,7 @@ impl RotatingDisplayRecorder {
 #[async_trait::async_trait]
 impl DisplayRecorder for RotatingDisplayRecorder {
     async fn write_rendered(&mut self, output: &RenderedOutput) -> Result<(), RecordError> {
-        // A rendered Message carries its own timestamp; fall back to now() if the
+        // A rendered chunk carries its own timestamp; fall back to now() if the
         // view emits none, so rotation still advances.
         let at = output
             .timestamp
