@@ -58,10 +58,11 @@ const MIN_WINDOW_SIZE: [f32; 2] = [640.0, 480.0];
 /// (main) thread; the runtime bridge runs on its own Tokio thread (ADR-008).
 ///
 /// **Shared GUI-startup funnel (two-binary invariant — see `src/main.rs`).** Both
-/// GUI entry points route through here: the flash-free `listener-gui.exe`
-/// (windows-subsystem) binary, and `listener.exe`'s bare-launch / `--gui` path.
-/// Put ALL GUI startup (console detach, logging, window options) in this function
-/// so the two binaries stay identical — never in either `main`.
+/// GUI entry points route through here: the `listener-gui.exe` (windows-subsystem)
+/// binary, which avoids the brief console-window flash on a double-click, and
+/// `listener.exe`'s bare-launch / `--gui` path. Put ALL GUI startup (console detach,
+/// logging, window options) in this function so the two binaries stay identical —
+/// never in either `main`.
 pub fn run() -> anyhow::Result<()> {
     detach_console(); // drop the double-click console before the window opens
     crate::diagnostics::init_logging(); // §114; non-fatal if already installed (§117)
@@ -69,13 +70,14 @@ pub fn run() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(DEFAULT_WINDOW_SIZE)
             .with_min_inner_size(MIN_WINDOW_SIZE),
-        // Don't persist/restore window geometry. eframe restores the saved position+size
-        // *after* the window is shown, so the window appeared at the default spot and
-        // then jumped to its saved geometry — the double frame/title-bar flash on launch.
-        // With this off the window always opens at DEFAULT_WINDOW_SIZE with no post-show
-        // move. Trade-off: it no longer reopens where it was last (the recent-profiles
-        // list is persisted separately via `save`, so that still survives). This also
-        // makes a bad tiny geometry impossible to restore, so no first-frame clamp needed.
+        // Don't persist/restore window geometry. eframe restores the saved window state
+        // (size, position, and — the one that bit us — `maximized`) *after* the window
+        // is shown, so the window appeared at the default size and then jumped to its
+        // saved geometry: the double frame/title-bar flash on launch. With this off the
+        // window always opens at DEFAULT_WINDOW_SIZE with no post-show move, and a bad
+        // tiny geometry can't be restored either. Trade-off: it no longer reopens where
+        // it was last; the recent-profiles list is persisted separately via `save`, so
+        // that still survives.
         persist_window: false,
         ..Default::default()
     };
@@ -106,12 +108,11 @@ pub fn run() -> anyhow::Result<()> {
 /// drives scaling, see below), and no 3-D / outline / button-sizing overrides.
 fn apply_style(ctx: &egui::Context) {
     install_fonts(ctx);
-    // Use the OS's DPI scaling rather than forcing a custom scale. Forcing
-    // `set_pixels_per_point` overrode the system scale *after* eframe had already
-    // created/sized the window for the OS scale, so the window resized right after it
-    // was shown — the double frame/title-bar flash on launch. Letting the OS scale
-    // stand means no post-show resize. (Text size is still nudged in `all_styles_mut`
-    // below.)
+    // No custom UI scale: the OS DPI setting drives sizing. (We deliberately do not
+    // call `set_pixels_per_point` / `set_zoom_factor` — overriding the scale here both
+    // ignores the user's system setting and gets persisted into eframe storage, where
+    // a stale value then sticks across launches. Text size is nudged in
+    // `all_styles_mut` below instead.)
 
     // Clean slate: a light theme with the grey backdrop the user likes and darker
     // (heavier) text — no custom 3-D / outline / sizing overrides.

@@ -414,14 +414,10 @@ impl ListenerApp {
         // so we can convert the available pixel width into a column count for wrapping.
         let (row_h, char_w) =
             ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0').max(1.0)));
-        // Columns that fit in the viewer's *inner* width. Computed from the content
-        // width inside the Frame (its 4px L/R margins are already excluded there),
-        // minus only the scrollbar gutter — so wrapped text reaches nearly to the right
-        // edge instead of stopping an over-generous slack short. Pre-wrapping to this
-        // keeps every cached row exactly one visual line (uniform height) so we can
-        // soft-wrap *and* virtualize with `show_rows`. Re-wrap only when it changes.
-        // egui's scrollbar is ~10px; keep a hair more so a full row doesn't touch it.
-        const SCROLLBAR_GUTTER: f32 = 12.0;
+        // Width of the (non-floating) vertical scrollbar. Used both to size the bar
+        // below and to reserve its space when wrapping, so a full row ends just before
+        // the bar instead of under it. One const so the two uses can't drift apart.
+        const SCROLLBAR_WIDTH: f32 = 12.0;
         // Pin the viewer to exactly the height left in the pane, so the ScrollArea owns
         // the scrolling (and `stick_to_bottom` keeps the newest bytes pinned to the
         // bottom edge) instead of the content overflowing and scrolling the whole pane —
@@ -432,7 +428,11 @@ impl ListenerApp {
             .fill(bg)
             .inner_margin(4.0)
             .show(ui, |ui| {
-                let avail_w = (ui.available_width() - SCROLLBAR_GUTTER).max(char_w);
+                // Pre-wrap each cached row to the columns that fit the viewer's inner
+                // width (less the scrollbar), so every row is exactly one visual line —
+                // uniform height, which `show_rows` needs to virtualize. Re-wraps only
+                // when the column count changes (the cache key includes it).
+                let avail_w = (ui.available_width() - SCROLLBAR_WIDTH).max(char_w);
                 let wrap_cols = (avail_w / char_w).floor().max(8.0) as usize;
                 self.refresh_stream_rows(id, &renderer, wrap_cols);
                 let rows: &[String] = self
@@ -448,19 +448,19 @@ impl ListenerApp {
                 // Text selection across the (non-interactive) row labels.
                 ui.style_mut().interaction.selectable_labels = true;
                 // Give the scrollbar a visible track + handle, distinct from the text
-                // background, so the gutter on the right edge reads as the scrollbar
-                // (not mysterious empty space). The track contrasts with `bg`; the
-                // handle is darker still. Set before the per-widget overrides below.
+                // background, so the strip on the right edge reads as the scrollbar (not
+                // mysterious empty space). Both contrast with `bg`, the handle more
+                // strongly (see `scrollbar_colors`). Set before the per-widget overrides.
                 let (track, handle) = scrollbar_colors(bg);
                 ui.visuals_mut().extreme_bg_color = track;
-                // Keep the scrollbar at a fixed full width always — egui's default
-                // "floating" scrollbar renders thin until hovered, which made the track
-                // look like it was widening on hover. `floating = false` + equal
-                // allocated/interact widths pin it to a constant strip.
+                // A solid, constant-width scrollbar. egui's default is "floating" — thin
+                // until hovered, which read as the track widening on hover; `floating =
+                // false` plus a fixed `bar_width` (and zero margins) pins it to a steady
+                // strip the width we reserved above.
                 {
                     let s = &mut ui.style_mut().spacing.scroll;
                     s.floating = false;
-                    s.bar_width = 12.0;
+                    s.bar_width = SCROLLBAR_WIDTH;
                     s.bar_inner_margin = 0.0;
                     s.bar_outer_margin = 0.0;
                 }

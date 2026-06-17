@@ -455,9 +455,6 @@ impl Driver {
                 // delta was lost forever and the view froze while bytes kept counting.)
                 if let Some(delta) = self.listener.stream_delta(id, self.stream_cursor).await {
                     let end = delta.end_offset;
-                    // Advance past an empty ("caught up") delta unconditionally; for a
-                    // non-empty one, only if the push was accepted (not dropped on a
-                    // full channel).
                     let advance = delta.bytes.is_empty()
                         || self.push(UiUpdate::StreamDelta(id, Box::new(delta)));
                     if advance {
