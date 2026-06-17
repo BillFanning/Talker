@@ -193,7 +193,7 @@ impl MonitoredChannel {
     }
 
     /// Cheap O(1) liveness stats for a multi-channel overview (§91.1, ADR-006) —
-    /// no Message cloning. `None` if the pipeline task has already ended.
+    /// no stream-buffer copy. `None` if the pipeline task has already ended.
     pub(crate) async fn stats(&self) -> Option<ChannelStats> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.requests

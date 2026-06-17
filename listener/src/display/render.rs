@@ -179,8 +179,7 @@ impl Default for DisplayView {
 }
 
 impl DisplayView {
-    /// Render raw bytes to the view's text representation. Used by the
-    /// [`Renderer`] impl for Messages and directly for Stream data (§41).
+    /// Render raw stream bytes to the view's text representation (§41).
     pub fn render_text(&self, bytes: &[u8]) -> String {
         let wrap = matches!(self.wrapping, WrappingMode::Wrap);
         match self.mode {

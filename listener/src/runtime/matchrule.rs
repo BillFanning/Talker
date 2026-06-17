@@ -60,8 +60,8 @@ pub struct FiredRule {
     pub id: MatchRuleId,
     pub actions: Vec<MatchAction>,
     /// Absolute stream offset of the **first byte** of the match that fired
-    /// (§50.2: byte offsets, not Message Numbers). `None` for an `Idle` firing,
-    /// which is not tied to a data position.
+    /// (§50.2: matches are anchored on byte offsets — the stream-only model has no
+    /// message numbers). `None` for an `Idle` firing, not tied to a data position.
     pub match_offset: Option<u64>,
     /// Whether this match was a **boundary split** — its first byte fell in the
     /// previous chunk and it completed in this one, so a per-chunk scan would have

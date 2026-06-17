@@ -17,7 +17,7 @@ use crate::record::{FileRotationPolicy, OverwritePolicy};
 use crate::transport::udp::UdpMode;
 
 /// One configured Channel (§72). Carries only configuration; runtime objects
-/// (connections, message numbers, history) are never stored here (§69).
+/// (live connections, the byte stream, diagnostics) are never stored here (§69).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChannelConfig {
     #[serde(default)]
@@ -41,7 +41,7 @@ pub struct ChannelConfig {
     #[serde(default)]
     pub reconnect: ReconnectPolicy,
     /// Per-Channel Match Rules (§50.2, §165); default empty. Presentation/control
-    /// only — a rule never modifies Messages, bytes, recordings, or metadata.
+    /// only — a rule never modifies the stream bytes, recordings, or metadata.
     #[serde(default)]
     pub match_rules: Vec<MatchRule>,
 }
@@ -332,7 +332,7 @@ pub enum LowDiskAction {
 
 /// A per-Channel Match Rule (§50.2, §165): a predicate over received data that
 /// fires one or more presentation/control Actions on a match. Rules are
-/// **presentation/control only** — they never modify Messages, bytes, recordings,
+/// **presentation/control only** — they never modify the stream bytes, recordings,
 /// or metadata (§40, §103, §116). Persisted in profiles; identified at runtime by
 /// a minted [`MatchRuleId`](crate::core::MatchRuleId), in config by `name`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

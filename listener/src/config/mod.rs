@@ -229,7 +229,7 @@ pub enum ChannelConfigError {
         "channel name is not filesystem-safe but recording file rotation uses it in filenames (§59)"
     )]
     InvalidChannelName,
-    #[error("a match rule's byte pattern is empty (it would match every message, §50.2)")]
+    #[error("a match rule's byte pattern is empty (it would match at every byte offset, §50.2)")]
     EmptyMatchPattern,
 }
 
