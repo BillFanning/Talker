@@ -41,6 +41,18 @@ pub enum UiCommand {
     AddChannel(Box<ChannelConfig>),
     Start(ChannelId),
     Stop(ChannelId),
+    /// Start a batch of channels (the "Start all" button) in one command instead of a
+    /// 2N-command `Reconfigure`+`Start` burst that could overflow the bounded command
+    /// channel. Each pair is a channel id and the config to start it with (the GUI has
+    /// already validated them and filtered out unconfigured / already-running ones).
+    /// The driver reconfigures then starts each, server-side, off the UI thread.
+    StartAll(Vec<(ChannelId, Box<ChannelConfig>)>),
+    /// Stop every channel the driver knows about (the "Stop all" button). One command
+    /// per click instead of an N-command burst: a burst of per-channel `Stop`s could
+    /// overflow the bounded command channel and silently drop some, leaving those
+    /// channels' UI views stuck Running. The driver iterates server-side and awaits
+    /// each stop off the UI thread, skipping channels that aren't stoppable.
+    StopAll,
     /// Remove a channel from the runtime entirely (stops it first if live). Used to
     /// recover from a misconfigured channel (e.g. a bind conflict).
     RemoveChannel(ChannelId),
@@ -257,9 +269,11 @@ impl Driver {
                 let _ = self.listener.set_pending_config(id, config.clone());
                 match self.listener.apply_pending(id).await {
                     Ok(()) => {
-                        self.push(UiUpdate::ChannelReconfigured(id, details, Box::new(config)))
+                        self.push(UiUpdate::ChannelReconfigured(id, details, Box::new(config)));
                     }
-                    Err(err) => self.push(UiUpdate::ChannelError(id, err.to_string())),
+                    Err(err) => {
+                        self.push(UiUpdate::ChannelError(id, err.to_string()));
+                    }
                 }
             }
             UiCommand::Start(id) => {
@@ -272,6 +286,41 @@ impl Driver {
             UiCommand::Stop(id) => {
                 if let Err(err) = self.listener.stop(id).await {
                     self.push(UiUpdate::ChannelError(id, err.to_string()));
+                }
+            }
+            UiCommand::StartAll(batch) => {
+                // Reconfigure-then-start each channel server-side, awaiting in turn so
+                // the lifecycle events spread across awaits (the bounded event channel
+                // drains between them). The GUI already validated configs and filtered
+                // the batch, so anything here is meant to start.
+                for (id, config) in batch {
+                    let config = *config;
+                    let details = describe_interface(&config);
+                    let _ = self.listener.set_pending_config(id, config.clone());
+                    if let Err(err) = self.listener.apply_pending(id).await {
+                        self.push(UiUpdate::ChannelError(id, err.to_string()));
+                        continue;
+                    }
+                    self.push(UiUpdate::ChannelReconfigured(id, details, Box::new(config)));
+                    if let Err(err) = self.listener.start(id).await {
+                        self.push(UiUpdate::ChannelError(id, err.to_string()));
+                    }
+                }
+            }
+            UiCommand::StopAll => {
+                // Iterate server-side and await each stop. The runtime rejects a Stop
+                // on an already-Stopped channel (IllegalTransition); that's expected
+                // here, so skip it silently rather than surfacing an error. Each stop
+                // emits its own ChannelStopped, spread across awaits so the bounded
+                // event channel drains between them (the bug a synchronous burst hit).
+                for id in self.channels.clone() {
+                    match self.listener.stop(id).await {
+                        Ok(()) => {}
+                        Err(crate::runtime::OrchestratorError::IllegalTransition { .. }) => {}
+                        Err(err) => {
+                            self.push(UiUpdate::ChannelError(id, err.to_string()));
+                        }
+                    }
                 }
             }
             UiCommand::RemoveChannel(id) => {
@@ -339,8 +388,12 @@ impl Driver {
             .filter_map(|id| self.listener.config(*id).cloned())
             .collect();
         match profile.save(&path) {
-            Ok(()) => self.push(UiUpdate::ProfileSaved(path)),
-            Err(err) => self.push(UiUpdate::ProfileError(format!("save failed: {err}"))),
+            Ok(()) => {
+                self.push(UiUpdate::ProfileSaved(path));
+            }
+            Err(err) => {
+                self.push(UiUpdate::ProfileError(format!("save failed: {err}")));
+            }
         }
     }
 
@@ -393,13 +446,22 @@ impl Driver {
                     self.push(UiUpdate::Snapshot(id, Box::new(snap)));
                 }
                 // Incremental live stream (§87, ADR-009): fetch only the bytes new
-                // since our cursor, so we never re-ship the whole scrollback. Always
-                // advance the cursor, but only push (and wake the UI) when there are
-                // actually new bytes — a "caught up" empty delta is a no-op.
+                // since our cursor, so we never re-ship the whole scrollback. A
+                // "caught up" empty delta is a no-op (just advance past it). For a
+                // non-empty delta, advance the cursor ONLY if the push was accepted —
+                // if the bounded update channel was full and dropped it, keep the
+                // cursor so the next poll re-fetches those bytes instead of skipping
+                // them. (Previously the cursor advanced unconditionally, so a dropped
+                // delta was lost forever and the view froze while bytes kept counting.)
                 if let Some(delta) = self.listener.stream_delta(id, self.stream_cursor).await {
-                    self.stream_cursor = delta.end_offset;
-                    if !delta.bytes.is_empty() {
-                        self.push(UiUpdate::StreamDelta(id, Box::new(delta)));
+                    let end = delta.end_offset;
+                    // Advance past an empty ("caught up") delta unconditionally; for a
+                    // non-empty one, only if the push was accepted (not dropped on a
+                    // full channel).
+                    let advance = delta.bytes.is_empty()
+                        || self.push(UiUpdate::StreamDelta(id, Box::new(delta)));
+                    if advance {
+                        self.stream_cursor = end;
                     }
                 }
             } else if let Some(stats) = self.listener.channel_stats(id).await {
@@ -414,10 +476,14 @@ impl Driver {
     }
 
     /// Hand one update to the GUI and wake it. Advisory and non-blocking: a full
-    /// update channel drops the item rather than stalling the driver (§99).
-    fn push(&self, update: UiUpdate) {
-        let _ = self.updates.try_send(update);
+    /// update channel drops the item rather than stalling the driver (§99). Returns
+    /// whether the update was actually enqueued — the stream-delta poll uses this to
+    /// avoid advancing its cursor past bytes the UI never received (a dropped delta
+    /// would otherwise be lost forever, freezing the view while bytes kept arriving).
+    fn push(&self, update: UiUpdate) -> bool {
+        let sent = self.updates.try_send(update).is_ok();
         (self.repaint)();
+        sent
     }
 }
 

@@ -214,26 +214,6 @@ impl AppState {
             .collect()
     }
 
-    /// Channels that can be **stopped** right now — Running, Faulted, or Reconnecting.
-    /// Used by "Stop all" so it skips already-Stopped channels (whose Stop would be an
-    /// illegal Stopped→Stopped transition — the bug this fixes).
-    pub fn stoppable_channel_ids(&self) -> Vec<ChannelId> {
-        self.order
-            .iter()
-            .filter(|id| {
-                self.views.get(id).is_some_and(|v| {
-                    matches!(
-                        v.status,
-                        ChannelStatus::Running
-                            | ChannelStatus::Faulted
-                            | ChannelStatus::Reconnecting
-                    )
-                })
-            })
-            .copied()
-            .collect()
-    }
-
     /// Fold one update into the model.
     pub fn apply(&mut self, update: UiUpdate) {
         match update {

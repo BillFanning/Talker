@@ -323,7 +323,7 @@ fn recording_file_fields(
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         if ui
-            .add(egui::TextEdit::singleline(&mut path).desired_width(260.0))
+            .add(egui::TextEdit::singleline(&mut path).desired_width(180.0))
             .changed()
         {
             let trimmed = path.trim();

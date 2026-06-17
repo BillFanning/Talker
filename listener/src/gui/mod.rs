@@ -48,6 +48,12 @@ fn detach_console() {
 #[cfg(not(windows))]
 fn detach_console() {}
 
+/// The window size every launch opens at (window geometry isn't persisted — see
+/// `persist_window: false` in [`run`]).
+const DEFAULT_WINDOW_SIZE: [f32; 2] = [1100.0, 740.0];
+/// Smallest size the window can be dragged to (a usability floor).
+const MIN_WINDOW_SIZE: [f32; 2] = [640.0, 480.0];
+
 /// Launch the graphical interface (§3). Owns the eframe event loop on the calling
 /// (main) thread; the runtime bridge runs on its own Tokio thread (ADR-008).
 ///
@@ -60,7 +66,17 @@ pub fn run() -> anyhow::Result<()> {
     detach_console(); // drop the double-click console before the window opens
     crate::diagnostics::init_logging(); // §114; non-fatal if already installed (§117)
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 740.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(DEFAULT_WINDOW_SIZE)
+            .with_min_inner_size(MIN_WINDOW_SIZE),
+        // Don't persist/restore window geometry. eframe restores the saved position+size
+        // *after* the window is shown, so the window appeared at the default spot and
+        // then jumped to its saved geometry — the double frame/title-bar flash on launch.
+        // With this off the window always opens at DEFAULT_WINDOW_SIZE with no post-show
+        // move. Trade-off: it no longer reopens where it was last (the recent-profiles
+        // list is persisted separately via `save`, so that still survives). This also
+        // makes a bad tiny geometry impossible to restore, so no first-frame clamp needed.
+        persist_window: false,
         ..Default::default()
     };
     eframe::run_native(
@@ -85,12 +101,17 @@ pub fn run() -> anyhow::Result<()> {
 /// Apply the app's base style. This fork keeps visuals *per theme* and the active
 /// theme separately, so a plain `set_global_style` is ignored — visuals must go
 /// through `set_visuals_of` + `set_theme` and sizes through `all_styles_mut` (the
-/// same path talker uses). Sets the Noto font at talker's 1.15 zoom, a light theme
-/// with the grey backdrop and darker/heavier text, and a text size matching talker
-/// (+0.5) — no 3-D, outline, or button-sizing overrides (clean slate).
+/// same path talker uses). Sets the Noto font, a light theme with the grey backdrop
+/// and darker/heavier text, and a nudged text size — no custom UI scale (the OS DPI
+/// drives scaling, see below), and no 3-D / outline / button-sizing overrides.
 fn apply_style(ctx: &egui::Context) {
     install_fonts(ctx);
-    ctx.set_pixels_per_point(1.15); // talker's baseline zoom
+    // Use the OS's DPI scaling rather than forcing a custom scale. Forcing
+    // `set_pixels_per_point` overrode the system scale *after* eframe had already
+    // created/sized the window for the OS scale, so the window resized right after it
+    // was shown — the double frame/title-bar flash on launch. Letting the OS scale
+    // stand means no post-show resize. (Text size is still nudged in `all_styles_mut`
+    // below.)
 
     // Clean slate: a light theme with the grey backdrop the user likes and darker
     // (heavier) text — no custom 3-D / outline / sizing overrides.
@@ -362,24 +383,48 @@ impl ListenerApp {
     /// silently "run" (#3, #6). Edits commit only here (or via Apply & Restart), never
     /// on every keystroke — a running channel keeps its config until you act.
     pub(super) fn try_start(&mut self, id: ChannelId) {
-        // Prefer the edit draft (what the user sees in the editor); fall back to the
-        // committed config if no draft is loaded for this channel.
-        let config = match &self.edit_draft {
-            Some((eid, cfg)) if *eid == id => cfg.clone(),
-            _ => match self.state.channel(id) {
-                Some(v) => v.config.clone(),
-                None => return,
-            },
-        };
-        if config_incomplete(&config) {
-            self.complain_unconfigured(id);
+        let Some(config) = self.start_config(id) else {
             return;
-        }
+        };
         // Reconfigure to the (possibly edited) config, then Start — so Start picks up
         // pending edits. Reconfiguring a Stopped channel just swaps the config in for
         // the upcoming Start (§13); no restart of a live channel happens here.
         self.send(UiCommand::Reconfigure(id, Box::new(config)));
         self.send(UiCommand::Start(id));
+    }
+
+    /// The config to start channel `id` with: the edit draft if one is loaded for this
+    /// channel (what the editor shows), else its committed config. Returns `None` —
+    /// raising an inline "unconfigured" complaint — if that config is incomplete (e.g.
+    /// a UDP channel with no port, which would otherwise bind an ephemeral port and
+    /// silently "run", #3/#6). Shared by `try_start` and `start_all` so both honor the
+    /// same draft-preference and validation rule.
+    fn start_config(&mut self, id: ChannelId) -> Option<ChannelConfig> {
+        let config = match &self.edit_draft {
+            Some((eid, cfg)) if *eid == id => cfg.clone(),
+            _ => self.state.channel(id)?.config.clone(),
+        };
+        if config_incomplete(&config) {
+            self.complain_unconfigured(id);
+            return None;
+        }
+        Some(config)
+    }
+
+    /// "Start all": validate every Stopped channel the same way `try_start` does
+    /// (inline complaint for an unconfigured one), and send the ready ones as a single
+    /// `StartAll` batch. One command, not a 2N `Reconfigure`+`Start` burst — a burst
+    /// could overflow the bounded command channel and silently drop starts.
+    pub(super) fn start_all(&mut self) {
+        let mut batch = Vec::new();
+        for id in self.state.startable_channel_ids() {
+            if let Some(config) = self.start_config(id) {
+                batch.push((id, Box::new(config)));
+            }
+        }
+        if !batch.is_empty() {
+            self.send(UiCommand::StartAll(batch));
+        }
     }
 
     /// Surface an "unconfigured" complaint for a channel inline (red ⚠ line) and open

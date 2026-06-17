@@ -91,18 +91,18 @@ impl ListenerApp {
             });
             if ui.button("Start all").clicked() {
                 // Only Stopped channels — starting an already-Running one would be an
-                // illegal Running→Starting transition. Each still routes through the
-                // try_start guard (an unconfigured one gets an inline complaint, #3/#6).
-                for cid in self.state.startable_channel_ids() {
-                    self.try_start(cid);
-                }
+                // illegal Running→Starting transition. Validate each (unconfigured ones
+                // get an inline complaint, #3/#6) and batch the ready ones into a single
+                // StartAll, rather than a 2N-command Reconfigure+Start burst that could
+                // overflow the bounded command channel (the bug Stop all hit).
+                self.start_all();
             }
             if ui.button("Stop all").clicked() {
-                // Only channels that can be stopped — sending Stop to an already-Stopped
-                // channel was the "illegal Stopped→Stopped transition" error.
-                for cid in self.state.stoppable_channel_ids() {
-                    self.send(UiCommand::Stop(cid));
-                }
+                // One command, not an N-command burst: a burst could overflow the
+                // bounded command channel (and the resulting ChannelStopped events the
+                // event channel), leaving some channels stuck Running in the UI. The
+                // driver iterates server-side and skips already-Stopped channels.
+                self.send(UiCommand::StopAll);
             }
         });
         // The last Save/Load outcome (e.g. "Saved foo.toml" or an error), if any.
@@ -183,9 +183,9 @@ impl ListenerApp {
                         // Line 3: live stats.
                         ui.label(
                             egui::RichText::new(format!(
-                                "{}  ·  {:.0} B/s",
+                                "{}  ·  {:.1} kB/s",
                                 human_bytes(row.bytes_total),
-                                row.bytes_per_sec
+                                row.bytes_per_sec / 1000.0
                             ))
                             .weak(),
                         );

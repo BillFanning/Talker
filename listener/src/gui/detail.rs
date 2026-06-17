@@ -148,87 +148,6 @@ impl ListenerApp {
             });
         }
 
-        let base = egui::TextStyle::Body.resolve(ui.style()).size;
-        ui.horizontal(|ui| {
-            ui.label(bold("View"));
-            ui.radio_value(&mut self.msg_mode, DisplayMode::Hex, "Hex");
-            ui.radio_value(&mut self.msg_mode, DisplayMode::Rendered, "Rendered");
-            ui.radio_value(&mut self.msg_mode, DisplayMode::Raw, "Raw");
-        });
-        // Control-character rendering (§46) — applies to Raw mode. Three styles, matching
-        // talker (glyph / token / hex; LF shown as the example). Its own row so the label
-        // and its radios never wrap apart from each other. The control-picture glyph is a
-        // compact 2-letter design, bumped up to match the full-size [LF]/<0A> neighbours.
-        ui.add_enabled_ui(self.msg_mode == DisplayMode::Raw, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(bold("ctrl-chars"));
-                ui.radio_value(
-                    &mut self.msg_chars,
-                    CharacterRendering::Glyph,
-                    egui::RichText::new("␊").size(base * 1.6),
-                )
-                .on_hover_text("Control pictures (␊ ␍ ␉ …)");
-                ui.radio_value(&mut self.msg_chars, CharacterRendering::Token, "[LF]")
-                    .on_hover_text("Bracketed names ([LF] [CR] [TAB] …)");
-                ui.radio_value(&mut self.msg_chars, CharacterRendering::HexEscape, "<0A>")
-                    .on_hover_text("Hex escapes (<0A> <0D> <09> …)");
-            });
-        });
-        ui.horizontal(|ui| {
-            ui.label(bold("Size"));
-            // An editable "combo": type any size into the field, or pick a preset
-            // from the ▾ menu (#7 — no separate entry box). The text is the source of
-            // truth while editing; a valid parse updates the size (clamped).
-            let resp = ui.add(egui::TextEdit::singleline(&mut self.font_text).desired_width(40.0));
-            if resp.changed() {
-                if let Ok(v) = self.font_text.trim().parse::<f32>() {
-                    self.msg_font_size = v.clamp(6.0, 72.0);
-                }
-            }
-            // U+25BC (full triangle), not U+25BE (the "small" one) — the small glyph
-            // rendered noticeably tinier than the ComboBox / collapsing arrows.
-            ui.menu_button("\u{25BC}", |ui| {
-                for &size in MSG_FONT_SIZES {
-                    if ui.button(format!("{size:.0}")).clicked() {
-                        self.msg_font_size = size;
-                        self.font_text = format!("{size:.0}");
-                        ui.close();
-                    }
-                }
-            });
-            ui.separator();
-            // Color scheme as a dropdown. It opens instantly now that the global
-            // popup fade is off (see `apply_style`).
-            ui.label(bold("Colors"));
-            egui::ComboBox::from_id_salt("msg_colors")
-                .selected_text(self.msg_colors.label())
-                .show_ui(ui, |ui| {
-                    for scheme in [
-                        ColorScheme::BlackOnWhite,
-                        ColorScheme::GreenOnBlack,
-                        ColorScheme::AmberOnBlack,
-                        ColorScheme::WhiteOnBlack,
-                    ] {
-                        ui.selectable_value(&mut self.msg_colors, scheme, scheme.label());
-                    }
-                });
-            ui.separator();
-            // Monospace face for the message dump.
-            ui.label(bold("Mono"));
-            egui::ComboBox::from_id_salt("msg_font")
-                .selected_text(self.msg_font.label())
-                .show_ui(ui, |ui| {
-                    for &font in MonoFont::ALL {
-                        ui.selectable_value(&mut self.msg_font, font, font.label());
-                    }
-                });
-        });
-        let msg_mode = self.msg_mode;
-        let msg_chars = self.msg_chars;
-        let font_size = self.msg_font_size;
-        let mono_family = self.msg_font.family();
-        let fg = self.msg_colors.fg();
-        let bg = self.msg_colors.bg();
         ui.separator();
 
         // Diagnostics / matches — only meaningful once there's a snapshot. Pull the
@@ -354,15 +273,18 @@ impl ListenerApp {
         }
 
         ui.separator();
-        // Pause/Resume the primary Display View, if one exists.
+        let base = egui::TextStyle::Body.resolve(ui.style()).size;
+        // Stream-view controls, below Diagnostics. Row 1: Pause/Resume (if a Display
+        // View exists) + the View mode (Hex/Rendered/Raw) + the ctrl-chars rendering
+        // (Raw mode only). Row 2: the font/colors/mono pickers.
         let view0 = self
             .state
             .channel(id)
             .and_then(|v| v.snapshot.as_ref())
             .and_then(|s| s.display_views.first())
             .map(|v0| (v0.id, v0.paused));
-        if let Some((view_id, is_paused)) = view0 {
-            ui.horizontal(|ui| {
+        ui.horizontal(|ui| {
+            if let Some((view_id, is_paused)) = view0 {
                 if is_paused {
                     if ui.button("Resume").clicked() {
                         self.send(UiCommand::ResumeDisplay(id, view_id));
@@ -371,11 +293,87 @@ impl ListenerApp {
                 } else if ui.button("Pause").clicked() {
                     self.send(UiCommand::PauseDisplay(id, view_id));
                 }
+                ui.separator();
+            }
+            ui.label(bold("View"));
+            ui.radio_value(&mut self.msg_mode, DisplayMode::Hex, "Hex");
+            ui.radio_value(&mut self.msg_mode, DisplayMode::Rendered, "Rendered");
+            ui.radio_value(&mut self.msg_mode, DisplayMode::Raw, "Raw");
+            ui.separator();
+            // Control-character rendering (§46) — on the same row as View, enabled only
+            // in Raw mode. The oversized ␊ glyph makes the row taller than the text, so
+            // the "ctrl-chars" label is bottom-aligned to sit on the radios' baseline.
+            ui.add_enabled_ui(self.msg_mode == DisplayMode::Raw, |ui| {
+                // The oversized ␊ glyph makes this row taller than plain text. Render
+                // the whole ctrl-chars cluster bottom-aligned so the "ctrl-chars" label
+                // and the radio captions sit on the same baseline as the View radios.
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(bold("ctrl-chars"));
+                        ui.radio_value(
+                            &mut self.msg_chars,
+                            CharacterRendering::Glyph,
+                            egui::RichText::new("␊").size(base * 1.6),
+                        )
+                        .on_hover_text("Control pictures (␊ ␍ ␉ …)");
+                        ui.radio_value(&mut self.msg_chars, CharacterRendering::Token, "[LF]")
+                            .on_hover_text("Bracketed names ([LF] [CR] [TAB] …)");
+                        ui.radio_value(&mut self.msg_chars, CharacterRendering::HexEscape, "<0A>")
+                            .on_hover_text("Hex escapes (<0A> <0D> <09> …)");
+                    });
+                });
             });
-        }
+        });
+        ui.horizontal(|ui| {
+            ui.label(bold("Size"));
+            // An editable "combo": type any size into the field, or pick a preset from
+            // the ▾ menu; the text is the source of truth while editing.
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.font_text).desired_width(40.0));
+            if resp.changed() {
+                if let Ok(v) = self.font_text.trim().parse::<f32>() {
+                    self.msg_font_size = v.clamp(6.0, 72.0);
+                }
+            }
+            ui.menu_button("\u{25BC}", |ui| {
+                for &size in MSG_FONT_SIZES {
+                    if ui.button(format!("{size:.0}")).clicked() {
+                        self.msg_font_size = size;
+                        self.font_text = format!("{size:.0}");
+                        ui.close();
+                    }
+                }
+            });
+            ui.separator();
+            ui.label(bold("Colors"));
+            egui::ComboBox::from_id_salt("msg_colors")
+                .selected_text(self.msg_colors.label())
+                .show_ui(ui, |ui| {
+                    for scheme in [
+                        ColorScheme::BlackOnWhite,
+                        ColorScheme::GreenOnBlack,
+                        ColorScheme::AmberOnBlack,
+                        ColorScheme::WhiteOnBlack,
+                    ] {
+                        ui.selectable_value(&mut self.msg_colors, scheme, scheme.label());
+                    }
+                });
+            ui.separator();
+            ui.label(bold("Mono"));
+            egui::ComboBox::from_id_salt("msg_font")
+                .selected_text(self.msg_font.label())
+                .show_ui(ui, |ui| {
+                    for &font in MonoFont::ALL {
+                        ui.selectable_value(&mut self.msg_font, font, font.label());
+                    }
+                });
+        });
+        let msg_mode = self.msg_mode;
+        let msg_chars = self.msg_chars;
+        let font_size = self.msg_font_size;
+        let mono_family = self.msg_font.family();
+        let fg = self.msg_colors.fg();
+        let bg = self.msg_colors.bg();
 
-        // The message area is ALWAYS present (#1) — it shows a waiting note before
-        // there's data, rather than popping into existence on first Start.
         let has_snapshot = self
             .state
             .channel(id)
@@ -396,7 +394,10 @@ impl ListenerApp {
             .channel(id)
             .map(|v| v.stream_bytes.len())
             .unwrap_or(0);
-        ui.label(format!("Stream ({}):", human_bytes(stream_len as u64)));
+        ui.label(format!(
+            "Scroll buffer ({}):",
+            human_bytes(stream_len as u64)
+        ));
 
         // Verbatim received bytes (§17–18, §41): line breaks come only from the
         // data — Rendered honors real CR/LF (§44), Raw shows control pictures, Hex
@@ -413,35 +414,56 @@ impl ListenerApp {
         // so we can convert the available pixel width into a column count for wrapping.
         let (row_h, char_w) =
             ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0').max(1.0)));
-        // Columns that fit in the current viewer width (minus the frame margin + a
-        // little slack for the scrollbar). Pre-wrapping to this keeps every cached row
-        // exactly one visual line — uniform height — so we can soft-wrap *and*
-        // virtualize with `show_rows`. Re-wrap only when this column count changes.
-        let avail_w = (ui.available_width() - 24.0).max(char_w);
-        let wrap_cols = (avail_w / char_w).floor().max(8.0) as usize;
-        self.refresh_stream_rows(id, &renderer, wrap_cols);
-        let rows: &[String] = self
-            .stream_cache
-            .as_ref()
-            .filter(|c| c.key.channel == id)
-            .map(|c| c.rows.as_slice())
-            .unwrap_or(&[]);
-
+        // Columns that fit in the viewer's *inner* width. Computed from the content
+        // width inside the Frame (its 4px L/R margins are already excluded there),
+        // minus only the scrollbar gutter — so wrapped text reaches nearly to the right
+        // edge instead of stopping an over-generous slack short. Pre-wrapping to this
+        // keeps every cached row exactly one visual line (uniform height) so we can
+        // soft-wrap *and* virtualize with `show_rows`. Re-wrap only when it changes.
+        // egui's scrollbar is ~10px; keep a hair more so a full row doesn't touch it.
+        const SCROLLBAR_GUTTER: f32 = 12.0;
+        // Pin the viewer to exactly the height left in the pane, so the ScrollArea owns
+        // the scrolling (and `stick_to_bottom` keeps the newest bytes pinned to the
+        // bottom edge) instead of the content overflowing and scrolling the whole pane —
+        // which left the latest data stranded below the window fold ("never reaches the
+        // bottom"). The Frame's 4px inner margin top+bottom is subtracted.
+        let viewer_height = (ui.available_height() - 8.0).max(0.0);
         egui::Frame::new()
             .fill(bg)
             .inner_margin(4.0)
             .show(ui, |ui| {
-                if stream_len == 0 {
-                    let note = if has_snapshot {
-                        "no data received yet"
-                    } else {
-                        "waiting for data — Start the channel"
-                    };
-                    ui.label(egui::RichText::new(note).weak());
-                    return;
-                }
+                let avail_w = (ui.available_width() - SCROLLBAR_GUTTER).max(char_w);
+                let wrap_cols = (avail_w / char_w).floor().max(8.0) as usize;
+                self.refresh_stream_rows(id, &renderer, wrap_cols);
+                let rows: &[String] = self
+                    .stream_cache
+                    .as_ref()
+                    .filter(|c| c.key.channel == id)
+                    .map(|c| c.rows.as_slice())
+                    .unwrap_or(&[]);
+                // The viewer fills its full height whether or not data is flowing — the
+                // ScrollArea (`auto_shrink([false,false])`) reserves the space, so the
+                // window doesn't pop open when a channel starts. Empty state shows a
+                // weak note *inside* the scroll area rather than collapsing the frame.
                 // Text selection across the (non-interactive) row labels.
                 ui.style_mut().interaction.selectable_labels = true;
+                // Give the scrollbar a visible track + handle, distinct from the text
+                // background, so the gutter on the right edge reads as the scrollbar
+                // (not mysterious empty space). The track contrasts with `bg`; the
+                // handle is darker still. Set before the per-widget overrides below.
+                let (track, handle) = scrollbar_colors(bg);
+                ui.visuals_mut().extreme_bg_color = track;
+                // Keep the scrollbar at a fixed full width always — egui's default
+                // "floating" scrollbar renders thin until hovered, which made the track
+                // look like it was widening on hover. `floating = false` + equal
+                // allocated/interact widths pin it to a constant strip.
+                {
+                    let s = &mut ui.style_mut().spacing.scroll;
+                    s.floating = false;
+                    s.bar_width = 12.0;
+                    s.bar_inner_margin = 0.0;
+                    s.bar_outer_margin = 0.0;
+                }
                 // Suppress the per-widget hover/active visuals egui paints on selectable
                 // labels (they drew a flickering box around the rows near the pointer).
                 {
@@ -457,6 +479,46 @@ impl ListenerApp {
                         s.bg_fill = egui::Color32::TRANSPARENT;
                     }
                 }
+                // The scroll handle is drawn from the *idle* widget visuals (egui maps an
+                // un-hovered scrollbar to `widgets.inactive`), using `bg_fill` when
+                // `scroll_style.foreground_color` is false (the default) or `fg_stroke`
+                // when true. We just cleared those fills for the labels, which is why the
+                // handle vanished. Set `foreground_color = true` and drive the handle via
+                // `fg_stroke.color` on every interaction state — explicit and immune to
+                // the bg_fill clearing above. Hover/drag brighten so it stays visible on
+                // a dark scheme.
+                ui.style_mut().spacing.scroll.foreground_color = true;
+                {
+                    let w = &mut ui.visuals_mut().widgets;
+                    w.inactive.fg_stroke.color = handle;
+                    w.noninteractive.fg_stroke.color = handle;
+                    w.hovered.fg_stroke.color = handle.gamma_multiply(1.2);
+                    w.active.fg_stroke.color = handle.gamma_multiply(1.4);
+                }
+                // Zero the inter-row spacing *here*, before `show_rows`, so the row pitch
+                // it uses to size the virtual content (and thus where `stick_to_bottom`
+                // scrolls) matches what the rows actually render at. Setting it only
+                // inside the closure left `show_rows` reserving `row_h + default_spacing`
+                // per row while rows drew at `row_h`, so the computed bottom overshot the
+                // real last row and the newest data never came into view.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let scroll = egui::ScrollArea::vertical()
+                    .id_salt("stream")
+                    .stick_to_bottom(true)
+                    .max_height(viewer_height)
+                    .auto_shrink([false, false]);
+                if stream_len == 0 {
+                    // No data yet: still occupy the full viewer height, with a note.
+                    scroll.show(ui, |ui| {
+                        let note = if has_snapshot {
+                            "no data received yet"
+                        } else {
+                            "waiting for data — Start the channel"
+                        };
+                        ui.label(egui::RichText::new(note).weak());
+                    });
+                    return;
+                }
                 // Soft-wrapped AND virtualized: rows are pre-wrapped to `wrap_cols`
                 // (above) so each is one uniform-height visual line, which lets
                 // `show_rows` lay out only the visible rows. This is what keeps the UI
@@ -464,21 +526,14 @@ impl ListenerApp {
                 // one giant galley) re-laid-out the whole buffer every frame and made
                 // resizing/the whole UI sluggish. Rows don't wrap again here (they're
                 // already wrapped); they just extend if anything slipped through.
-                egui::ScrollArea::vertical()
-                    .id_salt("stream")
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
-                    .show_rows(ui, row_h, rows.len().max(1), |ui, range| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        for row in &rows[range] {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(row).font(font.clone()).color(fg),
-                                )
+                scroll.show_rows(ui, row_h, rows.len().max(1), |ui, range| {
+                    for row in &rows[range] {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(row).font(font.clone()).color(fg))
                                 .wrap_mode(egui::TextWrapMode::Extend),
-                            );
-                        }
-                    });
+                        );
+                    }
+                });
             });
     }
 
@@ -534,8 +589,9 @@ impl ListenerApp {
         });
         // Byte-based liveness (§18): total received + rolling throughput.
         ui.label(format!(
-            "Received: {}    Throughput: {bps:.0} B/s",
-            human_bytes(bytes_total)
+            "Received: {}    Throughput: {:.1} kB/s",
+            human_bytes(bytes_total),
+            bps / 1000.0
         ));
         let size = CONTROL_BUTTON_SIZE;
         ui.horizontal(|ui| {
@@ -565,10 +621,9 @@ impl ListenerApp {
         });
     }
 
-    /// Raw recording block: the "[▸] Record Raw Data  ●/■ state  [Start/Stop
-    /// recording]" line and the expandable setup. The live toggle reads the recording
-    /// settings from the editor at click time (ADR-012). Extracted for readability;
-    /// the layout (a header row + an optional setup group) is unchanged.
+    /// Raw recording block: a "Record Raw Data  ●/■ state" header, the always-shown
+    /// setup fields, and a Start/Stop recording button at the bottom. The live toggle
+    /// reads the recording settings from the editor at click time (ADR-012).
     fn show_recording_block(
         &mut self,
         ui: &mut egui::Ui,
@@ -578,81 +633,57 @@ impl ListenerApp {
         rec_dest: &Option<std::path::PathBuf>,
     ) {
         let size = CONTROL_BUTTON_SIZE;
-        // Globally-stable id so the expander toggle and its body read one flag.
-        let open_id = egui::Id::new(("raw_rec_open", id));
+        // Header: title + live state indicator (no expander — the setup is always shown).
         ui.horizontal(|ui| {
-            let mut open = ui
-                .ctx()
-                .data_mut(|d| d.get_temp::<bool>(open_id))
-                .unwrap_or(false);
-            let arrow = if open { "\u{25BE}" } else { "\u{25B8}" }; // ▾ / ▸
-            if ui
-                .button(arrow)
-                .on_hover_text("Raw recording setup")
-                .clicked()
-            {
-                open = !open;
-                ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
-            }
             ui.label(bold("Record Raw Data"));
-            // Same painted-glyph technique + symbol set as channel status, then the
-            // label text at body size.
+            // Same painted-glyph technique + symbol set as channel status, then the text.
             let (glyph, color, text) = recording_indicator(recording);
             paint_glyph(ui, glyph, recording_glyph_size(glyph), color);
             ui.colored_label(color, text);
-            // Live recording toggle, for a running channel. Reads the recording settings
-            // from the editor *at click time* and sends them with the command, so it
-            // records to exactly what's on screen — no Apply, no restart (ADR-012).
-            // Enabled when the on-screen settings have a destination.
-            if status == ChannelStatus::Running {
-                let draft_raw = self
-                    .edit_draft
-                    .as_ref()
-                    .filter(|(eid, _)| *eid == id)
-                    .map(|(_, cfg)| cfg.raw_recording.clone());
-                let has_dest = draft_raw.as_ref().is_some_and(|r| r.destination.is_some());
-                let recording_now = matches!(recording, Some(RecordingState::Enabled));
-                let label = if recording_now {
-                    "Stop recording"
-                } else {
-                    "Start recording"
-                };
-                let resp = ui.add_enabled(
-                    has_dest || recording_now,
-                    egui::Button::new(label).min_size(size),
-                );
-                let resp = if !has_dest && !recording_now {
-                    resp.on_hover_text("Set a destination in the Raw recording setup (▸) first")
-                } else {
-                    resp
-                };
-                if resp.clicked() {
-                    let raw = draft_raw.unwrap_or_default();
-                    self.send(UiCommand::SetRecording(id, !recording_now, Box::new(raw)));
-                }
-            }
         });
-        // Raw recording setup body, shown when expanded. No surrounding `group` box —
-        // it reads as part of the recording block, not a separate framed panel.
-        let raw_open = ui
-            .ctx()
-            .data_mut(|d| d.get_temp::<bool>(open_id))
-            .unwrap_or(false);
-        if raw_open {
-            if let Some(RecordingState::Enabled) = recording {
-                let dest = rec_dest
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "(no destination)".to_string());
-                ui.colored_label(
-                    theme::FAULT_RED,
-                    format!("\u{25CF} Recording \u{2192} {dest}"),
-                );
-            }
-            if let Some((_, config)) = &mut self.edit_draft {
-                edit_raw_recording(ui, config);
+        if let Some(RecordingState::Enabled) = recording {
+            let dest = rec_dest
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(no destination)".to_string());
+            ui.colored_label(
+                theme::FAULT_RED,
+                format!("\u{25CF} Recording \u{2192} {dest}"),
+            );
+        }
+        // Setup fields, always visible.
+        if let Some((_, config)) = &mut self.edit_draft {
+            edit_raw_recording(ui, config);
+        } else {
+            ui.label(egui::RichText::new("(select the channel to edit)").weak());
+        }
+        // Start/Stop recording button at the bottom of the config. Live (no restart,
+        // ADR-012): reads the on-screen settings at click time. Only for a running
+        // channel; enabled once a destination is set.
+        if status == ChannelStatus::Running {
+            let draft_raw = self
+                .edit_draft
+                .as_ref()
+                .filter(|(eid, _)| *eid == id)
+                .map(|(_, cfg)| cfg.raw_recording.clone());
+            let has_dest = draft_raw.as_ref().is_some_and(|r| r.destination.is_some());
+            let recording_now = matches!(recording, Some(RecordingState::Enabled));
+            let label = if recording_now { "Stop" } else { "Record" };
+            // Match the start-channel button's *width* (96) but keep the default
+            // height — a full CONTROL_BUTTON_SIZE min_size plus a long label made it
+            // both too wide and too tall. Short labels fit the 96px width.
+            let resp = ui.add_enabled(
+                has_dest || recording_now,
+                egui::Button::new(label).min_size(egui::vec2(size.x, 0.0)),
+            );
+            let resp = if !has_dest && !recording_now {
+                resp.on_hover_text("Set a destination above first")
             } else {
-                ui.label(egui::RichText::new("(select the channel to edit)").weak());
+                resp
+            };
+            if resp.clicked() {
+                let raw = draft_raw.unwrap_or_default();
+                self.send(UiCommand::SetRecording(id, !recording_now, Box::new(raw)));
             }
         }
     }
@@ -679,6 +710,25 @@ impl ListenerApp {
         }
         let rows = split_stream_rows(&renderer.render_text(view.stream_contiguous()), wrap_cols);
         self.stream_cache = Some(super::StreamRenderCache { key, rows });
+    }
+}
+
+/// Scrollbar (track, handle) colors for a viewer whose text background is `bg`. Both
+/// are nudged off `bg` toward its opposite end so the scrollbar reads as a distinct
+/// strip against the text background — the track subtly, the handle more strongly —
+/// and the choice works for both a light (black-on-white) and dark (white-on-black)
+/// scheme. Returns colors, not a mutation, so the caller controls when they apply.
+fn scrollbar_colors(bg: egui::Color32) -> (egui::Color32, egui::Color32) {
+    // Perceived lightness of the background; pick the contrast direction from it.
+    let light = (bg.r() as u32 + bg.g() as u32 + bg.b() as u32) / 3 > 128;
+    if light {
+        // Light bg: a light-grey track, a mid-grey handle.
+        (egui::Color32::from_gray(225), egui::Color32::from_gray(150))
+    } else {
+        // Dark bg: a clearly-lifted track (so it reads against near-black text bg) and
+        // a much brighter handle on top of it (gray-95 track vs gray-200 handle reads
+        // clearly even when idle).
+        (egui::Color32::from_gray(95), egui::Color32::from_gray(200))
     }
 }
 
