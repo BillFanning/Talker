@@ -9,9 +9,9 @@ use crate::record::{FileRotationPolicy, OverwritePolicy};
 
 use super::super::theme;
 
-/// The shared destination / overwrite / rotation / timestamp controls for a recording
-/// (§55–§59), used by both the Raw and Display editors (their config structs carry the
-/// same fields; ADR-013). `ext` is the file extension shown in hints (".raw"/".disp").
+/// The shared destination / overwrite / rotation controls for a recording (§55–§59),
+/// used by both the Raw and Display editors (their config structs carry the same
+/// fields; ADR-013). `ext` is the file extension shown in hints (".raw"/".disp").
 #[allow(clippy::too_many_arguments)]
 fn recording_file_fields(
     ui: &mut egui::Ui,
@@ -19,9 +19,11 @@ fn recording_file_fields(
     destination: &mut Option<PathBuf>,
     overwrite_policy: &mut OverwritePolicy,
     file_rotation: &mut FileRotationPolicy,
-    timestamp_enabled: &mut bool,
-    // When `Some`, a "Record at start" checkbox is shown on the same line, left of the
-    // "Record timestamps" checkbox (Raw uses this; Display has its own enable above).
+    // When `Some`, a "Record timestamps" checkbox is shown — Display only. Raw passes
+    // `None`: a `.raw` file is the verbatim byte stream, so it has no timestamp option.
+    timestamp_enabled: Option<&mut bool>,
+    // When `Some`, a "Record at start" checkbox is shown on the same line (Raw uses
+    // this; Display has its own enable above).
     record_at_start: Option<&mut bool>,
 ) {
     // A single file when not rotating; a directory of <channel>_<period> files
@@ -70,14 +72,16 @@ fn recording_file_fields(
     });
     ui.horizontal(|ui| {
         ui.label("Rotate").on_hover_text(
-            "Start a fresh file each time period instead of one growing file. When on, the \
-             destination is a folder and files are named <channel>_<time period>.",
+            "Start a fresh file each time period instead of one continuously growing \
+             file. When on, the destination is a folder and files are named \
+             <channel>_<time period>.",
         );
         ui.radio_value(file_rotation, FileRotationPolicy::None, "None")
             .on_hover_text("One file that grows for the whole session.");
         ui.radio_value(file_rotation, FileRotationPolicy::Hourly, "Hourly")
             .on_hover_text(
-                "A new file each hour, named <channel>_<date>_<hour> (e.g. GPS_2026-06-03_08).",
+                "A new file each hour, named <channel>_<date>_<hour> (e.g. \
+                 GPS_2026-06-03_08) — keep the channel name filesystem-safe (§59).",
             );
         ui.radio_value(file_rotation, FileRotationPolicy::Daily, "Daily")
             .on_hover_text(
@@ -88,28 +92,32 @@ fn recording_file_fields(
     ui.horizontal(|ui| {
         if let Some(enabled) = record_at_start {
             ui.checkbox(enabled, "Record at start")
-                .on_hover_text("Begin recording when the channel starts (§53)");
+                .on_hover_text("Begin recording when the channel starts (§53).");
         }
-        ui.checkbox(timestamp_enabled, format!("Record timestamps ({ext})"))
-            .on_hover_text("Sidecar index for Raw; inline for Display (§57)");
+        if let Some(timestamp_enabled) = timestamp_enabled {
+            ui.checkbox(timestamp_enabled, format!("Record timestamps ({ext})"))
+                .on_hover_text("Prefix each rendered line with its arrival time (§57).");
+        }
     });
 }
 
-/// Edit the channel's **Raw** recording setup (§53): destination, overwrite,
-/// rotation, timestamps, and the "record at start" flag. The byte-exact verbatim
-/// stream (§53) — a separate pipeline tap from Display (ADR-013). Config-driven:
-/// applied via a §13 Reconfigure. The live Record toggle (ADR-012) begins/stops it at
-/// runtime without a restart, as long as a destination is set.
+/// Edit the channel's **Raw** recording setup (§53): destination, overwrite, rotation,
+/// and the "record at start" flag. The byte-exact verbatim stream (§53) — a separate
+/// pipeline tap from Display (ADR-013). Config-driven: applied via a §13 Reconfigure.
+/// The live Record toggle (ADR-012) begins/stops it at runtime without a restart, as
+/// long as a destination is set. No timestamp option — a `.raw` file is the bytes
+/// exactly as received, so the timestamp flag is forced off.
 pub(crate) fn edit_raw_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
     let rec = &mut config.raw_recording;
+    rec.timestamp_enabled = false; // Raw never timestamps; keep the config honest.
     recording_file_fields(
         ui,
         ".raw",
         &mut rec.destination,
         &mut rec.overwrite_policy,
         &mut rec.file_rotation,
-        &mut rec.timestamp_enabled,
-        Some(&mut rec.enabled), // "Record at start", shown left of "Record timestamps"
+        None,                   // Raw: no "Record timestamps" option (verbatim bytes only).
+        Some(&mut rec.enabled), // "Record at start"
     );
 }
 
@@ -129,7 +137,7 @@ pub(crate) fn edit_display_recording(ui: &mut egui::Ui, config: &mut ChannelConf
         &mut rec.destination,
         &mut rec.overwrite_policy,
         &mut rec.file_rotation,
-        &mut rec.timestamp_enabled,
-        None, // Display has its own enable checkbox above
+        Some(&mut rec.timestamp_enabled), // Display can prefix rendered lines with time
+        None,                             // Display has its own enable checkbox above
     );
 }

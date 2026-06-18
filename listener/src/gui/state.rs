@@ -196,18 +196,19 @@ impl AppState {
         self.order.clone()
     }
 
-    /// Channels that can be **started** right now — i.e. Stopped. Used by "Start all"
-    /// so it skips channels already Running/Reconnecting (whose Start would be an
-    /// illegal Running→Starting transition). Faulted is excluded here: clearing a fault
-    /// is the per-channel "Retry" (one `CommitAndStart`; the runtime normalizes
-    /// Faulted→Stopped first), not a bulk start.
+    /// Channels "Start all" should bring up: Stopped **or Faulted**. A faulted channel
+    /// is included so that, after fixing what faulted it (e.g. freeing a bound port),
+    /// "Start all" retries it — `CommitAndStart` normalizes Faulted→Stopped→Starting in
+    /// the runtime, so no separate per-channel Retry is needed. Running/Reconnecting are
+    /// excluded: a Start there would be an illegal transition (Reconnecting's only valid
+    /// action mid-reconnect is Stop).
     pub fn startable_channel_ids(&self) -> Vec<ChannelId> {
         self.order
             .iter()
             .filter(|id| {
-                self.views
-                    .get(id)
-                    .is_some_and(|v| v.status == ChannelStatus::Stopped)
+                self.views.get(id).is_some_and(|v| {
+                    matches!(v.status, ChannelStatus::Stopped | ChannelStatus::Faulted)
+                })
             })
             .copied()
             .collect()
@@ -654,5 +655,43 @@ mod tests {
         let v = state.channel(a).unwrap();
         assert_eq!(v.name, "Bridge");
         assert_eq!(v.config.name.as_str(), "Bridge");
+    }
+
+    #[test]
+    fn start_all_includes_faulted_channels_so_a_freed_resource_retries() {
+        // After a bind fail the channel is Faulted; "Start all" must still pick it up
+        // (the runtime normalizes Faulted→Stopped→Starting), or freeing the port and
+        // clicking Start all again would do nothing.
+        let mut state = AppState::default();
+        let stopped = ChannelId::new();
+        let faulted = ChannelId::new();
+        let running = ChannelId::new();
+        let reconnecting = ChannelId::new();
+        for (id, name) in [
+            (stopped, "stopped"),
+            (faulted, "faulted"),
+            (running, "running"),
+            (reconnecting, "reconnecting"),
+        ] {
+            state.apply(added(id, name, "UDP"));
+        }
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelFaulted(faulted)));
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(running)));
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelReconnecting(
+            reconnecting,
+            1,
+        )));
+
+        let startable = state.startable_channel_ids();
+        assert!(startable.contains(&stopped));
+        assert!(
+            startable.contains(&faulted),
+            "faulted must be retried by Start all"
+        );
+        assert!(!startable.contains(&running), "running is already up");
+        assert!(
+            !startable.contains(&reconnecting),
+            "reconnecting can't legally Start (only Stop)"
+        );
     }
 }
