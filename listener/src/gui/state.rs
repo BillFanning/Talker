@@ -72,6 +72,10 @@ pub struct ChannelView {
     /// Next absolute stream offset to request — the cursor handed to
     /// `Listener::stream_delta`. Advances as deltas are folded.
     pub stream_cursor: u64,
+    /// Per-channel stream-view presentation (mode, ctrl-chars, font, colors — §42).
+    /// Each channel renders independently; seeded from the config's first display view
+    /// on add/load and folded back on save (see [`super::view_prefs`]).
+    pub(crate) view_prefs: super::view_prefs::ViewPrefs,
 }
 
 /// GUI-side scrollback cap (§87, §124): bounds the accumulated live-view bytes
@@ -89,11 +93,13 @@ pub const STREAM_VIEW_CAP: usize = 128 * 1024;
 
 impl ChannelView {
     fn new(id: ChannelId, name: String, details: String, config: ChannelConfig) -> Self {
+        let view_prefs = super::view_prefs::ViewPrefs::from_config(&config);
         Self {
             id,
             name,
             details,
             config,
+            view_prefs,
             status: ChannelStatus::Stopped,
             bytes_total: 0,
             bytes_per_sec: 0.0,

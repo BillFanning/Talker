@@ -199,6 +199,17 @@ impl Listener {
         self.channels.get(&id).map(|c| &c.config)
     }
 
+    /// Update a Channel's stored **display** config in place, without a restart (§78).
+    /// The stream viewer's presentation (mode, font, colors) is rendered GUI-side, so
+    /// these fields don't affect the live transport/pipeline — this only keeps the
+    /// stored config current so a profile save captures the per-channel view settings.
+    /// Unknown id is ignored.
+    pub fn set_display_config(&mut self, id: ChannelId, display: crate::config::DisplayConfig) {
+        if let Some(channel) = self.channels.get_mut(&id) {
+            channel.config.display = display;
+        }
+    }
+
     /// Request an on-demand snapshot of a running Channel's *small* observable state
     /// (§137, ADR-006): diagnostics, recent match firings, per-view pause state,
     /// recording state, liveness, and the stream end offset. The scrollback bytes

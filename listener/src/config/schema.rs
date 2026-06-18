@@ -207,6 +207,10 @@ pub struct DisplayViewConfig {
     pub character_rendering: CharacterRendering,
     #[serde(default)]
     pub font: Option<String>,
+    /// Monospace point size for the viewer. `None` = the GUI default. Additive
+    /// (`#[serde(default)]`), so profiles written before this field round-trip (§78).
+    #[serde(default)]
+    pub font_size: Option<f32>,
     #[serde(default)]
     pub foreground_color: Option<String>,
     #[serde(default)]

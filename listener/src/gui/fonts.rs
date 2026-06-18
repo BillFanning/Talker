@@ -150,7 +150,7 @@ pub(super) fn bold(text: impl Into<String>) -> egui::RichText {
 /// A selectable message-view monospace face. `Hack` is egui's built-in monospace;
 /// the rest are bundled (see [`MONO_FONTS`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum MonoFont {
+pub(crate) enum MonoFont {
     Hack,
     Cascadia,
     JetBrains,
@@ -180,6 +180,28 @@ impl MonoFont {
             MonoFont::Cascadia => egui::FontFamily::Name("mono_cascadia".into()),
             MonoFont::JetBrains => egui::FontFamily::Name("mono_jetbrains".into()),
             MonoFont::DejaVu => egui::FontFamily::Name("mono_dejavu".into()),
+        }
+    }
+
+    /// A stable token for persisting the choice in a profile (the `font` field of
+    /// `DisplayViewConfig`). Round-trips with [`from_name`](Self::from_name).
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            MonoFont::Hack => "hack",
+            MonoFont::Cascadia => "cascadia",
+            MonoFont::JetBrains => "jetbrains",
+            MonoFont::DejaVu => "dejavu",
+        }
+    }
+
+    /// Parse a persisted token back to a face; unknown/None tokens fall back to the
+    /// default (Cascadia).
+    pub(super) fn from_name(name: Option<&str>) -> Self {
+        match name {
+            Some("hack") => MonoFont::Hack,
+            Some("jetbrains") => MonoFont::JetBrains,
+            Some("dejavu") => MonoFont::DejaVu,
+            _ => MonoFont::Cascadia,
         }
     }
 }

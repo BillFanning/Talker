@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::config::{ChannelConfig, InterfaceConfig, Profile, RawRecordingConfig};
+use crate::config::{ChannelConfig, DisplayConfig, InterfaceConfig, Profile, RawRecordingConfig};
 use crate::core::{ChannelId, ChannelName, DisplayViewId, RuntimeEvent};
 use crate::runtime::{ChannelSnapshot, ChannelStats, Listener, PipelineCapacities, StreamDelta};
 use crate::transport::udp::UdpMode;
@@ -82,6 +82,10 @@ pub enum UiCommand {
     /// Apply. The driver arms the running pipeline from these. The outcome shows up in
     /// the next snapshot's recording state.
     SetRecording(ChannelId, bool, Box<RawRecordingConfig>),
+    /// Update a channel's display config (per-channel view settings: mode, font,
+    /// colors — §78) in the stored config, without a restart. The viewer renders these
+    /// GUI-side, so this only keeps the runtime's config current for a profile save.
+    SetViewConfig(ChannelId, Box<DisplayConfig>),
     /// Tell the driver which channel is on screen (`None` = none). Only the selected
     /// channel gets a snapshot + incremental stream delta polled; the rest get cheap
     /// stats (ADR-006).
@@ -385,6 +389,11 @@ impl Driver {
                         "can't change recording — channel isn't running".to_string(),
                     ));
                 }
+            }
+            UiCommand::SetViewConfig(id, display) => {
+                // Display/view settings render GUI-side, so this just keeps the stored
+                // config current (no restart) for a later profile save.
+                self.listener.set_display_config(id, *display);
             }
             UiCommand::Select(id) => {
                 // New selection: restart the live stream cursor so the new channel's

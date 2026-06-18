@@ -16,6 +16,7 @@ fn view(mode: DisplayMode) -> DisplayViewConfig {
         encoding: DisplayEncoding::Utf8,
         character_rendering: CharacterRendering::Native,
         font: None,
+        font_size: None,
         foreground_color: None,
         background_color: None,
         wrapping: WrappingMode::NoWrap,

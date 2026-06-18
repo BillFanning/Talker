@@ -14,6 +14,7 @@ mod detail;
 mod fonts;
 pub mod state;
 mod theme;
+mod view_prefs;
 mod widgets;
 
 use anyhow::anyhow;
@@ -23,11 +24,10 @@ use crate::core::ChannelId;
 use crate::display::{CharacterRendering, DisplayMode};
 
 use bridge::{BridgeHandle, UiCommand};
-use fonts::{install_fonts, MonoFont};
+use fonts::install_fonts;
 use state::{AppState, ChannelStatus};
 use widgets::{
     config_incomplete, list_serial_ports, status_color, status_glyph, template_for, AddKind,
-    ColorScheme,
 };
 
 /// Detach the inherited console when going graphical. The binary is a
@@ -176,18 +176,6 @@ struct ListenerApp {
     /// Last selection sent to the driver, so we only send `Select` on change. The
     /// driver full-snapshots only the selected channel (the rest get cheap stats).
     last_selected_sent: Option<ChannelId>,
-    /// How the stream view renders bytes (§42): Hex / Rendered / Raw, plus the
-    /// control-character style used in Raw mode (§46).
-    msg_mode: DisplayMode,
-    msg_chars: CharacterRendering,
-    /// Stream-view font size and color scheme.
-    msg_font_size: f32,
-    /// Editable text backing the font-size combo, so a typed size persists across
-    /// frames while it's being entered (#7).
-    font_text: String,
-    /// Selected monospace face for the stream view.
-    msg_font: MonoFont,
-    msg_colors: ColorScheme,
     /// A working copy of the selected channel's config, edited in the Configure
     /// section and sent on Apply. Re-seeded when the selection changes.
     edit_draft: Option<(ChannelId, ChannelConfig)>,
@@ -271,12 +259,6 @@ impl ListenerApp {
             state: AppState::default(),
             selected: None,
             last_selected_sent: None,
-            msg_mode: DisplayMode::Rendered,
-            msg_chars: CharacterRendering::Glyph,
-            msg_font_size: 13.0,
-            font_text: "13".to_string(),
-            msg_font: MonoFont::Cascadia,
-            msg_colors: ColorScheme::BlackOnWhite,
             edit_draft: None,
             confirm_remove: None,
             force_config_open: false,

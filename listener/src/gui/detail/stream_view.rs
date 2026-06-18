@@ -9,6 +9,7 @@ use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, DisplayVi
 
 use super::super::bridge::UiCommand;
 use super::super::fonts::{bold, MonoFont};
+use super::super::view_prefs::ViewPrefs;
 use super::super::widgets::{human_bytes, ColorScheme, MSG_FONT_SIZES};
 use super::super::ListenerApp;
 
@@ -18,17 +19,42 @@ impl ListenerApp {
     /// `show_detail` — this is the densest layout in the pane (scrollbar styling,
     /// selectable-label visuals, row-pitch/virtualization), so it lives on its own.
     pub(super) fn show_stream_view(&mut self, ui: &mut egui::Ui, id: ChannelId) {
-        let base = egui::TextStyle::Body.resolve(ui.style()).size;
-        // Stream-view controls, below Diagnostics. Row 1: Pause/Resume (if a Display
-        // View exists) + the View mode (Hex/Rendered/Raw) + the ctrl-chars rendering
-        // (Raw mode only). Row 2: the font/colors/mono pickers.
+        // Per-channel view settings (mode, ctrl-chars, font, colors) live on the
+        // channel's ViewPrefs — each channel renders independently. Edit a clone, then
+        // (if it changed) write it back, fold it into the channel's config, and tell the
+        // runtime so a profile save captures it (SetViewConfig — no restart, §78).
+        let Some(mut prefs) = self.state.channel(id).map(|v| v.view_prefs.clone()) else {
+            return;
+        };
+
+        let stream_len = self
+            .state
+            .channel(id)
+            .map(|v| v.stream_bytes.len())
+            .unwrap_or(0);
+
+        // Header: a "View configuration" dropdown holding the controls, with the
+        // Pause/Resume button kept on the title row whether the dropdown is open or
+        // closed. A plain CollapsingHeader lays its body *and* the sibling button in
+        // document order, so opening it pushed the button down onto the first control
+        // row; CollapsingState lets us render the title row (title + button) ourselves
+        // and the body separately, so the button stays put.
         let view0 = self
             .state
             .channel(id)
             .and_then(|v| v.snapshot.as_ref())
             .and_then(|s| s.display_views.first())
             .map(|v0| (v0.id, v0.paused));
-        ui.horizontal(|ui| {
+        let header_id = ui.make_persistent_id(("view_config", id));
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            header_id,
+            false,
+        )
+        .show_header(ui, |ui| {
+            // The collapse arrow is drawn by show_header; add the title + the
+            // Pause/Resume button on the same row.
+            ui.label(bold("View configuration"));
             if let Some((view_id, is_paused)) = view0 {
                 if is_paused {
                     if ui.button("Resume").clicked() {
@@ -38,86 +64,26 @@ impl ListenerApp {
                 } else if ui.button("Pause").clicked() {
                     self.send(UiCommand::PauseDisplay(id, view_id));
                 }
-                ui.separator();
             }
-            ui.label(bold("View"));
-            ui.radio_value(&mut self.msg_mode, DisplayMode::Hex, "Hex");
-            ui.radio_value(&mut self.msg_mode, DisplayMode::Rendered, "Rendered");
-            ui.radio_value(&mut self.msg_mode, DisplayMode::Raw, "Raw");
-            ui.separator();
-            // Control-character rendering (§46) — on the same row as View, enabled only
-            // in Raw mode. The oversized ␊ glyph makes the row taller than the text, so
-            // the "ctrl-chars" label is bottom-aligned to sit on the radios' baseline.
-            ui.add_enabled_ui(self.msg_mode == DisplayMode::Raw, |ui| {
-                // The oversized ␊ glyph makes this row taller than plain text. Render
-                // the whole ctrl-chars cluster bottom-aligned so the "ctrl-chars" label
-                // and the radio captions sit on the same baseline as the View radios.
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(bold("ctrl-chars"));
-                        ui.radio_value(
-                            &mut self.msg_chars,
-                            CharacterRendering::Glyph,
-                            egui::RichText::new("␊").size(base * 1.6),
-                        )
-                        .on_hover_text("Control pictures (␊ ␍ ␉ …)");
-                        ui.radio_value(&mut self.msg_chars, CharacterRendering::Token, "[LF]")
-                            .on_hover_text("Bracketed names ([LF] [CR] [TAB] …)");
-                        ui.radio_value(&mut self.msg_chars, CharacterRendering::HexEscape, "<0A>")
-                            .on_hover_text("Hex escapes (<0A> <0D> <09> …)");
-                    });
-                });
-            });
-        });
-        ui.horizontal(|ui| {
-            ui.label(bold("Size"));
-            // An editable "combo": type any size into the field, or pick a preset from
-            // the ▾ menu; the text is the source of truth while editing.
-            let resp = ui.add(egui::TextEdit::singleline(&mut self.font_text).desired_width(40.0));
-            if resp.changed() {
-                if let Ok(v) = self.font_text.trim().parse::<f32>() {
-                    self.msg_font_size = v.clamp(6.0, 72.0);
-                }
+        })
+        .body(|ui| self.show_view_controls(ui, &mut prefs, stream_len));
+
+        // Persist any edit: update this channel's prefs + config and sync the runtime.
+        if let Some(view) = self.state.channel_mut(id) {
+            if !view.view_prefs.eq_settings(&prefs) {
+                view.view_prefs = prefs.clone();
+                prefs.apply_to_config(&mut view.config);
+                let display = view.config.display.clone();
+                self.send(UiCommand::SetViewConfig(id, Box::new(display)));
             }
-            ui.menu_button("\u{25BC}", |ui| {
-                for &size in MSG_FONT_SIZES {
-                    if ui.button(format!("{size:.0}")).clicked() {
-                        self.msg_font_size = size;
-                        self.font_text = format!("{size:.0}");
-                        ui.close();
-                    }
-                }
-            });
-            ui.separator();
-            ui.label(bold("Colors"));
-            egui::ComboBox::from_id_salt("msg_colors")
-                .selected_text(self.msg_colors.label())
-                .show_ui(ui, |ui| {
-                    for scheme in [
-                        ColorScheme::BlackOnWhite,
-                        ColorScheme::GreenOnBlack,
-                        ColorScheme::AmberOnBlack,
-                        ColorScheme::WhiteOnBlack,
-                    ] {
-                        ui.selectable_value(&mut self.msg_colors, scheme, scheme.label());
-                    }
-                });
-            ui.separator();
-            ui.label(bold("Mono"));
-            egui::ComboBox::from_id_salt("msg_font")
-                .selected_text(self.msg_font.label())
-                .show_ui(ui, |ui| {
-                    for &font in MonoFont::ALL {
-                        ui.selectable_value(&mut self.msg_font, font, font.label());
-                    }
-                });
-        });
-        let msg_mode = self.msg_mode;
-        let msg_chars = self.msg_chars;
-        let font_size = self.msg_font_size;
-        let mono_family = self.msg_font.family();
-        let fg = self.msg_colors.fg();
-        let bg = self.msg_colors.bg();
+        }
+
+        let msg_mode = prefs.mode;
+        let msg_chars = prefs.chars;
+        let font_size = prefs.font_size;
+        let mono_family = prefs.mono.family();
+        let fg = prefs.colors.fg();
+        let bg = prefs.colors.bg();
 
         let has_snapshot = self
             .state
@@ -134,16 +100,6 @@ impl ListenerApp {
             hex_separator: " ".to_string(),
             hex_bytes_per_line: 16,
         };
-        let stream_len = self
-            .state
-            .channel(id)
-            .map(|v| v.stream_bytes.len())
-            .unwrap_or(0);
-        ui.label(format!(
-            "Scroll buffer ({}):",
-            human_bytes(stream_len as u64)
-        ));
-
         // Verbatim received bytes (§17–18, §41): line breaks come only from the
         // data — Rendered honors real CR/LF (§44), Raw shows control pictures, Hex
         // is a byte run. Serial and UDP render identically (no reframing).
@@ -282,6 +238,92 @@ impl ListenerApp {
             });
     }
 
+    /// The view-configuration controls (inside the "View configuration" dropdown):
+    /// View mode + ctrl-chars on one row, font size / colors / mono on the next, then
+    /// the scroll-buffer size readout. Edits the passed-in [`ViewPrefs`] (a clone of
+    /// the selected channel's); the caller persists any change. `stream_len` is the
+    /// channel's current scrollback byte count. Takes `&self` — touches no app state
+    /// beyond rendering.
+    fn show_view_controls(&self, ui: &mut egui::Ui, prefs: &mut ViewPrefs, stream_len: usize) {
+        let base = egui::TextStyle::Body.resolve(ui.style()).size;
+        ui.horizontal(|ui| {
+            ui.label(bold("View"));
+            ui.radio_value(&mut prefs.mode, DisplayMode::Hex, "Hex");
+            ui.radio_value(&mut prefs.mode, DisplayMode::Rendered, "Rendered");
+            ui.radio_value(&mut prefs.mode, DisplayMode::Raw, "Raw");
+            ui.separator();
+            // Control-character rendering (§46) — enabled only in Raw mode. The
+            // oversized ␊ glyph makes the row taller than the text, so the whole
+            // ctrl-chars cluster is bottom-aligned to sit on the View radios' baseline.
+            ui.add_enabled_ui(prefs.mode == DisplayMode::Raw, |ui| {
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(bold("ctrl-chars"));
+                        ui.radio_value(
+                            &mut prefs.chars,
+                            CharacterRendering::Glyph,
+                            egui::RichText::new("␊").size(base * 1.6),
+                        )
+                        .on_hover_text("Control pictures (␊ ␍ ␉ …)");
+                        ui.radio_value(&mut prefs.chars, CharacterRendering::Token, "[LF]")
+                            .on_hover_text("Bracketed names ([LF] [CR] [TAB] …)");
+                        ui.radio_value(&mut prefs.chars, CharacterRendering::HexEscape, "<0A>")
+                            .on_hover_text("Hex escapes (<0A> <0D> <09> …)");
+                    });
+                });
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.label(bold("Size"));
+            // An editable "combo": type any size into the field, or pick a preset from
+            // the ▾ menu; the text is the source of truth while editing.
+            let resp = ui.add(egui::TextEdit::singleline(&mut prefs.font_text).desired_width(40.0));
+            if resp.changed() {
+                if let Ok(v) = prefs.font_text.trim().parse::<f32>() {
+                    prefs.font_size = v.clamp(6.0, 72.0);
+                }
+            }
+            ui.menu_button("\u{25BC}", |ui| {
+                for &size in MSG_FONT_SIZES {
+                    if ui.button(format!("{size:.0}")).clicked() {
+                        prefs.font_size = size;
+                        prefs.font_text = format!("{size:.0}");
+                        ui.close();
+                    }
+                }
+            });
+            ui.separator();
+            ui.label(bold("Colors"));
+            egui::ComboBox::from_id_salt("msg_colors")
+                .selected_text(prefs.colors.label())
+                .show_ui(ui, |ui| {
+                    for scheme in [
+                        ColorScheme::BlackOnWhite,
+                        ColorScheme::GreenOnBlack,
+                        ColorScheme::AmberOnBlack,
+                        ColorScheme::WhiteOnBlack,
+                    ] {
+                        ui.selectable_value(&mut prefs.colors, scheme, scheme.label());
+                    }
+                });
+            ui.separator();
+            ui.label(bold("Mono"));
+            egui::ComboBox::from_id_salt("msg_font")
+                .selected_text(prefs.mono.label())
+                .show_ui(ui, |ui| {
+                    for &font in MonoFont::ALL {
+                        ui.selectable_value(&mut prefs.mono, font, font.label());
+                    }
+                });
+        });
+        // The channel's current scrollback size (§87) — a per-channel readout, so it
+        // belongs with the per-channel view settings.
+        ui.label(format!(
+            "Scroll buffer ({})",
+            human_bytes(stream_len as u64)
+        ));
+    }
+
     /// Refresh the memoized stream-view rows for `id` if the accumulated bytes or
     /// the render settings changed. Keyed on the view's stream cursor (advances as
     /// deltas are folded) plus the view mode/character rendering, so we re-render
@@ -295,8 +337,8 @@ impl ListenerApp {
             channel: id,
             cursor: view.stream_cursor,
             len: view.stream_bytes.len(),
-            mode: self.msg_mode,
-            chars: self.msg_chars,
+            mode: view.view_prefs.mode,
+            chars: view.view_prefs.chars,
             wrap_cols,
         };
         if self.stream_cache.as_ref().is_some_and(|c| c.key == key) {

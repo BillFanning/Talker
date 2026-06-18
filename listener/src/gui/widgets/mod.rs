@@ -33,7 +33,7 @@ pub(super) enum AddKind {
 
 /// A simple preset color scheme for the message view (#6 — simpler than a picker).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum ColorScheme {
+pub(crate) enum ColorScheme {
     BlackOnWhite,
     GreenOnBlack,
     AmberOnBlack,
@@ -61,6 +61,29 @@ impl ColorScheme {
         match self {
             ColorScheme::BlackOnWhite => egui::Color32::from_gray(252),
             _ => egui::Color32::from_gray(16),
+        }
+    }
+
+    /// A stable token for persisting the preset in a profile. The scheme bundles fg+bg,
+    /// so it round-trips as one token (stored in `DisplayViewConfig.foreground_color`)
+    /// rather than two free color strings. Pairs with [`from_name`](Self::from_name).
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            ColorScheme::BlackOnWhite => "black_on_white",
+            ColorScheme::GreenOnBlack => "green_on_black",
+            ColorScheme::AmberOnBlack => "amber_on_black",
+            ColorScheme::WhiteOnBlack => "white_on_black",
+        }
+    }
+
+    /// Parse a persisted token back to a preset; unknown/None falls back to the default
+    /// (BlackOnWhite).
+    pub(super) fn from_name(name: Option<&str>) -> Self {
+        match name {
+            Some("green_on_black") => ColorScheme::GreenOnBlack,
+            Some("amber_on_black") => ColorScheme::AmberOnBlack,
+            Some("white_on_black") => ColorScheme::WhiteOnBlack,
+            _ => ColorScheme::BlackOnWhite,
         }
     }
 }
