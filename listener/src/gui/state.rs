@@ -66,8 +66,8 @@ pub struct ChannelView {
     pub boundary_saves: u64,
     /// Accumulated stream scrollback bytes for the live viewer (§87, ADR-009),
     /// grown incrementally from [`UiUpdate::StreamDelta`] so the driver never
-    /// re-ships the whole ~1 MB buffer each poll. Capped to `STREAM_VIEW_CAP`
-    /// (oldest dropped) to match the runtime's bounded scrollback.
+    /// re-ships the whole buffer each poll. Capped (oldest dropped) at this channel's
+    /// `view_prefs.scroll_buffer_bytes` — the same value the runtime retains.
     pub stream_bytes: std::collections::VecDeque<u8>,
     /// Next absolute stream offset to request — the cursor handed to
     /// `Listener::stream_delta`. Advances as deltas are folded.
@@ -77,19 +77,6 @@ pub struct ChannelView {
     /// on add/load and folded back on save (see [`super::view_prefs`]).
     pub(crate) view_prefs: super::view_prefs::ViewPrefs,
 }
-
-/// GUI-side scrollback cap (§87, §124): bounds the accumulated live-view bytes
-/// independent of the runtime cap, so a long-lived selection can't grow the view
-/// model without bound.
-///
-/// This is **display-only** — the live scroll-back window. It feeds nothing else
-/// (recording is a separate pipeline tap; match rules and diagnostics don't read it),
-/// so it only governs how far back you can scroll in the viewer. Kept small (~128 KB,
-/// roughly 1000+ typical lines): the viewer pre-wraps each line into uniform-height
-/// rows and virtualizes them with `show_rows` (laying out only the visible window), so
-/// even at the cap a frame stays cheap. The full history lives in the `.raw` recording,
-/// not here.
-pub const STREAM_VIEW_CAP: usize = 128 * 1024;
 
 impl ChannelView {
     fn new(id: ChannelId, name: String, details: String, config: ChannelConfig) -> Self {
@@ -127,7 +114,11 @@ impl ChannelView {
         }
         self.stream_bytes.extend(bytes.iter().copied());
         self.stream_cursor = end_offset;
-        let overflow = self.stream_bytes.len().saturating_sub(STREAM_VIEW_CAP);
+        // Cap the GUI's accumulated copy at this channel's configured scroll buffer
+        // (the same value the runtime retains — §87), so the viewer scrolls back
+        // exactly as far as the setting allows.
+        let cap = self.view_prefs.scroll_buffer_bytes;
+        let overflow = self.stream_bytes.len().saturating_sub(cap);
         if overflow > 0 {
             self.stream_bytes.drain(..overflow);
         }

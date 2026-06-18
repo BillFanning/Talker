@@ -9,7 +9,10 @@ use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, DisplayVi
 
 use super::super::bridge::UiCommand;
 use super::super::fonts::{bold, MonoFont};
-use super::super::view_prefs::ViewPrefs;
+use super::super::view_prefs::{
+    scroll_buffer_label, ViewPrefs, MAX_SCROLL_BUFFER_BYTES, MIN_SCROLL_BUFFER_BYTES,
+    SCROLL_BUFFER_PRESETS_KB,
+};
 use super::super::widgets::{human_bytes, ColorScheme, MSG_FONT_SIZES};
 use super::super::ListenerApp;
 
@@ -68,13 +71,19 @@ impl ListenerApp {
         })
         .body(|ui| self.show_view_controls(ui, &mut prefs, stream_len));
 
-        // Persist any edit: update this channel's prefs + config and sync the runtime.
+        // Persist any edit: update this channel's prefs + config and sync the runtime
+        // (display + scroll-buffer retention; no restart — see SetViewConfig).
         if let Some(view) = self.state.channel_mut(id) {
             if !view.view_prefs.eq_settings(&prefs) {
                 view.view_prefs = prefs.clone();
                 prefs.apply_to_config(&mut view.config);
                 let display = view.config.display.clone();
-                self.send(UiCommand::SetViewConfig(id, Box::new(display)));
+                let retention = view.config.retention.clone();
+                self.send(UiCommand::SetViewConfig(
+                    id,
+                    Box::new(display),
+                    Box::new(retention),
+                ));
             }
         }
 
@@ -316,12 +325,31 @@ impl ListenerApp {
                     }
                 });
         });
-        // The channel's current scrollback size (§87) — a per-channel readout, so it
-        // belongs with the per-channel view settings.
-        ui.label(format!(
-            "Scroll buffer ({})",
-            human_bytes(stream_len as u64)
-        ));
+        // Scroll-buffer cap (§87): how far back the viewer scrolls, chosen from presets
+        // (0 = off … 256 kB) — no free text, so it's always a known value. The current
+        // fill is shown alongside. Persisted via retention (the runtime adopts it next
+        // start; the GUI viewer caps live).
+        ui.horizontal(|ui| {
+            ui.label(bold("Scroll buffer"));
+            egui::ComboBox::from_id_salt("scroll_buffer")
+                .selected_text(scroll_buffer_label(prefs.scroll_buffer_bytes))
+                .show_ui(ui, |ui| {
+                    for &kb in SCROLL_BUFFER_PRESETS_KB {
+                        let bytes =
+                            (kb * 1024).clamp(MIN_SCROLL_BUFFER_BYTES, MAX_SCROLL_BUFFER_BYTES);
+                        ui.selectable_value(
+                            &mut prefs.scroll_buffer_bytes,
+                            bytes,
+                            scroll_buffer_label(bytes),
+                        );
+                    }
+                });
+            ui.separator();
+            // The current fill (how much is buffered right now, ≤ the cap).
+            ui.label(
+                egui::RichText::new(format!("now: {}", human_bytes(stream_len as u64))).weak(),
+            );
+        });
     }
 
     /// Refresh the memoized stream-view rows for `id` if the accumulated bytes or

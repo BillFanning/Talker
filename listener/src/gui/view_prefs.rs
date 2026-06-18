@@ -20,6 +20,23 @@ use super::widgets::ColorScheme;
 /// The GUI default font size when a config carries none.
 pub(crate) const DEFAULT_FONT_SIZE: f32 = 13.0;
 
+/// Default scroll-buffer cap (§87) when a channel's config carries no retention byte
+/// limit: 64 KB. Bounds both the runtime's retained scrollback and the GUI viewer's
+/// accumulated copy (they hold the same value — one user concept).
+pub(crate) const DEFAULT_SCROLL_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Min/max the scroll-buffer field clamps to: 2 KB … 256 KB.
+pub(crate) const MIN_SCROLL_BUFFER_BYTES: usize = 2 * 1024;
+pub(crate) const MAX_SCROLL_BUFFER_BYTES: usize = 256 * 1024;
+
+/// The selectable scroll-buffer presets (kB), 2 KB … 256 KB.
+pub(crate) const SCROLL_BUFFER_PRESETS_KB: &[usize] = &[2, 8, 16, 32, 64, 128, 256];
+
+/// A label for a scroll-buffer byte size in the dropdown ("N kB").
+pub(crate) fn scroll_buffer_label(bytes: usize) -> String {
+    format!("{} kB", bytes / 1024)
+}
+
 /// One channel's stream-view presentation settings.
 #[derive(Clone)]
 pub(crate) struct ViewPrefs {
@@ -31,6 +48,11 @@ pub(crate) struct ViewPrefs {
     pub font_text: String,
     pub mono: MonoFont,
     pub colors: ColorScheme,
+    /// Scroll-buffer cap in bytes (§87): how far back the viewer scrolls. Drives the
+    /// GUI viewer's accumulation cap live and persists as the channel's
+    /// `retention.byte_limit` (the runtime adopts it on the channel's next start).
+    /// Set from the presets-only dropdown (no free text), so it's always a known value.
+    pub scroll_buffer_bytes: usize,
 }
 
 impl Default for ViewPrefs {
@@ -43,6 +65,7 @@ impl Default for ViewPrefs {
             font_text: format!("{DEFAULT_FONT_SIZE:.0}"),
             mono: MonoFont::Cascadia,
             colors: ColorScheme::BlackOnWhite,
+            scroll_buffer_bytes: DEFAULT_SCROLL_BUFFER_BYTES,
         }
     }
 }
@@ -56,14 +79,25 @@ impl ViewPrefs {
             && self.font_size == other.font_size
             && self.mono == other.mono
             && self.colors == other.colors
+            && self.scroll_buffer_bytes == other.scroll_buffer_bytes
     }
 
     /// Seed prefs from a channel's first display view (or defaults if it has none).
     /// Mode and ctrl-chars map directly; the font face and color scheme are parsed
     /// from their persisted preset tokens; an absent font size falls back to default.
     pub(crate) fn from_config(config: &crate::config::ChannelConfig) -> Self {
+        // Scroll buffer comes from retention (a channel-level field), independent of
+        // whether the channel has a display view.
+        let scroll_buffer_bytes = config
+            .retention
+            .byte_limit
+            .unwrap_or(DEFAULT_SCROLL_BUFFER_BYTES)
+            .clamp(MIN_SCROLL_BUFFER_BYTES, MAX_SCROLL_BUFFER_BYTES);
         let Some(view) = config.display.views.first() else {
-            return Self::default();
+            return Self {
+                scroll_buffer_bytes,
+                ..Self::default()
+            };
         };
         let font_size = view.font_size.unwrap_or(DEFAULT_FONT_SIZE);
         Self {
@@ -73,15 +107,18 @@ impl ViewPrefs {
             font_text: format!("{font_size:.0}"),
             mono: MonoFont::from_name(view.font.as_deref()),
             colors: ColorScheme::from_name(view.foreground_color.as_deref()),
+            scroll_buffer_bytes,
         }
     }
 
-    /// Fold these prefs into a channel's first display view so a profile save captures
-    /// them. No-op if the channel has no display view.
+    /// Fold these prefs into a channel's config so a profile save captures them: the
+    /// presentation fields onto the first display view, and the scroll buffer onto
+    /// `retention.byte_limit`. The display no-ops if the channel has no view.
     pub(crate) fn apply_to_config(&self, config: &mut crate::config::ChannelConfig) {
         if let Some(view) = config.display.views.first_mut() {
             apply_to_view(self, view);
         }
+        config.retention.byte_limit = Some(self.scroll_buffer_bytes);
     }
 }
 
@@ -109,9 +146,11 @@ mod tests {
         prefs.font_size = 20.0;
         prefs.mono = MonoFont::JetBrains;
         prefs.colors = ColorScheme::GreenOnBlack;
+        prefs.scroll_buffer_bytes = 256 * 1024;
 
         // Fold into the config, then re-seed from it — the settings survive.
         prefs.apply_to_config(&mut config);
+        assert_eq!(config.retention.byte_limit, Some(256 * 1024)); // persisted in retention
         let restored = ViewPrefs::from_config(&config);
         assert!(restored.eq_settings(&prefs), "settings should round-trip");
         assert_eq!(restored.font_text, "20"); // edit buffer reflects the size

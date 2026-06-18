@@ -30,9 +30,11 @@ fn raw_and_hex() -> DisplayConfig {
     }
 }
 
-/// A bounded default retention so templates validate (§80).
+/// A bounded default retention so templates validate (§80). 64 KB — matches the GUI's
+/// default scroll buffer (`gui::view_prefs::DEFAULT_SCROLL_BUFFER_BYTES`) and sits
+/// within its 256 KB max, so a fresh channel's Scroll buffer reads 64 kB.
 fn default_retention() -> RetentionConfig {
-    RetentionConfig::with_byte_limit(1_048_576)
+    RetentionConfig::with_byte_limit(64 * 1024)
 }
 
 /// Generic serial channel (§82): 9600 8N1, Raw + Hex.

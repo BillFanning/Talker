@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::config::{ChannelConfig, DisplayConfig, InterfaceConfig, Profile, RawRecordingConfig};
+use crate::config::{
+    ChannelConfig, DisplayConfig, InterfaceConfig, Profile, RawRecordingConfig, RetentionConfig,
+};
 use crate::core::{ChannelId, ChannelName, DisplayViewId, RuntimeEvent};
 use crate::runtime::{ChannelSnapshot, ChannelStats, Listener, PipelineCapacities, StreamDelta};
 use crate::transport::udp::UdpMode;
@@ -82,10 +84,12 @@ pub enum UiCommand {
     /// Apply. The driver arms the running pipeline from these. The outcome shows up in
     /// the next snapshot's recording state.
     SetRecording(ChannelId, bool, Box<RawRecordingConfig>),
-    /// Update a channel's display config (per-channel view settings: mode, font,
-    /// colors — §78) in the stored config, without a restart. The viewer renders these
-    /// GUI-side, so this only keeps the runtime's config current for a profile save.
-    SetViewConfig(ChannelId, Box<DisplayConfig>),
+    /// Update a channel's per-channel view settings in the stored config without a
+    /// restart: the display config (mode, font, colors — §78) and the scroll-buffer
+    /// `retention` (§87). The viewer renders these GUI-side and the GUI caps its own
+    /// scrollback live, so this only keeps the runtime's stored config current — for a
+    /// profile save, and so the runtime adopts the retention on the channel's next start.
+    SetViewConfig(ChannelId, Box<DisplayConfig>, Box<RetentionConfig>),
     /// Tell the driver which channel is on screen (`None` = none). Only the selected
     /// channel gets a snapshot + incremental stream delta polled; the rest get cheap
     /// stats (ADR-006).
@@ -390,10 +394,11 @@ impl Driver {
                     ));
                 }
             }
-            UiCommand::SetViewConfig(id, display) => {
-                // Display/view settings render GUI-side, so this just keeps the stored
-                // config current (no restart) for a later profile save.
-                self.listener.set_display_config(id, *display);
+            UiCommand::SetViewConfig(id, display, retention) => {
+                // View settings render GUI-side and the scroll buffer is capped GUI-side
+                // live, so this just keeps the stored config current (no restart): for a
+                // profile save, and so the runtime adopts the retention on next start.
+                self.listener.set_view_config(id, *display, *retention);
             }
             UiCommand::Select(id) => {
                 // New selection: restart the live stream cursor so the new channel's
@@ -782,13 +787,28 @@ mod tests {
             .send(UiCommand::AddChannel(Box::new(udp_config(free_udp_port()))))
             .await
             .unwrap();
-        // Drain the two ChannelAdded acks.
+        // Drain the two ChannelAdded acks, keeping the first channel's id + config.
         let mut added = 0;
+        let mut first: Option<(ChannelId, ChannelConfig)> = None;
         while added < 2 {
-            if let UiUpdate::ChannelAdded(..) = next(&mut upd_rx).await {
+            if let UiUpdate::ChannelAdded(cid, _, _, config) = next(&mut upd_rx).await {
+                first.get_or_insert((cid, *config));
                 added += 1;
             }
         }
+        // Set a non-default scroll buffer on the first channel (via the view-config
+        // command) so we can prove it survives save→load.
+        let (first_id, first_config) = first.unwrap();
+        let mut retention = first_config.retention.clone();
+        retention.byte_limit = Some(32 * 1024);
+        cmd_tx
+            .send(UiCommand::SetViewConfig(
+                first_id,
+                Box::new(first_config.display.clone()),
+                Box::new(retention),
+            ))
+            .await
+            .unwrap();
         cmd_tx
             .send(UiCommand::SaveProfile(path.clone()))
             .await
@@ -817,15 +837,25 @@ mod tests {
             .await
             .unwrap();
         let mut loaded_channels = 0;
+        let mut saw_scroll_buffer = false;
         let name = loop {
             match next(&mut upd_rx).await {
-                UiUpdate::ChannelAdded(..) => loaded_channels += 1,
+                UiUpdate::ChannelAdded(_, _, _, config) => {
+                    loaded_channels += 1;
+                    if config.retention.byte_limit == Some(32 * 1024) {
+                        saw_scroll_buffer = true;
+                    }
+                }
                 UiUpdate::ProfileLoaded(name) => break name,
                 UiUpdate::ProfileError(e) => panic!("load errored: {e}"),
                 _ => {}
             }
         };
         assert_eq!(loaded_channels, 2, "both saved channels were re-registered");
+        assert!(
+            saw_scroll_buffer,
+            "the per-channel scroll buffer (retention.byte_limit) survived save→load"
+        );
         assert_eq!(name, path.file_stem().unwrap().to_str().unwrap());
 
         cmd_tx.send(UiCommand::Shutdown).await.unwrap();

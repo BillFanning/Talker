@@ -199,14 +199,22 @@ impl Listener {
         self.channels.get(&id).map(|c| &c.config)
     }
 
-    /// Update a Channel's stored **display** config in place, without a restart (§78).
-    /// The stream viewer's presentation (mode, font, colors) is rendered GUI-side, so
-    /// these fields don't affect the live transport/pipeline — this only keeps the
-    /// stored config current so a profile save captures the per-channel view settings.
-    /// Unknown id is ignored.
-    pub fn set_display_config(&mut self, id: ChannelId, display: crate::config::DisplayConfig) {
+    /// Update a Channel's stored per-channel **view** config in place, without a
+    /// restart (§78, §87): the display config and the scroll-buffer `retention`. The
+    /// viewer's presentation (mode, font, colors) is rendered GUI-side and the GUI caps
+    /// its own scrollback live, so neither affects the live transport/pipeline — this
+    /// only keeps the stored config current so a profile save captures the settings and
+    /// the runtime's retention adopts the new limit on the Channel's next start. Unknown
+    /// id is ignored.
+    pub fn set_view_config(
+        &mut self,
+        id: ChannelId,
+        display: crate::config::DisplayConfig,
+        retention: crate::config::RetentionConfig,
+    ) {
         if let Some(channel) = self.channels.get_mut(&id) {
             channel.config.display = display;
+            channel.config.retention = retention;
         }
     }
 
