@@ -326,11 +326,16 @@ impl ListenerApp {
                 });
         });
         // Scroll-buffer cap (§87): how far back the viewer scrolls, chosen from presets
-        // (0 = off … 256 kB) — no free text, so it's always a known value. The current
-        // fill is shown alongside. Persisted via retention (the runtime adopts it next
-        // start; the GUI viewer caps live).
+        // (2 … 256 kB) — no free text, so it's always a known value. The current fill is
+        // shown alongside. Persisted via retention (the runtime adopts it next start; the
+        // GUI viewer caps live).
+        const SCROLL_BUFFER_HINT: &str = "How far back you can scroll in this channel's \
+            view. A larger buffer uses more memory and can make scrolling and rendering \
+            heavier, so pick the smallest that covers what you need — the full history is \
+            kept in the .raw recording regardless.";
         ui.horizontal(|ui| {
-            ui.label(bold("Scroll buffer"));
+            ui.label(bold("Scroll buffer"))
+                .on_hover_text(SCROLL_BUFFER_HINT);
             egui::ComboBox::from_id_salt("scroll_buffer")
                 .selected_text(scroll_buffer_label(prefs.scroll_buffer_bytes))
                 .show_ui(ui, |ui| {
@@ -343,12 +348,15 @@ impl ListenerApp {
                             scroll_buffer_label(bytes),
                         );
                     }
-                });
+                })
+                .response
+                .on_hover_text(SCROLL_BUFFER_HINT);
             ui.separator();
             // The current fill (how much is buffered right now, ≤ the cap).
             ui.label(
                 egui::RichText::new(format!("now: {}", human_bytes(stream_len as u64))).weak(),
-            );
+            )
+            .on_hover_text("Bytes currently buffered (≤ the scroll-buffer cap).");
         });
     }
 
