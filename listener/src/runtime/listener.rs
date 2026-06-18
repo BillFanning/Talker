@@ -83,7 +83,9 @@ struct ReconnectState {
 }
 
 /// Registry entry: the configuration, any accepted-but-unapplied change (§13),
-/// the lifecycle state, and the running handle (when Running).
+/// the lifecycle state, and the live handle — usually present while Running, though a
+/// spontaneous fault can leave a handle attached (effective state Faulted) until a
+/// stop/recovery consumes it.
 struct ManagedChannel {
     config: ChannelConfig,
     pending: Option<ChannelConfig>,
@@ -410,28 +412,37 @@ impl Listener {
 
     /// Stop a Channel (§10.2). A Running Channel is stopped gracefully (§110); a
     /// Faulted Channel is returned to Stopped (§8.5). Other states are illegal.
+    ///
+    /// Split into three phases so a caller can bound only the *await* (the graceful
+    /// drain) without abandoning the bookkeeping: `begin_stop` marks Stopping and takes
+    /// the handle out (cheap, synchronous), `drain_handle` awaits the handle's
+    /// shutdown (the only part that can hang), and `finish_stop` lands the channel in
+    /// Stopped and announces it. `shutdown` uses the phases directly so a timed-out
+    /// drain still runs `finish_stop`; everyone else uses this convenience wrapper.
     pub async fn stop(&mut self, id: ChannelId) -> Result<(), OrchestratorError> {
+        let handle = self.begin_stop(id)?;
+        drain_handle(handle).await;
+        self.finish_stop(id);
+        Ok(())
+    }
+
+    /// Phase 1 of [`stop`](Self::stop): validate the transition, mark a Running
+    /// channel Stopping, and take its handle out (so the slow drain in `drain_handle`
+    /// owns no `&mut self`). Returns the handle to drain (or `None` if there was none,
+    /// e.g. a start-time fault). Illegal from any state but Running/Faulted.
+    fn begin_stop(&mut self, id: ChannelId) -> Result<Option<ChannelHandle>, OrchestratorError> {
         let state = self
             .state(id)
             .ok_or(OrchestratorError::UnknownChannel(id))?;
         match state {
             // Running → graceful drain; Faulted → §8.5 recovery. Both consume the
-            // handle (a spontaneous fault leaves one whose tasks have already
-            // ended; a start-time fault leaves none) and land in Stopped.
+            // handle (a spontaneous fault leaves one whose tasks have already ended; a
+            // start-time fault leaves none) and land in Stopped.
             ChannelState::Running | ChannelState::Faulted => {
                 if state == ChannelState::Running {
                     self.set_state(id, ChannelState::Stopping);
                 }
-                let handle = self.channels.get_mut(&id).and_then(|c| c.handle.take());
-                match handle {
-                    Some(ChannelHandle::Data(tasks)) => {
-                        let _ = tasks.stop().await;
-                    }
-                    Some(ChannelHandle::TcpListener(listener)) => listener.stop().await,
-                    None => {}
-                }
-                self.finish_stop(id);
-                Ok(())
+                Ok(self.channels.get_mut(&id).and_then(|c| c.handle.take()))
             }
             other => Err(OrchestratorError::IllegalTransition {
                 from: other,
@@ -489,6 +500,68 @@ impl Listener {
         }
         if was_running {
             self.start(id).await?;
+        }
+        Ok(())
+    }
+
+    /// Stop a Channel only if it is in a state `stop` accepts (Running or Faulted),
+    /// returning whether a stop actually happened. A no-op (returns `false`) for any
+    /// other state — chiefly Stopped — so callers that just want "make sure it's down"
+    /// don't have to special-case the already-Stopped `IllegalTransition`. (Stopping is
+    /// transient inside a single `stop` call and never observed across an await, so it
+    /// isn't a reachable input here.) Unknown id still errors.
+    pub async fn stop_if_live(&mut self, id: ChannelId) -> Result<bool, OrchestratorError> {
+        let state = self
+            .state(id)
+            .ok_or(OrchestratorError::UnknownChannel(id))?;
+        if matches!(state, ChannelState::Running | ChannelState::Faulted) {
+            self.stop(id).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// The one lifecycle primitive the command layer drives (§10, §13): optionally
+    /// commit a new config, optionally (re)start, in one coordinated, server-side
+    /// sequence — so single-channel and bulk flows share exactly one path and the
+    /// Faulted→Stopped recovery lives here, not in the GUI.
+    ///
+    /// - `config: Some(c)` swaps `c` in as the active config (a live channel is
+    ///   stopped first so it restarts onto `c`; a stopped one just adopts it).
+    /// - `start = true` brings the channel up afterward. A Faulted channel is
+    ///   normalized to Stopped first (§8.5), so the direct `Stopped → Starting`
+    ///   transition is always legal — the illegal `Faulted → Starting` can't occur.
+    ///
+    /// With `config = None, start = true` this is a plain start/retry; with
+    /// `config = Some, start = true` it is "Apply & Restart"/"Start with this config".
+    /// With `config = Some, start = false` it commits the config and leaves the channel
+    /// Stopped — note a *live* channel is stopped to adopt it (it does not stay up on
+    /// the old config); use `start = true` to bring it back.
+    pub async fn commit_and_start(
+        &mut self,
+        id: ChannelId,
+        config: Option<ChannelConfig>,
+        start: bool,
+    ) -> Result<(), OrchestratorError> {
+        if !self.channels.contains_key(&id) {
+            return Err(OrchestratorError::UnknownChannel(id));
+        }
+        if let Some(config) = config {
+            // Stop a live channel so it comes back up on the new config; then swap it in.
+            self.stop_if_live(id).await?;
+            if let Some(channel) = self.channels.get_mut(&id) {
+                channel.pending = None; // the explicit config supersedes any queued one
+                channel.config = config;
+            }
+        }
+        if start {
+            // Normalize Faulted/Reconnecting → Stopped so Start is a legal
+            // Stopped→Starting transition (§8.5); a Running channel is already up.
+            if self.state(id) != Some(ChannelState::Running) {
+                self.stop_if_live(id).await?;
+                self.start(id).await?;
+            }
         }
         Ok(())
     }
@@ -553,11 +626,19 @@ impl Listener {
             // Graceful stop (§110) preserves the accepted backlog — it drains the
             // bounded ingest queue into recordings before finalizing — so we prefer
             // it over a forced abort, which would abandon up to `caps.ingest`
-            // buffered chunks. But it is *bounded*: should a recorder's finalize
-            // hang, the timeout abandons the wait so process exit can't deadlock.
-            // The transport is already cancelled inside `stop`, so the detached
-            // tasks wind down on their own.
-            let _ = tokio::time::timeout(Self::SHUTDOWN_GRACE, self.stop(id)).await;
+            // buffered chunks. But it is *bounded*: should a recorder's finalize hang,
+            // the timeout abandons the *wait* so process exit can't deadlock.
+            //
+            // Crucially we time out only the drain, not the bookkeeping: `begin_stop`
+            // takes the handle out (cancelling the transport, so detached tasks wind
+            // down on their own), and `finish_stop` always runs afterward — so even a
+            // timed-out channel lands in Stopped, clears its handles, and emits
+            // ChannelStopped, rather than being abandoned mid-`Stopping`.
+            let Ok(handle) = self.begin_stop(id) else {
+                continue; // not stoppable (shouldn't happen — we filtered to live)
+            };
+            let _ = tokio::time::timeout(Self::SHUTDOWN_GRACE, drain_handle(handle)).await;
+            self.finish_stop(id);
         }
     }
 
@@ -909,6 +990,20 @@ impl Listener {
     }
 }
 
+/// Phase 2 of [`Listener::stop`]: await the taken-out handle's graceful shutdown.
+/// Owns the handle (no `&mut Listener`), so a caller can wrap *this* in a timeout
+/// and, if it fires, still run `Listener::finish_stop` — the cleanup never depends
+/// on the drain completing.
+async fn drain_handle(handle: Option<ChannelHandle>) {
+    match handle {
+        Some(ChannelHandle::Data(tasks)) => {
+            let _ = tasks.stop().await;
+        }
+        Some(ChannelHandle::TcpListener(listener)) => listener.stop().await,
+        None => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,6 +1105,84 @@ mod tests {
         // Stop returns a Faulted channel to Stopped (§8.5).
         listener.stop(id).await.unwrap();
         assert_eq!(listener.state(id), Some(ChannelState::Stopped));
+    }
+
+    #[tokio::test]
+    async fn commit_and_start_recovers_a_faulted_channel_without_an_explicit_stop() {
+        // A Faulted channel, fixed by committing a good config and starting in one
+        // call — commit_and_start owns the Faulted→Stopped→Starting recovery, so the
+        // caller never issues the intermediate Stop (the bug the GUI worked around).
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let mut bad = udp_channel();
+        if let InterfaceConfig::Udp(udp) = &mut bad.interface {
+            udp.bind_address = "not-an-ip-address".to_string();
+        }
+        let id = listener.add_channel(bad);
+        assert!(listener.start(id).await.is_err());
+        assert_eq!(listener.state(id), Some(ChannelState::Faulted));
+
+        // A plain start from Faulted is still illegal directly...
+        assert!(listener.start(id).await.is_err());
+        // ...but commit_and_start with a good config recovers and comes up Running.
+        listener
+            .commit_and_start(id, Some(udp_channel()), true)
+            .await
+            .unwrap();
+        assert_eq!(listener.state(id), Some(ChannelState::Running));
+    }
+
+    #[tokio::test]
+    async fn commit_and_start_restarts_a_running_channel_onto_the_new_config() {
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+        listener.start(id).await.unwrap();
+        assert_eq!(listener.state(id), Some(ChannelState::Running));
+
+        // Commit a fresh (still-valid) config and restart in one call.
+        listener
+            .commit_and_start(id, Some(udp_channel()), true)
+            .await
+            .unwrap();
+        assert_eq!(listener.state(id), Some(ChannelState::Running));
+    }
+
+    #[tokio::test]
+    async fn stop_if_live_is_a_noop_on_a_stopped_channel() {
+        let mut listener = Listener::with_default_capacities();
+        let _ = listener.take_events();
+        let id = listener.add_channel(udp_channel());
+
+        // Stopped → no stop happened, and no IllegalTransition error to swallow.
+        assert_eq!(listener.stop_if_live(id).await.unwrap(), false);
+        assert_eq!(listener.state(id), Some(ChannelState::Stopped));
+
+        listener.start(id).await.unwrap();
+        // Running → it stops.
+        assert_eq!(listener.stop_if_live(id).await.unwrap(), true);
+        assert_eq!(listener.state(id), Some(ChannelState::Stopped));
+    }
+
+    #[tokio::test]
+    async fn shutdown_lands_channels_in_stopped_and_emits_the_stop() {
+        // shutdown times out only the drain, never the cleanup: every live channel
+        // ends Stopped with a ChannelStopped emitted (see the cancel-vs-drain split).
+        let mut listener = Listener::with_default_capacities();
+        let mut events = listener.take_events().unwrap();
+        let id = listener.add_channel(udp_channel());
+        listener.start(id).await.unwrap();
+        assert_eq!(
+            events.recv().await.unwrap(),
+            RuntimeEvent::ChannelStarted(id)
+        );
+
+        listener.shutdown().await;
+        assert_eq!(listener.state(id), Some(ChannelState::Stopped));
+        assert_eq!(
+            events.recv().await.unwrap(),
+            RuntimeEvent::ChannelStopped(id)
+        );
     }
 
     #[tokio::test]

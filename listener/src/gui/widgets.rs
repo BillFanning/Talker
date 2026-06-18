@@ -447,40 +447,6 @@ pub(super) fn config_incomplete(config: &ChannelConfig) -> bool {
     }
 }
 
-/// One step of an "Apply & Start/Restart" config commit, in dispatch order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum CommitStep {
-    Stop,
-    Reconfigure,
-    Start,
-}
-
-/// Plan an "Apply & Start/Restart": the ordered commands to install the edited
-/// config and bring the channel up, given its current state. `None` means the
-/// config can't start (e.g. no port) — the caller complains and changes nothing.
-///
-/// Pure (no egui, no bridge) so the state-machine sequencing is unit-tested. Start
-/// must be a legal `Stopped → Running` transition (§8.5), so anything currently up
-/// (Running) or not cleanly stoppable (Faulted/Reconnecting) is Stopped first.
-pub(super) fn plan_config_commit(
-    status: ChannelStatus,
-    config_incomplete: bool,
-) -> Option<Vec<CommitStep>> {
-    if config_incomplete {
-        return None;
-    }
-    let mut steps = Vec::new();
-    if matches!(
-        status,
-        ChannelStatus::Running | ChannelStatus::Faulted | ChannelStatus::Reconnecting
-    ) {
-        steps.push(CommitStep::Stop);
-    }
-    steps.push(CommitStep::Reconfigure);
-    steps.push(CommitStep::Start);
-    Some(steps)
-}
-
 /// Whether an edited config draft differs from the channel's committed config in any
 /// way that needs an Apply & Restart — i.e. everything **except** the name, which
 /// renames live without a restart (§6). Used to switch the Start button to
@@ -500,9 +466,10 @@ pub(super) fn config_differs_ignoring_name(
 /// - Stopped → "Start Channel", enabled (Stopped→Starting is legal)
 /// - Running + pending edits → "Apply & Restart", enabled (a coordinated restart)
 /// - Running + no edits → "Start Channel", **disabled** (nothing to do)
-/// - Faulted → "Retry Channel", enabled (Stop then Start, §8.5)
-/// - Reconnecting → "Start Channel", **disabled** — a Start would be an illegal
-///   Reconnecting→Starting transition; Stop is the only valid action mid-reconnect.
+/// - Faulted → "Retry Channel", enabled — one `CommitAndStart`; the runtime
+///   normalizes Faulted→Stopped before starting (§8.5), no client-side Stop step
+/// - Reconnecting → "Start Channel", **disabled** — Stop is the only valid action
+///   mid-reconnect.
 pub(super) fn start_button(status: ChannelStatus, config_changed: bool) -> (&'static str, bool) {
     match status {
         ChannelStatus::Stopped => ("Start Channel", true),
@@ -793,38 +760,6 @@ mod tests {
         );
         assert_eq!(recording_indicator(Some(RecordingState::Disabled)).2, "off");
         assert_eq!(recording_indicator(None).2, "off");
-    }
-
-    #[test]
-    fn config_commit_sequences_by_state() {
-        use CommitStep::*;
-        // Running = a real restart: Stop → Reconfigure → Start.
-        assert_eq!(
-            plan_config_commit(ChannelStatus::Running, false),
-            Some(vec![Stop, Reconfigure, Start])
-        );
-        // Stopped just installs + starts (nothing to stop).
-        assert_eq!(
-            plan_config_commit(ChannelStatus::Stopped, false),
-            Some(vec![Reconfigure, Start])
-        );
-        // Faulted/Reconnecting must be Stopped first so Start is legal (§8.5).
-        for s in [ChannelStatus::Faulted, ChannelStatus::Reconnecting] {
-            assert_eq!(
-                plan_config_commit(s, false),
-                Some(vec![Stop, Reconfigure, Start]),
-                "{s:?}"
-            );
-        }
-        // An incomplete config can't start in any state → refuse (None).
-        for s in [
-            ChannelStatus::Running,
-            ChannelStatus::Stopped,
-            ChannelStatus::Faulted,
-            ChannelStatus::Reconnecting,
-        ] {
-            assert_eq!(plan_config_commit(s, true), None, "{s:?}");
-        }
     }
 
     #[test]

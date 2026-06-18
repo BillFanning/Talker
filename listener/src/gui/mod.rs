@@ -26,8 +26,8 @@ use bridge::{BridgeHandle, UiCommand};
 use fonts::{install_fonts, MonoFont};
 use state::{AppState, ChannelStatus};
 use widgets::{
-    config_incomplete, list_serial_ports, plan_config_commit, status_color, status_glyph,
-    template_for, AddKind, ColorScheme, CommitStep,
+    config_incomplete, list_serial_ports, status_color, status_glyph, template_for, AddKind,
+    ColorScheme,
 };
 
 /// Detach the inherited console when going graphical. The binary is a
@@ -347,51 +347,22 @@ impl ListenerApp {
         }
     }
 
-    /// Apply the edited config and bring the channel up on it in one action (§13) —
-    /// the single "Apply & Restart" button, so there's no separate Apply-then-Start.
-    /// Drives the channel to Stopped first (if it's Running/Faulted/Reconnecting),
-    /// swaps in the new config, then Starts — so Start is always a legal
-    /// Stopped→Running transition (§8.5). Refuses, with an inline complaint, if the
-    /// new config can't start (e.g. no port), leaving the channel as-is.
-    pub(super) fn apply_and_restart(&mut self, id: ChannelId) {
-        let Some((_, config)) = self.edit_draft.clone() else {
-            return;
-        };
-        let Some(status) = self.state.channel(id).map(|v| v.status) else {
-            return;
-        };
-        match plan_config_commit(status, config_incomplete(&config)) {
-            None => self.complain_unconfigured(id),
-            Some(steps) => {
-                for step in steps {
-                    match step {
-                        CommitStep::Stop => self.send(UiCommand::Stop(id)),
-                        CommitStep::Reconfigure => {
-                            self.send(UiCommand::Reconfigure(id, Box::new(config.clone())))
-                        }
-                        CommitStep::Start => self.send(UiCommand::Start(id)),
-                    }
-                }
-            }
-        }
-    }
-
-    /// Start a channel, applying any pending config edits first (the unified "go"
-    /// action). Start always reflects what's in the editor: it commits the edit draft
-    /// via the §13 Reconfigure path and then Starts, so there is no way to start on a
-    /// stale config. Refuses (with an inline complaint) if the config is incomplete —
+    /// Start a channel on the config currently in the editor (the unified "go" action,
+    /// also reached as "Apply & Restart" / "Retry"). Commits the edited config and
+    /// starts in one server-side step (`CommitAndStart` → `commit_and_start`), so Start
+    /// can never run on a stale config and the Faulted/Running→restart sequencing lives
+    /// in the runtime. Refuses, with an inline complaint, if the config is incomplete —
     /// e.g. a UDP channel with no port would otherwise bind an ephemeral port and
-    /// silently "run" (#3, #6). Edits commit only here (or via Apply & Restart), never
-    /// on every keystroke — a running channel keeps its config until you act.
+    /// silently "run" (#3, #6).
     pub(super) fn try_start(&mut self, id: ChannelId) {
         let Some(config) = self.start_config(id) else {
             return;
         };
-        // Reconfigure to the (possibly edited) config, then Start — so Start picks up
-        // pending edits. Reconfiguring a Stopped channel just swaps the config in for
-        // the upcoming Start (§13); no restart of a live channel happens here.
-        self.send(UiCommand::Reconfigure(id, Box::new(config)));
-        self.send(UiCommand::Start(id));
+        self.send(UiCommand::CommitAndStart {
+            id,
+            config: Some(Box::new(config)),
+            start: true,
+        });
     }
 
     /// The config to start channel `id` with: the edit draft if one is loaded for this

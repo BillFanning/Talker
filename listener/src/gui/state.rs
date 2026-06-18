@@ -200,8 +200,9 @@ impl AppState {
 
     /// Channels that can be **started** right now — i.e. Stopped. Used by "Start all"
     /// so it skips channels already Running/Reconnecting (whose Start would be an
-    /// illegal Running→Starting transition). Faulted is excluded here: clearing a
-    /// fault is the per-channel "Retry" (Stop+Start), not a bulk start.
+    /// illegal Running→Starting transition). Faulted is excluded here: clearing a fault
+    /// is the per-channel "Retry" (one `CommitAndStart`; the runtime normalizes
+    /// Faulted→Stopped first), not a bulk start.
     pub fn startable_channel_ids(&self) -> Vec<ChannelId> {
         self.order
             .iter()

@@ -29,9 +29,11 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A command from the GUI to the runtime — the GUI's on-the-wire command form, which
-/// the driver translates into [`Listener`] async method calls (the command surface;
-/// ADR-012). There is no separate `core::RuntimeCommand` enum. Each variant here has
-/// a backing `Listener` method today; the dynamic in-pipeline actions
+/// the driver translates into [`Listener`] calls (the command surface; ADR-012). There
+/// is no separate `core::RuntimeCommand` enum. The lifecycle variants map to `Listener`
+/// methods; some variants are driver-owned *workflows* over several runtime calls
+/// (`StartAll`/`StopAll` iterate, `SaveProfile`/`LoadProfile` gather/swap configs,
+/// `Select` just steers polling). The dynamic in-pipeline actions
 /// (`SetMatchRuleEnabled`, `MarkNow`, mid-run recording enable/disable) wait on the
 /// command channel into `run_channel` (deferred, ADR-008).
 #[derive(Debug)]
@@ -41,28 +43,34 @@ pub enum UiCommand {
     AddChannel(Box<ChannelConfig>),
     Start(ChannelId),
     Stop(ChannelId),
+    /// The unified lifecycle command (maps to `Listener::commit_and_start`): optionally
+    /// commit `config`, optionally `start`, in one coordinated server-side sequence.
+    /// This is how single-channel Start / Retry / "Apply & Restart" all reach the
+    /// runtime — one command, no client-side Stop→Reconfigure→Start choreography, and
+    /// the Faulted→Stopped→Starting recovery lives in the runtime, not the GUI. The
+    /// driver echoes `ChannelReconfigured` when a config was committed.
+    CommitAndStart {
+        id: ChannelId,
+        config: Option<Box<ChannelConfig>>,
+        start: bool,
+    },
     /// Start a batch of channels (the "Start all" button) in one command instead of a
-    /// 2N-command `Reconfigure`+`Start` burst that could overflow the bounded command
-    /// channel. Each pair is a channel id and the config to start it with (the GUI has
-    /// already validated them and filtered out unconfigured / already-running ones).
-    /// The driver reconfigures then starts each, server-side, off the UI thread.
+    /// per-channel command burst that could overflow the bounded command channel. Each
+    /// pair is a channel id and the config to start it with (the GUI has already
+    /// validated them and filtered out unconfigured / already-running ones). The driver
+    /// runs each through the same `commit_and_start` path as the single-channel command.
     StartAll(Vec<(ChannelId, Box<ChannelConfig>)>),
     /// Stop every channel the driver knows about (the "Stop all" button). One command
     /// per click instead of an N-command burst: a burst of per-channel `Stop`s could
     /// overflow the bounded command channel and silently drop some, leaving those
-    /// channels' UI views stuck Running. The driver iterates server-side and awaits
-    /// each stop off the UI thread, skipping channels that aren't stoppable.
+    /// channels' UI views stuck Running. The driver iterates server-side and stops each
+    /// that is live (already-Stopped channels are skipped), off the UI thread.
     StopAll,
     /// Remove a channel from the runtime entirely (stops it first if live). Used to
     /// recover from a misconfigured channel (e.g. a bind conflict).
     RemoveChannel(ChannelId),
-    /// Replace a channel's configuration (e.g. change its port) via the §13
-    /// pending-config/apply path: a Running channel restarts onto the new config;
-    /// a Stopped/Faulted one swaps it in to be used on the next Start/Retry.
-    Reconfigure(ChannelId, Box<ChannelConfig>),
     /// Rename a channel in place — instant, no restart (the name is a label only).
     Rename(ChannelId, ChannelName),
-    ApplyPending(ChannelId),
     PauseDisplay(ChannelId, DisplayViewId),
     ResumeDisplay(ChannelId, DisplayViewId),
     SetRts(ChannelId, bool),
@@ -231,16 +239,7 @@ impl Driver {
                     None => break, // the App dropped its command sender — close down
                 },
                 ev = self.events.recv(), if events_open => match ev {
-                    Some(ev) => {
-                        // A (re)start resets the channel's stream offset to 0; reset our
-                        // cursor so the new stream's first bytes aren't skipped (§87).
-                        if let RuntimeEvent::ChannelStarted(id) | RuntimeEvent::ChannelReconnected(id) = ev {
-                            if Some(id) == self.selected {
-                                self.stream_cursor = 0;
-                            }
-                        }
-                        self.push(UiUpdate::Event(ev));
-                    }
+                    Some(ev) => self.forward_event(ev),
                     None => events_open = false, // stream closed; keep serving commands
                 },
                 _ = snapshot_tick.tick() => self.poll_snapshots().await,
@@ -250,6 +249,56 @@ impl Driver {
 
         // The App is gone (or asked to shut down): stop every channel cleanly.
         self.listener.shutdown().await;
+    }
+
+    /// Forward one runtime event to the GUI, applying the stream-cursor reset a
+    /// (re)start needs (§87). Shared by the `select!` loop and `drain_events`.
+    fn forward_event(&mut self, ev: RuntimeEvent) {
+        // A (re)start resets the channel's stream offset to 0; reset our cursor so the
+        // new stream's first bytes aren't skipped (§87).
+        if let RuntimeEvent::ChannelStarted(id) | RuntimeEvent::ChannelReconnected(id) = ev {
+            if Some(id) == self.selected {
+                self.stream_cursor = 0;
+            }
+        }
+        self.push(UiUpdate::Event(ev));
+    }
+
+    /// Forward every event currently queued in the runtime→driver channel, without
+    /// blocking. The driver owns the `Listener` in this task, so while a long command
+    /// handler (`StartAll`/`StopAll`) awaits the runtime, the `select!` arm that
+    /// normally drains events isn't running — the runtime's `try_send` lifecycle
+    /// events would just pile up in the bounded channel. Calling this after each
+    /// per-channel await keeps it drained so a large batch can't overflow it and lose
+    /// a `ChannelStarted`/`ChannelStopped` (the bug behind stale GUI status).
+    fn drain_events(&mut self) {
+        while let Ok(ev) = self.events.try_recv() {
+            self.forward_event(ev);
+        }
+    }
+
+    /// The single-channel lifecycle path shared by `CommitAndStart` and each entry of
+    /// `StartAll`: optionally commit `config`, optionally `start`, via the runtime's
+    /// `commit_and_start` (which owns the Faulted→Stopped→Starting recovery). Echoes
+    /// `ChannelReconfigured` when a config was committed so the UI refreshes its editor
+    /// and connection details; reports any failure as a `ChannelError`.
+    async fn commit_and_start_one(
+        &mut self,
+        id: ChannelId,
+        config: Option<ChannelConfig>,
+        start: bool,
+    ) {
+        let echo = config.as_ref().map(|c| (describe_interface(c), c.clone()));
+        match self.listener.commit_and_start(id, config, start).await {
+            Ok(()) => {
+                if let Some((details, config)) = echo {
+                    self.push(UiUpdate::ChannelReconfigured(id, details, Box::new(config)));
+                }
+            }
+            Err(err) => {
+                self.push(UiUpdate::ChannelError(id, err.to_string()));
+            }
+        }
     }
 
     /// Apply one command. Returns `false` only for `Shutdown` (end the loop).
@@ -263,19 +312,6 @@ impl Driver {
                 self.channels.push(id);
                 self.push(UiUpdate::ChannelAdded(id, name, details, echo));
             }
-            UiCommand::Reconfigure(id, config) => {
-                let config = *config;
-                let details = describe_interface(&config);
-                let _ = self.listener.set_pending_config(id, config.clone());
-                match self.listener.apply_pending(id).await {
-                    Ok(()) => {
-                        self.push(UiUpdate::ChannelReconfigured(id, details, Box::new(config)));
-                    }
-                    Err(err) => {
-                        self.push(UiUpdate::ChannelError(id, err.to_string()));
-                    }
-                }
-            }
             UiCommand::Start(id) => {
                 // Surface the reason on failure (e.g. a bind "address in use"),
                 // instead of leaving the channel Faulted with no explanation.
@@ -288,39 +324,31 @@ impl Driver {
                     self.push(UiUpdate::ChannelError(id, err.to_string()));
                 }
             }
+            UiCommand::CommitAndStart { id, config, start } => {
+                self.commit_and_start_one(id, config.map(|c| *c), start)
+                    .await;
+            }
             UiCommand::StartAll(batch) => {
-                // Reconfigure-then-start each channel server-side, awaiting in turn so
-                // the lifecycle events spread across awaits (the bounded event channel
-                // drains between them). The GUI already validated configs and filtered
-                // the batch, so anything here is meant to start.
+                // Run each channel through the same single-channel commit_and_start
+                // path, draining the runtime's lifecycle events after each so a large
+                // batch can't pile them up undrained in the bounded event channel (the
+                // `select!` arm that normally drains them doesn't run while we're here).
                 for (id, config) in batch {
-                    let config = *config;
-                    let details = describe_interface(&config);
-                    let _ = self.listener.set_pending_config(id, config.clone());
-                    if let Err(err) = self.listener.apply_pending(id).await {
-                        self.push(UiUpdate::ChannelError(id, err.to_string()));
-                        continue;
-                    }
-                    self.push(UiUpdate::ChannelReconfigured(id, details, Box::new(config)));
-                    if let Err(err) = self.listener.start(id).await {
-                        self.push(UiUpdate::ChannelError(id, err.to_string()));
-                    }
+                    self.commit_and_start_one(id, Some(*config), true).await;
+                    self.drain_events();
                 }
             }
             UiCommand::StopAll => {
-                // Iterate server-side and await each stop. The runtime rejects a Stop
-                // on an already-Stopped channel (IllegalTransition); that's expected
-                // here, so skip it silently rather than surfacing an error. Each stop
-                // emits its own ChannelStopped, spread across awaits so the bounded
-                // event channel drains between them (the bug a synchronous burst hit).
+                // Stop each *live* channel server-side, off the UI thread. `stop_if_live`
+                // skips an already-Stopped channel (no IllegalTransition to swallow), so
+                // a genuine illegal transition still surfaces as an error instead of
+                // disappearing. Drain events after each so the batch can't overflow the
+                // bounded event channel and lose a ChannelStopped.
                 for id in self.channels.clone() {
-                    match self.listener.stop(id).await {
-                        Ok(()) => {}
-                        Err(crate::runtime::OrchestratorError::IllegalTransition { .. }) => {}
-                        Err(err) => {
-                            self.push(UiUpdate::ChannelError(id, err.to_string()));
-                        }
+                    if let Err(err) = self.listener.stop_if_live(id).await {
+                        self.push(UiUpdate::ChannelError(id, err.to_string()));
                     }
+                    self.drain_events();
                 }
             }
             UiCommand::RemoveChannel(id) => {
@@ -331,11 +359,6 @@ impl Driver {
             UiCommand::Rename(id, name) => {
                 if self.listener.rename(id, name.clone()).is_ok() {
                     self.push(UiUpdate::ChannelRenamed(id, name.as_str().to_string()));
-                }
-            }
-            UiCommand::ApplyPending(id) => {
-                if let Err(err) = self.listener.apply_pending(id).await {
-                    self.push(UiUpdate::ChannelError(id, err.to_string()));
                 }
             }
             UiCommand::PauseDisplay(id, view) => {
@@ -863,5 +886,74 @@ mod tests {
             .await
             .expect("driver did not stop when the command channel closed")
             .unwrap();
+    }
+
+    /// `CommitAndStart` recovers a Faulted channel through the driver in one command:
+    /// no client-side Stop choreography, and the GUI sees the channel come up. Drives
+    /// the channel to Faulted with a bad bind, then commits a good config + starts.
+    #[tokio::test]
+    async fn commit_and_start_recovers_a_faulted_channel_through_the_driver() {
+        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("driver update timed out")
+                .expect("update stream closed")
+        }
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let handle =
+            tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
+
+        // A channel whose bind address is invalid → Start faults it.
+        let mut bad = udp_config(free_udp_port());
+        if let InterfaceConfig::Udp(udp) = &mut bad.interface {
+            udp.bind_address = "not-an-ip-address".to_string();
+        }
+        cmd_tx
+            .send(UiCommand::AddChannel(Box::new(bad)))
+            .await
+            .unwrap();
+        let id = loop {
+            if let UiUpdate::ChannelAdded(id, ..) = next(&mut upd_rx).await {
+                break id;
+            }
+        };
+        cmd_tx.send(UiCommand::Start(id)).await.unwrap();
+        // Observe the fault (forwarded as an Event).
+        loop {
+            if let UiUpdate::Event(RuntimeEvent::ChannelFaulted(fid)) = next(&mut upd_rx).await {
+                assert_eq!(fid, id);
+                break;
+            }
+        }
+
+        // One CommitAndStart with a good config recovers and starts — no manual Stop.
+        cmd_tx
+            .send(UiCommand::CommitAndStart {
+                id,
+                config: Some(Box::new(udp_config(free_udp_port()))),
+                start: true,
+            })
+            .await
+            .unwrap();
+        // We see the reconfigure echo and a ChannelStarted (the recovery worked).
+        let mut reconfigured = false;
+        let mut started = false;
+        while !(reconfigured && started) {
+            match next(&mut upd_rx).await {
+                UiUpdate::ChannelReconfigured(rid, ..) if rid == id => reconfigured = true,
+                UiUpdate::Event(RuntimeEvent::ChannelStarted(sid)) if sid == id => started = true,
+                UiUpdate::ChannelError(eid, msg) if eid == id => {
+                    panic!("commit_and_start should have recovered the channel, got: {msg}")
+                }
+                _ => {}
+            }
+        }
+
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 }

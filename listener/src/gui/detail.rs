@@ -600,14 +600,11 @@ impl ListenerApp {
                 .add_enabled(start_enabled, egui::Button::new(start_label).min_size(size))
                 .clicked()
             {
-                if status == ChannelStatus::Running {
-                    self.apply_and_restart(id); // one coherent restart onto the new config
-                } else {
-                    if status == ChannelStatus::Faulted {
-                        self.send(UiCommand::Stop(id)); // §8.5: Faulted -> Stop first
-                    }
-                    self.try_start(id); // applies pending edits, then starts
-                }
+                // Start / Apply & Restart / Retry are all the same action: commit the
+                // edited config and bring the channel up. `try_start` sends one
+                // CommitAndStart; the runtime handles the Running-restart and the
+                // Faulted→Stopped→Starting recovery (§8.5) — no per-state client steps.
+                self.try_start(id);
             }
             if ui
                 .add_enabled(
