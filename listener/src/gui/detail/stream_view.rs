@@ -1,0 +1,349 @@
+//! The stream viewer: the toolbar (Pause/Resume, View mode, ctrl-chars, font/
+//! colors/mono) above a virtualized, soft-wrapped byte view, plus its row cache and
+//! scrollbar styling. This is the densest layout in the detail pane, so it lives on
+//! its own — see the long comments inside for the layout invariants (row-pitch vs
+//! `show_rows`, scrollbar handle visibility, viewer height/stick-to-bottom).
+
+use crate::core::ChannelId;
+use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, DisplayView, WrappingMode};
+
+use super::super::bridge::UiCommand;
+use super::super::fonts::{bold, MonoFont};
+use super::super::widgets::{human_bytes, ColorScheme, MSG_FONT_SIZES};
+use super::super::ListenerApp;
+
+impl ListenerApp {
+    /// The stream viewer (§41): the toolbar (Pause/Resume, View mode, ctrl-chars,
+    /// font/colors/mono) above a virtualized, soft-wrapped byte view. Split out of
+    /// `show_detail` — this is the densest layout in the pane (scrollbar styling,
+    /// selectable-label visuals, row-pitch/virtualization), so it lives on its own.
+    pub(super) fn show_stream_view(&mut self, ui: &mut egui::Ui, id: ChannelId) {
+        let base = egui::TextStyle::Body.resolve(ui.style()).size;
+        // Stream-view controls, below Diagnostics. Row 1: Pause/Resume (if a Display
+        // View exists) + the View mode (Hex/Rendered/Raw) + the ctrl-chars rendering
+        // (Raw mode only). Row 2: the font/colors/mono pickers.
+        let view0 = self
+            .state
+            .channel(id)
+            .and_then(|v| v.snapshot.as_ref())
+            .and_then(|s| s.display_views.first())
+            .map(|v0| (v0.id, v0.paused));
+        ui.horizontal(|ui| {
+            if let Some((view_id, is_paused)) = view0 {
+                if is_paused {
+                    if ui.button("Resume").clicked() {
+                        self.send(UiCommand::ResumeDisplay(id, view_id));
+                    }
+                    ui.label("view paused — reception continues");
+                } else if ui.button("Pause").clicked() {
+                    self.send(UiCommand::PauseDisplay(id, view_id));
+                }
+                ui.separator();
+            }
+            ui.label(bold("View"));
+            ui.radio_value(&mut self.msg_mode, DisplayMode::Hex, "Hex");
+            ui.radio_value(&mut self.msg_mode, DisplayMode::Rendered, "Rendered");
+            ui.radio_value(&mut self.msg_mode, DisplayMode::Raw, "Raw");
+            ui.separator();
+            // Control-character rendering (§46) — on the same row as View, enabled only
+            // in Raw mode. The oversized ␊ glyph makes the row taller than the text, so
+            // the "ctrl-chars" label is bottom-aligned to sit on the radios' baseline.
+            ui.add_enabled_ui(self.msg_mode == DisplayMode::Raw, |ui| {
+                // The oversized ␊ glyph makes this row taller than plain text. Render
+                // the whole ctrl-chars cluster bottom-aligned so the "ctrl-chars" label
+                // and the radio captions sit on the same baseline as the View radios.
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(bold("ctrl-chars"));
+                        ui.radio_value(
+                            &mut self.msg_chars,
+                            CharacterRendering::Glyph,
+                            egui::RichText::new("␊").size(base * 1.6),
+                        )
+                        .on_hover_text("Control pictures (␊ ␍ ␉ …)");
+                        ui.radio_value(&mut self.msg_chars, CharacterRendering::Token, "[LF]")
+                            .on_hover_text("Bracketed names ([LF] [CR] [TAB] …)");
+                        ui.radio_value(&mut self.msg_chars, CharacterRendering::HexEscape, "<0A>")
+                            .on_hover_text("Hex escapes (<0A> <0D> <09> …)");
+                    });
+                });
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.label(bold("Size"));
+            // An editable "combo": type any size into the field, or pick a preset from
+            // the ▾ menu; the text is the source of truth while editing.
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.font_text).desired_width(40.0));
+            if resp.changed() {
+                if let Ok(v) = self.font_text.trim().parse::<f32>() {
+                    self.msg_font_size = v.clamp(6.0, 72.0);
+                }
+            }
+            ui.menu_button("\u{25BC}", |ui| {
+                for &size in MSG_FONT_SIZES {
+                    if ui.button(format!("{size:.0}")).clicked() {
+                        self.msg_font_size = size;
+                        self.font_text = format!("{size:.0}");
+                        ui.close();
+                    }
+                }
+            });
+            ui.separator();
+            ui.label(bold("Colors"));
+            egui::ComboBox::from_id_salt("msg_colors")
+                .selected_text(self.msg_colors.label())
+                .show_ui(ui, |ui| {
+                    for scheme in [
+                        ColorScheme::BlackOnWhite,
+                        ColorScheme::GreenOnBlack,
+                        ColorScheme::AmberOnBlack,
+                        ColorScheme::WhiteOnBlack,
+                    ] {
+                        ui.selectable_value(&mut self.msg_colors, scheme, scheme.label());
+                    }
+                });
+            ui.separator();
+            ui.label(bold("Mono"));
+            egui::ComboBox::from_id_salt("msg_font")
+                .selected_text(self.msg_font.label())
+                .show_ui(ui, |ui| {
+                    for &font in MonoFont::ALL {
+                        ui.selectable_value(&mut self.msg_font, font, font.label());
+                    }
+                });
+        });
+        let msg_mode = self.msg_mode;
+        let msg_chars = self.msg_chars;
+        let font_size = self.msg_font_size;
+        let mono_family = self.msg_font.family();
+        let fg = self.msg_colors.fg();
+        let bg = self.msg_colors.bg();
+
+        let has_snapshot = self
+            .state
+            .channel(id)
+            .map(|v| v.snapshot.is_some())
+            .unwrap_or(false);
+        // The stream viewer (§41): there is one source — the verbatim byte stream.
+        let renderer = DisplayView {
+            mode: msg_mode,
+            encoding: DisplayEncoding::Utf8,
+            character_rendering: msg_chars,
+            wrapping: WrappingMode::NoWrap,
+            wrap_width: None,
+            hex_separator: " ".to_string(),
+            hex_bytes_per_line: 16,
+        };
+        let stream_len = self
+            .state
+            .channel(id)
+            .map(|v| v.stream_bytes.len())
+            .unwrap_or(0);
+        ui.label(format!(
+            "Scroll buffer ({}):",
+            human_bytes(stream_len as u64)
+        ));
+
+        // Verbatim received bytes (§17–18, §41): line breaks come only from the
+        // data — Rendered honors real CR/LF (§44), Raw shows control pictures, Hex
+        // is a byte run. Serial and UDP render identically (no reframing).
+        //
+        // Performance (§100): the scrollback can reach the ~1 MB cap. The bytes
+        // arrive incrementally (StreamDelta) so the driver never re-ships the whole
+        // buffer; here we (a) memoize the split rows, re-rendering only when data
+        // arrives or the view mode changes — keyed on the stream cursor — and (b)
+        // virtualize the layout with `show_rows`, laying out only visible rows. Both
+        // matter: a non-virtualized selectable Label over ~1 MB stalled the UI.
+        let font = egui::FontId::new(font_size, mono_family.clone());
+        // Monospace metrics: row height and the width of one glyph ('0' as a stand-in),
+        // so we can convert the available pixel width into a column count for wrapping.
+        let (row_h, char_w) =
+            ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0').max(1.0)));
+        // Width of the (non-floating) vertical scrollbar. Used both to size the bar
+        // below and to reserve its space when wrapping, so a full row ends just before
+        // the bar instead of under it. One const so the two uses can't drift apart.
+        const SCROLLBAR_WIDTH: f32 = 12.0;
+        // Pin the viewer to exactly the height left in the pane, so the ScrollArea owns
+        // the scrolling (and `stick_to_bottom` keeps the newest bytes pinned to the
+        // bottom edge) instead of the content overflowing and scrolling the whole pane —
+        // which left the latest data stranded below the window fold ("never reaches the
+        // bottom"). The Frame's 4px inner margin top+bottom is subtracted.
+        let viewer_height = (ui.available_height() - 8.0).max(0.0);
+        egui::Frame::new()
+            .fill(bg)
+            .inner_margin(4.0)
+            .show(ui, |ui| {
+                // Pre-wrap each cached row to the columns that fit the viewer's inner
+                // width (less the scrollbar), so every row is exactly one visual line —
+                // uniform height, which `show_rows` needs to virtualize. Re-wraps only
+                // when the column count changes (the cache key includes it).
+                let avail_w = (ui.available_width() - SCROLLBAR_WIDTH).max(char_w);
+                let wrap_cols = (avail_w / char_w).floor().max(8.0) as usize;
+                self.refresh_stream_rows(id, &renderer, wrap_cols);
+                let rows: &[String] = self
+                    .stream_cache
+                    .as_ref()
+                    .filter(|c| c.key.channel == id)
+                    .map(|c| c.rows.as_slice())
+                    .unwrap_or(&[]);
+                // The viewer fills its full height whether or not data is flowing — the
+                // ScrollArea (`auto_shrink([false,false])`) reserves the space, so the
+                // window doesn't pop open when a channel starts. Empty state shows a
+                // weak note *inside* the scroll area rather than collapsing the frame.
+                // Text selection across the (non-interactive) row labels.
+                ui.style_mut().interaction.selectable_labels = true;
+                // Give the scrollbar a visible track + handle, distinct from the text
+                // background, so the strip on the right edge reads as the scrollbar (not
+                // mysterious empty space). Both contrast with `bg`, the handle more
+                // strongly (see `scrollbar_colors`). Set before the per-widget overrides.
+                let (track, handle) = scrollbar_colors(bg);
+                ui.visuals_mut().extreme_bg_color = track;
+                // A solid, constant-width scrollbar. egui's default is "floating" — thin
+                // until hovered, which read as the track widening on hover; `floating =
+                // false` plus a fixed `bar_width` (and zero margins) pins it to a steady
+                // strip the width we reserved above.
+                {
+                    let s = &mut ui.style_mut().spacing.scroll;
+                    s.floating = false;
+                    s.bar_width = SCROLLBAR_WIDTH;
+                    s.bar_inner_margin = 0.0;
+                    s.bar_outer_margin = 0.0;
+                }
+                // Suppress the per-widget hover/active visuals egui paints on selectable
+                // labels (they drew a flickering box around the rows near the pointer).
+                {
+                    let w = &mut ui.visuals_mut().widgets;
+                    for s in [
+                        &mut w.hovered,
+                        &mut w.active,
+                        &mut w.inactive,
+                        &mut w.noninteractive,
+                    ] {
+                        s.bg_stroke = egui::Stroke::NONE;
+                        s.weak_bg_fill = egui::Color32::TRANSPARENT;
+                        s.bg_fill = egui::Color32::TRANSPARENT;
+                    }
+                }
+                // The scroll handle is drawn from the *idle* widget visuals (egui maps an
+                // un-hovered scrollbar to `widgets.inactive`), using `bg_fill` when
+                // `scroll_style.foreground_color` is false (the default) or `fg_stroke`
+                // when true. We just cleared those fills for the labels, which is why the
+                // handle vanished. Set `foreground_color = true` and drive the handle via
+                // `fg_stroke.color` on every interaction state — explicit and immune to
+                // the bg_fill clearing above. Hover/drag brighten so it stays visible on
+                // a dark scheme.
+                ui.style_mut().spacing.scroll.foreground_color = true;
+                {
+                    let w = &mut ui.visuals_mut().widgets;
+                    w.inactive.fg_stroke.color = handle;
+                    w.noninteractive.fg_stroke.color = handle;
+                    w.hovered.fg_stroke.color = handle.gamma_multiply(1.2);
+                    w.active.fg_stroke.color = handle.gamma_multiply(1.4);
+                }
+                // Zero the inter-row spacing *here*, before `show_rows`, so the row pitch
+                // it uses to size the virtual content (and thus where `stick_to_bottom`
+                // scrolls) matches what the rows actually render at. Setting it only
+                // inside the closure left `show_rows` reserving `row_h + default_spacing`
+                // per row while rows drew at `row_h`, so the computed bottom overshot the
+                // real last row and the newest data never came into view.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let scroll = egui::ScrollArea::vertical()
+                    .id_salt("stream")
+                    .stick_to_bottom(true)
+                    .max_height(viewer_height)
+                    .auto_shrink([false, false]);
+                if stream_len == 0 {
+                    // No data yet: still occupy the full viewer height, with a note.
+                    scroll.show(ui, |ui| {
+                        let note = if has_snapshot {
+                            "no data received yet"
+                        } else {
+                            "waiting for data — Start the channel"
+                        };
+                        ui.label(egui::RichText::new(note).weak());
+                    });
+                    return;
+                }
+                // Soft-wrapped AND virtualized: rows are pre-wrapped to `wrap_cols`
+                // (above) so each is one uniform-height visual line, which lets
+                // `show_rows` lay out only the visible rows. This is what keeps the UI
+                // responsive — the earlier "render everything" approaches (N labels or
+                // one giant galley) re-laid-out the whole buffer every frame and made
+                // resizing/the whole UI sluggish. Rows don't wrap again here (they're
+                // already wrapped); they just extend if anything slipped through.
+                scroll.show_rows(ui, row_h, rows.len().max(1), |ui, range| {
+                    for row in &rows[range] {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(row).font(font.clone()).color(fg))
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                        );
+                    }
+                });
+            });
+    }
+
+    /// Refresh the memoized stream-view rows for `id` if the accumulated bytes or
+    /// the render settings changed. Keyed on the view's stream cursor (advances as
+    /// deltas are folded) plus the view mode/character rendering, so we re-render
+    /// the scrollback only when something actually changed — not every frame.
+    fn refresh_stream_rows(&mut self, id: ChannelId, renderer: &DisplayView, wrap_cols: usize) {
+        let Some(view) = self.state.channel_mut(id) else {
+            self.stream_cache = None;
+            return;
+        };
+        let key = super::super::StreamRenderKey {
+            channel: id,
+            cursor: view.stream_cursor,
+            len: view.stream_bytes.len(),
+            mode: self.msg_mode,
+            chars: self.msg_chars,
+            wrap_cols,
+        };
+        if self.stream_cache.as_ref().is_some_and(|c| c.key == key) {
+            return; // still valid — reuse the cached rows
+        }
+        let rows = split_stream_rows(&renderer.render_text(view.stream_contiguous()), wrap_cols);
+        self.stream_cache = Some(super::super::StreamRenderCache { key, rows });
+    }
+}
+
+/// Scrollbar (track, handle) colors for a viewer whose text background is `bg`. Both
+/// are nudged off `bg` toward its opposite end so the scrollbar reads as a distinct
+/// strip against the text background — the track subtly, the handle more strongly —
+/// and the choice works for both a light (black-on-white) and dark (white-on-black)
+/// scheme. Returns colors, not a mutation, so the caller controls when they apply.
+fn scrollbar_colors(bg: egui::Color32) -> (egui::Color32, egui::Color32) {
+    // Perceived lightness of the background; pick the contrast direction from it.
+    let light = (bg.r() as u32 + bg.g() as u32 + bg.b() as u32) / 3 > 128;
+    if light {
+        // Light bg: a light-grey track, a mid-grey handle.
+        (egui::Color32::from_gray(225), egui::Color32::from_gray(150))
+    } else {
+        // Dark bg: a clearly-lifted track (so it reads against near-black text bg) and
+        // a much brighter handle on top of it (gray-95 track vs gray-200 handle reads
+        // clearly even when idle).
+        (egui::Color32::from_gray(95), egui::Color32::from_gray(200))
+    }
+}
+
+/// Split rendered stream text into virtualization rows, soft-wrapping each data line
+/// to `wrap_cols` monospace columns so every row is exactly one visual line (uniform
+/// height — required by `show_rows`). A data line shorter than `wrap_cols` is one row;
+/// a longer one (or a line with no LF, e.g. raw binary / UDP) is wrapped into several.
+fn split_stream_rows(text: &str, wrap_cols: usize) -> Vec<String> {
+    let cols = wrap_cols.max(8);
+    let mut rows: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        if line.is_empty() {
+            rows.push(String::new());
+            continue;
+        }
+        // Wrap by character count (monospace, so columns == chars). Char-based, not
+        // byte-based, so multi-byte UTF-8 isn't split mid-codepoint.
+        let chars: Vec<char> = line.chars().collect();
+        for chunk in chars.chunks(cols) {
+            rows.push(chunk.iter().collect());
+        }
+    }
+    rows
+}

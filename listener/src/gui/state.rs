@@ -81,9 +81,10 @@ pub struct ChannelView {
 /// This is **display-only** — the live scroll-back window. It feeds nothing else
 /// (recording is a separate pipeline tap; match rules and diagnostics don't read it),
 /// so it only governs how far back you can scroll in the viewer. Kept small (~128 KB,
-/// roughly 1000+ typical lines) so the viewer can soft-wrap every line each frame
-/// without virtualization and still stay cheap; the full history lives in the `.raw`
-/// recording, not here.
+/// roughly 1000+ typical lines): the viewer pre-wraps each line into uniform-height
+/// rows and virtualizes them with `show_rows` (laying out only the visible window), so
+/// even at the cap a frame stays cheap. The full history lives in the `.raw` recording,
+/// not here.
 pub const STREAM_VIEW_CAP: usize = 128 * 1024;
 
 impl ChannelView {

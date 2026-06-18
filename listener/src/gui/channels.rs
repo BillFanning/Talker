@@ -245,9 +245,16 @@ impl ListenerApp {
     }
 
     /// Always prompt for a destination, then save there and remember it as the
-    /// current profile path. The picker runs synchronously on the UI thread (a brief
-    /// modal); the actual file write happens off-thread in the driver (§67). Defaults
-    /// to the app's `profiles/` directory (next to the exe) on first use.
+    /// current profile path. Defaults to the app's `profiles/` directory (next to the
+    /// exe) on first use.
+    ///
+    /// **The one intentional exception to "the UI thread never blocks / never does
+    /// I/O" (AGENTS §5).** A native file picker is inherently modal and synchronous, so
+    /// `save_file()`/`pick_file()` (and the best-effort `profiles_dir()` mkdir that
+    /// seeds them) run on the UI thread for the moment the dialog is open. That's
+    /// acceptable: it's a user-driven modal, not background work, and the only blocking
+    /// call. The actual profile *write* still happens off-thread in the driver (§67) —
+    /// this method just hands it the chosen path.
     pub(super) fn save_profile_as(&mut self) {
         let mut dialog = rfd::FileDialog::new().add_filter("TOML profile", &["toml"]);
         // Seed the picker with the current file's name/location if we have one;
