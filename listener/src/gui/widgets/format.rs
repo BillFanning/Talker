@@ -1,0 +1,34 @@
+//! Pure string/number formatting helpers for the GUI readouts. No egui, no state.
+
+/// Truncate a one-line status to `max` characters (on a char boundary), adding an
+/// ellipsis when shortened — keeps the collapsed diagnostics header tidy.
+pub(crate) fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{kept}\u{2026}")
+    }
+}
+
+/// Format a byte count compactly in SI units (kB = 1000 B, MB = 1000 kB, …) for the
+/// stream liveness readouts (ADR-009): the Channel list rows and the detail header.
+pub(crate) fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1000.0 && u < UNITS.len() - 1 {
+        v /= 1000.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.3} {}", UNITS[u])
+    }
+}
+
+/// Shorten a UUID string to its first segment, enough to disambiguate at a glance.
+pub(crate) fn short_id(id: &str) -> &str {
+    id.split('-').next().unwrap_or(id)
+}

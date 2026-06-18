@@ -1,20 +1,27 @@
 //! Stateless presentation helpers for the GUI: small reusable widgets, the serial
 //! option tables, the interface-config editor, and pure formatting/utility
 //! functions. Nothing here holds application state — the `ListenerApp` panels in
-//! the parent module call into these.
+//! the parent module call into these. Grouped by responsibility into submodules,
+//! re-exported flat so callers keep using `widgets::<name>`.
 
-use std::path::PathBuf;
+mod format;
+mod recording_editor;
+mod status;
+
+pub(super) use format::{human_bytes, short_id, truncate};
+pub(super) use recording_editor::{edit_display_recording, edit_raw_recording};
+pub(super) use status::{
+    latest_diagnostic, line_indicator, line_toggle, paint_glyph, recording_glyph_size,
+    recording_indicator, start_button, status_color, status_glyph, status_label, stop_enabled,
+};
 
 use crate::config::{
     templates, ChannelConfig, DataBits, FlowControl, InterfaceConfig, Parity, StopBits,
 };
 use crate::core::ChannelId;
-use crate::record::{FileRotationPolicy, OverwritePolicy};
 use crate::transport::udp::UdpMode;
 
 use super::fonts::bold;
-use super::state::ChannelStatus;
-use super::theme;
 
 /// Which interface a new channel uses, in the add-channel form.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -297,120 +304,6 @@ pub(super) fn edit_interface(
     refresh
 }
 
-/// The shared destination / overwrite / rotation / timestamp controls for a recording
-/// (§55–§59), used by both the Raw and Display editors (their config structs carry the
-/// same fields; ADR-013). `ext` is the file extension shown in hints (".raw"/".disp").
-#[allow(clippy::too_many_arguments)]
-fn recording_file_fields(
-    ui: &mut egui::Ui,
-    ext: &str,
-    destination: &mut Option<PathBuf>,
-    overwrite_policy: &mut OverwritePolicy,
-    file_rotation: &mut FileRotationPolicy,
-    timestamp_enabled: &mut bool,
-    // When `Some`, a "Record at start" checkbox is shown on the same line, left of the
-    // "Record timestamps" checkbox (Raw uses this; Display has its own enable above).
-    record_at_start: Option<&mut bool>,
-) {
-    // A single file when not rotating; a directory of <channel>_<period> files
-    // otherwise (§59). `rotating` reflects this frame's start — a one-frame lag when
-    // the user flips rotation below is harmless.
-    let rotating = *file_rotation != FileRotationPolicy::None;
-    ui.horizontal(|ui| {
-        ui.label(if rotating { "Folder" } else { "File" });
-        let mut path = destination
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        if ui
-            .add(egui::TextEdit::singleline(&mut path).desired_width(180.0))
-            .changed()
-        {
-            let trimmed = path.trim();
-            *destination = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed));
-        }
-        if ui.button("Browse…").clicked() {
-            let picked = if rotating {
-                rfd::FileDialog::new().pick_folder()
-            } else {
-                rfd::FileDialog::new().save_file()
-            };
-            if let Some(p) = picked {
-                *destination = Some(p);
-            }
-        }
-    });
-    if destination.is_none() {
-        ui.label(
-            egui::RichText::new("⚠ set a destination — recording won't start without one")
-                .color(theme::WARNING_AMBER),
-        );
-    }
-    ui.horizontal(|ui| {
-        ui.label("On exists");
-        ui.radio_value(overwrite_policy, OverwritePolicy::Refuse, "Refuse");
-        ui.radio_value(overwrite_policy, OverwritePolicy::Overwrite, "Overwrite");
-        ui.radio_value(overwrite_policy, OverwritePolicy::AppendIfExists, "Append");
-    });
-    ui.horizontal(|ui| {
-        ui.label("Rotate");
-        ui.radio_value(file_rotation, FileRotationPolicy::None, "None");
-        ui.radio_value(file_rotation, FileRotationPolicy::Hourly, "Hourly");
-        ui.radio_value(file_rotation, FileRotationPolicy::Daily, "Daily")
-            .on_hover_text(
-                "Rotating files are named <channel>_<period> — keep the channel name \
-                 filesystem-safe (§59)",
-            );
-    });
-    ui.horizontal(|ui| {
-        if let Some(enabled) = record_at_start {
-            ui.checkbox(enabled, "Record at start")
-                .on_hover_text("Begin recording when the channel starts (§53)");
-        }
-        ui.checkbox(timestamp_enabled, format!("Record timestamps ({ext})"))
-            .on_hover_text("Sidecar index for Raw; inline for Display (§57)");
-    });
-}
-
-/// Edit the channel's **Raw** recording setup (§53): destination, overwrite,
-/// rotation, timestamps, and the "record at start" flag. The byte-exact verbatim
-/// stream (§53) — a separate pipeline tap from Display (ADR-013). Config-driven:
-/// applied via a §13 Reconfigure. The live Record toggle (ADR-012) begins/stops it at
-/// runtime without a restart, as long as a destination is set.
-pub(super) fn edit_raw_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
-    let rec = &mut config.raw_recording;
-    recording_file_fields(
-        ui,
-        ".raw",
-        &mut rec.destination,
-        &mut rec.overwrite_policy,
-        &mut rec.file_rotation,
-        &mut rec.timestamp_enabled,
-        Some(&mut rec.enabled), // "Record at start", shown left of "Record timestamps"
-    );
-}
-
-/// Edit the channel's **Display** recording setup (§54): records the rendered view
-/// output (`.disp`) — a separate pipeline tap from Raw (ADR-013). Config-driven:
-/// applied via a §13 Reconfigure.
-pub(super) fn edit_display_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
-    let rec = &mut config.display_recording;
-    ui.checkbox(&mut rec.enabled, "Record display output (.disp)")
-        .on_hover_text("Record the rendered view, not the raw bytes (§54)");
-    if !rec.enabled {
-        return;
-    }
-    recording_file_fields(
-        ui,
-        ".disp",
-        &mut rec.destination,
-        &mut rec.overwrite_policy,
-        &mut rec.file_rotation,
-        &mut rec.timestamp_enabled,
-        None, // Display has its own enable checkbox above
-    );
-}
-
 /// The available serial port names, sorted (§14.4). Empty if enumeration fails.
 pub(super) fn list_serial_ports() -> Vec<String> {
     let mut ports: Vec<String> = serialport::available_ports()
@@ -460,218 +353,9 @@ pub(super) fn config_differs_ignoring_name(
     &a != committed
 }
 
-/// The Start/Apply/Retry button's label and enabled state, from the channel status
-/// and whether the edit draft has pending changes (§8.5). Pure decision, unit-tested;
-/// the detail pane just renders the result and dispatches on click:
-/// - Stopped → "Start Channel", enabled (Stopped→Starting is legal)
-/// - Running + pending edits → "Apply & Restart", enabled (a coordinated restart)
-/// - Running + no edits → "Start Channel", **disabled** (nothing to do)
-/// - Faulted → "Retry Channel", enabled — one `CommitAndStart`; the runtime
-///   normalizes Faulted→Stopped before starting (§8.5), no client-side Stop step
-/// - Reconnecting → "Start Channel", **disabled** — Stop is the only valid action
-///   mid-reconnect.
-pub(super) fn start_button(status: ChannelStatus, config_changed: bool) -> (&'static str, bool) {
-    match status {
-        ChannelStatus::Stopped => ("Start Channel", true),
-        ChannelStatus::Running if config_changed => ("Apply & Restart", true),
-        ChannelStatus::Running => ("Start Channel", false),
-        ChannelStatus::Faulted => ("Retry Channel", true),
-        ChannelStatus::Reconnecting => ("Start Channel", false),
-    }
-}
-
-/// Whether the Stop button is enabled: a Stop is legal from Running, Faulted, or
-/// Reconnecting (it returns any of those to Stopped, §8.5/§10.2), and illegal from
-/// Stopped. Pure, unit-tested.
-pub(super) fn stop_enabled(status: ChannelStatus) -> bool {
-    matches!(
-        status,
-        ChannelStatus::Running | ChannelStatus::Faulted | ChannelStatus::Reconnecting
-    )
-}
-
-/// The recording-state indicator: glyph, color, and label for a channel's raw
-/// recording state (§53). Uses the **same symbol set as channel status**
-/// ([`status_glyph`]) — `■` off, `●` recording, `⚠` faulted — so the two read
-/// consistently; only the colors differ (recording uses its own red). Pure,
-/// unit-tested; the detail pane renders it as a colored label sized via
-/// [`recording_glyph_size`].
-pub(super) fn recording_indicator(
-    recording: Option<crate::core::RecordingState>,
-) -> (&'static str, egui::Color32, &'static str) {
-    use crate::core::RecordingState;
-    match recording {
-        Some(RecordingState::Enabled) => ("\u{25CF}", theme::FAULT_RED, "recording"),
-        Some(RecordingState::Faulted) => ("\u{26A0}", theme::FAULT_RED, "faulted"),
-        Some(RecordingState::Disabled) | None => ("\u{25A0}", theme::IDLE_GREY, "off"),
-    }
-}
-
-/// The headline diagnostic for the real-time status line: the most recent error,
-/// else the most recent warning, else the most recent event, with its display color.
-/// Errors win so a fault stays visible in the collapsed header while troubleshooting.
-pub(super) fn latest_diagnostic(
-    diag: &crate::runtime::snapshot::DiagnosticsSnapshot,
-) -> (String, egui::Color32) {
-    if let Some(d) = diag.errors.last() {
-        (d.message.clone(), theme::FAULT_RED)
-    } else if let Some(d) = diag.warnings.last() {
-        (d.message.clone(), theme::WARNING_AMBER)
-    } else if let Some(d) = diag.events.last() {
-        (d.message.clone(), theme::EVENT_GREY)
-    } else {
-        ("no activity yet".to_string(), theme::IDLE_GREY)
-    }
-}
-
-/// Truncate a one-line status to `max` characters (on a char boundary), adding an
-/// ellipsis when shortened — keeps the collapsed diagnostics header tidy.
-pub(super) fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let kept: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{kept}\u{2026}")
-    }
-}
-
-/// Format a byte count compactly in SI units (kB = 1000 B, MB = 1000 kB, …) for the
-/// stream liveness readouts (ADR-009): the Channel list rows and the detail header.
-pub(super) fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
-    let mut v = n as f64;
-    let mut u = 0;
-    while v >= 1000.0 && u < UNITS.len() - 1 {
-        v /= 1000.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{n} B")
-    } else {
-        format!("{v:.3} {}", UNITS[u])
-    }
-}
-
-/// A short status word for the detail pane.
-pub(super) fn status_label(status: ChannelStatus) -> &'static str {
-    match status {
-        ChannelStatus::Stopped => "stopped",
-        ChannelStatus::Running => "running",
-        ChannelStatus::Faulted => "faulted",
-        ChannelStatus::Reconnecting => "reconnecting",
-    }
-}
-
-/// A serial control-line indicator (§161): the line name colored green when the
-/// line is high (asserted), grey when low, with a hover tooltip.
-pub(super) fn line_indicator(ui: &mut egui::Ui, name: &str, high: bool) {
-    let color = if high {
-        theme::LINE_HIGH_GREEN
-    } else {
-        theme::LINE_LOW_GREY
-    };
-    ui.colored_label(color, name)
-        .on_hover_text(if high { "high" } else { "low" });
-}
-
-/// A clickable serial output-line toggle (RTS/DTR, §161): a selectable chip,
-/// highlighted and green when the line is asserted (high). Returns the click
-/// response so the caller can send the matching Set command.
-pub(super) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Response {
-    let color = if high {
-        theme::LINE_HIGH_GREEN
-    } else {
-        ui.visuals().weak_text_color()
-    };
-    ui.selectable_label(high, egui::RichText::new(name).color(color))
-        .on_hover_text(format!(
-            "{name} output is {} — click to set it {}",
-            if high { "high" } else { "low" },
-            if high { "low" } else { "high" },
-        ))
-}
-
-/// The color for a status glyph. Running is a bright blue-green and Reconnecting a
-/// yellower amber, both chosen to read distinctly from the red fault for red-green
-/// color blindness (the distinct glyphs ●/■/⚠ are the primary signal; color reinforces).
-/// All values live in [`super::theme`].
-pub(super) fn status_color(status: ChannelStatus) -> egui::Color32 {
-    match status {
-        ChannelStatus::Running => theme::RUNNING_GREEN,
-        ChannelStatus::Stopped => theme::IDLE_GREY,
-        ChannelStatus::Faulted => theme::FAULT_RED,
-        ChannelStatus::Reconnecting => theme::RECONNECTING_AMBER,
-    }
-}
-
-/// The base size multiplier for status indicator glyphs (relative to body size). The
-/// square (`■`) is the reference at this size; the dot and triangle are enlarged by
-/// [`glyph_scale`] to match the square's apparent size.
-pub(super) const STATUS_GLYPH_SCALE: f32 = 1.5;
-
-/// Per-glyph optical correction: `●`/`■`/`⚠` have different bounding boxes, so at one
-/// font size they look different sizes. The square is the reference (1.0); the dot and
-/// triangle are enlarged so all three read the same size. Multiply into
-/// [`STATUS_GLYPH_SCALE`].
-fn glyph_scale(glyph: &str) -> f32 {
-    match glyph {
-        "\u{25A0}" => 1.0,  // ■ square — the reference
-        "\u{25CF}" => 1.34, // ● dot — enlarge up to the square
-        "\u{26A0}" => 1.30, // ⚠ triangle — enlarge up to the square
-        _ => 1.0,
-    }
-}
-
-/// The shared status symbol set + its size, used for BOTH channel-lifecycle and raw-
-/// recording state so the two read consistently:
-/// - Stopped / recording-off → `■`
-/// - Running / recording-on → `●`
-/// - Faulted (channel or recording) → `⚠`
-/// - Reconnecting → `●`
-///
-/// Returns the glyph and the body-relative size (base scale × optical correction), so
-/// every call site renders the same symbol at the same apparent size. Pair with
-/// [`status_color`] (channel) or the recording color from [`recording_indicator`].
-pub(super) fn status_glyph(status: ChannelStatus) -> (&'static str, f32) {
-    let glyph = match status {
-        ChannelStatus::Stopped => "\u{25A0}", // ■ square
-        ChannelStatus::Faulted => "\u{26A0}", // ⚠ triangle
-        ChannelStatus::Running | ChannelStatus::Reconnecting => "\u{25CF}", // ● dot
-    };
-    (glyph, STATUS_GLYPH_SCALE * glyph_scale(glyph))
-}
-
-/// The size for a recording-indicator glyph, matching [`status_glyph`]'s optical
-/// sizing for the same symbol.
-pub(super) fn recording_glyph_size(glyph: &str) -> f32 {
-    STATUS_GLYPH_SCALE * glyph_scale(glyph)
-}
-
-/// Paint a status/recording `glyph` into a **fixed-size, non-interactive cell**,
-/// centered. Painting (rather than adding a sized label) keeps the glyph from driving
-/// the row height — a taller glyph otherwise shifts the line beside it. `allocate_space`
-/// reserves only layout space with no widget id, so there's no stray hover/focus
-/// rectangle. `scale` is the body-relative glyph size (from [`status_glyph`] /
-/// [`recording_glyph_size`]); the cell is sized to the largest glyph.
-pub(super) fn paint_glyph(ui: &mut egui::Ui, glyph: &str, scale: f32, color: egui::Color32) {
-    let base = egui::TextStyle::Body.resolve(ui.style()).size;
-    let (_id, rect) = ui.allocate_space(egui::vec2(base * 1.5, base));
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        glyph,
-        egui::FontId::proportional(base * scale),
-        color,
-    );
-}
-
-/// Shorten a UUID string to its first segment, enough to disambiguate at a glance.
-pub(super) fn short_id(id: &str) -> &str {
-    id.split('-').next().unwrap_or(id)
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::state::ChannelStatus;
     use super::*;
     use crate::diagnostics::Diagnostic;
     use crate::runtime::snapshot::DiagnosticsSnapshot;
