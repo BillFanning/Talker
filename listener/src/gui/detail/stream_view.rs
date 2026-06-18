@@ -64,7 +64,13 @@ impl ListenerApp {
                         self.send(UiCommand::ResumeDisplay(id, view_id));
                     }
                     ui.label("view paused — reception continues");
-                } else if ui.button("Pause").clicked() {
+                } else if ui
+                    .button("Pause")
+                    .on_hover_text(
+                        "Freeze the view — reception continues (the channel stays open).",
+                    )
+                    .clicked()
+                {
                     self.send(UiCommand::PauseDisplay(id, view_id));
                 }
             }
@@ -256,10 +262,17 @@ impl ListenerApp {
     fn show_view_controls(&self, ui: &mut egui::Ui, prefs: &mut ViewPrefs, stream_len: usize) {
         let base = egui::TextStyle::Body.resolve(ui.style()).size;
         ui.horizontal(|ui| {
-            ui.label(bold("View"));
-            ui.radio_value(&mut prefs.mode, DisplayMode::Hex, "Hex");
-            ui.radio_value(&mut prefs.mode, DisplayMode::Rendered, "Rendered");
-            ui.radio_value(&mut prefs.mode, DisplayMode::Raw, "Raw");
+            ui.label(bold("View"))
+                .on_hover_text("How the received bytes are displayed in the viewer.");
+            ui.radio_value(&mut prefs.mode, DisplayMode::Hex, "Hex")
+                .on_hover_text("Each byte as two-digit hex (e.g. 0A 0D 41).");
+            ui.radio_value(&mut prefs.mode, DisplayMode::Rendered, "Rendered")
+                .on_hover_text("As text, honoring real CR/LF line breaks (§44).");
+            ui.radio_value(&mut prefs.mode, DisplayMode::Raw, "Raw")
+                .on_hover_text(
+                    "As text, but with control characters shown as pictures/markers \
+                     instead of acting on the layout (§46).",
+                );
             ui.separator();
             // Control-character rendering (§46) — enabled only in Raw mode. The
             // oversized ␊ glyph makes the row taller than the text, so the whole

@@ -101,7 +101,7 @@ impl ListenerApp {
         // Configure is edit-only: there's no Apply button here. Edits commit via the
         // Start / Apply & Restart button at the top, which applies the pending draft.
         if let Some((_, config)) = &mut self.edit_draft {
-            egui::CollapsingHeader::new("Configure")
+            egui::CollapsingHeader::new("Configure channel")
                 // A STABLE id (not per-channel) so switching channels doesn't create a
                 // "new" header each time — that re-triggered a focus/animation highlight
                 // that flashed a rectangle around the label on every channel switch. The
@@ -305,12 +305,16 @@ impl ListenerApp {
             // sized label).
             let (glyph, scale) = status_glyph(status);
             paint_glyph(ui, glyph, scale, status_color(status));
-            ui.label(bold("Name"));
+            const NAME_HINT: &str = "This channel's display name. When file rotation is \
+                on, it's also the base name of the rotated files (<channel>_<time \
+                period>), so keep it filesystem-safe.";
+            ui.label(bold("Name")).on_hover_text(NAME_HINT);
             let mut renamed = None;
             if let Some((_, config)) = &mut self.edit_draft {
                 let mut name = config.name.as_str().to_string();
                 if ui
                     .add(egui::TextEdit::singleline(&mut name).desired_width(180.0))
+                    .on_hover_text(NAME_HINT)
                     .changed()
                 {
                     config.name = crate::core::ChannelName::new(name.clone());

@@ -59,19 +59,30 @@ fn recording_file_fields(
         );
     }
     ui.horizontal(|ui| {
-        ui.label("On exists");
-        ui.radio_value(overwrite_policy, OverwritePolicy::Refuse, "Refuse");
-        ui.radio_value(overwrite_policy, OverwritePolicy::Overwrite, "Overwrite");
-        ui.radio_value(overwrite_policy, OverwritePolicy::AppendIfExists, "Append");
+        ui.label("On exists")
+            .on_hover_text("What to do when the destination file already exists.");
+        ui.radio_value(overwrite_policy, OverwritePolicy::Refuse, "Refuse")
+            .on_hover_text("Don't record — fail rather than touch the existing file.");
+        ui.radio_value(overwrite_policy, OverwritePolicy::Overwrite, "Overwrite")
+            .on_hover_text("Replace the existing file (its current contents are lost).");
+        ui.radio_value(overwrite_policy, OverwritePolicy::AppendIfExists, "Append")
+            .on_hover_text("Keep the existing file and add new data to the end.");
     });
     ui.horizontal(|ui| {
-        ui.label("Rotate");
-        ui.radio_value(file_rotation, FileRotationPolicy::None, "None");
-        ui.radio_value(file_rotation, FileRotationPolicy::Hourly, "Hourly");
+        ui.label("Rotate").on_hover_text(
+            "Start a fresh file each time period instead of one growing file. When on, the \
+             destination is a folder and files are named <channel>_<time period>.",
+        );
+        ui.radio_value(file_rotation, FileRotationPolicy::None, "None")
+            .on_hover_text("One file that grows for the whole session.");
+        ui.radio_value(file_rotation, FileRotationPolicy::Hourly, "Hourly")
+            .on_hover_text(
+                "A new file each hour, named <channel>_<date>_<hour> (e.g. GPS_2026-06-03_08).",
+            );
         ui.radio_value(file_rotation, FileRotationPolicy::Daily, "Daily")
             .on_hover_text(
-                "Rotating files are named <channel>_<period> — keep the channel name \
-                 filesystem-safe (§59)",
+                "A new file each day, named <channel>_<date> (e.g. GPS_2026-06-03) — keep \
+                 the channel name filesystem-safe (§59).",
             );
     });
     ui.horizontal(|ui| {
