@@ -1155,12 +1155,12 @@ mod tests {
         let id = listener.add_channel(udp_channel());
 
         // Stopped → no stop happened, and no IllegalTransition error to swallow.
-        assert_eq!(listener.stop_if_live(id).await.unwrap(), false);
+        assert!(!listener.stop_if_live(id).await.unwrap());
         assert_eq!(listener.state(id), Some(ChannelState::Stopped));
 
         listener.start(id).await.unwrap();
         // Running → it stops.
-        assert_eq!(listener.stop_if_live(id).await.unwrap(), true);
+        assert!(listener.stop_if_live(id).await.unwrap());
         assert_eq!(listener.state(id), Some(ChannelState::Stopped));
     }
 
