@@ -189,32 +189,76 @@ pub(super) fn edit_interface(
                 .num_columns(2)
                 .spacing([8.0, 4.0])
                 .show(ui, |ui| {
-                    ui.label(bold("Mode"));
+                    ui.label(bold("Mode"))
+                        .on_hover_text("How this UDP socket receives datagrams.");
                     ui.horizontal(|ui| {
-                        ui.radio_value(&mut udp.mode, UdpMode::Broadcast, "Broadcast");
-                        ui.radio_value(&mut udp.mode, UdpMode::Unicast, "Unicast");
-                        ui.radio_value(&mut udp.mode, UdpMode::Multicast, "Multicast");
+                        ui.radio_value(&mut udp.mode, UdpMode::Broadcast, "Broadcast")
+                            .on_hover_text(
+                                "Receive broadcast datagrams (sent to the subnet \
+                                 broadcast address). Bind to 0.0.0.0 to accept them on \
+                                 any local interface.",
+                            );
+                        ui.radio_value(&mut udp.mode, UdpMode::Unicast, "Unicast")
+                            .on_hover_text(
+                                "Receive datagrams addressed directly to this host. \
+                                 Bind to 0.0.0.0 to listen on every local interface, or \
+                                 a specific local IP to listen on just that one.",
+                            );
+                        ui.radio_value(&mut udp.mode, UdpMode::Multicast, "Multicast")
+                            .on_hover_text(
+                                "Join a multicast group and receive its datagrams. Bind \
+                                 to 0.0.0.0 to join on any interface; set the Group \
+                                 address below.",
+                            );
                     });
                     ui.end_row();
 
                     // Binding address + port — always directly under Mode, so it
                     // never moves when switching modes (#2, #3). The multicast Group
                     // row appears *below* it.
-                    ui.label(bold("Binding address"));
+                    // The bind-address tip is mode-aware: 0.0.0.0 is the right default
+                    // in every mode (accept on any local interface), but *why* differs.
+                    let bind_hint = match udp.mode {
+                        UdpMode::Broadcast => {
+                            "The local interface(s) to receive on. 0.0.0.0 means \"any \
+                             interface\" — the usual choice for broadcast, since the \
+                             sender targets the subnet, not a specific host."
+                        }
+                        UdpMode::Unicast => {
+                            "The local interface(s) to receive on. 0.0.0.0 means \"any \
+                             interface\" (accept on all NICs); use a specific local IP \
+                             to receive only on that interface."
+                        }
+                        UdpMode::Multicast => {
+                            "The local interface to join the group on. 0.0.0.0 means \
+                             \"any interface\" — fine for most setups; use a specific \
+                             local IP to join on just that NIC."
+                        }
+                    };
+                    ui.label(bold("Binding address")).on_hover_text(bind_hint);
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut udp.bind_address)
                                 .id_salt("udp_bind")
                                 .desired_width(130.0)
                                 .hint_text("0.0.0.0"),
+                        )
+                        .on_hover_text(bind_hint);
+                        ui.label("port").on_hover_text(
+                            "The UDP port to listen on — i.e. the destination port the \
+                             sending machine sends to.",
                         );
-                        ui.label("port");
                         port_field(ui, "udp_port", &mut udp.port);
                     });
                     ui.end_row();
 
                     if udp.mode == UdpMode::Multicast {
-                        ui.label(bold("Group"));
+                        const GROUP_HINT: &str = "The multicast group address to join, in \
+                            the 224.0.0.0–239.255.255.255 range. 239.0.0.0/8 is the \
+                            administratively-scoped (private) block — a good default; \
+                            avoid 224.0.0.x, which is reserved for local control traffic. \
+                            Must match the sender's group.";
+                        ui.label(bold("Group")).on_hover_text(GROUP_HINT);
                         let mut group = udp.multicast_group.clone().unwrap_or_default();
                         if ui
                             .add(
@@ -223,6 +267,7 @@ pub(super) fn edit_interface(
                                     .desired_width(130.0)
                                     .hint_text("239.0.0.1"),
                             )
+                            .on_hover_text(GROUP_HINT)
                             .changed()
                         {
                             let g = group.trim();
@@ -363,16 +408,27 @@ pub(super) fn config_incomplete(config: &ChannelConfig) -> bool {
     }
 }
 
-/// Whether an edited config draft differs from the channel's committed config in any
-/// way that needs an Apply & Restart — i.e. everything **except** the name, which
-/// renames live without a restart (§6). Used to switch the Start button to
-/// "Apply & Restart" while a running channel has pending edits. Pure / unit-tested.
-pub(super) fn config_differs_ignoring_name(
-    draft: &ChannelConfig,
-    committed: &ChannelConfig,
-) -> bool {
+/// Whether an edited config draft differs from the channel's committed config in a way
+/// that needs an Apply & Restart. Used to switch the Start button to "Apply & Restart"
+/// while a running channel has pending edits. Pure / unit-tested.
+///
+/// Fields that are applied **live** (no restart) are neutralized before comparing, so
+/// editing them doesn't flip the lifecycle button:
+/// - `name` — renames live (§6).
+/// - `raw_recording` — the live Record/Stop toggle (ADR-012); destination/rotation/etc.
+///   take effect when recording is (re)started, not via a channel restart.
+/// - `display` (view settings) and `retention` (scroll buffer) — synced live via
+///   `SetViewConfig` (§78, §87), no restart.
+///
+/// Display **recording** (`display_recording`) and the `interface` still count: those
+/// are applied via a §13 Reconfigure, i.e. a restart.
+pub(super) fn config_needs_restart(draft: &ChannelConfig, committed: &ChannelConfig) -> bool {
     let mut a = draft.clone();
-    a.name = committed.name.clone(); // neutralize the name before comparing
+    // Neutralize the live-applied fields so only restart-worthy edits register.
+    a.name = committed.name.clone();
+    a.raw_recording = committed.raw_recording.clone();
+    a.display = committed.display.clone();
+    a.retention = committed.retention.clone();
     &a != committed
 }
 
@@ -470,18 +526,44 @@ mod tests {
     }
 
     #[test]
-    fn config_change_detection_ignores_the_name() {
+    fn config_change_detection_excludes_live_applied_fields() {
         let base = templates::udp_template();
         // Identical config = no change.
-        assert!(!config_differs_ignoring_name(&base, &base));
-        // A name-only difference is NOT a restart-worthy change (renames live, §6).
+        assert!(!config_needs_restart(&base, &base));
+
+        // Live-applied edits are NOT restart-worthy (they don't flip the lifecycle
+        // button) — name (§6), raw recording (ADR-012), view settings + scroll buffer
+        // (SetViewConfig, §78/§87).
         let mut renamed = base.clone();
         renamed.name = crate::core::ChannelName::new("different");
-        assert!(!config_differs_ignoring_name(&renamed, &base));
-        // A real config edit (recording destination) IS a change.
-        let mut edited = base.clone();
-        edited.raw_recording.destination = Some(std::path::PathBuf::from("/tmp/x.raw"));
-        assert!(config_differs_ignoring_name(&edited, &base));
+        assert!(!config_needs_restart(&renamed, &base));
+
+        let mut raw = base.clone();
+        raw.raw_recording.destination = Some(std::path::PathBuf::from("/tmp/x.raw"));
+        raw.raw_recording.file_rotation = crate::record::FileRotationPolicy::Hourly;
+        assert!(
+            !config_needs_restart(&raw, &base),
+            "editing raw recording must not require an Apply & Restart"
+        );
+
+        let mut view = base.clone();
+        view.retention.byte_limit = Some(256 * 1024);
+        if let Some(v) = view.display.views.first_mut() {
+            v.font_size = Some(20.0);
+        }
+        assert!(!config_needs_restart(&view, &base));
+
+        // A real restart-worthy edit (the interface) DOES register.
+        let mut iface = base.clone();
+        if let crate::config::InterfaceConfig::Udp(udp) = &mut iface.interface {
+            udp.port = udp.port.wrapping_add(1);
+        }
+        assert!(config_needs_restart(&iface, &base));
+
+        // Display *recording* is config-driven (a restart), so it still registers.
+        let mut disp = base.clone();
+        disp.display_recording.destination = Some(std::path::PathBuf::from("/tmp/x.disp"));
+        assert!(config_needs_restart(&disp, &base));
     }
 
     #[test]

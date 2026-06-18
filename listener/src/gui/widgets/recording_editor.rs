@@ -44,6 +44,11 @@ fn recording_file_fields(
             *destination = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed));
         }
         if ui.button("Browse…").clicked() {
+            // The native picker is modal and synchronous, so the egui UI (and the live
+            // view) freeze while it's open — the same intentional exception to "the UI
+            // thread never blocks" (AGENTS §5) as the profile picker. Acceptable: it's a
+            // brief user-driven modal, and *reception* never stops (it runs on the
+            // runtime thread); only the on-screen view pauses until the dialog closes.
             let picked = if rotating {
                 rfd::FileDialog::new().pick_folder()
             } else {
@@ -60,11 +65,23 @@ fn recording_file_fields(
                 .color(theme::WARNING_AMBER),
         );
     }
+    // With rotation on, each period gets a fresh file, so "Refuse" (fail if the file
+    // exists) makes no sense — disable it, and move a Refuse selection to Append (the
+    // sensible default when re-opening a period's file, e.g. after a restart).
+    if rotating && *overwrite_policy == OverwritePolicy::Refuse {
+        *overwrite_policy = OverwritePolicy::AppendIfExists;
+    }
     ui.horizontal(|ui| {
         ui.label("On exists")
             .on_hover_text("What to do when the destination file already exists.");
-        ui.radio_value(overwrite_policy, OverwritePolicy::Refuse, "Refuse")
-            .on_hover_text("Don't record — fail rather than touch the existing file.");
+        ui.add_enabled_ui(!rotating, |ui| {
+            ui.radio_value(overwrite_policy, OverwritePolicy::Refuse, "Refuse")
+                .on_hover_text(if rotating {
+                    "Not available with rotation — each period starts a fresh file."
+                } else {
+                    "Don't record — fail rather than touch the existing file."
+                });
+        });
         ui.radio_value(overwrite_policy, OverwritePolicy::Overwrite, "Overwrite")
             .on_hover_text("Replace the existing file (its current contents are lost).");
         ui.radio_value(overwrite_policy, OverwritePolicy::AppendIfExists, "Append")

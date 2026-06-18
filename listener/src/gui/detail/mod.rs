@@ -15,8 +15,8 @@ use super::fonts::bold;
 use super::state::ChannelStatus;
 use super::theme;
 use super::widgets::{
-    config_differs_ignoring_name, edit_display_recording, edit_interface, edit_raw_recording,
-    human_bytes, latest_diagnostic, line_indicator, line_toggle, paint_glyph, recording_glyph_size,
+    config_needs_restart, edit_display_recording, edit_interface, edit_raw_recording, human_bytes,
+    latest_diagnostic, line_indicator, line_toggle, paint_glyph, recording_glyph_size,
     recording_indicator, short_id, start_button, status_color, status_glyph, status_label,
     stop_enabled, truncate,
 };
@@ -50,11 +50,13 @@ impl ListenerApp {
             return;
         };
 
-        // Does the edit draft differ from the channel's committed config? (Name is
-        // excluded — it renames live, not via restart.) Drives the Start button label.
+        // Does the edit draft differ from the committed config in a way that needs a
+        // restart? Drives the Start button's "Apply & Restart" label. Live-applied
+        // fields (name, raw recording, view settings, scroll buffer) are excluded — see
+        // `config_needs_restart` — so editing them doesn't flip the lifecycle button.
         let config_changed = match (&self.edit_draft, self.state.channel(id)) {
             (Some((eid, draft)), Some(view)) if *eid == id => {
-                config_differs_ignoring_name(draft, &view.config)
+                config_needs_restart(draft, &view.config)
             }
             _ => false,
         };
