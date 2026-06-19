@@ -84,6 +84,11 @@ pub enum UiCommand {
     /// Apply. The driver arms the running pipeline from these. The outcome shows up in
     /// the next snapshot's recording state.
     SetRecording(ChannelId, bool, Box<RawRecordingConfig>),
+    /// Persist a channel's Raw recording **settings** (destination, rotation, overwrite,
+    /// "record on start") into the stored config without a restart — Raw recording is a
+    /// live field (ADR-012/-013). Keeps the runtime's config current so a profile save
+    /// captures the settings; the live recorder is (re)armed separately by `SetRecording`.
+    SetRawRecordingConfig(ChannelId, Box<RawRecordingConfig>),
     /// Update a channel's per-channel view settings in the stored config without a
     /// restart: the display config (mode, font, colors — §78) and the scroll-buffer
     /// `retention` (§87). The viewer renders these GUI-side and the GUI caps its own
@@ -393,6 +398,12 @@ impl Driver {
                         "can't change recording — channel isn't running".to_string(),
                     ));
                 }
+            }
+            UiCommand::SetRawRecordingConfig(id, raw) => {
+                // Persist the Raw recording settings into the stored config (no restart),
+                // so a profile save captures them. Arming the live recorder is separate
+                // (SetRecording).
+                self.listener.set_raw_recording_config(id, *raw);
             }
             UiCommand::SetViewConfig(id, display, retention) => {
                 // View settings render GUI-side and the scroll buffer is capped GUI-side
@@ -796,8 +807,8 @@ mod tests {
                 added += 1;
             }
         }
-        // Set a non-default scroll buffer on the first channel (via the view-config
-        // command) so we can prove it survives save→load.
+        // Set a non-default scroll buffer + Raw recording settings on the first channel
+        // (the live-config commands) so we can prove they survive save→load.
         let (first_id, first_config) = first.unwrap();
         let mut retention = first_config.retention.clone();
         retention.byte_limit = Some(32 * 1024);
@@ -807,6 +818,13 @@ mod tests {
                 Box::new(first_config.display.clone()),
                 Box::new(retention),
             ))
+            .await
+            .unwrap();
+        let mut raw = first_config.raw_recording.clone();
+        raw.destination = Some(std::path::PathBuf::from("rec.raw"));
+        raw.enabled = true; // "Record on start"
+        cmd_tx
+            .send(UiCommand::SetRawRecordingConfig(first_id, Box::new(raw)))
             .await
             .unwrap();
         cmd_tx
@@ -838,12 +856,19 @@ mod tests {
             .unwrap();
         let mut loaded_channels = 0;
         let mut saw_scroll_buffer = false;
+        let mut saw_raw_recording = false;
         let name = loop {
             match next(&mut upd_rx).await {
                 UiUpdate::ChannelAdded(_, _, _, config) => {
                     loaded_channels += 1;
                     if config.retention.byte_limit == Some(32 * 1024) {
                         saw_scroll_buffer = true;
+                    }
+                    if config.raw_recording.enabled
+                        && config.raw_recording.destination
+                            == Some(std::path::PathBuf::from("rec.raw"))
+                    {
+                        saw_raw_recording = true;
                     }
                 }
                 UiUpdate::ProfileLoaded(name) => break name,
@@ -855,6 +880,10 @@ mod tests {
         assert!(
             saw_scroll_buffer,
             "the per-channel scroll buffer (retention.byte_limit) survived save→load"
+        );
+        assert!(
+            saw_raw_recording,
+            "Raw recording settings (incl. \"record on start\") survived save→load"
         );
         assert_eq!(name, path.file_stem().unwrap().to_str().unwrap());
 

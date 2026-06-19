@@ -218,6 +218,21 @@ impl Listener {
         }
     }
 
+    /// Update a Channel's stored **Raw recording** config in place, without a restart
+    /// (ADR-012/-013). Raw recording is a live field — the running recorder is (re)armed
+    /// separately by [`set_recording`](Self::set_recording); this only keeps the stored
+    /// config current so a profile save captures the destination/rotation/"record on
+    /// start" settings. Unknown id is ignored.
+    pub fn set_raw_recording_config(
+        &mut self,
+        id: ChannelId,
+        raw: crate::config::RawRecordingConfig,
+    ) {
+        if let Some(channel) = self.channels.get_mut(&id) {
+            channel.config.raw_recording = raw;
+        }
+    }
+
     /// Request an on-demand snapshot of a running Channel's *small* observable state
     /// (§137, ADR-006): diagnostics, recent match firings, per-view pause state,
     /// recording state, liveness, and the stream end offset. The scrollback bytes

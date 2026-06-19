@@ -57,7 +57,7 @@ impl ListenerApp {
         .show_header(ui, |ui| {
             // The collapse arrow is drawn by show_header; add the title + the
             // Pause/Resume button on the same row.
-            ui.label(bold("View configuration"));
+            ui.label(bold("Configure view"));
             if let Some((view_id, is_paused)) = view0 {
                 if is_paused {
                     if ui.button("Resume").clicked() {

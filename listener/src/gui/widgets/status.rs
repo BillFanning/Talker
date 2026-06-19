@@ -37,17 +37,18 @@ pub(crate) fn stop_enabled(status: ChannelStatus) -> bool {
 }
 
 /// The recording-state indicator: glyph, color, and label for a channel's raw
-/// recording state (§53). Uses the **same symbol set as channel status**
-/// ([`status_glyph`]) — `■` off, `●` recording, `⚠` faulted — so the two read
-/// consistently; only the colors differ (recording uses its own red). Pure,
-/// unit-tested; the detail pane renders it as a colored label sized via
-/// [`recording_glyph_size`].
+/// recording state (§53). Uses the **same symbol set and colors as channel status**
+/// ([`status_glyph`] / [`status_color`]) — `■` off (grey), `●` recording (green), `⚠`
+/// faulted (red) — so the two read consistently. Pure, unit-tested; the detail pane
+/// renders it as a colored label sized via [`recording_glyph_size`].
 pub(crate) fn recording_indicator(
     recording: Option<crate::core::RecordingState>,
 ) -> (&'static str, egui::Color32, &'static str) {
     use crate::core::RecordingState;
+    // Same colors as channel status (`status_color`): the active ● is RUNNING_GREEN
+    // (like a Running channel), faulted ⚠ is FAULT_RED, off ■ is IDLE_GREY.
     match recording {
-        Some(RecordingState::Enabled) => ("\u{25CF}", theme::FAULT_RED, "recording"),
+        Some(RecordingState::Enabled) => ("\u{25CF}", theme::RUNNING_GREEN, "recording"),
         Some(RecordingState::Faulted) => ("\u{26A0}", theme::FAULT_RED, "faulted"),
         Some(RecordingState::Disabled) | None => ("\u{25A0}", theme::IDLE_GREY, "off"),
     }

@@ -370,9 +370,13 @@ impl ListenerApp {
         });
     }
 
-    /// Raw recording block: a "Record Raw Data  ●/■ state" header, the always-shown
-    /// setup fields, and a Start/Stop recording button at the bottom. The live toggle
+    /// Raw recording block: a header row ("Record Raw Data" + live state glyph + the
+    /// Start/Stop recording button) over the always-shown setup fields. The live toggle
     /// reads the recording settings from the editor at click time (ADR-012).
+    ///
+    /// Kept in small pieces (the header row, `raw_record_button`, the setup) because
+    /// this block is still evolving — add new recording controls as their own helpers
+    /// rather than growing this method.
     fn show_recording_block(
         &mut self,
         ui: &mut egui::Ui,
@@ -381,14 +385,16 @@ impl ListenerApp {
         recording: Option<RecordingState>,
         rec_dest: &Option<std::path::PathBuf>,
     ) {
-        let size = CONTROL_BUTTON_SIZE;
-        // Header: title + live state indicator (no expander — the setup is always shown).
+        // Header row: title + live state indicator + the Start/Stop recording button on
+        // the same line (no expander — the setup is always shown below).
         ui.horizontal(|ui| {
             ui.label(bold("Record Raw Data"));
-            // Same painted-glyph technique + symbol set as channel status, then the text.
-            let (glyph, color, text) = recording_indicator(recording);
+            // Status glyph only (same symbol set/colors as channel status) — the word
+            // ("recording"/"off"/"faulted") is dropped to keep the row compact; the glyph
+            // ■/●/⚠ carries the state.
+            let (glyph, color, _text) = recording_indicator(recording);
             paint_glyph(ui, glyph, recording_glyph_size(glyph), color);
-            ui.colored_label(color, text);
+            self.raw_record_button(ui, id, status, recording);
         });
         if let Some(RecordingState::Enabled) = recording {
             let dest = rec_dest
@@ -400,40 +406,153 @@ impl ListenerApp {
                 format!("\u{25CF} Recording \u{2192} {dest}"),
             );
         }
-        // Setup fields, always visible.
-        if let Some((_, config)) = &mut self.edit_draft {
-            edit_raw_recording(ui, config);
-        } else {
+        // Setup: a collapsible block (collapsed by default). Expanded shows the full
+        // editor; collapsed shows a one-line summary (path · rotation · on-exists) so
+        // the configured destination stays visible without the controls.
+        let Some((_, config)) = &mut self.edit_draft else {
             ui.label(egui::RichText::new("(select the channel to edit)").weak());
-        }
-        // Start/Stop recording button at the bottom of the config. Live (no restart,
-        // ADR-012): reads the on-screen settings at click time. Only for a running
-        // channel; enabled once a destination is set.
-        if status == ChannelStatus::Running {
-            let draft_raw = self
-                .edit_draft
-                .as_ref()
-                .filter(|(eid, _)| *eid == id)
-                .map(|(_, cfg)| cfg.raw_recording.clone());
-            let has_dest = draft_raw.as_ref().is_some_and(|r| r.destination.is_some());
-            let recording_now = matches!(recording, Some(RecordingState::Enabled));
-            let label = if recording_now { "Stop" } else { "Record" };
-            // Match the start-channel button's *width* (96) but keep the default
-            // height — a full CONTROL_BUTTON_SIZE min_size plus a long label made it
-            // both too wide and too tall. Short labels fit the 96px width.
-            let resp = ui.add_enabled(
-                has_dest || recording_now,
-                egui::Button::new(label).min_size(egui::vec2(size.x, 0.0)),
-            );
-            let resp = if !has_dest && !recording_now {
-                resp.on_hover_text("Set a destination above first")
-            } else {
-                resp
-            };
-            if resp.clicked() {
-                let raw = draft_raw.unwrap_or_default();
-                self.send(UiCommand::SetRecording(id, !recording_now, Box::new(raw)));
+            return;
+        };
+        let setup_id = ui.make_persistent_id(("raw_rec_setup", id));
+        let state = egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            setup_id,
+            false,
+        );
+        let open = state.is_open();
+        state
+            .show_header(ui, |ui| {
+                ui.label(bold("Setup"));
+                // Show the summary on the (closed) header so it reads as one line; when
+                // open, the full editor is in the body below, so keep the header terse.
+                if !open {
+                    ui.label(egui::RichText::new(raw_record_summary(&config.raw_recording)).weak());
+                }
+            })
+            .body(|ui| edit_raw_recording(ui, config));
+
+        self.persist_raw_recording(id);
+    }
+
+    /// Persist Raw recording edits (destination/rotation/overwrite/"record on start").
+    /// Raw recording is applied live (no restart), so its edits never travel through
+    /// the Apply & Restart path — without this, a profile save wouldn't capture them.
+    /// When the draft's `raw_recording` differs from the channel's stored config, fold
+    /// it into the stored config and sync the runtime (`SetRawRecordingConfig`).
+    fn persist_raw_recording(&mut self, id: ChannelId) {
+        let draft = self
+            .edit_draft
+            .as_ref()
+            .filter(|(eid, _)| *eid == id)
+            .map(|(_, cfg)| cfg.raw_recording.clone());
+        let Some(draft) = draft else { return };
+        if let Some(view) = self.state.channel_mut(id) {
+            if view.config.raw_recording != draft {
+                view.config.raw_recording = draft.clone();
+                self.send(UiCommand::SetRawRecordingConfig(id, Box::new(draft)));
             }
         }
     }
+
+    /// The Raw-recording controls on the header row: a "Record on start" toggle (the
+    /// `raw_recording.enabled` flag — begins recording when the channel next starts,
+    /// §53) and, for a running channel, the live Start/Stop Record button (ADR-012).
+    /// The button reads the on-screen settings *at click time* (from the edit draft) and
+    /// sends them with the command, so recording goes exactly where the controls say —
+    /// no restart, no Apply.
+    fn raw_record_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: ChannelId,
+        status: ChannelStatus,
+        recording: Option<RecordingState>,
+    ) {
+        // "Record on start" — the auto-start flag, editable whether or not the channel
+        // is running (it governs the next start). Edits the draft's raw_recording.enabled.
+        if let Some((_, config)) = &mut self.edit_draft {
+            ui.checkbox(&mut config.raw_recording.enabled, "Record on start")
+                .on_hover_text("Begin recording automatically when the channel starts (§53).");
+        }
+        if status != ChannelStatus::Running {
+            return;
+        }
+        let draft_raw = self
+            .edit_draft
+            .as_ref()
+            .filter(|(eid, _)| *eid == id)
+            .map(|(_, cfg)| cfg.raw_recording.clone());
+        let has_dest = draft_raw.as_ref().is_some_and(|r| r.destination.is_some());
+        let recording_now = matches!(recording, Some(RecordingState::Enabled));
+        let label = if recording_now { "Stop" } else { "Record" };
+        // Match the start-channel button's *width* (96) but keep the default height —
+        // a full CONTROL_BUTTON_SIZE min_size plus a long label made it both too wide
+        // and too tall. Short labels fit the 96px width.
+        let resp = ui.add_enabled(
+            has_dest || recording_now,
+            egui::Button::new(label).min_size(egui::vec2(CONTROL_BUTTON_SIZE.x, 0.0)),
+        );
+        let resp = if !has_dest && !recording_now {
+            resp.on_hover_text("Set a destination below first")
+        } else {
+            resp
+        };
+        if resp.clicked() {
+            let raw = draft_raw.unwrap_or_default();
+            self.send(UiCommand::SetRecording(id, !recording_now, Box::new(raw)));
+        }
+    }
+}
+
+/// A one-line summary of a Raw recording config for the collapsed Setup header:
+/// `path · rotation · on-exists` (e.g. `C:\logs\gps.raw · Daily · Append`). The path
+/// reads "(no destination)" when unset; rotation/on-exists use short words.
+fn raw_record_summary(rec: &crate::config::RawRecordingConfig) -> String {
+    use crate::record::{FileRotationPolicy, OverwritePolicy};
+    let path = rec
+        .destination
+        .as_ref()
+        .map(|p| shorten_path(p))
+        .unwrap_or_else(|| "(no destination)".to_string());
+    let rotation = match rec.file_rotation {
+        FileRotationPolicy::None => "no rotation",
+        FileRotationPolicy::Hourly => "Hourly",
+        FileRotationPolicy::Daily => "Daily",
+    };
+    let on_exists = match rec.overwrite_policy {
+        OverwritePolicy::Refuse => "Refuse",
+        OverwritePolicy::Overwrite => "Overwrite",
+        OverwritePolicy::AppendIfExists => "Append",
+    };
+    format!("{path} · {rotation} · {on_exists}")
+}
+
+/// Shorten a path for a compact display: collapse the user's home directory to `~`
+/// (the OS-idiomatic shorthand — `USERPROFILE` on Windows, `HOME` elsewhere), then, if
+/// still long, middle-ellipsize so the start and the filename stay visible
+/// (`C:\logs\…\gps.raw`). Display-only — never used for the actual path.
+fn shorten_path(path: &std::path::Path) -> String {
+    const MAX: usize = 28; // characters before middle-ellipsizing (aggressive)
+
+    // Collapse $HOME / %USERPROFILE% to ~.
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from);
+    let s = match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => path.display().to_string(),
+    };
+
+    if s.chars().count() <= MAX {
+        return s;
+    }
+    // Keep the filename whole; ellipsize the directory prefix in the middle.
+    let sep = std::path::MAIN_SEPARATOR;
+    let (dir, file) = match s.rfind(sep) {
+        Some(i) => (&s[..i], &s[i + sep.len_utf8()..]),
+        None => return s, // single component longer than MAX — leave it
+    };
+    // Budget for the directory part after reserving the filename + "…\" markers.
+    let keep = MAX.saturating_sub(file.chars().count() + 3);
+    let head: String = dir.chars().take(keep).collect();
+    format!("{head}…{sep}{file}")
 }
