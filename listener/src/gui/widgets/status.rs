@@ -54,23 +54,6 @@ pub(crate) fn recording_indicator(
     }
 }
 
-/// The headline diagnostic for the real-time status line: the most recent error,
-/// else the most recent warning, else the most recent event, with its display color.
-/// Errors win so a fault stays visible in the collapsed header while troubleshooting.
-pub(crate) fn latest_diagnostic(
-    diag: &crate::runtime::snapshot::DiagnosticsSnapshot,
-) -> (String, egui::Color32) {
-    if let Some(d) = diag.errors.last() {
-        (d.message.clone(), theme::FAULT_RED)
-    } else if let Some(d) = diag.warnings.last() {
-        (d.message.clone(), theme::WARNING_AMBER)
-    } else if let Some(d) = diag.events.last() {
-        (d.message.clone(), theme::EVENT_GREY)
-    } else {
-        ("no activity yet".to_string(), theme::IDLE_GREY)
-    }
-}
-
 /// A short status word for the detail pane.
 pub(crate) fn status_label(status: ChannelStatus) -> &'static str {
     match status {

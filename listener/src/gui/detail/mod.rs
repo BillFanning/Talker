@@ -16,9 +16,8 @@ use super::state::ChannelStatus;
 use super::theme;
 use super::widgets::{
     config_needs_restart, edit_display_recording, edit_interface, edit_raw_recording, human_bytes,
-    latest_diagnostic, line_indicator, line_toggle, paint_glyph, recording_glyph_size,
-    recording_indicator, short_id, start_button, status_color, status_glyph, status_label,
-    stop_enabled, truncate,
+    line_indicator, line_toggle, paint_glyph, recording_glyph_size, recording_indicator, short_id,
+    start_button, status_color, status_glyph, status_label, stop_enabled,
 };
 use super::ListenerApp;
 
@@ -86,10 +85,15 @@ impl ListenerApp {
         });
         if let Some(err) = &last_error {
             ui.colored_label(theme::FAULT_RED, format!("⚠ {err}"));
-            ui.label(
-                "Recourse: change the port below and Apply, free the resource (Stop \
-                 the other channel on that port) then Retry, or Remove this channel.",
-            );
+            // The port/bind recourse only applies to a *start* fault (channel Faulted) —
+            // not a recording fault, which leaves the channel Running and whose error
+            // already names its own recourse (check the destination / on-exists).
+            if status == ChannelStatus::Faulted {
+                ui.label(
+                    "Recourse: change the port below and Apply, free the resource (Stop \
+                     the other channel on that port) then Retry, or Remove this channel.",
+                );
+            }
         }
 
         // Configure: edit the full interface config on a working copy, then commit
@@ -166,6 +170,7 @@ impl ListenerApp {
         // data into owned locals so the filter checkboxes can mutate `self` without a
         // live `self.state` borrow.
         struct DiagView {
+            headline_level: &'static str,
             headline: String,
             headline_color: egui::Color32,
             counts: (usize, usize, usize),
@@ -188,8 +193,22 @@ impl ListenerApp {
                 // Chronological now that each entry carries a timestamp (a single
                 // timeline across severities, not three separate buckets).
                 entries.sort_by_key(|(t, _, _)| *t);
-                let (headline, headline_color) = latest_diagnostic(d);
+                // The headline is the *chronologically latest* entry, so a fresh INFO
+                // (e.g. "recording started") supersedes an older ERROR in the rolled-up
+                // line — not severity-ranked, which would keep stale errors headlined.
+                let (headline_level, headline, headline_color) = match entries.last() {
+                    Some((_, sev, msg)) => {
+                        let (level, color) = match sev {
+                            DiagnosticSeverity::Event => ("INFO", theme::EVENT_GREY),
+                            DiagnosticSeverity::Warning => ("WARN", theme::WARNING_AMBER),
+                            DiagnosticSeverity::Error => ("ERROR", theme::FAULT_RED),
+                        };
+                        (level, msg.clone(), color)
+                    }
+                    None => ("", "no activity yet".to_string(), theme::IDLE_GREY),
+                };
                 DiagView {
+                    headline_level,
                     headline,
                     headline_color,
                     counts: (d.events.len(), d.warnings.len(), d.errors.len()),
@@ -205,57 +224,106 @@ impl ListenerApp {
                 }
             });
         if let Some(dv) = diag_view {
-            // A real-time, color-coded status line (the channel's headline diagnostic)
-            // that opens into a filterable, ms-timestamped log. The header updates
-            // every snapshot (5 Hz); errors stay headlined over warnings over info.
-            let header =
-                egui::RichText::new(format!("Diagnostics — {}", truncate(&dv.headline, 70)))
-                    .color(dv.headline_color);
-            egui::CollapsingHeader::new(header)
-                .id_salt("diagnostics")
-                .show(ui, |ui| {
+            // A "Diagnostics" dropdown whose **header row** carries the live headline
+            // diagnostic (most-recent error > warning > info) on its own wrapping line —
+            // so it's visible whether the section is rolled up or open, and a long
+            // message wraps instead of being truncated in the single-line header title.
+            // Opening it reveals the filterable, ms-timestamped log.
+            // The headline diagnostic — `LEVEL message` — the chronologically latest
+            // entry (so a fresh INFO supersedes an older ERROR). Shown directly under the
+            // header row and above the collapsible body, so it stays visible when the
+            // section is rolled up and reads as the section's live status line.
+            let headline = if dv.headline_level.is_empty() {
+                dv.headline.clone()
+            } else {
+                format!("{}  {}", dv.headline_level, dv.headline)
+            };
+            let headline_color = dv.headline_color;
+            // Wrap at the *visible* width (clip rect), not `available_width`: a sibling
+            // widget (the wide stream view) inflates the panel's desired width past the
+            // viewport, so `available_width` reads too wide and the label wrapped
+            // off-screen, clipping the last word. Computed before the header borrows `ui`.
+            let visible = (ui.clip_rect().right() - ui.cursor().left() - 8.0).max(64.0);
+            let diag_id = ui.make_persistent_id(("diagnostics", id));
+            egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                diag_id,
+                false,
+            )
+            .show_header(ui, |ui| {
+                // Header row + headline line stacked: the count row to click, the live
+                // status line beneath it (both visible while collapsed).
+                ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         let (e, w, x) = dv.counts;
-                        ui.label(bold("Show"));
-                        ui.checkbox(&mut self.show_info, format!("Info ({e})"));
-                        ui.checkbox(&mut self.show_warn, format!("Warn ({w})"));
-                        ui.checkbox(&mut self.show_error, format!("Error ({x})"));
+                        ui.label(bold("Diagnostics"));
+                        ui.label(
+                            egui::RichText::new(format!("({e} info · {w} warn · {x} err)")).weak(),
+                        );
                     });
-                    egui::ScrollArea::vertical()
-                        .id_salt("diag_log")
-                        .max_height(200.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let mut shown = 0usize;
-                            for (t, sev, msg) in dv.entries.iter().rev() {
-                                let (enabled, color, level) = match sev {
-                                    DiagnosticSeverity::Event => {
-                                        (self.show_info, theme::INFO_GREY, "INFO ")
-                                    }
-                                    DiagnosticSeverity::Warning => {
-                                        (self.show_warn, theme::WARNING_AMBER, "WARN ")
-                                    }
-                                    DiagnosticSeverity::Error => {
-                                        (self.show_error, theme::FAULT_RED, "ERROR")
-                                    }
-                                };
-                                if !enabled {
-                                    continue;
-                                }
-                                let dt: chrono::DateTime<chrono::Local> = (*t).into();
-                                shown += 1;
-                                ui.colored_label(
-                                    color,
-                                    format!("{}  {level}  {msg}", dt.format("%H:%M:%S%.3f")),
-                                );
-                            }
-                            if shown == 0 {
-                                ui.label(
-                                    egui::RichText::new("no diagnostics match the filter").weak(),
-                                );
-                            }
-                        });
+                    ui.scope(|ui| {
+                        ui.set_max_width(visible);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(headline).color(headline_color))
+                                .wrap(),
+                        );
+                    });
                 });
+            })
+            .body(|ui| {
+                ui.horizontal(|ui| {
+                    let (e, w, x) = dv.counts;
+                    ui.label(bold("Show"));
+                    ui.checkbox(&mut self.show_info, format!("Info ({e})"));
+                    ui.checkbox(&mut self.show_warn, format!("Warn ({w})"));
+                    ui.checkbox(&mut self.show_error, format!("Error ({x})"));
+                });
+                egui::ScrollArea::vertical()
+                    .id_salt("diag_log")
+                    .max_height(200.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Clamp the log's wrap width to the visible (clip-rect) width, like
+                        // the headline: the wide stream view inflates `available_width`, so
+                        // entries wrapped off-screen and looked unwrapped (clipped).
+                        let log_w = (ui.clip_rect().right() - ui.cursor().left() - 8.0).max(64.0);
+                        ui.set_max_width(log_w);
+                        let mut shown = 0usize;
+                        for (t, sev, msg) in dv.entries.iter().rev() {
+                            let (enabled, color, level) = match sev {
+                                DiagnosticSeverity::Event => {
+                                    (self.show_info, theme::INFO_GREY, "INFO ")
+                                }
+                                DiagnosticSeverity::Warning => {
+                                    (self.show_warn, theme::WARNING_AMBER, "WARN ")
+                                }
+                                DiagnosticSeverity::Error => {
+                                    (self.show_error, theme::FAULT_RED, "ERROR")
+                                }
+                            };
+                            if !enabled {
+                                continue;
+                            }
+                            let dt: chrono::DateTime<chrono::Local> = (*t).into();
+                            shown += 1;
+                            // Wrap long entries so the full message stays readable
+                            // (a plain colored_label was clipped at the pane edge).
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "{}  {level}  {msg}",
+                                        dt.format("%H:%M:%S%.3f")
+                                    ))
+                                    .color(color),
+                                )
+                                .wrap(),
+                            );
+                        }
+                        if shown == 0 {
+                            ui.label(egui::RichText::new("no diagnostics match the filter").weak());
+                        }
+                    });
+            });
             if !dv.matches.is_empty() || dv.boundary_saves > 0 {
                 egui::CollapsingHeader::new(format!("Match firings ({})", dv.matches.len()))
                     .id_salt("matches")

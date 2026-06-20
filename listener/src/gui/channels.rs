@@ -20,6 +20,9 @@ struct ChannelRow {
     info: usize,
     warnings: usize,
     errors: usize,
+    /// The channel's last error (e.g. a recording fault), shown on the tab so a fault on
+    /// a non-selected channel is visible without opening it.
+    last_error: Option<String>,
 }
 
 impl ListenerApp {
@@ -126,6 +129,7 @@ impl ListenerApp {
                 info: v.info,
                 warnings: v.warnings,
                 errors: v.errors,
+                last_error: v.last_error.clone(),
             })
             .collect();
 
@@ -205,6 +209,18 @@ impl ListenerApp {
                                     .color(theme::FAULT_RED),
                             );
                         });
+                        // Line 5: the last error (e.g. a recording fault), so a fault on
+                        // this channel is visible on its tab even when it isn't selected.
+                        if let Some(err) = &row.last_error {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("⚠ {err}"))
+                                        .small()
+                                        .color(theme::FAULT_RED),
+                                )
+                                .wrap(),
+                            );
+                        }
                     });
                     // Box-select: sense a click on the whole box first.
                     let box_resp = inner.response.interact(egui::Sense::click());

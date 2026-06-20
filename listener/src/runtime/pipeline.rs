@@ -144,6 +144,11 @@ pub struct ChannelPipeline {
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     /// Whether the raw recorder's fault has already been reported.
     recording_fault_reported: bool,
+    /// A `begin_recording` that failed to even open the file leaves no recorder, so the
+    /// recording state would otherwise read back as "off". This sticky flag makes it
+    /// read `Faulted` instead (so the GUI shows ⚠, not ■). Cleared on a successful
+    /// begin or a stop.
+    begin_faulted: bool,
     /// Disk-space guard for recording (§56.2, §168): the policy and the path whose
     /// filesystem free space is polled. `None` = no guard.
     disk_guard: Option<(DiskGuard, PathBuf)>,
@@ -163,6 +168,11 @@ pub struct ChannelPipeline {
     /// lazy-create: nothing on disk until a `Begin` fires). `None` = no destination
     /// set, so a `Begin` can't record.
     recording_settings: Option<RawRecordingSettings>,
+    /// "Record on start" (§53): when set, `run_channel` calls `begin_recording` once at
+    /// startup. Begin goes through the same path as the live Record toggle, so a start
+    /// failure (e.g. Refuse over an existing file) records a diagnostic and emits
+    /// `RecordingFaulted` — it doesn't fail silently.
+    auto_begin_recording: bool,
     /// Anchor for the `Idle` condition before any data has arrived (§50.2): idle is
     /// measured from the last data, or from this instant when none has arrived yet.
     created_at: Instant,
@@ -214,6 +224,7 @@ impl ChannelPipeline {
             ),
             raw_recorder: None,
             recording_fault_reported: false,
+            begin_faulted: false,
             disk_guard: None,
             disk_low_reported: false,
             activity: ActivityMeter::new(),
@@ -222,6 +233,7 @@ impl ChannelPipeline {
             recent_matches: DropOldestQueue::with_capacity(RECENT_MATCHES_CAP),
             pending_record_controls: Vec::new(),
             recording_settings: None,
+            auto_begin_recording: false,
             created_at: Instant::now(),
             stream_buf: VecDeque::new(),
             stream_cap: caps.stream_display,
@@ -241,6 +253,18 @@ impl ChannelPipeline {
     pub fn with_recording_settings(mut self, settings: RawRecordingSettings) -> Self {
         self.recording_settings = Some(settings);
         self
+    }
+
+    /// Mark "Record on start" (§53): `run_channel` begins recording once at startup,
+    /// via the same path as the live toggle. Pair with `with_recording_settings`.
+    pub fn with_auto_begin_recording(mut self) -> Self {
+        self.auto_begin_recording = true;
+        self
+    }
+
+    /// Whether "Record on start" was set (consumed by `run_channel` at startup).
+    pub fn should_auto_begin_recording(&self) -> bool {
+        self.auto_begin_recording
     }
 
     /// Attach a Raw Recording handle (§53). The orchestrator creates it at Start
@@ -532,6 +556,7 @@ impl ChannelPipeline {
         let Some(settings) = self.recording_settings.clone() else {
             // No destination set — a Begin can't record. Surface it instead of a
             // silent no-op (the live toggle would otherwise appear to do nothing).
+            self.begin_faulted = true;
             self.diagnostics.record(Diagnostic::error(
                 "can't begin Raw recording: no destination is set — set one in the Raw \
                  recording setup, then press Record again",
@@ -565,8 +590,20 @@ impl ChannelPipeline {
             Ok(rec) => {
                 self.raw_recorder = Some(rec);
                 self.recording_fault_reported = false;
+                self.begin_faulted = false; // a successful begin clears the prior fault
+                                            // Positive feedback: record an INFO so the headline becomes "recording
+                                            // started" (pushing a prior begin-error off the headline) and the user
+                                            // sees the begin actually took.
+                self.diagnostics.record(Diagnostic::event(format!(
+                    "Raw recording started → {}",
+                    settings.destination.display(),
+                )));
+                if let Some(events) = &self.events {
+                    let _ = events.try_send(RuntimeEvent::RecordingStarted(self.channel_id));
+                }
             }
             Err(err) => {
+                self.begin_faulted = true;
                 // Record *why* the begin failed (e.g. Refuse over an existing file) in
                 // the diagnostic log, and signal it as a recording fault so the GUI can
                 // surface it — a silent no-op left the user clicking "Record now" with
@@ -584,8 +621,10 @@ impl ChannelPipeline {
     }
 
     /// Stop and finalize the Raw recording on a `Record { Stop }` (§50.2, §56): a
-    /// clean finalize, reception continues. A no-op if none is active.
+    /// clean finalize, reception continues. A no-op if none is active. Also clears a
+    /// prior begin-fault so the state reads "off" again, not ⚠.
     async fn stop_recording(&mut self) {
+        self.begin_faulted = false;
         if let Some(recorder) = self.raw_recorder.take() {
             recorder.finalize(RecordingStopReason::Disabled).await;
         }
@@ -726,9 +765,15 @@ impl ChannelPipeline {
         &self.diagnostics
     }
 
-    /// Current raw-recording state (§53), or `None` if no recorder is attached.
+    /// Current raw-recording state (§53). `None` if no recorder is attached and none
+    /// was attempted; `Some(Faulted)` if a begin failed to open the file (so the GUI
+    /// shows ⚠ rather than "off" when "Record on start" couldn't start).
     pub fn raw_recording_state(&self) -> Option<RecordingState> {
-        self.raw_recorder.as_ref().map(|r| r.state())
+        match self.raw_recorder.as_ref() {
+            Some(r) => Some(r.state()),
+            None if self.begin_faulted => Some(RecordingState::Faulted),
+            None => None,
+        }
     }
 
     /// Cheap O(1) counters for a multi-channel overview (§91.1): liveness plus
@@ -856,6 +901,12 @@ pub async fn run_channel(
     // promptly once the stream goes quiet. Cheap no-op when no idle rule exists.
     let mut idle_check = tokio::time::interval(Duration::from_millis(250));
     idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // "Record on start" (§53): begin once at startup through the same path as the live
+    // Record toggle, so a failure (e.g. Refuse over an existing file) records a
+    // diagnostic and emits RecordingFaulted instead of failing silently.
+    if pipeline.should_auto_begin_recording() {
+        pipeline.begin_recording().await;
+    }
     loop {
         tokio::select! {
             biased;

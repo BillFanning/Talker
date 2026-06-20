@@ -8,11 +8,11 @@ mod format;
 mod recording_editor;
 mod status;
 
-pub(super) use format::{human_bytes, short_id, truncate};
+pub(super) use format::{human_bytes, short_id};
 pub(super) use recording_editor::{edit_display_recording, edit_raw_recording};
 pub(super) use status::{
-    latest_diagnostic, line_indicator, line_toggle, paint_glyph, recording_glyph_size,
-    recording_indicator, start_button, status_color, status_glyph, status_label, stop_enabled,
+    line_indicator, line_toggle, paint_glyph, recording_glyph_size, recording_indicator,
+    start_button, status_color, status_glyph, status_label, stop_enabled,
 };
 
 use crate::config::{
@@ -436,19 +436,6 @@ pub(super) fn config_needs_restart(draft: &ChannelConfig, committed: &ChannelCon
 mod tests {
     use super::super::state::ChannelStatus;
     use super::*;
-    use crate::diagnostics::Diagnostic;
-    use crate::runtime::snapshot::DiagnosticsSnapshot;
-
-    #[test]
-    fn truncate_keeps_short_strings_and_clips_long_ones_on_char_boundaries() {
-        assert_eq!(truncate("short", 70), "short");
-        assert_eq!(truncate("abcdef", 4), "abc\u{2026}");
-        // Multibyte input must not panic or split a char.
-        let s = "ééééééé"; // 7 two-byte chars
-        let out = truncate(s, 4);
-        assert_eq!(out.chars().count(), 4); // 3 kept + ellipsis
-        assert!(out.ends_with('\u{2026}'));
-    }
 
     #[test]
     fn config_incomplete_flags_missing_port_or_serial_device() {
@@ -564,23 +551,5 @@ mod tests {
         let mut disp = base.clone();
         disp.display_recording.destination = Some(std::path::PathBuf::from("/tmp/x.disp"));
         assert!(config_needs_restart(&disp, &base));
-    }
-
-    #[test]
-    fn latest_diagnostic_headlines_errors_then_warnings_then_events() {
-        let mut diag = DiagnosticsSnapshot::default();
-        assert_eq!(latest_diagnostic(&diag).0, "no activity yet");
-
-        diag.events.push(Diagnostic::event("connected"));
-        assert_eq!(latest_diagnostic(&diag).0, "connected");
-
-        diag.warnings.push(Diagnostic::warning("checksum"));
-        assert_eq!(latest_diagnostic(&diag).0, "checksum");
-
-        diag.errors.push(Diagnostic::error("bind failed"));
-        assert_eq!(latest_diagnostic(&diag).0, "bind failed");
-        // The most recent error wins over earlier ones.
-        diag.errors.push(Diagnostic::error("port lost"));
-        assert_eq!(latest_diagnostic(&diag).0, "port lost");
     }
 }

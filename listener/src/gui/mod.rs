@@ -340,6 +340,12 @@ impl ListenerApp {
         let Some(config) = self.start_config(id) else {
             return;
         };
+        // Optimistically clear the prior error on a (re)start click, so a stale fault
+        // message doesn't linger until the ChannelStarted echo arrives. A fresh fault
+        // re-sets it if the restart fails again.
+        if let Some(view) = self.state.channel_mut(id) {
+            view.last_error = None;
+        }
         self.send(UiCommand::CommitAndStart {
             id,
             config: Some(Box::new(config)),
@@ -470,6 +476,14 @@ impl eframe::App for ListenerApp {
             .collect::<Vec<_>>()
             .join("\n");
         storage.set_string(RECENT_PROFILES_KEY, joined);
+    }
+
+    /// On window close (the X button) or any app exit, shut the driver down and wait
+    /// for it — so every open recording is finalized before the process dies. Without
+    /// this the runtime thread was detached and the last buffered bytes of a `.raw`/
+    /// `.disp` could be lost on exit.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.bridge.shutdown_and_join();
     }
 
     // This workspace's eframe surfaces a `Ui` directly (App::ui), like talker's GUI.

@@ -260,6 +260,7 @@ impl AppState {
                     view.recording = snapshot.raw_recording;
                     view.boundary_saves = snapshot.match_boundary_saves;
                     view.snapshot = Some(*snapshot);
+                    clear_error_if_recording_ok(view);
                 }
             }
             // Cheap per-tab health for non-selected channels (no scrollback bytes).
@@ -272,6 +273,7 @@ impl AppState {
                     view.errors = stats.error_count;
                     view.recording = stats.raw_recording;
                     view.boundary_saves = stats.match_boundary_saves;
+                    clear_error_if_recording_ok(view);
                 }
             }
             UiUpdate::ControlLines(id, lines) => {
@@ -338,11 +340,19 @@ impl AppState {
             // of silently doing nothing. The specific reason is in the diagnostics log.
             RuntimeEvent::RecordingFaulted(id) => {
                 if let Some(view) = self.views.get_mut(&id) {
-                    view.last_error = Some(
-                        "recording could not start — see Diagnostics (check the \
-                         destination and on-exists policy)"
-                            .to_string(),
-                    );
+                    view.last_error = Some(format!(
+                        "{}: recording could not start — see Diagnostics (check the \
+                         destination and on-exists policy)",
+                        view.name
+                    ));
+                }
+            }
+            RuntimeEvent::RecordingStarted(id) => {
+                // Recording now began OK — clear a prior recording fault. A recording
+                // fault leaves the Channel Running, so ChannelStarted never re-fires to
+                // clear it; this is the only signal that the recourse worked.
+                if let Some(view) = self.views.get_mut(&id) {
+                    view.last_error = None;
                 }
             }
             // `MessageReceived` no longer drives the list: liveness is byte-based now
@@ -359,6 +369,17 @@ impl AppState {
         if let Some(view) = self.views.get_mut(&id) {
             view.status = status;
         }
+    }
+}
+
+/// Clear a recording-fault `last_error` once the snapshot/stats poll shows recording is
+/// actually enabled. The `RecordingStarted` event already clears it, but events use
+/// `try_send` and can drop under load; the poll always runs, so this guarantees a stale
+/// recording error doesn't outlive a recording that's now working. A bind/start fault
+/// leaves the channel Faulted (recording can't be Enabled), so this never clears one.
+fn clear_error_if_recording_ok(view: &mut ChannelView) {
+    if view.last_error.is_some() && view.recording == Some(RecordingState::Enabled) {
+        view.last_error = None;
     }
 }
 

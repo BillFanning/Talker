@@ -23,6 +23,10 @@ pub enum RuntimeEvent {
     ChannelStopped(ChannelId),
     ChannelFaulted(ChannelId),
     RecordingFaulted(ChannelId),
+    /// A Raw recording successfully began (§50.2): the file is open and recording.
+    /// Lets observers clear a prior `RecordingFaulted` state — a recording fault leaves
+    /// the Channel Running, so `ChannelStarted` doesn't re-fire to clear it.
+    RecordingStarted(ChannelId),
     WarningRaised(ChannelId),
     TcpClientConnected(ChannelId),
     TcpClientDisconnected(ChannelId),

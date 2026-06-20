@@ -27,8 +27,8 @@ use crate::config::ChannelConfig;
 use crate::core::{ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
 use crate::display::{DisplayView, RenderedOutput};
 use crate::record::{
-    start_display_recording, start_raw_recording, DisplayFileRecorder, FileRotationPolicy,
-    RawFileRecorder, Recording, RotatingDisplayRecorder, RotatingRawRecorder,
+    start_display_recording, DisplayFileRecorder, FileRotationPolicy, Recording,
+    RotatingDisplayRecorder,
 };
 use crate::transport::{
     DataTransportRunner, SerialControlCommand, SerialControlHooks, SerialControlLines,
@@ -123,9 +123,12 @@ impl ManagedChannel {
 /// Errors from orchestrating a Channel.
 #[derive(Debug, thiserror::Error)]
 pub enum OrchestratorError {
-    #[error("unknown channel {0}")]
+    // The id is kept in the variant (callers may want it) but left out of the user-
+    // facing message: it's a raw UUID, and the GUI already attaches the error to the
+    // right channel (by name) — see `Driver::push_channel_error`.
+    #[error("unknown channel")]
     UnknownChannel(ChannelId),
-    #[error("unknown display view {0:?} on the channel")]
+    #[error("unknown display view on the channel")]
     UnknownDisplayView(DisplayViewId),
     #[error("illegal channel state transition from {from:?} to {to:?}")]
     IllegalTransition {
@@ -138,7 +141,7 @@ pub enum OrchestratorError {
     SerialOpen(#[source] serialport::Error),
     #[error("failed to bind interface: {0}")]
     Bind(#[source] std::io::Error),
-    #[error("serial control is not available for channel {0} (not a running serial channel)")]
+    #[error("serial control is not available (not a running serial channel)")]
     SerialControlUnavailable(ChannelId),
 }
 
@@ -811,10 +814,11 @@ impl Listener {
                     .map_err(OrchestratorError::SerialOpen)?
                     .with_notice_sender(notice_tx)
                     .with_control(hooks);
-                let raw = self.build_raw_recorder(id, config).await;
+                // "Record on start" is begun by the pipeline (auto_begin_recording), not
+                // pre-built here — so its failure surfaces like the live toggle.
                 let display = self.build_display_recorder(id, config).await;
                 let handle = ChannelHandle::Data(
-                    self.spawn_data(id, opened, config, raw, display, faulted, notice_rx),
+                    self.spawn_data(id, opened, config, None, display, faulted, notice_rx),
                 );
                 Ok((
                     handle,
@@ -829,12 +833,13 @@ impl Listener {
                     .bind()
                     .await
                     .map_err(OrchestratorError::Bind)?;
-                let raw = self.build_raw_recorder(id, config).await;
+                // "Record on start" is begun by the pipeline (auto_begin_recording), not
+                // pre-built here — so its failure surfaces like the live toggle.
                 let display = self.build_display_recorder(id, config).await;
                 // UDP is async and never stalls the reader; no notices to send.
                 let (_notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
                 let handle = ChannelHandle::Data(
-                    self.spawn_data(id, bound, config, raw, display, faulted, notice_rx),
+                    self.spawn_data(id, bound, config, None, display, faulted, notice_rx),
                 );
                 Ok((handle, None))
             }
@@ -887,6 +892,10 @@ impl Listener {
             MatchSetup {
                 rules: config.match_rules.clone(),
                 recording_settings: self.recording_settings(config),
+                // "Record on start": begin in the pipeline so a start failure surfaces
+                // like the live toggle (diagnostic + RecordingFaulted), not silently —
+                // including the no-destination case, which `begin_recording` faults.
+                auto_begin_recording: config.raw_recording.enabled,
             },
             self.channel_caps(config),
             self.events_tx.clone(),
@@ -923,54 +932,6 @@ impl Listener {
                 file_rotation: raw.file_rotation,
                 capacity: self.caps.raw_recording,
             })
-    }
-
-    /// Create the Raw Recording handle for a Channel if enabled (§53). Per §55,
-    /// failing to open the file (e.g. a refused overwrite, §121) does **not**
-    /// fault the Channel: recording stays disabled, a warning is surfaced, and
-    /// reception continues (§5.8). Returns `None` when disabled or on failure.
-    async fn build_raw_recorder(
-        &self,
-        id: ChannelId,
-        config: &ChannelConfig,
-    ) -> Option<DataRecorder> {
-        let recording = &config.raw_recording;
-        if !recording.enabled {
-            return None;
-        }
-        let Some(destination) = &recording.destination else {
-            // Enabled but no destination — cannot record; surface a warning.
-            let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
-            return None;
-        };
-        let policy = recording.overwrite_policy;
-        let ts = recording.timestamp_enabled;
-        let cap = self.caps.raw_recording;
-        // With rotation, `destination` is a directory and files are named per
-        // period from the channel name (§59); otherwise it is a single file path.
-        let created = if recording.file_rotation == FileRotationPolicy::None {
-            RawFileRecorder::create(destination, policy, ts)
-                .await
-                .map(|r| start_raw_recording(r, cap))
-        } else {
-            RotatingRawRecorder::create(
-                destination,
-                config.name.as_str(),
-                ".raw",
-                policy,
-                ts,
-                recording.file_rotation,
-            )
-            .await
-            .map(|r| start_raw_recording(r, cap))
-        };
-        match created {
-            Ok(rec) => Some(DataRecorder::Raw(rec)),
-            Err(_err) => {
-                let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
-                None
-            }
-        }
     }
 
     /// Create the Display Recording for a Channel if enabled (§54). v1 records
@@ -1471,16 +1432,25 @@ mod tests {
         listener.start(id).await.unwrap();
         assert_eq!(listener.state(id), Some(ChannelState::Running));
 
-        // A warning was surfaced for the recording-enable failure (§55).
-        let mut saw_warning = false;
-        while let Ok(event) = events.try_recv() {
-            if matches!(event, RuntimeEvent::WarningRaised(_)) {
-                saw_warning = true;
+        // The start-time recording failure surfaces as RecordingFaulted (the same path
+        // as the live Begin), so the GUI shows it — it previously only warned, which the
+        // GUI didn't surface (start-time recording failed silently). "Record on start"
+        // is now begun by the pipeline task, so the event arrives just after start.
+        let mut saw_recording_fault = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
+                Ok(Some(RuntimeEvent::RecordingFaulted(_))) => {
+                    saw_recording_fault = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => continue,
             }
         }
         assert!(
-            saw_warning,
-            "a WarningRaised event should surface the failure"
+            saw_recording_fault,
+            "a RecordingFaulted event should surface the failure"
         );
         // The pre-existing file was not clobbered (§121).
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"existing");

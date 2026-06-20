@@ -309,7 +309,7 @@ impl Driver {
                 }
             }
             Err(err) => {
-                self.push(UiUpdate::ChannelError(id, err.to_string()));
+                self.push_channel_error(id, err);
             }
         }
     }
@@ -329,12 +329,12 @@ impl Driver {
                 // Surface the reason on failure (e.g. a bind "address in use"),
                 // instead of leaving the channel Faulted with no explanation.
                 if let Err(err) = self.listener.start(id).await {
-                    self.push(UiUpdate::ChannelError(id, err.to_string()));
+                    self.push_channel_error(id, err);
                 }
             }
             UiCommand::Stop(id) => {
                 if let Err(err) = self.listener.stop(id).await {
-                    self.push(UiUpdate::ChannelError(id, err.to_string()));
+                    self.push_channel_error(id, err);
                 }
             }
             UiCommand::CommitAndStart { id, config, start } => {
@@ -359,7 +359,7 @@ impl Driver {
                 // bounded event channel and lose a ChannelStopped.
                 for id in self.channels.clone() {
                     if let Err(err) = self.listener.stop_if_live(id).await {
-                        self.push(UiUpdate::ChannelError(id, err.to_string()));
+                        self.push_channel_error(id, err);
                     }
                     self.drain_events();
                 }
@@ -393,10 +393,7 @@ impl Driver {
                 // a begin that reaches the pipeline but can't open the file reports
                 // separately via RecordingFaulted (§55).
                 if !self.listener.set_recording(id, enabled, *raw_config).await {
-                    self.push(UiUpdate::ChannelError(
-                        id,
-                        "can't change recording — channel isn't running".to_string(),
-                    ));
+                    self.push_channel_error(id, "can't change recording — channel isn't running");
                 }
             }
             UiCommand::SetRawRecordingConfig(id, raw) => {
@@ -530,6 +527,18 @@ impl Driver {
         (self.repaint)();
         sent
     }
+
+    /// Surface a channel error, identified by the channel **name** rather than a raw
+    /// id: `"<name>: <error>"`. (The id still routes the error to the right channel in
+    /// the UI; this makes the text itself readable wherever it's shown.) Falls back to
+    /// the bare error if the channel has no stored config.
+    fn push_channel_error(&self, id: ChannelId, error: impl std::fmt::Display) {
+        let msg = match self.listener.config(id) {
+            Some(cfg) => format!("{}: {error}", cfg.name.as_str()),
+            None => error.to_string(),
+        };
+        self.push(UiUpdate::ChannelError(id, msg));
+    }
 }
 
 /// A handle the egui App holds: the command sender, the update receiver, and the
@@ -537,7 +546,25 @@ impl Driver {
 pub struct BridgeHandle {
     pub commands: Sender<UiCommand>,
     pub updates: Receiver<UiUpdate>,
-    _runtime_thread: std::thread::JoinHandle<()>,
+    /// The runtime thread, taken and joined by [`shutdown_and_join`](Self::shutdown_and_join)
+    /// on app exit. `Option` so it can be moved out of `&mut self` (in `on_exit`).
+    runtime_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BridgeHandle {
+    /// Orderly shutdown on app exit: tell the driver to stop, then **block** until its
+    /// thread finishes. The driver's loop runs `Listener::shutdown()` on its way out,
+    /// which finalizes (flushes + closes) every open recording. Without this join the
+    /// process could exit while a recording's last bytes were still buffered, leaving a
+    /// `.raw`/`.disp` file unflushed — this is the X-button close path. Idempotent.
+    pub fn shutdown_and_join(&mut self) {
+        // Best-effort signal; if the channel is already closed the driver is stopping
+        // anyway. `blocking_send` is correct from this (non-async) UI thread.
+        let _ = self.commands.blocking_send(UiCommand::Shutdown);
+        if let Some(handle) = self.runtime_thread.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Channel depths for the bridge. Commands are rare (user clicks); updates are
@@ -580,7 +607,7 @@ pub fn spawn(repaint: impl Fn() + Send + 'static) -> anyhow::Result<BridgeHandle
     Ok(BridgeHandle {
         commands: cmd_tx,
         updates: upd_rx,
-        _runtime_thread: runtime_thread,
+        runtime_thread: Some(runtime_thread),
     })
 }
 
