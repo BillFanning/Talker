@@ -32,4 +32,12 @@ pub enum RecordError {
     /// start; no existing data is touched.
     #[error("recording destination is already in use by another recording")]
     DestinationInUse,
+    /// With file rotation, the destination is a **folder** of per-period files (§59),
+    /// but the configured path is an existing **file**. Surfaced clearly instead of the
+    /// opaque OS "cannot create a file when that file already exists" from `create_dir`.
+    #[error(
+        "rotation is on, so the destination must be a folder, but '{0}' is an existing \
+         file — choose a folder, or turn rotation off to record to that file"
+    )]
+    RotationDestinationIsFile(String),
 }

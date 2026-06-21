@@ -25,6 +25,21 @@ use super::{
     DisplayRecorder, FileRotationPolicy, OverwritePolicy, RawRecorder, RecordingStopReason,
 };
 
+/// Ensure the rotation **directory** exists (§59), with a clear error when the path is
+/// an existing **file**. `create_dir_all` on a path that is already a file fails with an
+/// opaque OS message ("cannot create a file when that file already exists", error 183 on
+/// Windows); catch that case explicitly so the user is told the real problem — rotation
+/// needs a folder, not a file.
+async fn ensure_rotation_dir(dir: &Path) -> Result<(), RecordError> {
+    if dir.is_file() {
+        return Err(RecordError::RotationDestinationIsFile(
+            dir.display().to_string(),
+        ));
+    }
+    tokio::fs::create_dir_all(dir).await?;
+    Ok(())
+}
+
 /// The period key for `at` under `policy` — the rotation trigger *and* the
 /// filename time component (§59), in **UTC**. `None` policy has no period.
 pub(crate) fn period_key(policy: FileRotationPolicy, at: SystemTime) -> Option<String> {
@@ -93,7 +108,7 @@ impl RotatingRawRecorder {
         timestamps: bool,
         rotation: FileRotationPolicy,
     ) -> Result<Self, RecordError> {
-        tokio::fs::create_dir_all(dir).await?;
+        ensure_rotation_dir(dir).await?;
         let key = period_key(rotation, SystemTime::now())
             .expect("RotatingRawRecorder requires a rotation period");
         let path = dir.join(rotation_filename(channel, &key, ext));
@@ -167,7 +182,7 @@ impl RotatingDisplayRecorder {
         timestamps: bool,
         rotation: FileRotationPolicy,
     ) -> Result<Self, RecordError> {
-        tokio::fs::create_dir_all(dir).await?;
+        ensure_rotation_dir(dir).await?;
         let key = period_key(rotation, SystemTime::now())
             .expect("RotatingDisplayRecorder requires a rotation period");
         let path = dir.join(rotation_filename(channel, &key, ext));
@@ -289,6 +304,33 @@ mod tests {
             assert!(!is_filesystem_safe(bad), "{bad:?} should be rejected");
         }
         assert!(!is_filesystem_safe(&"x".repeat(65)));
+    }
+
+    #[tokio::test]
+    async fn rotating_to_a_path_that_is_an_existing_file_gives_a_clear_error() {
+        // §59: with rotation the destination is a folder. If the path is an existing
+        // *file*, the user gets a clear RotationDestinationIsFile error, not the opaque
+        // OS "cannot create a file when that file already exists" from create_dir_all.
+        let mut path = std::env::temp_dir();
+        path.push(format!("listener-rot-file-{}.raw", uuid::Uuid::new_v4()));
+        tokio::fs::write(&path, b"i am a file, not a folder")
+            .await
+            .unwrap();
+
+        let result = RotatingRawRecorder::create(
+            &path,
+            "GPS",
+            ".raw",
+            OverwritePolicy::AppendIfExists,
+            false,
+            FileRotationPolicy::Hourly,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(RecordError::RotationDestinationIsFile(_))),
+            "an existing file as a rotation destination must give the clear error"
+        );
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]
