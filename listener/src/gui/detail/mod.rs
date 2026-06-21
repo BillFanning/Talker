@@ -395,8 +395,8 @@ impl ListenerApp {
                 // Names must be unique (§6, ADR-014). Commit only a name not already used
                 // by another channel (case-insensitively); a duplicate is kept in the
                 // draft (so the user can keep editing toward a unique name) but not sent
-                // to the runtime, and an inline warning shows why. `exclude` is this
-                // channel, so re-typing its own current name is fine.
+                // to the runtime, and an inline warning shows why. This channel itself is
+                // excluded (`v.id != id`), so re-typing its own current name is fine.
                 let is_duplicate = self
                     .state
                     .channels()

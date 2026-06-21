@@ -418,10 +418,10 @@ impl Listener {
 
         // Note: a recording-destination collision (§121, ADR-014) is **not** checked
         // here — it must not fault the *channel* (reception is fine; only recording can't
-        // start). It is enforced where recording is armed: the pipeline's begin path,
-        // backed by the advisory file lock (#2), surfaces it as a recording fault that
-        // leaves the channel Running. (An earlier version faulted the whole channel here,
-        // which wrongly stopped reception and showed the bind/port recourse.)
+        // start). It is enforced by the advisory file lock when the recorder opens its
+        // file, which surfaces a recording fault that leaves the channel Running. (An
+        // earlier version faulted the whole channel here, which wrongly stopped reception
+        // and showed the bind/port recourse.)
 
         // Install a fresh fault flag for this run (ADR-006); the monitor flips it
         // on a spontaneous fault and `state()`/validation read it back.
