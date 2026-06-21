@@ -99,14 +99,35 @@ impl Profile {
     /// Validate every channel without starting anything (§71). A channel's
     /// validity is reported independently — one invalid channel does not
     /// invalidate the others. Returns `(channel name, result)` per channel.
+    ///
+    /// Channel-name **uniqueness** (§6, ADR-014) is a workspace-level rule, so it is
+    /// applied here rather than in per-channel `validate_channel`: a name shared by two
+    /// or more channels marks *every* channel carrying that name as invalid (the user
+    /// must rename to disambiguate). Names compare case-insensitively, matching the
+    /// filename collision they guard against on case-insensitive filesystems.
     pub fn validate(&self) -> Vec<(String, Result<(), Vec<ChannelConfigError>>)> {
+        use std::collections::HashMap;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for channel in &self.channels {
+            *counts
+                .entry(channel.name.as_str().to_ascii_lowercase())
+                .or_insert(0) += 1;
+        }
         self.channels
             .iter()
             .map(|channel| {
-                (
-                    channel.name.as_str().to_string(),
-                    validate_channel(channel, &self.defaults),
-                )
+                let result = validate_channel(channel, &self.defaults);
+                let duplicated = counts
+                    .get(&channel.name.as_str().to_ascii_lowercase())
+                    .is_some_and(|&n| n > 1);
+                let result = if duplicated {
+                    let mut errors = result.err().unwrap_or_default();
+                    errors.push(ChannelConfigError::DuplicateChannelName);
+                    Err(errors)
+                } else {
+                    result
+                };
+                (channel.name.as_str().to_string(), result)
             })
             .collect()
     }
@@ -229,6 +250,8 @@ pub enum ChannelConfigError {
         "channel name is not filesystem-safe but recording file rotation uses it in filenames (§59)"
     )]
     InvalidChannelName,
+    #[error("channel name duplicates another channel's — names must be unique (§6, §71)")]
+    DuplicateChannelName,
     #[error("a match rule's byte pattern is empty (it would match at every byte offset, §50.2)")]
     EmptyMatchPattern,
 }
@@ -361,6 +384,37 @@ mod tests {
             ..DefaultConfig::default()
         };
         assert!(validate_channel(&channel, &defaults).is_ok());
+    }
+
+    #[test]
+    fn duplicate_channel_names_are_rejected_for_every_carrier() {
+        // Two channels share a name (case-insensitively) → both are flagged; the third,
+        // uniquely named, stays valid. Uniqueness is a workspace rule (§6, ADR-014).
+        let mut profile = Profile::new("dupes");
+        use crate::core::ChannelName;
+        let mut a = templates::udp_template();
+        a.name = ChannelName::new("Feed");
+        let mut b = templates::udp_template();
+        b.name = ChannelName::new("feed"); // same name, different case
+        let mut c = templates::udp_template();
+        c.name = ChannelName::new("Other");
+        profile.channels = vec![a, b, c];
+
+        let results = profile.validate();
+        let dup = |name: &str| {
+            results
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, r)| {
+                    r.as_ref()
+                        .err()
+                        .is_some_and(|e| e.contains(&ChannelConfigError::DuplicateChannelName))
+                })
+                .unwrap()
+        };
+        assert!(dup("Feed"), "both duplicate carriers are flagged");
+        assert!(dup("feed"), "both duplicate carriers are flagged");
+        assert!(!dup("Other"), "the unique name stays valid");
     }
 
     #[test]

@@ -609,9 +609,9 @@ impl ChannelPipeline {
                 // surface it — a silent no-op left the user clicking "Record now" with
                 // no feedback (§55).
                 self.diagnostics.record(Diagnostic::error(format!(
-                    "could not begin Raw recording to {}: {err} (check the destination \
-                     and the on-exists policy — Refuse will not overwrite)",
+                    "could not begin Raw recording to {} (on-exists: {:?}): {err}",
                     settings.destination.display(),
+                    settings.overwrite,
                 )));
                 if let Some(events) = &self.events {
                     let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));

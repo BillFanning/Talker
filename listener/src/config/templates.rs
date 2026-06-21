@@ -41,7 +41,7 @@ fn default_retention() -> RetentionConfig {
 pub fn serial_template() -> ChannelConfig {
     ChannelConfig {
         id: None,
-        name: ChannelName::new("Serial Channel"),
+        name: ChannelName::new("Serial_Channel"),
         kind: ChannelKind::Serial,
         interface: InterfaceConfig::Serial(SerialConfig {
             port: String::new(),
@@ -67,7 +67,7 @@ pub fn serial_template() -> ChannelConfig {
 pub fn udp_template() -> ChannelConfig {
     ChannelConfig {
         id: None,
-        name: ChannelName::new("UDP Channel"),
+        name: ChannelName::new("UDP_Channel"),
         kind: ChannelKind::Udp,
         interface: InterfaceConfig::Udp(UdpConfig {
             bind_address: "0.0.0.0".to_string(),
@@ -91,7 +91,7 @@ pub fn udp_template() -> ChannelConfig {
 pub fn tcp_listener_template() -> ChannelConfig {
     ChannelConfig {
         id: None,
-        name: ChannelName::new("TCP Listener"),
+        name: ChannelName::new("TCP_Listener"),
         kind: ChannelKind::TcpListener,
         interface: InterfaceConfig::TcpListener(TcpListenerConfig {
             bind_address: "0.0.0.0".to_string(),

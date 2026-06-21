@@ -185,6 +185,13 @@ struct ListenerApp {
     /// One-shot: open the Configure section on the next frame because focus moved to
     /// an unconfigured/faulted channel that needs attention.
     force_config_open: bool,
+    /// The last in-progress rename duplicated another channel's name (§6, ADR-014), so
+    /// it was not committed; drives an inline warning by the Name field.
+    name_duplicate: bool,
+    /// Per-kind monotonic counter for default channel names (§6): the Nth UDP channel is
+    /// `UDP_Channel<N>`. Counts up and is **never** reused — deleting `UDP_Channel2` does
+    /// not free the number 2; the next UDP add is 3. Each kind counts independently.
+    channel_seq: std::collections::HashMap<AddKind, u32>,
     /// Whether the channel-list (tabs) column is collapsed to a thin strip (#1).
     channels_collapsed: bool,
     /// Per-severity filters for the diagnostics log.
@@ -262,6 +269,8 @@ impl ListenerApp {
             edit_draft: None,
             confirm_remove: None,
             force_config_open: false,
+            name_duplicate: false,
+            channel_seq: std::collections::HashMap::new(),
             channels_collapsed: false,
             show_info: true,
             show_warn: true,
@@ -308,10 +317,35 @@ impl ListenerApp {
         let _ = self.bridge.commands.try_send(command);
     }
 
-    /// Add a fresh channel of `kind` (from the "Add" menu by the list heading). It
-    /// is auto-selected, and configured in the Configure section above the view.
+    /// Add a fresh channel of `kind` (from the "Add" menu by the list heading). It is
+    /// auto-selected, and configured in the Configure section above the view. The default
+    /// name is `<base><N>` (e.g. `UDP_Channel3`), where `N` is a per-kind monotonic
+    /// counter that is **never reused** — deleting a channel does not free its number
+    /// (§6, ADR-014). Each kind counts independently.
     pub(super) fn add_channel(&mut self, kind: AddKind) {
-        self.send(UiCommand::AddChannel(Box::new(template_for(kind))));
+        let mut config = template_for(kind);
+        config.name = self.next_channel_name(kind, config.name.as_str());
+        self.send(UiCommand::AddChannel(Box::new(config)));
+    }
+
+    /// The next default name for `kind`: `<base><seq>` with a per-kind monotonic, never-
+    /// reused sequence (§6, ADR-014). If that name somehow already exists (e.g. a loaded
+    /// profile used it), keep advancing the counter until it is free — still never
+    /// reusing a lower number.
+    fn next_channel_name(&mut self, kind: AddKind, base: &str) -> crate::core::ChannelName {
+        let taken: std::collections::HashSet<String> = self
+            .state
+            .channels()
+            .map(|v| v.name.to_ascii_lowercase())
+            .collect();
+        loop {
+            let seq = self.channel_seq.entry(kind).or_insert(0);
+            *seq += 1;
+            let candidate = format!("{base}{seq}");
+            if !taken.contains(&candidate.to_ascii_lowercase()) {
+                return crate::core::ChannelName::new(candidate);
+            }
+        }
     }
 
     /// Re-seed the edit draft from the selected channel's config whenever the
@@ -325,6 +359,7 @@ impl ListenerApp {
                 self.force_config_open =
                     config_incomplete(&view.config) || view.status == ChannelStatus::Faulted;
                 self.edit_draft = Some((id, view.config.clone()));
+                self.name_duplicate = false; // clear any stale rename warning on switch
             }
         }
     }

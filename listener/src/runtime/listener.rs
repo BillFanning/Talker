@@ -27,7 +27,7 @@ use crate::config::ChannelConfig;
 use crate::core::{ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
 use crate::display::{DisplayView, RenderedOutput};
 use crate::record::{
-    start_display_recording, DisplayFileRecorder, FileRotationPolicy, Recording,
+    start_display_recording, DisplayFileRecorder, FileRotationPolicy, OverwritePolicy, Recording,
     RotatingDisplayRecorder,
 };
 use crate::transport::{
@@ -415,6 +415,13 @@ impl Listener {
             }
             channel.config.clone()
         };
+
+        // Note: a recording-destination collision (§121, ADR-014) is **not** checked
+        // here — it must not fault the *channel* (reception is fine; only recording can't
+        // start). It is enforced where recording is armed: the pipeline's begin path,
+        // backed by the advisory file lock (#2), surfaces it as a recording fault that
+        // leaves the channel Running. (An earlier version faulted the whole channel here,
+        // which wrongly stopped reception and showed the bind/port recourse.)
 
         // Install a fresh fault flag for this run (ADR-006); the monitor flips it
         // on a spontaneous fault and `state()`/validation read it back.
@@ -927,7 +934,18 @@ impl Listener {
             .map(|destination| RawRecordingSettings {
                 destination,
                 channel_name: channel_name.to_string(),
-                overwrite: raw.overwrite_policy,
+                // `Refuse` is meaningless with rotation: each period is a *new* file, and
+                // re-opening the current period's file on a restart must append, not fail.
+                // Coerce it here — the single funnel for both the live and auto-begin
+                // paths — so a UI that left the policy at Refuse (the default) can't cause
+                // a spurious "file already exists" fault (§59).
+                overwrite: if raw.file_rotation != FileRotationPolicy::None
+                    && raw.overwrite_policy == OverwritePolicy::Refuse
+                {
+                    OverwritePolicy::AppendIfExists
+                } else {
+                    raw.overwrite_policy
+                },
                 timestamps: raw.timestamp_enabled,
                 file_rotation: raw.file_rotation,
                 capacity: self.caps.raw_recording,
@@ -1007,6 +1025,36 @@ mod tests {
     fn udp_channel() -> ChannelConfig {
         // Template binds 0.0.0.0:0 (ephemeral) — binds cleanly in tests.
         templates::udp_template()
+    }
+
+    #[test]
+    fn rotation_coerces_a_refuse_policy_to_append_in_the_recording_settings() {
+        // Refuse is meaningless with rotation (each period is a fresh file; a restart
+        // re-opens the current period and must append). `settings_from` coerces it so a
+        // UI leaving the default Refuse can't cause a spurious "file exists" fault (§59).
+        use crate::config::schema::RawRecordingConfig;
+        use crate::record::OverwritePolicy;
+        let listener = Listener::with_default_capacities();
+        let raw = RawRecordingConfig {
+            enabled: true,
+            destination: Some(std::path::PathBuf::from("C:/tmp/rec")),
+            timestamp_enabled: false,
+            overwrite_policy: OverwritePolicy::Refuse,
+            file_rotation: FileRotationPolicy::Hourly,
+            disk_guard: None,
+        };
+        let settings = listener.settings_from(&raw, "GPS").unwrap();
+        assert_eq!(settings.overwrite, OverwritePolicy::AppendIfExists);
+
+        // Without rotation, Refuse is preserved (it is a meaningful single-file policy).
+        let no_rot = RawRecordingConfig {
+            file_rotation: FileRotationPolicy::None,
+            ..raw
+        };
+        assert_eq!(
+            listener.settings_from(&no_rot, "GPS").unwrap().overwrite,
+            OverwritePolicy::Refuse
+        );
     }
 
     #[tokio::test]
@@ -1192,7 +1240,7 @@ mod tests {
         updated.name = crate::core::ChannelName::new("renamed");
         listener.set_pending_config(id, updated).unwrap();
         assert!(listener.has_pending(id));
-        assert_eq!(listener.config(id).unwrap().name.as_str(), "UDP Channel");
+        assert_eq!(listener.config(id).unwrap().name.as_str(), "UDP_Channel");
 
         listener.apply_pending(id).await.unwrap();
         assert!(!listener.has_pending(id));
@@ -1457,5 +1505,68 @@ mod tests {
 
         listener.stop(id).await.unwrap();
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn two_channels_cannot_record_to_one_destination_and_the_channel_stays_running() {
+        // §121 / ADR-014: the second recording to the same file is refused by the advisory
+        // lock as a *recording* fault — the channel keeps Running (reception is fine), it
+        // is not channel-faulted. The lock is the enforcement point (the friendly named
+        // pre-check was removed because it wrongly faulted the channel).
+        use crate::config::schema::RawRecordingConfig;
+        use crate::record::OverwritePolicy;
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("listener-dest-{}.raw", uuid::Uuid::new_v4()));
+
+        let raw_to = |path: &std::path::Path| RawRecordingConfig {
+            enabled: true,
+            destination: Some(path.to_path_buf()),
+            timestamp_enabled: false,
+            overwrite_policy: OverwritePolicy::Overwrite,
+            file_rotation: FileRotationPolicy::None,
+            disk_guard: None,
+        };
+
+        let mut listener = Listener::with_default_capacities();
+        let mut events = listener.take_events().unwrap();
+        let mut first = udp_channel();
+        first.name = crate::core::ChannelName::new("First");
+        first.raw_recording = raw_to(&dir);
+        let first_id = listener.add_channel(first);
+
+        let mut second = udp_channel();
+        second.name = crate::core::ChannelName::new("Second");
+        second.raw_recording = raw_to(&dir); // same destination
+        let second_id = listener.add_channel(second);
+
+        // Both channels start fine (reception runs); the second's recording faults on the
+        // lock. Allow time for the pipeline auto-begin to attempt and fault.
+        listener.start(first_id).await.unwrap();
+        listener.start(second_id).await.unwrap();
+        assert_eq!(listener.state(second_id), Some(ChannelState::Running));
+
+        let mut saw_recording_fault = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
+                Ok(Some(RuntimeEvent::RecordingFaulted(id))) if id == second_id => {
+                    saw_recording_fault = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => continue,
+            }
+        }
+        assert!(
+            saw_recording_fault,
+            "the second recording should fault on the destination lock"
+        );
+
+        listener.stop(first_id).await.unwrap();
+        listener.stop(second_id).await.unwrap();
+        let _ = tokio::fs::remove_file(&dir).await;
+        let mut lock = dir.clone().into_os_string();
+        lock.push(".lock");
+        let _ = tokio::fs::remove_file(std::path::PathBuf::from(lock)).await;
     }
 }

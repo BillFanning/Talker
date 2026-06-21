@@ -305,9 +305,12 @@ mod tests {
         path.push(format!("listener-cli-{}.toml", uuid::Uuid::new_v4()));
 
         let mut profile = Profile::new("test workspace");
+        let mut good = templates::udp_template();
+        good.name = crate::core::ChannelName::new("Good");
         let mut bad = templates::udp_template();
+        bad.name = crate::core::ChannelName::new("Bad"); // unique names (§6) — isolate the
         bad.retention = crate::config::RetentionConfig::default(); // all-None → invalid (§80)
-        profile.channels = vec![templates::udp_template(), bad];
+        profile.channels = vec![good, bad];
         profile.save(&path).unwrap();
 
         let cli = Cli {

@@ -24,7 +24,7 @@ use crate::transport::udp::UdpMode;
 use super::fonts::bold;
 
 /// Which interface a new channel uses, in the add-channel form.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum AddKind {
     Udp,
     Tcp,

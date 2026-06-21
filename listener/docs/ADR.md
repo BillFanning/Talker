@@ -504,6 +504,34 @@ A second, parallel command enum on top of a working method API + a GUI transport
 - Runtime `build_raw_recorder`/`build_display_recorder`/`record_arming`/disk-guard read their own config; the pipeline data path is unchanged (taps already separate).
 - A channel can now run **both** recordings to two destinations at once — pinned by `raw_and_display_recording_run_to_independent_destinations`. Existing rotation, live-record, and enable-failure tests updated to the split config.
 
+## ADR-014 — Recording destinations must be unique; enforced by unique channel names + an OS advisory lock
+
+**Status:** Accepted. **Context:** spec §55 (recording start), §59 (rotation / filename generation), §71 (configuration validation), §79 (recording config), §121 (file safety), ADR-013 (independent Raw/Display recording).
+
+**Problem.** Two Channels can be configured to record to the **same file**. The §121 `OverwritePolicy` guards against clobbering a *pre-existing* file, but it does **not** stop two *live* Channels from opening and interleaving writes into one destination — each passes its own enable check, then both write, corrupting the capture. This is easy to hit: duplicate the obvious destination across two channels, or (because the channel name appears in rotating filenames, §59) run two same-named rotating channels into one folder. The earlier spec explicitly allowed duplicate names (§6: "Channel Names … need not be unique"), which made the rotating-filename collision reachable by construction.
+
+**Decision.** Two complementary layers: the first removes the most common collision by construction, the second is the race-free enforcement point. (A third layer — an in-process pre-check at Start that named the conflicting channel — was prototyped and **removed**: it faulted the whole *channel*, which wrongly stopped reception and showed the bind/port recourse. A recording-destination collision must be a *recording* fault, leaving the channel Running, so enforcement belongs at the recording-arming point, not channel Start.)
+
+1. **Unique, filesystem-safe Channel Names (necessary, not sufficient).** Channel Names become **unique** in addition to the existing filesystem-safe rule (§59/§71). Enforced at add-channel (a per-kind monotonic, never-reused suffix — `UDP_Channel1`, `UDP_Channel2`, …), at rename (a duplicate is not committed and warns inline), and on profile load (a loaded workspace with duplicate names is rejected per §71's per-channel validation). This makes the **rotating** collision impossible: `<channel>_<period>.raw` leaf names cannot collide if names are unique. It does **not** cover the non-rotating case, where the destination is a full path the user typed — different names can still point at the same file.
+
+2. **OS advisory lock for the recording's lifetime.** When a recording opens its file, the recorder takes a cross-platform **advisory exclusive lock** on a companion `<path>.lock` file and holds it until finalize; failure to acquire surfaces as a recording fault (`RecordingFaulted`) that leaves the **channel Running** (reception continues; only recording is off). This catches both two channels here *and* a **second `listener` process**, and closes the start-race window. Implementation notes:
+   - The lock is on a **`<path>.lock` companion**, not the data file, so it is independent of the overwrite policy (Refuse must still fail atomically via the data open; Overwrite/Append must not be clobbered by the lock handle) and is taken *before* the data file is opened, so a lock conflict never touches the destination.
+   - The lock holder is a **synchronous `std::fs::File`** (using std's own `File::try_lock`, stable since Rust 1.89; no extra crate). A `std::fs::File` closes *deterministically* on drop, releasing the lock the instant the recorder drops — so a Stop→Start can immediately re-lock. A `tokio::fs::File` is unsuitable: it closes the OS handle asynchronously, so its lock would linger past drop and a restart would spuriously fail.
+
+**Robustness scope (explicit).** On a **local filesystem** the lock is robust on Windows, macOS, and Linux. Two residual gaps are inherent and identical on every OS, not platform bugs: (a) an *unrelated external program* that writes without locking is unaffected on Unix (advisory locks; Windows is mandatory, so it is actually stronger there); (b) over a **network filesystem** (NFS/SMB) advisory locks are unreliable — there the unique-name layer still prevents the rotating collision, and we accept the residual risk for an explicit shared full path. Both are documented, not silently assumed away.
+
+**Why not the alternatives.**
+- *Rely on `OverwritePolicy` alone.* It only guards a pre-existing file; it cannot stop two concurrent live writers (the actual failure here).
+- *OS open-mode share semantics instead of an explicit lock.* Not uniform: Windows denies a concurrent writer by default, Unix does not. An explicit advisory lock is the same code path on all three OSs. And `O_EXCL`/`CREATE_NEW` only acts at create time, conflicting with Append.
+- *An in-process pre-check at Start that names the conflicting channel.* Prototyped, then removed: it faulted the whole channel (stopping reception, showing the bind/port recourse). A destination collision is a *recording* fault, not a channel fault — the lock enforces it at the recording-arming point and leaves the channel Running. The friendly "used by channel X" message is lost; the recording-fault diagnostic still says the destination is in use.
+- *Name-derived filenames only (full structural uniqueness; the deferred #3).* Strongest prevent-by-design, but it removes the ability to pick an exact filename (destination becomes a folder) and needs profile migration — a larger UX decision, deferred to Appendix A.
+
+**Consequences.**
+- §6 changes: Channel Names are now **unique** (was "need not be unique"). §71 validation gains the uniqueness rule alongside filesystem-safe. §55/§121 gain the destination-lock requirement; a collision is a recording fault that leaves the channel Running.
+- No new crate dependency: the advisory lock uses std's `File::try_lock` (stable since 1.89; MSRV is 1.95). `fs4` stays for the disk-space free functions only.
+- The lock feeds the existing `RecordingFaulted` event/diagnostic (ADR-013) — no new GUI surface needed.
+- Tests: a name-uniqueness validation test; a lock-conflict recorder test; an orchestrator test asserting the second channel stays Running while its recording faults on the destination lock.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

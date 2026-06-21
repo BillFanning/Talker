@@ -27,4 +27,9 @@ pub enum RecordError {
     /// recorder faults rather than blocking the producer.
     #[error("recorder queue overflow; recording faulted")]
     QueueOverflow,
+    /// The destination file is already locked by another recording — possibly another
+    /// channel here or a second `listener` process (§121, ADR-014). Recording does not
+    /// start; no existing data is touched.
+    #[error("recording destination is already in use by another recording")]
+    DestinationInUse,
 }

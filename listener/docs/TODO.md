@@ -105,6 +105,18 @@ Message-model removal). Everything below this block is verified done:
       `save_then_load_round_trips_the_workspace_through_the_driver` +
       `loading_a_missing_profile_errors_without_touching_the_workspace`.
 - [ ] Export (stream scrollback → file, §60–§63) — after GUI settles
+- [x] Recording destination uniqueness (ADR-014, spec §6/§55/§71/§121). Two layers:
+      (1) **unique Channel Names** — `Profile::validate` flags duplicates
+      (`DuplicateChannelName`); GUI add uses a per-kind monotonic, never-reused suffix
+      (`UDP_Channel1`…); rename won't commit a duplicate (inline warning); profile load
+      rejects duplicate-named channels via the per-channel validation. (2) **advisory
+      lock** — `lock_recording_destination` takes std's `File::try_lock` on a `<path>.lock`
+      companion (a *sync* std file, so the lock releases deterministically on drop, unlike
+      a tokio file), held by `RawFileRecorder`/`DisplayFileRecorder` for the recording's
+      lifetime; a conflict is `RecordError::DestinationInUse` → `RecordingFaulted`, channel
+      stays Running. An in-process named pre-check at Start was prototyped and removed (it
+      faulted the whole channel + showed the bind/port recourse). Tests: name-uniqueness
+      validation; recorder lock-conflict; orchestrator two-channel stays-Running.
 
 ## Carried over (still valid under v2)
 

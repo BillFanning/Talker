@@ -662,7 +662,7 @@ mod tests {
         // The driver mints the id and reports it, with connection details.
         let id = loop {
             if let UiUpdate::ChannelAdded(id, name, details, _) = next(&mut upd_rx).await {
-                assert_eq!(name, "UDP Channel");
+                assert_eq!(name, "UDP_Channel");
                 assert!(
                     details.contains("UDP"),
                     "details name the interface: {details}"

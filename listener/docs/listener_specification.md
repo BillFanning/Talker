@@ -1,9 +1,17 @@
-# Listener Specification v2.0.3
+# Listener Specification v2.0.4
 
 Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
+
+Revision v2.0.4 (recording-destination uniqueness):
+
+Two recordings may no longer write the same file (§121, ADR-014). §6 makes Channel
+Names **unique** (was "need not be unique"); §71 validation rejects a duplicate name;
+§55 fails enabling (as a *recording* fault, Channel stays Running) if an OS advisory
+lock on the destination cannot be taken; §121 states the two-layer rule (unique names +
+advisory lock). No schema change — names were already required filesystem-safe.
 
 Revision v2.0.3 (recording-config reconciliation):
 
@@ -318,7 +326,10 @@ Each Channel shall have:
 - Configuration
 - Runtime state
 
-Channel Names are user configurable and need not be unique.
+Channel Names are user configurable and shall be **unique** within a workspace
+(§71, ADR-014): the name appears in generated recording filenames (§59), so two
+Channels sharing a name could collide on a rotating recording destination.
+Uniqueness is enforced at add-channel, at rename, and on profile load.
 
 ## 7. Channel Kinds
 
@@ -1043,6 +1054,11 @@ Recording captures only data received while recording is Enabled. On enable:
   (§79). If the file exists and the policy forbids overwrite, enabling **fails**:
   recording remains Disabled and an error is surfaced. No existing file is
   clobbered (§121).
+- The destination must not already be in use by another recording (§121, ADR-014).
+  The recorder takes an OS advisory exclusive lock on the destination; if it cannot
+  (another Channel here, or a second `listener` process, holds it), enabling **fails**
+  as a recording fault and recording remains Disabled. This is a *recording* fault, not
+  a Channel fault: reception continues and the Channel stays Running.
 
 ## 56. Recording Stop and Fault Behavior
 
@@ -1301,6 +1317,12 @@ Validation shall also reject a `ChannelName` that is not **filesystem-safe**
 if it is empty, contains path separators or reserved characters, exceeds a bounded
 length, or is a reserved device name (e.g. Windows `CON`, `PRN`, `COMx`). Names are
 rejected, not silently sanitized.
+
+Validation shall also reject a `ChannelName` that **duplicates** another Channel's
+name in the same workspace (§6, ADR-014): names must be unique because they generate
+recording filenames (§59). On profile load, a duplicate-named Channel is rejected
+like any other invalid Channel (valid Channels still load). The GUI prevents
+duplicates at add-channel and rename time.
 
 ---
 
@@ -2105,6 +2127,19 @@ Received data shall not be executed, interpreted as commands, or used to alter L
 Listener shall avoid accidental data loss when writing files.
 
 Default behavior shall avoid overwriting existing files without explicit user confirmation or configured overwrite policy.
+
+**No two recordings to one file (ADR-014).** A recording destination shall not be
+written by more than one recording at a time. Two concurrent live writers would
+interleave and corrupt a capture — a failure the `OverwritePolicy` does not prevent
+(it only guards a *pre-existing* file). This is enforced in two layers: (1) unique
+Channel Names (§6, §71) make the rotating-filename collision impossible by
+construction; (2) an OS **advisory exclusive lock** held for the recording's lifetime
+is the race-free enforcement point — it catches two Channels here *and* a second
+`listener` process, and a lock conflict is surfaced as a *recording* fault that leaves
+the Channel Running (reception continues; recording stays off). On a local filesystem
+this is robust on Windows, macOS, and Linux. Residual gaps (identical on every OS): an
+unrelated external program that writes without locking is not blocked on Unix (advisory
+locks), and advisory locks over a network filesystem are unreliable.
 
 ## 122. Privileged Resources
 

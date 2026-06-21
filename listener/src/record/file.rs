@@ -43,6 +43,42 @@ pub async fn open_recording_file(
     Ok(opts.open(path).await?)
 }
 
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Take a cross-platform advisory exclusive lock guarding a recording destination
+/// (§121, ADR-014), so two recordings can never write the same file — whether two
+/// channels here or a second `listener` process.
+///
+/// The lock is taken on a companion `<path>.lock` file, **not** the data file itself:
+/// that keeps locking independent of the destination's overwrite policy (Refuse must
+/// still fail atomically via the data open; Overwrite/Append must not be clobbered by
+/// the lock handle), and it is taken *before* the data file is opened, so a lock
+/// conflict never touches the destination. The returned **synchronous**
+/// [`std::fs::File`] is the lock holder: a `std::fs::File` closes *deterministically*
+/// on drop, releasing the lock the instant a recorder is dropped (so a Stop→Start can
+/// immediately re-lock). A `tokio::fs::File` is unsuitable — it closes the OS handle
+/// asynchronously, so its lock would linger past drop. Returns
+/// [`RecordError::DestinationInUse`] if the destination is already locked.
+fn lock_recording_destination(path: &Path) -> Result<std::fs::File, RecordError> {
+    // `std::fs::File::try_lock` (stable since Rust 1.89; MSRV is 1.95) — no fs4 needed
+    // for the lock; fs4 stays for the disk-space free functions (§168).
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path(path))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => Err(RecordError::DestinationInUse),
+        Err(std::fs::TryLockError::Error(e)) => Err(RecordError::Io(e)),
+    }
+}
+
 fn sidecar_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".idx");
@@ -63,6 +99,9 @@ pub struct RawFileRecorder {
     /// Timestamp index: one `offset,wall_clock_nanos` line per chunk (§57).
     sidecar: Option<BufWriter<File>>,
     bytes_written: u64,
+    /// Advisory lock on the destination (§121, ADR-014); held for the recorder's
+    /// lifetime, released deterministically when this std handle drops.
+    _lock: std::fs::File,
 }
 
 impl RawFileRecorder {
@@ -73,6 +112,10 @@ impl RawFileRecorder {
         policy: OverwritePolicy,
         timestamps: bool,
     ) -> Result<Self, RecordError> {
+        // Lock the main destination first (§121, ADR-014): if it is already in use, fail
+        // before touching it. The sidecar (`.idx`) shares the recording's lifetime and
+        // never collides independently, so it is not locked.
+        let lock = lock_recording_destination(path)?;
         let file = BufWriter::new(open_recording_file(path, policy).await?);
         let sidecar = if timestamps {
             Some(BufWriter::new(
@@ -85,6 +128,7 @@ impl RawFileRecorder {
             file,
             sidecar,
             bytes_written: 0,
+            _lock: lock,
         })
     }
 
@@ -134,6 +178,8 @@ impl RawRecorder for RawFileRecorder {
 pub struct DisplayFileRecorder {
     file: BufWriter<File>,
     timestamps: bool,
+    /// Advisory lock on the destination (§121, ADR-014); see `RawFileRecorder._lock`.
+    _lock: std::fs::File,
 }
 
 impl DisplayFileRecorder {
@@ -142,8 +188,15 @@ impl DisplayFileRecorder {
         policy: OverwritePolicy,
         timestamps: bool,
     ) -> Result<Self, RecordError> {
+        // Lock the destination first (§121, ADR-014) — same as Raw, so a `.disp` cannot
+        // be shared by two recordings either.
+        let lock = lock_recording_destination(path)?;
         let file = BufWriter::new(open_recording_file(path, policy).await?);
-        Ok(Self { file, timestamps })
+        Ok(Self {
+            file,
+            timestamps,
+            _lock: lock,
+        })
     }
 }
 
@@ -204,6 +257,29 @@ mod tests {
         assert!(result.is_err());
         // The existing file is untouched.
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"original");
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn a_second_recorder_on_the_same_file_is_refused_while_the_first_is_open() {
+        // §121 / ADR-014: an advisory lock stops two live recordings sharing one file.
+        let path = temp_path("locked");
+        let _first = RawFileRecorder::create(&path, OverwritePolicy::Overwrite, false)
+            .await
+            .expect("first recorder takes the lock");
+
+        // While the first holds the file, a second open is refused as in-use.
+        let second = RawFileRecorder::create(&path, OverwritePolicy::AppendIfExists, false).await;
+        assert!(
+            matches!(second, Err(RecordError::DestinationInUse)),
+            "a second recorder must be refused while the first is open"
+        );
+
+        // After the first is dropped (lock released), the destination is free again.
+        drop(_first);
+        let third = RawFileRecorder::create(&path, OverwritePolicy::AppendIfExists, false).await;
+        assert!(third.is_ok(), "the lock releases on drop");
 
         let _ = tokio::fs::remove_file(&path).await;
     }
