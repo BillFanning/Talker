@@ -33,7 +33,11 @@ impl fmt::Display for ChannelId {
     }
 }
 
-/// User-visible Channel name (§6). User configurable and need not be unique.
+/// User-visible Channel name (§6). User configurable; must be **unique** within a
+/// workspace and filesystem-safe (§6, §71, ADR-014) — it generates recording filenames
+/// (§59). `ChannelName::new` does not enforce this; uniqueness is checked by
+/// `Profile::validate` and guarded in the GUI (the runtime API does not yet own the
+/// invariant — see ADR-014).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChannelName(String);
 

@@ -277,10 +277,11 @@ impl Listener {
     /// Begin or stop Raw recording on a running data Channel live, without a restart
     /// (§50.2, ADR-012) — the manual counterpart of the match-rule `Record` action,
     /// sharing the pipeline's lazy begin / clean finalize path. `enabled = true`
-    /// begins (a no-op if already recording, or if no destination is configured);
-    /// `false` stops and finalizes. Returns `false` when the Channel is unknown, not
-    /// running, or a TCP listener. The outcome is observed via the snapshot's
-    /// recording state, and a begin failure raises a `WarningRaised` event (§55).
+    /// begins (a no-op if already recording); `false` stops and finalizes. Returns
+    /// `false` when the Channel is unknown, not running, or a TCP listener. The outcome
+    /// is observed via the snapshot's recording state; a begin failure — including no
+    /// destination configured, or the destination in use (§121) — records a diagnostic
+    /// and raises a `RecordingFaulted` event (§55), leaving the Channel Running.
     pub async fn set_recording(
         &self,
         id: ChannelId,

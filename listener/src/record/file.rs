@@ -113,8 +113,11 @@ impl RawFileRecorder {
         timestamps: bool,
     ) -> Result<Self, RecordError> {
         // Lock the main destination first (§121, ADR-014): if it is already in use, fail
-        // before touching it. The sidecar (`.idx`) shares the recording's lifetime and
-        // never collides independently, so it is not locked.
+        // before touching it. Only the main destination is locked — the `.idx` sidecar
+        // is derived from it (`<path>.idx`) and shares the recording's lifetime, so two
+        // recordings collide on the main path (caught here) before their sidecars could.
+        // The one uncovered edge — a user pointing one channel's *main* destination at
+        // another's sidecar path — is left unguarded as vanishingly unlikely.
         let lock = lock_recording_destination(path)?;
         let file = BufWriter::new(open_recording_file(path, policy).await?);
         let sidecar = if timestamps {

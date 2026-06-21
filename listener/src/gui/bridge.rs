@@ -462,14 +462,31 @@ impl Driver {
         }
         self.selected = None;
         self.stream_cursor = 0;
+        // Validate before registering (§71, ADR-014): a hand-edited profile can carry an
+        // invalid channel (e.g. a duplicate name) — skip those and load the rest, like
+        // the CLI. Validation is workspace-level (`Profile::validate`), so duplicate
+        // names flag every carrier.
+        let results = profile.validate();
+        let mut skipped: Vec<String> = Vec::new();
         // Register the loaded channels Stopped.
-        for config in profile.channels {
+        for (config, (name, result)) in profile.channels.into_iter().zip(results) {
+            if let Err(errors) = result {
+                skipped.push(format!("\"{name}\": {errors:?}"));
+                continue;
+            }
             let name = config.name.as_str().to_string();
             let details = describe_interface(&config);
             let echo = config.clone();
             let id = self.listener.add_channel(config);
             self.channels.push(id);
             self.push(UiUpdate::ChannelAdded(id, name, details, Box::new(echo)));
+        }
+        if !skipped.is_empty() {
+            self.push(UiUpdate::ProfileError(format!(
+                "loaded with {} channel(s) skipped (invalid): {}",
+                skipped.len(),
+                skipped.join("; ")
+            )));
         }
         self.push(UiUpdate::ProfileLoaded(profile.name));
     }
@@ -817,12 +834,18 @@ mod tests {
         let handle =
             tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
 
+        // Distinct names (§6, ADR-014) — the GUI auto-suffixes on add, but this test
+        // sends raw AddChannel, so name them so neither is skipped as a duplicate on load.
+        let mut c1 = udp_config(free_udp_port());
+        c1.name = crate::core::ChannelName::new("Chan_A");
+        let mut c2 = udp_config(free_udp_port());
+        c2.name = crate::core::ChannelName::new("Chan_B");
         cmd_tx
-            .send(UiCommand::AddChannel(Box::new(udp_config(free_udp_port()))))
+            .send(UiCommand::AddChannel(Box::new(c1)))
             .await
             .unwrap();
         cmd_tx
-            .send(UiCommand::AddChannel(Box::new(udp_config(free_udp_port()))))
+            .send(UiCommand::AddChannel(Box::new(c2)))
             .await
             .unwrap();
         // Drain the two ChannelAdded acks, keeping the first channel's id + config.
@@ -964,6 +987,67 @@ mod tests {
 
         cmd_tx.send(UiCommand::Shutdown).await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    /// A hand-edited profile with duplicate channel names loads the valid channels and
+    /// skips the duplicates (§71, ADR-014) — the GUI load path validates like the CLI,
+    /// rather than registering every channel blindly.
+    #[tokio::test]
+    async fn loading_a_profile_with_duplicate_names_skips_them_and_loads_the_rest() {
+        async fn next(rx: &mut Receiver<UiUpdate>) -> UiUpdate {
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("driver update timed out")
+                .expect("update stream closed")
+        }
+
+        // Build a profile: two channels share a name (both invalid), one is unique.
+        let mut profile = Profile::new("dupes");
+        let mut a = udp_config(free_udp_port());
+        a.name = crate::core::ChannelName::new("Dup");
+        let mut b = udp_config(free_udp_port());
+        b.name = crate::core::ChannelName::new("Dup");
+        let mut c = udp_config(free_udp_port());
+        c.name = crate::core::ChannelName::new("Unique");
+        profile.channels = vec![a, b, c];
+        let path = std::env::temp_dir().join(format!("listener-dup-{}.toml", uuid::Uuid::new_v4()));
+        profile.save(&path).unwrap();
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let (upd_tx, mut upd_rx) = tokio::sync::mpsc::channel(64);
+        let mut listener = Listener::with_default_capacities();
+        let events = listener.take_events().unwrap();
+        let handle =
+            tokio::spawn(Driver::new(listener, events, cmd_rx, upd_tx, Box::new(|| {})).run());
+
+        cmd_tx
+            .send(UiCommand::LoadProfile(path.clone()))
+            .await
+            .unwrap();
+
+        let mut added = Vec::new();
+        let mut saw_skip_error = false;
+        loop {
+            match next(&mut upd_rx).await {
+                UiUpdate::ChannelAdded(_, name, _, _) => added.push(name),
+                UiUpdate::ProfileError(msg) => {
+                    assert!(msg.contains("skipped"), "skip notice expected, got: {msg}");
+                    saw_skip_error = true;
+                }
+                UiUpdate::ProfileLoaded(_) => break,
+                _ => {}
+            }
+        }
+        // Only the uniquely-named channel registered; both duplicates were skipped.
+        assert_eq!(added, vec!["Unique".to_string()]);
+        assert!(
+            saw_skip_error,
+            "a skip notice should report the dropped duplicates"
+        );
+
+        cmd_tx.send(UiCommand::Shutdown).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Dropping the command sender ends the driver (the App closed).
