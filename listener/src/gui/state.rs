@@ -48,8 +48,12 @@ pub struct ChannelView {
     pub warnings: usize,
     pub errors: usize,
     /// The reason the last command on this Channel failed (e.g. a bind conflict),
-    /// cleared on a successful (re)start. `None` when there's nothing to report.
+    /// cleared on a successful (re)start. `None` when there's nothing to report. Set via
+    /// [`set_last_error`](ChannelView::set_last_error) so its timestamp stays in sync.
     pub last_error: Option<String>,
+    /// When `last_error` was set — frozen at fault time so the synthesized Diagnostics
+    /// entry shows the error's time and does not tick every frame.
+    pub last_error_at: Option<std::time::SystemTime>,
     /// The most recent snapshot, for detail panes (diagnostics, match firings,
     /// view pause, recording state). The stream bytes are *not* here — they
     /// accumulate separately in `stream_bytes` from incremental deltas. `None` until
@@ -98,6 +102,7 @@ impl ChannelView {
             warnings: 0,
             errors: 0,
             last_error: None,
+            last_error_at: None,
             snapshot: None,
             control_lines: None,
             recording: None,
@@ -107,6 +112,17 @@ impl ChannelView {
             stream_bytes: std::collections::VecDeque::new(),
             stream_cursor: 0,
         }
+    }
+
+    /// Set (or clear) the last-error message, freezing its timestamp at the moment it is
+    /// set so the synthesized Diagnostics entry shows the error's time and does not tick.
+    /// A repeated identical error keeps its original timestamp; a new/cleared one updates.
+    pub(crate) fn set_last_error(&mut self, error: Option<String>) {
+        if error == self.last_error {
+            return; // unchanged — keep the original timestamp
+        }
+        self.last_error_at = error.is_some().then(std::time::SystemTime::now);
+        self.last_error = error;
     }
 
     /// Fold an incremental stream delta (§87, ADR-009) into the accumulated view
@@ -252,7 +268,7 @@ impl AppState {
             }
             UiUpdate::ChannelError(id, message) => {
                 if let Some(view) = self.views.get_mut(&id) {
-                    view.last_error = Some(message);
+                    view.set_last_error(Some(message));
                 }
             }
             UiUpdate::Event(event) => self.apply_event(event),
@@ -325,10 +341,10 @@ impl AppState {
             RuntimeEvent::ChannelStarted(id) => {
                 self.set_status(id, ChannelStatus::Running);
                 if let Some(view) = self.views.get_mut(&id) {
-                    view.last_error = None; // a successful start clears the prior error
-                                            // A fresh Start resets the runtime's stream offset to 0, so drop
-                                            // any accumulated bytes/cursor from a previous run to avoid mixing
-                                            // old and new streams (§8.5).
+                    view.set_last_error(None); // a successful start clears the prior error
+                                               // A fresh Start resets the runtime's stream offset to 0, so drop
+                                               // any accumulated bytes/cursor from a previous run to avoid mixing
+                                               // old and new streams (§8.5).
                     view.stream_bytes.clear();
                     view.stream_cursor = 0;
                 }
@@ -337,9 +353,19 @@ impl AppState {
                 self.set_status(id, ChannelStatus::Stopped);
                 if let Some(view) = self.views.get_mut(&id) {
                     view.control_lines = None; // no live lines while stopped
+                    clear_live_pipeline_state(view);
                 }
             }
-            RuntimeEvent::ChannelFaulted(id) => self.set_status(id, ChannelStatus::Faulted),
+            RuntimeEvent::ChannelFaulted(id) => {
+                self.set_status(id, ChannelStatus::Faulted);
+                if let Some(view) = self.views.get_mut(&id) {
+                    // The pipeline is gone (a start-time bind fault never spawned one, a
+                    // spontaneous fault ended it), so its last snapshot is stale: it must
+                    // not keep showing e.g. "Raw recording started" on a channel that
+                    // failed to bind. Drop the live-pipeline-derived state.
+                    clear_live_pipeline_state(view);
+                }
+            }
             RuntimeEvent::ChannelReconnecting(id, _) => {
                 self.set_status(id, ChannelStatus::Reconnecting)
             }
@@ -350,11 +376,12 @@ impl AppState {
             // of silently doing nothing. The specific reason is in the diagnostics log.
             RuntimeEvent::RecordingFaulted(id) => {
                 if let Some(view) = self.views.get_mut(&id) {
-                    view.last_error = Some(format!(
+                    let msg = format!(
                         "{}: recording could not start — see Diagnostics (check the \
                          destination and on-exists policy)",
                         view.name
-                    ));
+                    );
+                    view.set_last_error(Some(msg));
                 }
             }
             RuntimeEvent::RecordingStarted(id) => {
@@ -362,7 +389,7 @@ impl AppState {
                 // fault leaves the Channel Running, so ChannelStarted never re-fires to
                 // clear it; this is the only signal that the recourse worked.
                 if let Some(view) = self.views.get_mut(&id) {
-                    view.last_error = None;
+                    view.set_last_error(None);
                 }
             }
             // `MessageReceived` no longer drives the list: liveness is byte-based now
@@ -389,8 +416,21 @@ impl AppState {
 /// leaves the channel Faulted (recording can't be Enabled), so this never clears one.
 fn clear_error_if_recording_ok(view: &mut ChannelView) {
     if view.last_error.is_some() && view.recording == Some(RecordingState::Enabled) {
-        view.last_error = None;
+        view.set_last_error(None);
     }
+}
+
+/// Drop the view's **live-pipeline-derived** state when a channel stops or faults: the
+/// last snapshot (its diagnostics/headline), the recording indicator, and the queue
+/// depths. Without this a faulted channel keeps rendering its previous run's snapshot —
+/// e.g. a stale "Raw recording started" INFO on a channel that just failed to bind.
+/// Byte totals/throughput are liveness facts kept as-is; this only clears state that
+/// requires a *running* pipeline to be true.
+fn clear_live_pipeline_state(view: &mut ChannelView) {
+    view.snapshot = None;
+    view.recording = None;
+    view.ingest_queue = crate::runtime::QueueDepth::default();
+    view.raw_recording_queue = None;
 }
 
 #[cfg(test)]
@@ -489,6 +529,34 @@ mod tests {
     }
 
     #[test]
+    fn faulting_clears_the_stale_live_pipeline_snapshot() {
+        // A restart that fails to bind (port in use) faults the channel with no live
+        // pipeline; its previous snapshot must not keep rendering (e.g. a stale
+        // "recording started" INFO in the Diagnostics pane). The snapshot/recording/
+        // queue state are dropped; byte liveness is kept.
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+        let mut snap = snapshot_with(id, 4096, 42.0, 0);
+        snap.raw_recording = Some(RecordingState::Enabled);
+        state.apply(UiUpdate::Snapshot(id, Box::new(snap)));
+        assert!(state.channel(id).unwrap().snapshot.is_some());
+
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelFaulted(id)));
+        let view = state.channel(id).unwrap();
+        assert_eq!(view.status, ChannelStatus::Faulted);
+        assert!(
+            view.snapshot.is_none(),
+            "stale snapshot must be cleared on fault"
+        );
+        assert_eq!(
+            view.recording, None,
+            "no recording indicator on a faulted channel"
+        );
+        assert_eq!(view.bytes_total, 4096, "byte liveness is kept");
+    }
+
+    #[test]
     fn snapshot_surfaces_cross_chunk_boundary_saves() {
         let mut state = AppState::default();
         let id = ChannelId::new();
@@ -574,6 +642,31 @@ mod tests {
         state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(id)));
         assert!(state.channel(id).unwrap().last_error.is_none());
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
+    }
+
+    #[test]
+    fn last_error_timestamp_is_frozen_until_the_error_changes() {
+        // The synthesized Diagnostics entry must show the error's time, not tick every
+        // frame: a repeated identical error keeps its first timestamp; a new one updates.
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP"));
+
+        state.apply(UiUpdate::ChannelError(id, "bind failed".into()));
+        let t1 = state.channel(id).unwrap().last_error_at.unwrap();
+
+        // Same message again → timestamp unchanged.
+        state.apply(UiUpdate::ChannelError(id, "bind failed".into()));
+        assert_eq!(state.channel(id).unwrap().last_error_at, Some(t1));
+
+        // A different message → a fresh timestamp (>= the first).
+        state.apply(UiUpdate::ChannelError(id, "other error".into()));
+        let t2 = state.channel(id).unwrap().last_error_at.unwrap();
+        assert!(t2 >= t1);
+
+        // Cleared → no timestamp.
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(id)));
+        assert!(state.channel(id).unwrap().last_error_at.is_none());
     }
 
     #[test]

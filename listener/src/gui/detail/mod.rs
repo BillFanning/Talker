@@ -223,6 +223,25 @@ impl ListenerApp {
                     boundary_saves: s.match_boundary_saves,
                 }
             });
+        // A faulted/stopped channel has no live snapshot (cleared with its dead pipeline),
+        // so synthesize a one-entry Diagnostics view from `last_error` — otherwise a
+        // start fault (e.g. a port-in-use bind failure) would show nowhere in the
+        // Diagnostics pane, only on the ⚠ line above Configure.
+        let diag_view = diag_view.or_else(|| {
+            let view = self.state.channel(id)?;
+            let err = view.last_error.clone()?;
+            // Frozen at fault time (not now()) so the entry's timestamp doesn't tick.
+            let at = view.last_error_at.unwrap_or_else(SystemTime::now);
+            Some(DiagView {
+                headline_level: "ERROR",
+                headline: err.clone(),
+                headline_color: theme::FAULT_RED,
+                counts: (0, 0, 1),
+                entries: vec![(at, DiagnosticSeverity::Error, err)],
+                matches: Vec::new(),
+                boundary_saves: 0,
+            })
+        });
         if let Some(dv) = diag_view {
             // A "Diagnostics" dropdown whose **header row** carries the live headline
             // diagnostic (most-recent error > warning > info) on its own wrapping line —

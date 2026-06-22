@@ -379,7 +379,7 @@ impl ListenerApp {
         // message doesn't linger until the ChannelStarted echo arrives. A fresh fault
         // re-sets it if the restart fails again.
         if let Some(view) = self.state.channel_mut(id) {
-            view.last_error = None;
+            view.set_last_error(None);
         }
         self.send(UiCommand::CommitAndStart {
             id,
