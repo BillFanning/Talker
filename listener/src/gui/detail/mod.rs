@@ -431,6 +431,34 @@ impl ListenerApp {
             human_bytes(bytes_total),
             bps / 1000.0
         ));
+        // Bounded-queue occupancy (§99) — current/peak/capacity, for stress testing.
+        // The peak is the value that matters; near capacity means backpressure is
+        // imminent (a reception stall or a recording-queue-overflow fault).
+        if let Some(view) = self.state.channel(id) {
+            let iq = view.ingest_queue;
+            let mut line = format!(
+                "Ingest queue: {}/{} (peak {})",
+                iq.current, iq.capacity, iq.peak
+            );
+            if let Some(rq) = view.raw_recording_queue {
+                line.push_str(&format!(
+                    "    Rec queue: {}/{} (peak {})",
+                    rq.current, rq.capacity, rq.peak
+                ));
+            }
+            // Amber once any queue's peak has reached half its capacity — an early
+            // backpressure warning while stress testing.
+            let pressured = iq.peak * 2 >= iq.capacity.max(1)
+                || view
+                    .raw_recording_queue
+                    .is_some_and(|rq| rq.peak * 2 >= rq.capacity.max(1));
+            let text = egui::RichText::new(line).weak();
+            ui.label(if pressured {
+                text.color(theme::WARNING_AMBER)
+            } else {
+                text
+            });
+        }
         let size = CONTROL_BUTTON_SIZE;
         ui.horizontal(|ui| {
             let (start_label, start_enabled) = start_button(status, config_changed);

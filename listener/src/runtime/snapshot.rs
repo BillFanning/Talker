@@ -78,6 +78,19 @@ pub struct StreamDelta {
     pub end_offset: u64,
 }
 
+/// Occupancy of one bounded pipeline queue (§99, §124) — for stress testing and
+/// backpressure diagnosis. `current` is the depth at snapshot time; `peak` is the
+/// high-water mark since Start (the value that matters — a transient spike a 5 Hz poll
+/// would miss); `capacity` is the bound. A `peak` approaching `capacity` means the queue
+/// is backing up: the recorder/disk (or the reader) can't keep up, the precursor to a
+/// reception stall or a recording-queue-overflow fault.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueueDepth {
+    pub current: usize,
+    pub peak: usize,
+    pub capacity: usize,
+}
+
 /// Cheap, O(1) liveness counters for a Channel — everything a multi-channel
 /// overview needs per tab without cloning the stream scrollback (the expensive
 /// part of a full [`ChannelSnapshot`]).
@@ -96,6 +109,13 @@ pub struct ChannelStats {
     /// rising count tells an operator that read boundaries are routinely splitting
     /// the patterns they search for (the "how often").
     pub match_boundary_saves: u64,
+    /// Depth of the Transport→Pipeline ingest queue (§99) — the edge that backpressures
+    /// the reader. A rising `peak` is the first sign reception is outrunning processing.
+    pub ingest_queue: QueueDepth,
+    /// Depth of the Raw-recording queue (§56.1), or `None` when no recorder is attached.
+    /// A `peak` near `capacity` precedes a `QueueOverflow` recording fault — i.e. the
+    /// disk can't keep up with the inflow.
+    pub raw_recording_queue: Option<QueueDepth>,
 }
 
 /// A point-in-time, owned copy of one Channel's *small* observable pipeline state
@@ -131,6 +151,11 @@ pub struct ChannelSnapshot {
     /// [`PipelineRequest::StreamDelta`] — the big scrollback is **not** bundled into
     /// every snapshot (that was O(buffer) at 5 Hz).
     pub stream_end_offset: u64,
+    /// Ingest queue occupancy (§99) — see [`ChannelStats::ingest_queue`].
+    pub ingest_queue: QueueDepth,
+    /// Raw-recording queue occupancy (§56.1), or `None` when no recorder is attached —
+    /// see [`ChannelStats::raw_recording_queue`].
+    pub raw_recording_queue: Option<QueueDepth>,
 }
 
 /// A single rule firing (§50.2). Records which rule fired and, for a data

@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use super::activity::ActivityMeter;
 use super::snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
-    StreamDelta,
+    QueueDepth, StreamDelta,
 };
 use crate::config::{
     DiskGuard, DiskThreshold, LowDiskAction, MatchAction, MatchRule, RecordControl, RecordTarget,
@@ -186,6 +186,13 @@ pub struct ChannelPipeline {
     /// (or tell it its cursor was evicted). `stream_dropped + stream_buf.len()` is the
     /// absolute end offset.
     stream_dropped: u64,
+    /// Ingest queue occupancy (§99) reported by `run_channel` each loop turn: the most
+    /// recent depth/capacity and the high-water mark since Start. Surfaced in
+    /// `ChannelStats.ingest_queue` for stress testing — a rising `peak` is the first
+    /// sign reception is outrunning the pipeline.
+    ingest_depth: usize,
+    ingest_peak: usize,
+    ingest_capacity: usize,
 }
 
 /// A `Record` action queued for asynchronous application (§50.2).
@@ -238,7 +245,19 @@ impl ChannelPipeline {
             stream_buf: VecDeque::new(),
             stream_cap: caps.stream_display,
             stream_dropped: 0,
+            ingest_depth: 0,
+            ingest_peak: 0,
+            ingest_capacity: caps.ingest,
         }
+    }
+
+    /// Record the ingest queue's occupancy (§99), tracking the high-water mark — called
+    /// by `run_channel` each loop turn with the live `Receiver` depth/capacity. The
+    /// receiver lives in `run_channel`, not here, so it is pushed in rather than polled.
+    pub fn record_ingest_depth(&mut self, current: usize, capacity: usize) {
+        self.ingest_depth = current;
+        self.ingest_capacity = capacity;
+        self.ingest_peak = self.ingest_peak.max(current);
     }
 
     /// Attach compiled find/trigger rules (§50.2, §165). `BytePattern` rules are
@@ -790,7 +809,30 @@ impl ChannelPipeline {
             error_count: self.diagnostics.errors().count(),
             raw_recording: self.raw_recording_state(),
             match_boundary_saves: self.match_rules.boundary_saves(),
+            ingest_queue: self.ingest_queue(),
+            raw_recording_queue: self.raw_recording_queue(),
         }
+    }
+
+    /// Ingest queue occupancy for the stats/snapshot views (§99).
+    fn ingest_queue(&self) -> QueueDepth {
+        QueueDepth {
+            current: self.ingest_depth,
+            peak: self.ingest_peak,
+            capacity: self.ingest_capacity,
+        }
+    }
+
+    /// Raw-recording queue occupancy, or `None` when no recorder is attached (§56.1).
+    fn raw_recording_queue(&self) -> Option<QueueDepth> {
+        self.raw_recorder.as_ref().map(|r| {
+            let (current, peak, capacity) = r.queue_depth();
+            QueueDepth {
+                current,
+                peak,
+                capacity,
+            }
+        })
     }
 
     /// Build an owned, point-in-time snapshot of the *small* observable state (§137,
@@ -821,6 +863,8 @@ impl ChannelPipeline {
             // The scrollback bytes are fetched incrementally (StreamDelta), not
             // bundled here — only the cursor target travels in the snapshot.
             stream_end_offset: self.stream_dropped + self.stream_buf.len() as u64,
+            ingest_queue: self.ingest_queue(),
+            raw_recording_queue: self.raw_recording_queue(),
         }
     }
 
@@ -937,6 +981,10 @@ pub async fn run_channel(
             }
             maybe = ingest.recv() => match maybe {
                 Some(data) => {
+                    // Sample ingest occupancy for stress testing (§99): `len()` after a
+                    // recv is the backlog still waiting — +1 for the item just taken is
+                    // the depth at arrival. Tracks a high-water mark a 5 Hz poll misses.
+                    pipeline.record_ingest_depth(ingest.len() + 1, ingest.max_capacity());
                     pipeline.ingest(data);
                     // A `Record` action may have been queued by a rule (§50.2).
                     pipeline.apply_pending_records().await;

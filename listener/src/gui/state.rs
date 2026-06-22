@@ -64,6 +64,10 @@ pub struct ChannelView {
     /// (§50.2) — the cross-chunk-carry measurement. From the latest snapshot/stats;
     /// shown per-tab so it's visible even when the channel isn't selected.
     pub boundary_saves: u64,
+    /// Bounded-queue occupancy from the latest snapshot/stats (§99) — for stress
+    /// testing / backpressure diagnosis. Shown in the detail pane.
+    pub ingest_queue: crate::runtime::QueueDepth,
+    pub raw_recording_queue: Option<crate::runtime::QueueDepth>,
     /// Accumulated stream scrollback bytes for the live viewer (§87, ADR-009),
     /// grown incrementally from [`UiUpdate::StreamDelta`] so the driver never
     /// re-ships the whole buffer each poll. Capped (oldest dropped) at this channel's
@@ -98,6 +102,8 @@ impl ChannelView {
             control_lines: None,
             recording: None,
             boundary_saves: 0,
+            ingest_queue: crate::runtime::QueueDepth::default(),
+            raw_recording_queue: None,
             stream_bytes: std::collections::VecDeque::new(),
             stream_cursor: 0,
         }
@@ -259,6 +265,8 @@ impl AppState {
                     view.errors = snapshot.diagnostics.errors.len();
                     view.recording = snapshot.raw_recording;
                     view.boundary_saves = snapshot.match_boundary_saves;
+                    view.ingest_queue = snapshot.ingest_queue;
+                    view.raw_recording_queue = snapshot.raw_recording_queue;
                     view.snapshot = Some(*snapshot);
                     clear_error_if_recording_ok(view);
                 }
@@ -273,6 +281,8 @@ impl AppState {
                     view.errors = stats.error_count;
                     view.recording = stats.raw_recording;
                     view.boundary_saves = stats.match_boundary_saves;
+                    view.ingest_queue = stats.ingest_queue;
+                    view.raw_recording_queue = stats.raw_recording_queue;
                     clear_error_if_recording_ok(view);
                 }
             }
@@ -423,6 +433,8 @@ mod tests {
             matches: vec![],
             match_boundary_saves: 0,
             stream_end_offset: total_bytes,
+            ingest_queue: crate::runtime::QueueDepth::default(),
+            raw_recording_queue: None,
         }
     }
 

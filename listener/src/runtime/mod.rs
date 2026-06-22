@@ -39,6 +39,6 @@ pub use queue::{
 };
 pub use snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
-    StreamDelta, TriggeredMatch,
+    QueueDepth, StreamDelta, TriggeredMatch,
 };
 pub use tcp::{start_tcp_listener, TcpListenerHandle};

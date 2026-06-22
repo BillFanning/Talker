@@ -170,11 +170,23 @@ pub struct Recording<I> {
     terminate: Option<oneshot::Sender<RecordingStopReason>>,
     state: RecordingState,
     task: JoinHandle<()>,
+    /// High-water mark of the queue depth seen at enqueue time (§99) — for stress
+    /// testing. A 5 Hz stats poll would miss a transient backlog; this peak does not.
+    peak_depth: usize,
 }
 
 impl<I: Send + 'static> Recording<I> {
     pub fn state(&self) -> RecordingState {
         self.state
+    }
+
+    /// Current/peak/capacity of the recorder queue as a `(current, peak, capacity)`
+    /// triple — surfaced in `ChannelStats.raw_recording_queue` for backpressure
+    /// diagnosis. `current` is `max_capacity - capacity` (queued = bound − free slots).
+    pub fn queue_depth(&self) -> (usize, usize, usize) {
+        let capacity = self.items.max_capacity();
+        let current = capacity.saturating_sub(self.items.capacity());
+        (current, self.peak_depth.max(current), capacity)
     }
 
     /// Offer one item to the recorder. Non-blocking (§56.1): a full queue faults
@@ -184,6 +196,13 @@ impl<I: Send + 'static> Recording<I> {
         if self.state != RecordingState::Enabled {
             return;
         }
+        // Sample the depth *before* this send (free slots = remaining capacity) so the
+        // peak reflects the deepest the queue actually got under load.
+        let depth = self
+            .items
+            .max_capacity()
+            .saturating_sub(self.items.capacity());
+        self.peak_depth = self.peak_depth.max(depth);
         match self.items.try_send(item) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => self.fault(RecordError::QueueOverflow),
@@ -241,6 +260,7 @@ where
         terminate: Some(term_tx),
         state: RecordingState::Enabled,
         task,
+        peak_depth: 0,
     }
 }
 
@@ -306,6 +326,62 @@ mod tests {
         async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
             Ok(())
         }
+    }
+
+    /// A recorder whose **first** write blocks until released, then all writes pass —
+    /// so items pile up in the queue (observable depth high-water mark) without
+    /// deadlocking the graceful-drain on finalize.
+    struct BlockFirstRecorder {
+        release: Arc<tokio::sync::Notify>,
+        blocked_once: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl RawRecorder for BlockFirstRecorder {
+        async fn write_chunk(&mut self, _chunk: &ReceivedData) -> Result<(), RecordError> {
+            if !self.blocked_once {
+                self.blocked_once = true;
+                self.release.notified().await; // hold only the first write
+            }
+            Ok(())
+        }
+        async fn flush(&mut self) -> Result<(), RecordError> {
+            Ok(())
+        }
+        async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_depth_tracks_current_and_peak() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let recorder = BlockFirstRecorder {
+            release: release.clone(),
+            blocked_once: false,
+        };
+        let mut recording = start_raw_recording(recorder, 8);
+
+        // Empty to start.
+        assert_eq!(recording.queue_depth(), (0, 0, 8));
+
+        // The task takes the first item and blocks in write_chunk; the rest sit in the
+        // queue. Yield so the task can pull the first item before we measure.
+        for _ in 0..5 {
+            recording.try_record(chunk(b"x"));
+        }
+        tokio::task::yield_now().await;
+
+        let (_current, peak, capacity) = recording.queue_depth();
+        assert_eq!(capacity, 8);
+        assert!(peak >= 1, "the peak should reflect the backlog, got {peak}");
+        assert!(peak <= 8, "the peak can never exceed capacity, got {peak}");
+
+        // Release the first write so the backlog drains, then finalize cleanly.
+        // `notify_one` leaves a stored permit even if the task isn't parked yet, so this
+        // can't race ahead of the writer's `.notified().await` and hang.
+        release.notify_one();
+        recording.finalize(RecordingStopReason::Disabled).await;
     }
 
     #[tokio::test]
