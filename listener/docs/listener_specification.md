@@ -1161,8 +1161,11 @@ generates a new file at the start of each period.
 
 **Generated filenames** are `<channel-name>_<start-time><ext>`, where:
 
-- `<start-time>` is the period's start at the **least resolution the period
-  needs**: `Daily` → `YYYY-MM-DD`; `Hourly` → `YYYY-MM-DD_HH`.
+- `<start-time>` is the period's start in **local time** (the operator's wall
+  clock), at the **least resolution the period needs**: `Daily` → `YYYY-MM-DD`;
+  `Hourly` → `YYYY-MM-DD_HH`. (Local rather than UTC so filenames match the clock
+  the operator reads; the DST edge — a repeated/skipped local hour at the change — is
+  accepted and harmless to the byte stream.)
 - `<ext>` identifies the file's contents:
   - **`.raw`** — raw data, byte-exact and contiguous (§53).
   - **`.disp`** — Display Recording (rendered text, §54).

@@ -6,15 +6,16 @@
 //! `<channel>_<start-time><ext>` (§59). Rotation is **data-driven** — the period
 //! is taken from each item's wall-clock arrival time, so a quiet period produces
 //! no file and a rotation happens when the first item of the next period arrives.
-//! Period keys are **UTC**: calendar-aligned, unambiguous, and free of DST
-//! collisions (two local "01:00" hours would otherwise collide on a fall-back).
-//! Each file stays contiguous and byte-exact for the data it holds; a rotation is
-//! a clean file boundary, never a gap (§56).
+//! Period keys are in **local time** so filenames match the operator's wall clock
+//! (`<channel>_2026-06-03_08` is the local 08:00 hour). The trade-off is the DST edge
+//! (a repeated/skipped local hour around the change) — see [`period_key`]. Each file
+//! stays contiguous and byte-exact for the data it holds; a rotation is a clean file
+//! boundary, never a gap (§56).
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local};
 
 use crate::core::RecordError;
 use crate::display::RenderedOutput;
@@ -41,9 +42,17 @@ async fn ensure_rotation_dir(dir: &Path) -> Result<(), RecordError> {
 }
 
 /// The period key for `at` under `policy` — the rotation trigger *and* the
-/// filename time component (§59), in **UTC**. `None` policy has no period.
+/// filename time component (§59), in **local time**. `None` policy has no period.
+///
+/// Local time so rotated filenames match the operator's wall clock (a `…_08` hourly
+/// file is the local 08:00 hour, not a UTC hour they must mentally offset). The
+/// trade-off is the DST edge UTC avoided: on a fall-back the local "01:00" hour repeats,
+/// so two consecutive periods can produce the same key and append to one file; on a
+/// spring-forward an hour's key is simply skipped. Both are rare and harmless to the
+/// byte stream (still contiguous), and the local-time readability is the deliberate
+/// choice here.
 pub(crate) fn period_key(policy: FileRotationPolicy, at: SystemTime) -> Option<String> {
-    let dt: DateTime<Utc> = at.into();
+    let dt: DateTime<Local> = at.into();
     match policy {
         FileRotationPolicy::None => None,
         FileRotationPolicy::Hourly => Some(dt.format("%Y-%m-%d_%H").to_string()),
@@ -246,9 +255,15 @@ mod tests {
     use chrono::TimeZone;
     use std::time::Instant;
 
-    /// A `SystemTime` at a fixed UTC instant, for deterministic period keys.
-    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> SystemTime {
-        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap().into()
+    /// A `SystemTime` at a fixed **local** instant, so period keys are deterministic
+    /// regardless of the test machine's timezone (period keys are local time now).
+    /// Avoids the DST-ambiguity edge by picking ordinary mid-day/mid-night times.
+    fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> SystemTime {
+        Local
+            .with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .single()
+            .expect("unambiguous local time")
+            .into()
     }
 
     fn chunk_at(bytes: &[u8], at: SystemTime) -> ReceivedData {
@@ -269,8 +284,8 @@ mod tests {
     }
 
     #[test]
-    fn period_keys_use_utc_at_the_right_resolution() {
-        let at = utc(2026, 6, 3, 8, 30);
+    fn period_keys_use_local_time_at_the_right_resolution() {
+        let at = local(2026, 6, 3, 8, 30);
         assert_eq!(
             period_key(FileRotationPolicy::Hourly, at).as_deref(),
             Some("2026-06-03_08")
@@ -348,13 +363,13 @@ mod tests {
         .unwrap();
 
         // Two chunks in the 08:00 hour, one in 09:00 → two files, no gap, no backfill.
-        rec.write_chunk(&chunk_at(b"A", utc(2026, 6, 3, 8, 30)))
+        rec.write_chunk(&chunk_at(b"A", local(2026, 6, 3, 8, 30)))
             .await
             .unwrap();
-        rec.write_chunk(&chunk_at(b"B", utc(2026, 6, 3, 8, 45)))
+        rec.write_chunk(&chunk_at(b"B", local(2026, 6, 3, 8, 45)))
             .await
             .unwrap();
-        rec.write_chunk(&chunk_at(b"C", utc(2026, 6, 3, 9, 5)))
+        rec.write_chunk(&chunk_at(b"C", local(2026, 6, 3, 9, 5)))
             .await
             .unwrap();
         rec.finalize(RecordingStopReason::ChannelStopped)
@@ -392,10 +407,10 @@ mod tests {
                 wall_clock: at,
             }),
         };
-        rec.write_rendered(&render("day1", utc(2026, 6, 3, 23, 50)))
+        rec.write_rendered(&render("day1", local(2026, 6, 3, 23, 50)))
             .await
             .unwrap();
-        rec.write_rendered(&render("day2", utc(2026, 6, 4, 0, 10)))
+        rec.write_rendered(&render("day2", local(2026, 6, 4, 0, 10)))
             .await
             .unwrap();
         rec.finalize(RecordingStopReason::ChannelStopped)
