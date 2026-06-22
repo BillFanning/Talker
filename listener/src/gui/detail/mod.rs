@@ -239,11 +239,6 @@ impl ListenerApp {
                 format!("{}  {}", dv.headline_level, dv.headline)
             };
             let headline_color = dv.headline_color;
-            // Wrap at the *visible* width (clip rect), not `available_width`: a sibling
-            // widget (the wide stream view) inflates the panel's desired width past the
-            // viewport, so `available_width` reads too wide and the label wrapped
-            // off-screen, clipping the last word. Computed before the header borrows `ui`.
-            let visible = (ui.clip_rect().right() - ui.cursor().left() - 8.0).max(64.0);
             let diag_id = ui.make_persistent_id(("diagnostics", id));
             egui::collapsing_header::CollapsingState::load_with_default_open(
                 ui.ctx(),
@@ -252,7 +247,12 @@ impl ListenerApp {
             )
             .show_header(ui, |ui| {
                 // Header row + headline line stacked: the count row to click, the live
-                // status line beneath it (both visible while collapsed).
+                // status line beneath it (both visible while collapsed). The headline is a
+                // **single, truncating** line (not wrapping): a wrapping, per-frame-changing
+                // label inside a collapsing header makes the header's measured height differ
+                // between egui's two layout passes, so the header's id never converges
+                // ("changed id between passes") and egui repaints forever — a CPU spin. The
+                // full untruncated text is in the expanded log below.
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         let (e, w, x) = dv.counts;
@@ -261,13 +261,10 @@ impl ListenerApp {
                             egui::RichText::new(format!("({e} info · {w} warn · {x} err)")).weak(),
                         );
                     });
-                    ui.scope(|ui| {
-                        ui.set_max_width(visible);
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(headline).color(headline_color))
-                                .wrap(),
-                        );
-                    });
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(headline).color(headline_color))
+                            .truncate(),
+                    );
                 });
             })
             .body(|ui| {
@@ -283,10 +280,11 @@ impl ListenerApp {
                     .max_height(200.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // Clamp the log's wrap width to the visible (clip-rect) width, like
-                        // the headline: the wide stream view inflates `available_width`, so
-                        // entries wrapped off-screen and looked unwrapped (clipped).
-                        let log_w = (ui.clip_rect().right() - ui.cursor().left() - 8.0).max(64.0);
+                        // Inside the scroll area (fixed height, auto_shrink off), the
+                        // available width is the stable wrap target — don't derive it from
+                        // `clip_rect`/`cursor`, which vary between egui's two layout passes
+                        // and were destabilizing the layout.
+                        let log_w = ui.available_width();
                         ui.set_max_width(log_w);
                         let mut shown = 0usize;
                         for (t, sev, msg) in dv.entries.iter().rev() {
