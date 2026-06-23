@@ -180,82 +180,88 @@ impl ListenerApp {
             /// the cross-chunk-carry measurement (where/why land in the diag log).
             boundary_saves: u64,
         }
-        let diag_view = self
-            .state
-            .channel(id)
-            .and_then(|v| v.snapshot.as_ref())
-            .map(|s| {
+        let view = self.state.channel(id);
+        // Collect the diagnostics log from the last snapshot (kept across stop/start, so
+        // a previous run's messages persist), then merge in a start/bind fault: a fault
+        // (`last_error` while Faulted) carries its own frozen-timestamp ERROR entry, so it
+        // shows in the log *and* leads the headline — even when there's no live snapshot
+        // (a start-time bind fault that never ran a pipeline).
+        let mut entries: Vec<(SystemTime, DiagnosticSeverity, String)> = Vec::new();
+        let (mut counts, matches, boundary_saves) = match view.and_then(|v| v.snapshot.as_ref()) {
+            Some(s) => {
                 let d = &s.diagnostics;
-                let mut entries: Vec<(SystemTime, DiagnosticSeverity, String)> = Vec::new();
                 for e in d.events.iter().chain(&d.warnings).chain(&d.errors) {
                     entries.push((e.timestamp, e.severity, e.message.clone()));
                 }
-                // Chronological now that each entry carries a timestamp (a single
-                // timeline across severities, not three separate buckets).
-                entries.sort_by_key(|(t, _, _)| *t);
-                // The headline is the *chronologically latest* entry, so a fresh INFO
-                // (e.g. "recording started") supersedes an older ERROR in the rolled-up
-                // line — not severity-ranked, which would keep stale errors headlined.
-                let (headline_level, headline, headline_color) = match entries.last() {
-                    Some((_, sev, msg)) => {
-                        let (level, color) = match sev {
-                            DiagnosticSeverity::Event => ("INFO", theme::EVENT_GREY),
-                            DiagnosticSeverity::Warning => ("WARN", theme::WARNING_AMBER),
-                            DiagnosticSeverity::Error => ("ERROR", theme::FAULT_RED),
-                        };
-                        (level, msg.clone(), color)
+                let matches = s
+                    .matches
+                    .iter()
+                    .rev()
+                    .take(20)
+                    .map(|m| (m.byte_offset, short_id(&m.rule_id.to_string()).to_string()))
+                    .collect();
+                (
+                    (d.events.len(), d.warnings.len(), d.errors.len()),
+                    matches,
+                    s.match_boundary_saves,
+                )
+            }
+            None => ((0, 0, 0), Vec::new(), 0),
+        };
+        // Merge the current fault (Faulted channel with a `last_error`) as an ERROR entry,
+        // unless the snapshot already carries that exact message.
+        if let Some(view) = view {
+            if view.status == ChannelStatus::Faulted {
+                if let Some(err) = &view.last_error {
+                    let dup = entries.iter().any(|(_, _, m)| m == err);
+                    if !dup {
+                        let at = view.last_error_at.unwrap_or_else(SystemTime::now);
+                        entries.push((at, DiagnosticSeverity::Error, err.clone()));
+                        counts.2 += 1;
                     }
-                    None => ("", "no activity yet".to_string(), theme::IDLE_GREY),
-                };
-                DiagView {
-                    headline_level,
-                    headline,
-                    headline_color,
-                    counts: (d.events.len(), d.warnings.len(), d.errors.len()),
-                    entries,
-                    matches: s
-                        .matches
-                        .iter()
-                        .rev()
-                        .take(20)
-                        .map(|m| (m.byte_offset, short_id(&m.rule_id.to_string()).to_string()))
-                        .collect(),
-                    boundary_saves: s.match_boundary_saves,
                 }
-            });
-        // A faulted/stopped channel has no live snapshot (cleared with its dead pipeline),
-        // so synthesize a one-entry Diagnostics view from `last_error` — otherwise a
-        // start fault (e.g. a port-in-use bind failure) would show nowhere in the
-        // Diagnostics pane, only on the ⚠ line above Configure.
-        let diag_view = diag_view.or_else(|| {
-            let view = self.state.channel(id)?;
-            let err = view.last_error.clone()?;
-            // Frozen at fault time (not now()) so the entry's timestamp doesn't tick.
-            let at = view.last_error_at.unwrap_or_else(SystemTime::now);
+            }
+        }
+        let diag_view = if entries.is_empty() {
+            None
+        } else {
+            // Chronological (a single timeline across severities). The headline is the
+            // latest entry, so a fresh INFO supersedes an older ERROR — and a just-merged
+            // fault (newest) leads.
+            entries.sort_by_key(|(t, _, _)| *t);
+            let (headline_level, headline, headline_color) = match entries.last() {
+                Some((_, sev, msg)) => {
+                    let (level, color) = match sev {
+                        DiagnosticSeverity::Event => ("INFO", theme::EVENT_GREY),
+                        DiagnosticSeverity::Warning => ("WARN", theme::WARNING_AMBER),
+                        DiagnosticSeverity::Error => ("ERROR", theme::FAULT_RED),
+                    };
+                    (level, msg.clone(), color)
+                }
+                None => ("", "no activity yet".to_string(), theme::IDLE_GREY),
+            };
             Some(DiagView {
-                headline_level: "ERROR",
-                headline: err.clone(),
-                headline_color: theme::FAULT_RED,
-                counts: (0, 0, 1),
-                entries: vec![(at, DiagnosticSeverity::Error, err)],
-                matches: Vec::new(),
-                boundary_saves: 0,
+                headline_level,
+                headline,
+                headline_color,
+                counts,
+                entries,
+                matches,
+                boundary_saves,
             })
-        });
+        };
         if let Some(dv) = diag_view {
-            // A "Diagnostics" dropdown whose **header row** carries the live headline
-            // diagnostic (most-recent error > warning > info) on its own wrapping line —
-            // so it's visible whether the section is rolled up or open, and a long
-            // message wraps instead of being truncated in the single-line header title.
-            // Opening it reveals the filterable, ms-timestamped log.
-            // The headline diagnostic — `LEVEL message` — the chronologically latest
-            // entry (so a fresh INFO supersedes an older ERROR). Shown directly under the
-            // header row and above the collapsible body, so it stays visible when the
-            // section is rolled up and reads as the section's live status line.
+            // The diagnostics header is a single line: "Diagnostics (counts)  LEVEL phrase"
+            // — the live headline (chronologically latest diagnostic) sits to the right of
+            // the title and score, shortened to a clean phrase (headline_phrase) and
+            // truncated by egui if it still overflows the row. Single-line and a fixed
+            // height, so the collapsing header's layout stays stable across egui's two
+            // passes (a wrapping/variable-height header caused a repaint spin). The full
+            // untruncated text is in the expanded log below.
             let headline = if dv.headline_level.is_empty() {
-                dv.headline.clone()
+                headline_phrase(&dv.headline)
             } else {
-                format!("{}  {}", dv.headline_level, dv.headline)
+                format!("{}  {}", dv.headline_level, headline_phrase(&dv.headline))
             };
             let headline_color = dv.headline_color;
             let diag_id = ui.make_persistent_id(("diagnostics", id));
@@ -265,26 +271,13 @@ impl ListenerApp {
                 false,
             )
             .show_header(ui, |ui| {
-                // Header row + headline line stacked: the count row to click, the live
-                // status line beneath it (both visible while collapsed). The headline is a
-                // **single, truncating** line (not wrapping): a wrapping, per-frame-changing
-                // label inside a collapsing header makes the header's measured height differ
-                // between egui's two layout passes, so the header's id never converges
-                // ("changed id between passes") and egui repaints forever — a CPU spin. The
-                // full untruncated text is in the expanded log below.
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        let (e, w, x) = dv.counts;
-                        ui.label(bold("Diagnostics"));
-                        ui.label(
-                            egui::RichText::new(format!("({e} info · {w} warn · {x} err)")).weak(),
-                        );
-                    });
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(headline).color(headline_color))
-                            .truncate(),
-                    );
-                });
+                let (e, w, x) = dv.counts;
+                ui.label(bold("Diagnostics"));
+                ui.label(egui::RichText::new(format!("({e} info · {w} warn · {x} err)")).weak());
+                ui.add(
+                    egui::Label::new(egui::RichText::new(headline).color(headline_color))
+                        .truncate(),
+                );
             })
             .body(|ui| {
                 ui.horizontal(|ui| {
@@ -634,6 +627,35 @@ impl ListenerApp {
     }
 }
 
+/// Shorten a full diagnostic message into a headline phrase by cutting at the first
+/// natural boundary, so the title-row headline reads as a clean phrase rather than a
+/// mid-word truncation. Drops the *detail* tail:
+/// - `→` separates a subject from its target — keep the subject ("Raw recording
+///   started → C:\…" → "Raw recording started").
+/// - ` — ` / `: ` introduce an explanation — keep up to and including the first
+///   `<name>:` segment but drop a following explanatory clause ("UDP_Channel3: failed
+///   to bind interface: Only one usage… (os error 10048)" → "UDP_Channel3: failed to
+///   bind interface").
+/// Falls back to the whole (trimmed) message when there is no such boundary; the egui
+/// label still ellipsizes if even the phrase overflows the row.
+fn headline_phrase(message: &str) -> String {
+    // First, drop a `→ target` tail (recording destinations etc.).
+    let head = message.split('→').next().unwrap_or(message).trim();
+    // Then drop an explanatory clause after the *second* `: ` (the first `: ` is the
+    // "<name>: <kind>" separator we want to keep) or after a ` — ` dash.
+    let mut cut = head.len();
+    if let Some(dash) = head.find(" — ") {
+        cut = cut.min(dash);
+    }
+    // Keep the first "<name>: <kind>" but trim a second ": <detail>".
+    if let Some(first_colon) = head.find(": ") {
+        if let Some(rel) = head[first_colon + 2..].find(": ") {
+            cut = cut.min(first_colon + 2 + rel);
+        }
+    }
+    head[..cut].trim_end().to_string()
+}
+
 /// A one-line summary of a Raw recording config for the collapsed Setup header:
 /// `path · rotation · on-exists` (e.g. `C:\logs\gps.raw · Daily · Append`). The path
 /// reads "(no destination)" when unset; rotation/on-exists use short words.
@@ -686,4 +708,34 @@ fn shorten_path(path: &std::path::Path) -> String {
     let keep = MAX.saturating_sub(file.chars().count() + 3);
     let head: String = dir.chars().take(keep).collect();
     format!("{head}…{sep}{file}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::headline_phrase;
+
+    #[test]
+    fn headline_phrase_cuts_at_natural_boundaries() {
+        // `→ target` is dropped (recording destination).
+        assert_eq!(
+            headline_phrase("Raw recording started → C:\\Users\\me\\Desktop\\poop"),
+            "Raw recording started"
+        );
+        // A second `: detail` (the OS reason) is dropped; the "<name>: <kind>" is kept.
+        assert_eq!(
+            headline_phrase(
+                "UDP_Channel3: failed to bind interface: Only one usage of each socket \
+                 address (os error 10048)"
+            ),
+            "UDP_Channel3: failed to bind interface"
+        );
+        // A ` — ` explanatory clause is dropped.
+        assert_eq!(
+            headline_phrase("recording could not start — check the destination"),
+            "recording could not start"
+        );
+        // No boundary → the whole (trimmed) message is kept (egui ellipsizes if needed).
+        assert_eq!(headline_phrase("connected"), "connected");
+        assert_eq!(headline_phrase("  spaced  "), "spaced");
+    }
 }

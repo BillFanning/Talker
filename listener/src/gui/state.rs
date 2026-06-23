@@ -359,10 +359,10 @@ impl AppState {
             RuntimeEvent::ChannelFaulted(id) => {
                 self.set_status(id, ChannelStatus::Faulted);
                 if let Some(view) = self.views.get_mut(&id) {
-                    // The pipeline is gone (a start-time bind fault never spawned one, a
-                    // spontaneous fault ended it), so its last snapshot is stale: it must
-                    // not keep showing e.g. "Raw recording started" on a channel that
-                    // failed to bind. Drop the live-pipeline-derived state.
+                    // Keep the diagnostics log (it survives the fault), but neutralize the
+                    // live-only indicators (recording/queues) — the pipeline is gone. The
+                    // headline prefers the fault, so a faulted channel doesn't headline a
+                    // stale "Raw recording started".
                     clear_live_pipeline_state(view);
                 }
             }
@@ -420,14 +420,13 @@ fn clear_error_if_recording_ok(view: &mut ChannelView) {
     }
 }
 
-/// Drop the view's **live-pipeline-derived** state when a channel stops or faults: the
-/// last snapshot (its diagnostics/headline), the recording indicator, and the queue
-/// depths. Without this a faulted channel keeps rendering its previous run's snapshot —
-/// e.g. a stale "Raw recording started" INFO on a channel that just failed to bind.
-/// Byte totals/throughput are liveness facts kept as-is; this only clears state that
-/// requires a *running* pipeline to be true.
+/// Neutralize the view's **live-only** indicators when a channel stops or faults: the
+/// recording state and the bounded-queue depths, which require a *running* pipeline to
+/// be true. The **diagnostics snapshot is kept** so the last run's log stays visible
+/// across a stop/start (and on a fault); the headline logic separately prefers the
+/// fault so a stopped/faulted channel doesn't headline a stale "Raw recording started".
+/// Byte totals/throughput are liveness facts kept as-is.
 fn clear_live_pipeline_state(view: &mut ChannelView) {
-    view.snapshot = None;
     view.recording = None;
     view.ingest_queue = crate::runtime::QueueDepth::default();
     view.raw_recording_queue = None;
@@ -529,11 +528,11 @@ mod tests {
     }
 
     #[test]
-    fn faulting_clears_the_stale_live_pipeline_snapshot() {
-        // A restart that fails to bind (port in use) faults the channel with no live
-        // pipeline; its previous snapshot must not keep rendering (e.g. a stale
-        // "recording started" INFO in the Diagnostics pane). The snapshot/recording/
-        // queue state are dropped; byte liveness is kept.
+    fn faulting_keeps_the_diagnostics_log_but_clears_live_indicators() {
+        // A fault keeps the diagnostics snapshot (so the last run's log persists across a
+        // stop/start) but neutralizes the live-only indicators (recording, queues), which
+        // require a running pipeline. Byte liveness is kept. The detail pane separately
+        // ensures a faulted channel's *headline* shows the fault, not a stale snapshot.
         let mut state = AppState::default();
         let id = ChannelId::new();
         state.apply(added(id, "udp", "UDP · test"));
@@ -546,8 +545,8 @@ mod tests {
         let view = state.channel(id).unwrap();
         assert_eq!(view.status, ChannelStatus::Faulted);
         assert!(
-            view.snapshot.is_none(),
-            "stale snapshot must be cleared on fault"
+            view.snapshot.is_some(),
+            "the diagnostics log is kept across a fault"
         );
         assert_eq!(
             view.recording, None,
