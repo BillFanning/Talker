@@ -5,8 +5,6 @@
 
 mod stream_view;
 
-use std::time::SystemTime;
-
 use crate::core::{ChannelId, RecordingState};
 use crate::diagnostics::DiagnosticSeverity;
 
@@ -173,7 +171,8 @@ impl ListenerApp {
             headline: String,
             headline_color: egui::Color32,
             counts: (usize, usize, usize),
-            entries: Vec<(SystemTime, DiagnosticSeverity, String)>,
+            /// The full diagnostics log, chronological (oldest → newest).
+            entries: Vec<crate::diagnostics::Diagnostic>,
             matches: Vec<(Option<u64>, String)>,
             /// How many matches were recovered across a read-chunk boundary (§50.2):
             /// the cross-chunk-carry measurement (where/why land in the diag log).
@@ -186,43 +185,38 @@ impl ListenerApp {
         // fault (which never ran a pipeline) is retained by the runtime and served via a
         // minimal snapshot for the faulted channel. The snapshot is kept across stop/start
         // so a previous run's messages persist.
-        let mut entries: Vec<(SystemTime, DiagnosticSeverity, String)> = Vec::new();
-        let (counts, matches, boundary_saves) = match view.and_then(|v| v.snapshot.as_ref()) {
-            Some(s) => {
-                let d = &s.diagnostics;
-                for e in d.events.iter().chain(&d.warnings).chain(&d.errors) {
-                    entries.push((e.timestamp, e.severity, e.message.clone()));
+        let (entries, counts, matches, boundary_saves) =
+            match view.and_then(|v| v.snapshot.as_ref()) {
+                Some(s) => {
+                    let d = &s.diagnostics;
+                    let counts = (d.events.len(), d.warnings.len(), d.errors.len());
+                    // One chronological timeline across severities (the snapshot owns the
+                    // flatten+sort; the GUI just renders it).
+                    let entries = d.clone().into_sorted_vec();
+                    let matches = s
+                        .matches
+                        .iter()
+                        .rev()
+                        .take(20)
+                        .map(|m| (m.byte_offset, short_id(&m.rule_id.to_string()).to_string()))
+                        .collect();
+                    (entries, counts, matches, s.match_boundary_saves)
                 }
-                let matches = s
-                    .matches
-                    .iter()
-                    .rev()
-                    .take(20)
-                    .map(|m| (m.byte_offset, short_id(&m.rule_id.to_string()).to_string()))
-                    .collect();
-                (
-                    (d.events.len(), d.warnings.len(), d.errors.len()),
-                    matches,
-                    s.match_boundary_saves,
-                )
-            }
-            None => ((0, 0, 0), Vec::new(), 0),
-        };
+                None => (Vec::new(), (0, 0, 0), Vec::new(), 0),
+            };
         let diag_view = if entries.is_empty() {
             None
         } else {
-            // Chronological (a single timeline across severities). The headline is the
-            // latest entry, so a fresh INFO supersedes an older ERROR — and a just-merged
-            // fault (newest) leads.
-            entries.sort_by_key(|(t, _, _)| *t);
+            // The headline is the latest entry, so the newest diagnostic leads — a fresh
+            // INFO supersedes an older ERROR, and a just-recorded fault (newest) leads.
             let (headline_level, headline, headline_color) = match entries.last() {
-                Some((_, sev, msg)) => {
-                    let (level, color) = match sev {
+                Some(d) => {
+                    let (level, color) = match d.severity {
                         DiagnosticSeverity::Event => ("INFO", theme::EVENT_GREY),
                         DiagnosticSeverity::Warning => ("WARN", theme::WARNING_AMBER),
                         DiagnosticSeverity::Error => ("ERROR", theme::FAULT_RED),
                     };
-                    (level, msg.clone(), color)
+                    (level, d.message.clone(), color)
                 }
                 None => ("", "no activity yet".to_string(), theme::IDLE_GREY),
             };
@@ -285,8 +279,8 @@ impl ListenerApp {
                         let log_w = ui.available_width();
                         ui.set_max_width(log_w);
                         let mut shown = 0usize;
-                        for (t, sev, msg) in dv.entries.iter().rev() {
-                            let (enabled, color, level) = match sev {
+                        for d in dv.entries.iter().rev() {
+                            let (enabled, color, level) = match d.severity {
                                 DiagnosticSeverity::Event => {
                                     (self.show_info, theme::INFO_GREY, "INFO ")
                                 }
@@ -300,7 +294,8 @@ impl ListenerApp {
                             if !enabled {
                                 continue;
                             }
-                            let dt: chrono::DateTime<chrono::Local> = (*t).into();
+                            let dt: chrono::DateTime<chrono::Local> = d.timestamp.into();
+                            let msg = &d.message;
                             shown += 1;
                             // Wrap long entries so the full message stays readable
                             // (a plain colored_label was clipped at the pane edge).

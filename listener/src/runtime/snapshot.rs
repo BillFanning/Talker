@@ -20,7 +20,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 use crate::core::{ChannelId, DisplayViewId, MatchRuleId, RecordingState};
-use crate::diagnostics::Diagnostic;
+use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
 
 use super::activity::ChannelActivity;
 use super::pipeline::RawRecordingSettings;
@@ -185,4 +185,65 @@ pub struct DiagnosticsSnapshot {
     pub events: Vec<Diagnostic>,
     pub warnings: Vec<Diagnostic>,
     pub errors: Vec<Diagnostic>,
+}
+
+impl DiagnosticsSnapshot {
+    /// Group a flat list of diagnostics back into the per-severity buckets (the inverse
+    /// of [`into_sorted_vec`](Self::into_sorted_vec)). Used to rebuild a snapshot from a
+    /// retained `Vec<Diagnostic>`.
+    pub fn from_diagnostics(diagnostics: impl IntoIterator<Item = Diagnostic>) -> Self {
+        let mut snap = Self::default();
+        for d in diagnostics {
+            match d.severity {
+                DiagnosticSeverity::Event => snap.events.push(d),
+                DiagnosticSeverity::Warning => snap.warnings.push(d),
+                DiagnosticSeverity::Error => snap.errors.push(d),
+            }
+        }
+        snap
+    }
+
+    /// Flatten all severities into one chronological `Vec` (oldest → newest). The single
+    /// timeline a consumer that doesn't care about severity buckets wants — the retained
+    /// log and the GUI render order both use this.
+    pub fn into_sorted_vec(self) -> Vec<Diagnostic> {
+        let mut all: Vec<_> = self
+            .events
+            .into_iter()
+            .chain(self.warnings)
+            .chain(self.errors)
+            .collect();
+        all.sort_by_key(|d| d.timestamp);
+        all
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn at(secs: u64, sev: DiagnosticSeverity, msg: &str) -> Diagnostic {
+        Diagnostic::at(sev, msg, UNIX_EPOCH + Duration::from_secs(secs))
+    }
+
+    #[test]
+    fn diagnostics_round_trip_through_grouping_and_flattening() {
+        use DiagnosticSeverity::*;
+        // Out-of-order across severities; from_diagnostics groups, into_sorted_vec
+        // flattens back into one chronological timeline.
+        let input = vec![
+            at(3, Error, "boom"),
+            at(1, Event, "started"),
+            at(2, Warning, "slow"),
+        ];
+        let grouped = DiagnosticsSnapshot::from_diagnostics(input);
+        assert_eq!(grouped.events.len(), 1);
+        assert_eq!(grouped.warnings.len(), 1);
+        assert_eq!(grouped.errors.len(), 1);
+
+        let sorted = grouped.into_sorted_vec();
+        let flat: Vec<&str> = sorted.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(flat, vec!["started", "slow", "boom"], "chronological order");
+    }
 }

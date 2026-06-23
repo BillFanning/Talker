@@ -161,6 +161,19 @@ clean path and does not foreclose it.
   ADR-010; originally retained messages / decoded metadata) while a channel runs
   still requires the on-demand snapshot API — built since, and the message-era
   parts of this ADR are superseded by ADR-010.
+- **Diagnostics are runtime-written, GUI-rendered (single writer).** Every diagnostic
+  is recorded once in the pipeline's `DiagnosticLog` with a real timestamp; the GUI
+  never synthesizes entries — it renders the `ChannelSnapshot.diagnostics` it polls.
+  Three delivery details follow from the method-based (no event-loop) runtime: (a) at
+  **stop** the orchestrator takes one *final* snapshot of the returned, already-finalized
+  pipeline (the 5 Hz poll can't fire during the synchronous stop) so the stop-time
+  Channel-Stopped/Recording-Stopped events reach the GUI; (b) a Channel's diagnostics are
+  **retained across its own stop→start** (spec §89.1) in a per-channel `retained_diagnostics`
+  vec, served via a minimal snapshot while not running and replayed (`DiagnosticLog::seed`)
+  into the next pipeline; (c) a **start fault** that never runs a pipeline is appended to
+  that vec as an Error diagnostic so it shows and survives a restart. Pinned by
+  `diagnostics_are_retained_across_a_stop_start_cycle`,
+  `a_start_fault_is_retained_as_an_error_diagnostic`, and the loopback final-snapshot test.
 - Pinned by tests: `runtime::channel` (`is_faulted` after a fault) and
   `runtime::listener` (`state()` reconciles to `Faulted`, then clears on `stop`).
 

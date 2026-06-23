@@ -1,9 +1,18 @@
-# Listener Specification v2.0.4
+# Listener Specification v2.0.5
 
 Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
+
+Revision v2.0.5 (diagnostics retention across a restart):
+
+New §89.1: a Channel's retained diagnostics (§92–§94) persist across that Channel's
+own stop→start within a session, so the log spans a restart instead of starting blank;
+a start that faults (e.g. a bind conflict) is retained as an Error and survives the
+next start. Bounded by the §88 limits; runtime-only (not persisted to disk); the stream
+scrollback is not carried across a restart (§8.5). See listener ADR-006. No schema
+change.
 
 Revision v2.0.4 (recording-destination uniqueness):
 
@@ -1710,6 +1719,22 @@ Memory-based limits may be implementation-specific but are not primary user-faci
 When retention limits are exceeded, oldest retained items shall be discarded first.
 
 Eviction discards the oldest stream bytes; it never reorders the bytes that remain.
+
+### 89.1 Diagnostics Across a Channel Restart
+
+A Channel's retained **diagnostics** (Events/Warnings/Errors, §92–§94) persist across
+that Channel's own stop→start **within a session**: a restarted Channel keeps the
+previous run's diagnostics log rather than starting blank, so an operator can see what
+happened before and after a restart in one timeline. The §88 per-severity limits still
+bound the carried-forward log (oldest evicted, §89).
+
+This applies to a start that **faults** too (e.g. a bind conflict that never runs a
+pipeline): the fault is retained as an Error diagnostic and remains visible after a
+later successful restart, alongside the Channel-Started/Stopped events.
+
+Retention remains **runtime-only** (§85): it is not persisted to disk and does not
+survive closing the application. The stream **scrollback** is not carried across a
+restart (a fresh run starts a new byte stream, §8.5).
 
 ## 90. Clearing Runtime Data
 

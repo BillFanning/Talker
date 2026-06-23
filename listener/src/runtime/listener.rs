@@ -41,7 +41,7 @@ use super::channel::{
     spawn_monitored_channel, DataRecorder, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES,
 };
 use super::pipeline::{DisplayViewHandle, PipelineCapacities, RawRecordingSettings};
-use super::snapshot::{ChannelSnapshot, ChannelStats, StreamDelta};
+use super::snapshot::{ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, StreamDelta};
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
 
 /// How many Display Views a Channel runs (§48): one per configured view, at
@@ -57,19 +57,10 @@ fn retained_snapshot(
     id: ChannelId,
     diagnostics: &[crate::diagnostics::Diagnostic],
 ) -> ChannelSnapshot {
-    use crate::diagnostics::DiagnosticSeverity;
-    let mut diag = crate::runtime::snapshot::DiagnosticsSnapshot::default();
-    for d in diagnostics {
-        match d.severity {
-            DiagnosticSeverity::Event => diag.events.push(d.clone()),
-            DiagnosticSeverity::Warning => diag.warnings.push(d.clone()),
-            DiagnosticSeverity::Error => diag.errors.push(d.clone()),
-        }
-    }
     ChannelSnapshot {
         channel_id: id,
         display_views: Vec::new(),
-        diagnostics: diag,
+        diagnostics: DiagnosticsSnapshot::from_diagnostics(diagnostics.iter().cloned()),
         raw_recording: None,
         activity: ChannelActivity {
             last_data_at: None,
@@ -482,9 +473,10 @@ impl Listener {
         if let Some(channel) = self.channels.get_mut(&id) {
             channel.faulted = faulted.clone();
             channel.state = ChannelState::Starting;
-            // The stop-time `final_snapshot` is left in place: `spawn_data` reads it to
-            // carry the prior run's diagnostics forward (§88). While Running, the live
-            // pipeline snapshot is served instead, so the stale stash is never shown.
+            // `retained_diagnostics` is left in place: `spawn_data` reads it to seed the
+            // new pipeline (§88). While Running, the live pipeline snapshot is served
+            // instead (the handle exists), so this stale copy is never shown; the next
+            // stop replaces it with the new run's log.
         }
         match self.spawn_channel(id, &config, faulted).await {
             Ok((handle, serial_control)) => {
@@ -579,15 +571,7 @@ impl Listener {
             // log already includes the prior run's retained entries (seeded at start), so
             // this *replaces* rather than appends — no growth across many cycles.
             if let Some(snap) = final_snapshot {
-                let d = snap.diagnostics;
-                let mut retained: Vec<_> = d
-                    .events
-                    .into_iter()
-                    .chain(d.warnings)
-                    .chain(d.errors)
-                    .collect();
-                retained.sort_by_key(|e| e.timestamp);
-                channel.retained_diagnostics = retained;
+                channel.retained_diagnostics = snap.diagnostics.into_sorted_vec();
             }
         }
         let _ = self.events_tx.try_send(RuntimeEvent::ChannelStopped(id));
