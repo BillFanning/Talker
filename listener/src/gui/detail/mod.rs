@@ -636,6 +636,7 @@ impl ListenerApp {
 ///   `<name>:` segment but drop a following explanatory clause ("UDP_Channel3: failed
 ///   to bind interface: Only one usage… (os error 10048)" → "UDP_Channel3: failed to
 ///   bind interface").
+///
 /// Falls back to the whole (trimmed) message when there is no such boundary; the egui
 /// label still ellipsizes if even the phrase overflows the row.
 fn headline_phrase(message: &str) -> String {
