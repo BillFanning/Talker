@@ -180,13 +180,14 @@ impl ListenerApp {
             boundary_saves: u64,
         }
         let view = self.state.channel(id);
-        // Collect the diagnostics log from the last snapshot (kept across stop/start, so
-        // a previous run's messages persist), then merge in a start/bind fault: a fault
-        // (`last_error` while Faulted) carries its own frozen-timestamp ERROR entry, so it
-        // shows in the log *and* leads the headline — even when there's no live snapshot
-        // (a start-time bind fault that never ran a pipeline).
+        // The diagnostics log comes *only* from the snapshot — the GUI never synthesizes
+        // entries. The runtime is the single writer: live diagnostics arrive via the 5 Hz
+        // poll; stop-time notes via the final snapshot taken at stop; and a start/bind
+        // fault (which never ran a pipeline) is retained by the runtime and served via a
+        // minimal snapshot for the faulted channel. The snapshot is kept across stop/start
+        // so a previous run's messages persist.
         let mut entries: Vec<(SystemTime, DiagnosticSeverity, String)> = Vec::new();
-        let (mut counts, matches, boundary_saves) = match view.and_then(|v| v.snapshot.as_ref()) {
+        let (counts, matches, boundary_saves) = match view.and_then(|v| v.snapshot.as_ref()) {
             Some(s) => {
                 let d = &s.diagnostics;
                 for e in d.events.iter().chain(&d.warnings).chain(&d.errors) {
@@ -207,20 +208,6 @@ impl ListenerApp {
             }
             None => ((0, 0, 0), Vec::new(), 0),
         };
-        if let Some(view) = view {
-            // Merge the current fault (Faulted channel with a `last_error`) as an ERROR
-            // entry, unless the snapshot already carries that exact message.
-            if view.status == ChannelStatus::Faulted {
-                if let Some(err) = &view.last_error {
-                    let dup = entries.iter().any(|(_, _, m)| m == err);
-                    if !dup {
-                        let at = view.last_error_at.unwrap_or_else(SystemTime::now);
-                        entries.push((at, DiagnosticSeverity::Error, err.clone()));
-                        counts.2 += 1;
-                    }
-                }
-            }
-        }
         let diag_view = if entries.is_empty() {
             None
         } else {

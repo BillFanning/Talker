@@ -47,13 +47,11 @@ pub struct ChannelView {
     pub info: usize,
     pub warnings: usize,
     pub errors: usize,
-    /// The reason the last command on this Channel failed (e.g. a bind conflict),
-    /// cleared on a successful (re)start. `None` when there's nothing to report. Set via
-    /// [`set_last_error`](ChannelView::set_last_error) so its timestamp stays in sync.
+    /// The reason the last command on this Channel failed (e.g. a bind conflict), shown
+    /// on the ⚠ line above Configure and the channel tab. Cleared on a successful
+    /// (re)start. `None` when there's nothing to report. (Not a diagnostic — the fault is
+    /// recorded as an ERROR diagnostic by the runtime; this is just the inline status.)
     pub last_error: Option<String>,
-    /// When `last_error` was set — frozen at fault time so the synthesized Diagnostics
-    /// entry shows the error's time and does not tick every frame.
-    pub last_error_at: Option<std::time::SystemTime>,
     /// The most recent snapshot, for detail panes (diagnostics, match firings,
     /// view pause, recording state). The stream bytes are *not* here — they
     /// accumulate separately in `stream_bytes` from incremental deltas. `None` until
@@ -102,7 +100,6 @@ impl ChannelView {
             warnings: 0,
             errors: 0,
             last_error: None,
-            last_error_at: None,
             snapshot: None,
             control_lines: None,
             recording: None,
@@ -112,17 +109,6 @@ impl ChannelView {
             stream_bytes: std::collections::VecDeque::new(),
             stream_cursor: 0,
         }
-    }
-
-    /// Set (or clear) the last-error message, freezing its timestamp at the moment it is
-    /// set so the synthesized Diagnostics entry shows the error's time and does not tick.
-    /// A repeated identical error keeps its original timestamp; a new/cleared one updates.
-    pub(crate) fn set_last_error(&mut self, error: Option<String>) {
-        if error == self.last_error {
-            return; // unchanged — keep the original timestamp
-        }
-        self.last_error_at = error.is_some().then(std::time::SystemTime::now);
-        self.last_error = error;
     }
 
     /// Fold an incremental stream delta (§87, ADR-009) into the accumulated view
@@ -268,7 +254,7 @@ impl AppState {
             }
             UiUpdate::ChannelError(id, message) => {
                 if let Some(view) = self.views.get_mut(&id) {
-                    view.set_last_error(Some(message));
+                    view.last_error = Some(message);
                 }
             }
             UiUpdate::Event(event) => self.apply_event(event),
@@ -341,10 +327,10 @@ impl AppState {
             RuntimeEvent::ChannelStarted(id) => {
                 self.set_status(id, ChannelStatus::Running);
                 if let Some(view) = self.views.get_mut(&id) {
-                    view.set_last_error(None); // a successful start clears the prior error
-                                               // A fresh Start resets the runtime's stream offset to 0, so drop
-                                               // any accumulated bytes/cursor from a previous run to avoid mixing
-                                               // old and new streams (§8.5).
+                    view.last_error = None; // a successful start clears the prior error
+                                            // A fresh Start resets the runtime's stream offset to 0, so drop
+                                            // any accumulated bytes/cursor from a previous run to avoid mixing
+                                            // old and new streams (§8.5).
                     view.stream_bytes.clear();
                     view.stream_cursor = 0;
                 }
@@ -359,10 +345,10 @@ impl AppState {
             RuntimeEvent::ChannelFaulted(id) => {
                 self.set_status(id, ChannelStatus::Faulted);
                 if let Some(view) = self.views.get_mut(&id) {
-                    // Keep the diagnostics log (it survives the fault), but neutralize the
-                    // live-only indicators (recording/queues) — the pipeline is gone. The
-                    // headline prefers the fault, so a faulted channel doesn't headline a
-                    // stale "Raw recording started".
+                    // Neutralize the live-only indicators (recording/queues) — the pipeline
+                    // is gone. The diagnostics log itself is left to the next snapshot: the
+                    // runtime serves the faulted channel a snapshot carrying the retained
+                    // fault ERROR, so the log/headline come from the runtime, not the GUI.
                     clear_live_pipeline_state(view);
                 }
             }
@@ -381,7 +367,7 @@ impl AppState {
                          destination and on-exists policy)",
                         view.name
                     );
-                    view.set_last_error(Some(msg));
+                    view.last_error = Some(msg);
                 }
             }
             RuntimeEvent::RecordingStarted(id) => {
@@ -389,7 +375,7 @@ impl AppState {
                 // fault leaves the Channel Running, so ChannelStarted never re-fires to
                 // clear it; this is the only signal that the recourse worked.
                 if let Some(view) = self.views.get_mut(&id) {
-                    view.set_last_error(None);
+                    view.last_error = None;
                 }
             }
             // `MessageReceived` no longer drives the list: liveness is byte-based now
@@ -416,16 +402,16 @@ impl AppState {
 /// leaves the channel Faulted (recording can't be Enabled), so this never clears one.
 fn clear_error_if_recording_ok(view: &mut ChannelView) {
     if view.last_error.is_some() && view.recording == Some(RecordingState::Enabled) {
-        view.set_last_error(None);
+        view.last_error = None;
     }
 }
 
 /// Neutralize the view's **live-only** indicators when a channel stops or faults: the
 /// recording state and the bounded-queue depths, which require a *running* pipeline to
 /// be true. The **diagnostics snapshot is kept** so the last run's log stays visible
-/// across a stop/start (and on a fault); the headline logic separately prefers the
-/// fault so a stopped/faulted channel doesn't headline a stale "Raw recording started".
-/// Byte totals/throughput are liveness facts kept as-is.
+/// until the next snapshot replaces it (the runtime serves a stopped/faulted channel a
+/// snapshot of its retained diagnostics). Byte totals/throughput are liveness facts kept
+/// as-is.
 fn clear_live_pipeline_state(view: &mut ChannelView) {
     view.recording = None;
     view.ingest_queue = crate::runtime::QueueDepth::default();
@@ -641,31 +627,6 @@ mod tests {
         state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(id)));
         assert!(state.channel(id).unwrap().last_error.is_none());
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
-    }
-
-    #[test]
-    fn last_error_timestamp_is_frozen_until_the_error_changes() {
-        // The synthesized Diagnostics entry must show the error's time, not tick every
-        // frame: a repeated identical error keeps its first timestamp; a new one updates.
-        let mut state = AppState::default();
-        let id = ChannelId::new();
-        state.apply(added(id, "udp", "UDP"));
-
-        state.apply(UiUpdate::ChannelError(id, "bind failed".into()));
-        let t1 = state.channel(id).unwrap().last_error_at.unwrap();
-
-        // Same message again → timestamp unchanged.
-        state.apply(UiUpdate::ChannelError(id, "bind failed".into()));
-        assert_eq!(state.channel(id).unwrap().last_error_at, Some(t1));
-
-        // A different message → a fresh timestamp (>= the first).
-        state.apply(UiUpdate::ChannelError(id, "other error".into()));
-        let t2 = state.channel(id).unwrap().last_error_at.unwrap();
-        assert!(t2 >= t1);
-
-        // Cleared → no timestamp.
-        state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(id)));
-        assert!(state.channel(id).unwrap().last_error_at.is_none());
     }
 
     #[test]
