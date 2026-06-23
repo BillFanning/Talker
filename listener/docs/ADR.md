@@ -129,10 +129,18 @@ Three models were considered:
 
 **Decision:** Adopt **model 3**, with a clear division of responsibility:
 
-- **`RuntimeEvent` is authoritative for presentation observers.** The CLI/GUI fold
-  the event stream into their own view models; they do **not** read or own
-  transport or pipeline state. Richer GUI state is built by folding events (and,
-  later, requesting on-demand snapshots), not by owning runtime internals.
+- **`RuntimeEvent` is the presentation surface, but advisory — not a guaranteed
+  ledger.** The CLI/GUI fold the event stream into their own view models; they do
+  **not** read or own transport or pipeline state. Events are sent non-blocking
+  (`try_send`) so a slow/saturated observer can never stall the runtime — which means
+  an event *may be dropped* under saturation. The design tolerates this because the
+  **truth lives elsewhere and is re-derivable**: durable facts (diagnostics, recording
+  state, liveness, the effective channel state) live in the periodically-polled
+  **snapshot**, so a dropped event self-corrects within one poll (≤200 ms at 5 Hz).
+  Events are best read as *wake-up / status hints* that make the UI feel live between
+  polls, **not** as the authoritative record. (If a future requirement needs
+  exactly-once lifecycle delivery, split critical lifecycle events onto an awaitable
+  channel — see model 2 — rather than treat the advisory stream as a ledger.)
 - **`Listener` keeps internal channel state only for command validation and
   lifecycle control** (enforcing the legal §9 transitions).
 - **Spontaneous transport faults reconcile that internal state through a

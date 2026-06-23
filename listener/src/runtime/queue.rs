@@ -9,7 +9,10 @@
 //! |---|---|
 //! | Fan-out → Display, Fan-out → Retention | [`DropOldestQueue`] |
 //! | Chunk tap → Raw Recording, Fan-out → Display Recording | [`FaultOnFullQueue`] |
-//! | Diagnostics | [`DiagnosticsQueue`] |
+//!
+//! Diagnostics retention (§88/§92–§95) is **not** one of these queue types: it lives in
+//! the [`DiagnosticLog`](crate::diagnostics::DiagnosticLog), which bounds each severity
+//! independently (count-capped, oldest evicted).
 //!
 //! Only the Transport→Pipeline edge may stall the reader (§97.1); it is a
 //! bounded `tokio::sync::mpsc` channel wired in [`super::pipeline`], not one of
@@ -113,73 +116,6 @@ impl<T> FaultOnFullQueue<T> {
     }
 }
 
-// The diagnostic record model lives in the `diagnostics` module (§91–§95);
-// re-exported here because `DiagnosticsQueue` is the §99 fan-out edge over it.
-pub use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
-
-/// A bounded diagnostics buffer that drops the **oldest lowest-priority** entry
-/// first when full (§99). A higher-priority newcomer evicts an older
-/// lower-priority entry; a newcomer that is itself the lowest priority present
-/// is dropped instead of displacing a more important record.
-#[derive(Debug)]
-pub struct DiagnosticsQueue {
-    cap: usize,
-    items: VecDeque<Diagnostic>,
-}
-
-impl DiagnosticsQueue {
-    pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            cap: cap.max(1),
-            items: VecDeque::new(),
-        }
-    }
-
-    /// Record a diagnostic, applying the §99 drop-oldest-low-priority policy if
-    /// full. Returns the dropped entry, if any.
-    pub fn push(&mut self, diag: Diagnostic) -> Option<Diagnostic> {
-        if self.items.len() < self.cap {
-            self.items.push_back(diag);
-            return None;
-        }
-
-        // The lowest priority currently queued.
-        let min_severity = self.items.iter().map(|d| d.severity).min();
-        match min_severity {
-            // The newcomer is strictly lower priority than everything queued:
-            // drop the newcomer rather than displace a more important record.
-            Some(min) if diag.severity < min => Some(diag),
-            Some(min) => {
-                // Evict the oldest entry at the lowest queued priority.
-                let victim_idx = self
-                    .items
-                    .iter()
-                    .position(|d| d.severity == min)
-                    .expect("min severity is present");
-                let evicted = self.items.remove(victim_idx);
-                self.items.push_back(diag);
-                evicted
-            }
-            None => {
-                self.items.push_back(diag);
-                None
-            }
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &Diagnostic> {
-        self.items.iter()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,31 +145,5 @@ mod tests {
         // Draining frees room again.
         assert_eq!(q.pop(), Some(10));
         assert!(q.try_push(20).is_ok());
-    }
-
-    #[test]
-    fn diagnostics_drop_oldest_low_priority_first() {
-        let mut q = DiagnosticsQueue::with_capacity(2);
-        q.push(Diagnostic::new(DiagnosticSeverity::Event, "old event"));
-        q.push(Diagnostic::new(DiagnosticSeverity::Warning, "a warning"));
-        // Full. A new Error evicts the oldest lowest-priority entry (the Event).
-        let dropped = q.push(Diagnostic::new(DiagnosticSeverity::Error, "an error"));
-        assert_eq!(dropped.unwrap().message, "old event");
-        let severities: Vec<_> = q.iter().map(|d| d.severity).collect();
-        assert_eq!(
-            severities,
-            vec![DiagnosticSeverity::Warning, DiagnosticSeverity::Error]
-        );
-    }
-
-    #[test]
-    fn diagnostics_drop_the_newcomer_when_it_is_lowest_priority() {
-        let mut q = DiagnosticsQueue::with_capacity(2);
-        q.push(Diagnostic::new(DiagnosticSeverity::Error, "error 1"));
-        q.push(Diagnostic::new(DiagnosticSeverity::Error, "error 2"));
-        // Full of Errors; a low-priority Event is dropped rather than displacing one.
-        let dropped = q.push(Diagnostic::new(DiagnosticSeverity::Event, "noise"));
-        assert_eq!(dropped.unwrap().message, "noise");
-        assert!(q.iter().all(|d| d.severity == DiagnosticSeverity::Error));
     }
 }

@@ -3,10 +3,8 @@
 //!
 //! This is `listener-diagnostics` (§128). It owns the diagnostic record model
 //! (Events §92, Warnings §93, Errors §94, with the §95 [`ErrorCategory`]),
-//! bounded per-type history ([`DiagnosticLog`], §86/§88), and diagnostic logging
-//! ([`init_logging`], §114). The §99 fan-out diagnostics queue
-//! ([`DiagnosticsQueue`](crate::runtime::queue::DiagnosticsQueue)) is a separate,
-//! drop-oldest-low-priority edge built over [`Diagnostic`].
+//! bounded per-type history ([`DiagnosticLog`], §86/§88 — each severity count-capped,
+//! oldest evicted), and diagnostic logging ([`init_logging`], §114).
 
 use std::time::SystemTime;
 
@@ -14,8 +12,7 @@ use crate::retention::{CountBounded, RetentionStore, DEFAULT_BACKSTOP};
 
 pub use crate::core::ErrorCategory;
 
-/// Severity of a diagnostic, ordered low → high priority (§92–§95). On the §99
-/// diagnostics queue the **oldest lowest-priority** entry is dropped first.
+/// Severity of a diagnostic, ordered low → high priority (§92–§95).
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]

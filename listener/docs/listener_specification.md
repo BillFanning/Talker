@@ -14,6 +14,12 @@ next start. Bounded by the §88 limits; runtime-only (not persisted to disk); th
 scrollback is not carried across a restart (§8.5). See listener ADR-006. No schema
 change.
 
+Also reconciles the docs with the code (doc-catch-up, no behavior change): §137 gains
+`RecordingStarted` (present since ADR-012/-013; it lets observers clear a prior
+recording fault); §99 describes diagnostics retention as the per-severity count-bounded
+`DiagnosticLog` actually shipped, not the abandoned single drop-oldest-low-priority
+queue.
+
 Revision v2.0.4 (recording-destination uniqueness):
 
 Two recordings may no longer write the same file (§121, ADR-014). §6 makes Channel
@@ -1914,7 +1920,7 @@ Each Channel shall maintain independent:
 | Fan-out → Display / scrollback | Yes | Drop oldest display items |
 | Fan-out → Display Recording | Yes | `try_send`; Display Recording faults on full; never stalls reception |
 | Fan-out → Find / Triggers | Yes | Bounded scan; never stalls reception |
-| Diagnostics | Yes | Drop oldest low-priority diagnostics first |
+| Diagnostics | Yes | Retained **per severity** (§88): each of Events/Warnings/Errors is count-bounded, oldest-within-severity evicted (§89) |
 
 Only the Transport→Pipeline edge may exert backpressure on the reader. Every
 other edge shall drop, evict, or fault — never stall acquisition.
@@ -1933,7 +1939,7 @@ fan-out (non-blocking)
   ├─ display / scrollback      [bounded; drop oldest]
   ├─ display recorder queue    [bounded; try_send — fault on full]
   ├─ find / triggers           [bounded scan]
-  └─ diagnostics queue         [bounded; drop oldest low-priority first]
+  └─ diagnostics log           [per-severity count-bounded; oldest-within-severity evicted]
 ```
 
 The transport→pipeline queue is the only edge permitted to block or stall the
@@ -2472,6 +2478,7 @@ pub enum RuntimeEvent {
     ChannelStopped(ChannelId),
     ChannelFaulted(ChannelId),
     RecordingFaulted(ChannelId),
+    RecordingStarted(ChannelId),              // a Raw recording began OK (§50.2); lets observers clear a prior fault
     WarningRaised(ChannelId),
     TcpClientConnected(ChannelId),
     TcpClientDisconnected(ChannelId),

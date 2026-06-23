@@ -8,12 +8,13 @@
 //!
 //! Commands are exposed as async methods (`start`/`stop`/`apply_pending`, …) —
 //! this method API *is* the command surface (there is no separate command enum;
-//! ADR-012). Raw recording is wired for
-//! serial/UDP channels from `RecordingConfig`; a recording-enable failure
-//! surfaces a warning without faulting the Channel (§55). Accepted TCP
-//! **connection** channels run the same stream pipeline as their listener (§16.2);
-//! per-connection recording and snapshots remain deferred (§59 filename
-//! templates; the supervisor keeps no per-connection handle).
+//! ADR-012). Raw and Display recording are wired for serial/UDP channels from the
+//! independent `raw_recording`/`display_recording` configs (ADR-013); a
+//! recording-enable failure records a diagnostic and emits `RecordingFaulted` without
+//! faulting the Channel (§55) — reception continues. Accepted TCP **connection**
+//! channels run the same stream pipeline as their listener (§16.2); per-connection
+//! recording and snapshots remain deferred (§59 filename templates; the supervisor
+//! keeps no per-connection handle).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -896,10 +897,17 @@ impl Listener {
                     .with_control(hooks);
                 // "Record on start" is begun by the pipeline (auto_begin_recording), not
                 // pre-built here — so its failure surfaces like the live toggle.
-                let display = self.build_display_recorder(id, config).await;
-                let handle = ChannelHandle::Data(
-                    self.spawn_data(id, opened, config, None, display, faulted, notice_rx),
-                );
+                let (display, display_diag) = self.build_display_recorder(id, config).await;
+                let handle = ChannelHandle::Data(self.spawn_data(
+                    id,
+                    opened,
+                    config,
+                    None,
+                    display,
+                    display_diag,
+                    faulted,
+                    notice_rx,
+                ));
                 Ok((
                     handle,
                     Some(SerialControl {
@@ -915,12 +923,19 @@ impl Listener {
                     .map_err(OrchestratorError::Bind)?;
                 // "Record on start" is begun by the pipeline (auto_begin_recording), not
                 // pre-built here — so its failure surfaces like the live toggle.
-                let display = self.build_display_recorder(id, config).await;
+                let (display, display_diag) = self.build_display_recorder(id, config).await;
                 // UDP is async and never stalls the reader; no notices to send.
                 let (_notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
-                let handle = ChannelHandle::Data(
-                    self.spawn_data(id, bound, config, None, display, faulted, notice_rx),
-                );
+                let handle = ChannelHandle::Data(self.spawn_data(
+                    id,
+                    bound,
+                    config,
+                    None,
+                    display,
+                    display_diag,
+                    faulted,
+                    notice_rx,
+                ));
                 Ok((handle, None))
             }
             // The TCP listener supervises per-connection faults itself; a
@@ -950,6 +965,9 @@ impl Listener {
         config: &ChannelConfig,
         data_recorder: Option<DataRecorder>,
         display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
+        // A diagnostic from building the display recorder (a setup failure) to seed into
+        // the new pipeline's log, so a display-recording start failure shows like raw's.
+        display_diag: Option<crate::diagnostics::Diagnostic>,
         faulted: Arc<AtomicBool>,
         notices_rx: mpsc::Receiver<TransportNotice>,
     ) -> MonitoredChannel {
@@ -977,8 +995,13 @@ impl Listener {
                 // including the no-destination case, which `begin_recording` faults.
                 auto_begin_recording: config.raw_recording.enabled,
                 // Carry the previous run's diagnostics forward so a restart keeps its log
-                // (§88, within session). Taken from the stop-time stash, if any.
-                prior_diagnostics: self.prior_diagnostics(id),
+                // (§88, within session), plus any display-recording setup failure just
+                // recorded, so it lands in this run's log.
+                prior_diagnostics: {
+                    let mut prior = self.prior_diagnostics(id);
+                    prior.extend(display_diag);
+                    prior
+                },
             },
             self.channel_caps(config),
             self.events_tx.clone(),
@@ -1038,21 +1061,35 @@ impl Listener {
             })
     }
 
-    /// Create the Display Recording for a Channel if enabled (§54). v1 records
-    /// the primary (first) Display View; an enable failure surfaces a warning
-    /// without faulting the Channel (§55), like raw recording.
+    /// Create the Display Recording for a Channel if enabled (§54). v1 records the
+    /// primary (first) Display View. An enable failure does **not** fault the Channel
+    /// (§55) — reception continues — but, like raw recording, it records a **concrete
+    /// diagnostic** (returned as the second tuple element so the caller can seed the
+    /// pipeline log with it) and emits `RecordingFaulted`, instead of a bare reason-less
+    /// warning. `None` recorder + `None` diagnostic when display recording is disabled.
     async fn build_display_recorder(
         &self,
         id: ChannelId,
         config: &ChannelConfig,
-    ) -> Option<(DisplayView, Recording<RenderedOutput>)> {
+    ) -> (
+        Option<(DisplayView, Recording<RenderedOutput>)>,
+        Option<crate::diagnostics::Diagnostic>,
+    ) {
+        use crate::diagnostics::Diagnostic;
         let recording = &config.display_recording;
         if !recording.enabled {
-            return None;
+            return (None, None);
         }
+        let name = config.name.as_str();
         let Some(destination) = &recording.destination else {
-            let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
-            return None;
+            let _ = self.events_tx.try_send(RuntimeEvent::RecordingFaulted(id));
+            return (
+                None,
+                Some(Diagnostic::error(format!(
+                    "{name}: can't start Display recording — no destination is set \
+                     (set one in Display record, then restart)"
+                ))),
+            );
         };
         let renderer = config
             .display
@@ -1070,7 +1107,7 @@ impl Listener {
         } else {
             RotatingDisplayRecorder::create(
                 destination,
-                config.name.as_str(),
+                name,
                 ".disp",
                 policy,
                 ts,
@@ -1080,10 +1117,17 @@ impl Listener {
             .map(|r| start_display_recording(r, cap))
         };
         match created {
-            Ok(recording) => Some((renderer, recording)),
-            Err(_err) => {
-                let _ = self.events_tx.try_send(RuntimeEvent::WarningRaised(id));
-                None
+            Ok(recording) => (Some((renderer, recording)), None),
+            Err(err) => {
+                let _ = self.events_tx.try_send(RuntimeEvent::RecordingFaulted(id));
+                (
+                    None,
+                    Some(Diagnostic::error(format!(
+                        "{name}: could not start Display recording to {} (on-exists: {:?}): {err}",
+                        destination.display(),
+                        policy,
+                    ))),
+                )
             }
         }
     }
@@ -1194,6 +1238,44 @@ mod tests {
         assert!(
             events.contains(&"Channel started"),
             "the new run records its own start: {events:?}"
+        );
+
+        listener.stop(id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn display_recording_setup_failure_records_a_diagnostic_not_a_silent_warning() {
+        // A Display recording enabled with no destination can't start. Like raw recording,
+        // it must record a concrete ERROR diagnostic (not a reason-less WarningRaised) and
+        // not fault the channel — reception continues.
+        use crate::config::schema::DisplayRecordingConfig;
+        let mut config = udp_channel();
+        config.display_recording = DisplayRecordingConfig {
+            enabled: true,
+            destination: None, // no destination → setup fails
+            ..Default::default()
+        };
+
+        let mut listener = Listener::with_default_capacities();
+        let id = listener.add_channel(config);
+        listener.start(id).await.unwrap();
+        assert_eq!(
+            listener.state(id),
+            Some(ChannelState::Running),
+            "a display-recording setup failure does not fault the channel (§55)"
+        );
+
+        let snap = listener
+            .snapshot(id)
+            .await
+            .expect("running channel snapshots");
+        assert!(
+            snap.diagnostics
+                .errors
+                .iter()
+                .any(|e| e.message.contains("Display recording")),
+            "the display-recording failure is a concrete diagnostic: {:?}",
+            snap.diagnostics.errors
         );
 
         listener.stop(id).await.unwrap();

@@ -193,8 +193,9 @@ pub struct OpenSerialTransport {
     channel_id: ChannelId,
     port: Box<dyn SerialPort>,
     /// Optional sink for transport notices (§95, §101). When set, a sustained
-    /// reader stall sends `ReceptionStalled`; the pipeline turns it into a
-    /// retained diagnostic + `WarningRaised` (listener ADR-007).
+    /// reader stall sends `ReceptionStalled`; the pipeline turns it into a retained
+    /// warning diagnostic and emits the dedicated `RuntimeEvent::ReceptionStalled`
+    /// (listener ADR-007).
     notices: Option<Sender<TransportNotice>>,
     /// Optional live control-line hooks (§161): command inbox + state cell + event
     /// sink. When set, the reader services RTS/DTR commands and polls input lines.

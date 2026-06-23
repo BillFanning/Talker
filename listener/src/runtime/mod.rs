@@ -28,15 +28,14 @@ pub mod queue;
 pub mod snapshot;
 pub mod tcp;
 
+pub use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
 pub use activity::{ActivityMeter, ChannelActivity};
 pub use build::BuildError;
 pub use channel::{start_data_channel, RunningChannel};
 pub use listener::{Listener, OrchestratorError};
 pub use matchrule::{FiredRule, MatchRuleSet};
 pub use pipeline::{run_channel, ChannelPipeline, PipelineCapacities};
-pub use queue::{
-    Diagnostic, DiagnosticSeverity, DiagnosticsQueue, DropOldestQueue, FaultOnFullQueue, QueueFull,
-};
+pub use queue::{DropOldestQueue, FaultOnFullQueue, QueueFull};
 pub use snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
     QueueDepth, StreamDelta, TriggeredMatch,

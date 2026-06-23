@@ -105,6 +105,12 @@ Message-model removal). Everything below this block is verified done:
       `save_then_load_round_trips_the_workspace_through_the_driver` +
       `loading_a_missing_profile_errors_without_touching_the_workspace`.
 - [ ] Export (stream scrollback → file, §60–§63) — after GUI settles
+- [ ] (YAGNI for now) Diagnostic ordering within one timer tick. `Diagnostic` carries
+      only `SystemTime`; on a coarse clock (Windows ~15 ms) two entries can share a
+      timestamp and the headline (newest) then orders by severity bucket, not insertion.
+      Not observable in practice (lifecycle/recording entries are I/O-separated by ≫ a
+      tick). If it ever bites, add a monotonic per-channel sequence to `Diagnostic` and
+      sort by it.
 - [x] Recording destination uniqueness (ADR-014, spec §6/§55/§71/§121). Two layers:
       (1) **unique Channel Names** — `Profile::validate` flags duplicates
       (`DuplicateChannelName`); GUI add uses a per-kind monotonic, never-reused suffix
