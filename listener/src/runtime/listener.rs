@@ -35,6 +35,7 @@ use crate::transport::{
     TransportNotice,
 };
 
+use super::activity::ChannelActivity;
 use super::build::{build_display_view, build_serial, build_tcp_listener, build_udp, BuildError};
 use super::channel::{
     spawn_monitored_channel, DataRecorder, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES,
@@ -47,6 +48,40 @@ use super::tcp::{start_tcp_listener, TcpListenerHandle};
 /// least one (the pipeline's default view).
 fn view_count(config: &ChannelConfig) -> usize {
     config.display.views.len().max(1)
+}
+
+/// A minimal [`ChannelSnapshot`] carrying only retained diagnostics — served for a
+/// stopped/faulted Channel (no live pipeline) so the GUI still shows its log. Liveness
+/// and match fields are empty/zero; the GUI keeps its own last byte totals.
+fn retained_snapshot(
+    id: ChannelId,
+    diagnostics: &[crate::diagnostics::Diagnostic],
+) -> ChannelSnapshot {
+    use crate::diagnostics::DiagnosticSeverity;
+    let mut diag = crate::runtime::snapshot::DiagnosticsSnapshot::default();
+    for d in diagnostics {
+        match d.severity {
+            DiagnosticSeverity::Event => diag.events.push(d.clone()),
+            DiagnosticSeverity::Warning => diag.warnings.push(d.clone()),
+            DiagnosticSeverity::Error => diag.errors.push(d.clone()),
+        }
+    }
+    ChannelSnapshot {
+        channel_id: id,
+        display_views: Vec::new(),
+        diagnostics: diag,
+        raw_recording: None,
+        activity: ChannelActivity {
+            last_data_at: None,
+            bytes_per_sec: 0.0,
+            total_bytes: 0,
+        },
+        matches: Vec::new(),
+        match_boundary_saves: 0,
+        stream_end_offset: 0,
+        ingest_queue: crate::runtime::QueueDepth::default(),
+        raw_recording_queue: None,
+    }
 }
 
 /// Bounded inbox for live serial control-line commands (§161). Tiny: commands are
@@ -105,6 +140,13 @@ struct ManagedChannel {
     /// Auto-reconnect backoff state (§9.1, §162); `Some` while a reconnect is
     /// pending for a faulted Channel with reconnect enabled.
     reconnect_state: Option<ReconnectState>,
+    /// Diagnostics retained across runs and faults for this Channel (§88, within
+    /// session): the last run's pipeline diagnostics (folded in at stop) plus any
+    /// start-time fault that never ran a pipeline (e.g. a bind conflict). Served by
+    /// [`snapshot`](Listener::snapshot) when the Channel isn't running (so the GUI shows
+    /// the log of a stopped/faulted Channel) and replayed into the next run's pipeline by
+    /// [`prior_diagnostics`](Listener::prior_diagnostics). Bounded on use.
+    retained_diagnostics: Vec<crate::diagnostics::Diagnostic>,
 }
 
 impl ManagedChannel {
@@ -189,6 +231,7 @@ impl Listener {
                 faulted: Arc::new(AtomicBool::new(false)),
                 serial_control: None,
                 reconnect_state: None,
+                retained_diagnostics: Vec::new(),
             },
         );
         id
@@ -244,9 +287,18 @@ impl Listener {
     /// snapshot targets in their own right; per-connection snapshots are deferred).
     /// The `RuntimeEvent` stream stays the authoritative liveness signal.
     pub async fn snapshot(&self, id: ChannelId) -> Option<ChannelSnapshot> {
-        match self.channels.get(&id)?.handle.as_ref()? {
-            ChannelHandle::Data(tasks) => tasks.snapshot().await,
-            ChannelHandle::TcpListener(_) => None,
+        let channel = self.channels.get(&id)?;
+        match channel.handle.as_ref() {
+            Some(ChannelHandle::Data(tasks)) => tasks.snapshot().await,
+            Some(ChannelHandle::TcpListener(_)) => None,
+            // Not running (Stopped/Faulted): there's no live pipeline, so serve a minimal
+            // snapshot carrying the retained diagnostics (the last run's log, the stop
+            // notes, and any start fault) — so the GUI shows the diagnostics of a
+            // stopped/faulted channel. Other fields are defaults (no live liveness).
+            None if !channel.retained_diagnostics.is_empty() => {
+                Some(retained_snapshot(id, &channel.retained_diagnostics))
+            }
+            None => None,
         }
     }
 
@@ -430,6 +482,9 @@ impl Listener {
         if let Some(channel) = self.channels.get_mut(&id) {
             channel.faulted = faulted.clone();
             channel.state = ChannelState::Starting;
+            // The stop-time `final_snapshot` is left in place: `spawn_data` reads it to
+            // carry the prior run's diagnostics forward (§88). While Running, the live
+            // pipeline snapshot is served instead, so the stale stash is never shown.
         }
         match self.spawn_channel(id, &config, faulted).await {
             Ok((handle, serial_control)) => {
@@ -449,6 +504,18 @@ impl Listener {
             }
             Err(err) => {
                 self.set_state(id, ChannelState::Faulted);
+                // Retain the start fault as an ERROR diagnostic (a bind conflict never
+                // ran a pipeline, so it isn't in any pipeline log) — so it shows in the
+                // diagnostics list and survives the next restart like the INFO entries.
+                // Named for the channel, matching how the GUI labels it.
+                if let Some(channel) = self.channels.get_mut(&id) {
+                    let name = channel.config.name.as_str();
+                    channel
+                        .retained_diagnostics
+                        .push(crate::diagnostics::Diagnostic::error(format!(
+                            "{name}: {err}"
+                        )));
+                }
                 let _ = self.events_tx.try_send(RuntimeEvent::ChannelFaulted(id));
                 Err(err)
             }
@@ -466,8 +533,8 @@ impl Listener {
     /// drain still runs `finish_stop`; everyone else uses this convenience wrapper.
     pub async fn stop(&mut self, id: ChannelId) -> Result<(), OrchestratorError> {
         let handle = self.begin_stop(id)?;
-        drain_handle(handle).await;
-        self.finish_stop(id);
+        let final_snapshot = drain_handle(handle).await;
+        self.finish_stop(id, final_snapshot);
         Ok(())
     }
 
@@ -499,13 +566,29 @@ impl Listener {
     /// Land a Channel in Stopped: clear its Display Views, reset the fault flag
     /// (so a previously-faulted Channel reads Stopped, not Faulted), and announce
     /// the stop (§110).
-    fn finish_stop(&mut self, id: ChannelId) {
+    fn finish_stop(&mut self, id: ChannelId, final_snapshot: Option<ChannelSnapshot>) {
         if let Some(channel) = self.channels.get_mut(&id) {
             channel.display_handles.clear();
             channel.serial_control = None;
             channel.reconnect_state = None;
             channel.state = ChannelState::Stopped;
             channel.faulted.store(false, Ordering::Relaxed);
+            // Retain the final pipeline's diagnostics (its full log, including the
+            // stop-time "Channel stopped"/"Raw recording stopped") so the GUI shows the
+            // stopped channel's log and the next start carries it forward. The pipeline's
+            // log already includes the prior run's retained entries (seeded at start), so
+            // this *replaces* rather than appends — no growth across many cycles.
+            if let Some(snap) = final_snapshot {
+                let d = snap.diagnostics;
+                let mut retained: Vec<_> = d
+                    .events
+                    .into_iter()
+                    .chain(d.warnings)
+                    .chain(d.errors)
+                    .collect();
+                retained.sort_by_key(|e| e.timestamp);
+                channel.retained_diagnostics = retained;
+            }
         }
         let _ = self.events_tx.try_send(RuntimeEvent::ChannelStopped(id));
     }
@@ -682,8 +765,13 @@ impl Listener {
             let Ok(handle) = self.begin_stop(id) else {
                 continue; // not stoppable (shouldn't happen — we filtered to live)
             };
-            let _ = tokio::time::timeout(Self::SHUTDOWN_GRACE, drain_handle(handle)).await;
-            self.finish_stop(id);
+            // On a timed-out drain there's no final snapshot (and the app is exiting, so
+            // no GUI to deliver it to anyway) — `Err` flattens to `None`.
+            let final_snapshot = tokio::time::timeout(Self::SHUTDOWN_GRACE, drain_handle(handle))
+                .await
+                .ok()
+                .flatten();
+            self.finish_stop(id, final_snapshot);
         }
     }
 
@@ -904,6 +992,9 @@ impl Listener {
                 // like the live toggle (diagnostic + RecordingFaulted), not silently —
                 // including the no-destination case, which `begin_recording` faults.
                 auto_begin_recording: config.raw_recording.enabled,
+                // Carry the previous run's diagnostics forward so a restart keeps its log
+                // (§88, within session). Taken from the stop-time stash, if any.
+                prior_diagnostics: self.prior_diagnostics(id),
             },
             self.channel_caps(config),
             self.events_tx.clone(),
@@ -919,6 +1010,16 @@ impl Listener {
     /// match-triggered recording matches what auto-start recording would produce.
     fn recording_settings(&self, config: &ChannelConfig) -> Option<RawRecordingSettings> {
         self.settings_from(&config.raw_recording, config.name.as_str())
+    }
+
+    /// The previous run's retained diagnostics for Channel `id`, so a restart carries its
+    /// log forward (§88, within session). Empty for a first start — the per-severity caps
+    /// bound it on replay into the new pipeline.
+    fn prior_diagnostics(&self, id: ChannelId) -> Vec<crate::diagnostics::Diagnostic> {
+        self.channels
+            .get(&id)
+            .map(|c| c.retained_diagnostics.clone())
+            .unwrap_or_default()
     }
 
     /// Build [`RawRecordingSettings`] from a Raw recording config + channel name — used
@@ -1008,13 +1109,22 @@ impl Listener {
 /// Owns the handle (no `&mut Listener`), so a caller can wrap *this* in a timeout
 /// and, if it fires, still run `Listener::finish_stop` — the cleanup never depends
 /// on the drain completing.
-async fn drain_handle(handle: Option<ChannelHandle>) {
+/// Drain a Channel's handle to a stop and return one **final snapshot** taken from the
+/// returned pipeline *after* it finalized (so its last diagnostics — "Channel stopped",
+/// "Raw recording stopped" — are included). Stashed by `finish_stop` so the GUI's next
+/// poll delivers it even though the 5 Hz poll never fired during the synchronous stop.
+/// `None` for a TCP listener or a start-time fault (no pipeline).
+async fn drain_handle(handle: Option<ChannelHandle>) -> Option<ChannelSnapshot> {
     match handle {
         Some(ChannelHandle::Data(tasks)) => {
-            let _ = tasks.stop().await;
+            let pipeline = tasks.stop().await;
+            Some(pipeline.snapshot())
         }
-        Some(ChannelHandle::TcpListener(listener)) => listener.stop().await,
-        None => {}
+        Some(ChannelHandle::TcpListener(listener)) => {
+            listener.stop().await;
+            None
+        }
+        None => None,
     }
 }
 
@@ -1068,6 +1178,71 @@ mod tests {
         assert_eq!(listener.state(id), None, "the channel is gone");
         // Removing it again is an error (it's unknown now).
         assert!(listener.remove_channel(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_are_retained_across_a_stop_start_cycle() {
+        // §88 (within session): a restarted channel keeps the previous run's diagnostics
+        // log instead of starting blank. After start→stop→start, the new pipeline's
+        // snapshot carries the prior run's "Channel stopped" alongside a fresh
+        // "Channel started".
+        let mut listener = Listener::with_default_capacities();
+        let id = listener.add_channel(udp_channel());
+
+        listener.start(id).await.unwrap();
+        listener.stop(id).await.unwrap();
+        listener.start(id).await.unwrap();
+
+        let snap = listener
+            .snapshot(id)
+            .await
+            .expect("a running channel snapshots");
+        let events: Vec<&str> = snap
+            .diagnostics
+            .events
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(
+            events.contains(&"Channel stopped"),
+            "the prior run's diagnostics are retained: {events:?}"
+        );
+        assert!(
+            events.contains(&"Channel started"),
+            "the new run records its own start: {events:?}"
+        );
+
+        listener.stop(id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_start_fault_is_retained_as_an_error_diagnostic() {
+        // A bind/start fault never runs a pipeline, so it isn't in any pipeline log; it's
+        // retained as an ERROR diagnostic so it shows in the diagnostics list (served via
+        // a minimal snapshot for the faulted channel) and survives the next restart.
+        let mut listener = Listener::with_default_capacities();
+        let mut config = udp_channel();
+        if let InterfaceConfig::Udp(udp) = &mut config.interface {
+            udp.bind_address = "not-an-ip-address".to_string();
+        }
+        let id = listener.add_channel(config);
+
+        assert!(listener.start(id).await.is_err());
+        assert_eq!(listener.state(id), Some(ChannelState::Faulted));
+
+        // The faulted channel serves a snapshot carrying the fault as an ERROR.
+        let snap = listener
+            .snapshot(id)
+            .await
+            .expect("a faulted channel serves its retained diagnostics");
+        assert!(
+            snap.diagnostics
+                .errors
+                .iter()
+                .any(|e| e.message.starts_with("UDP_Channel:")),
+            "the start fault is retained as a channel-named ERROR: {:?}",
+            snap.diagnostics.errors
+        );
     }
 
     #[tokio::test]

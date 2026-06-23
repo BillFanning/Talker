@@ -49,6 +49,9 @@ pub(crate) struct MatchSetup {
     /// "Record on start" (§53): the pipeline begins recording at startup. Set when the
     /// channel's `raw_recording.enabled` is true and a destination is configured.
     pub(crate) auto_begin_recording: bool,
+    /// The previous run's diagnostics, so a restarted Channel keeps its log across a
+    /// stop/start within a session (§88). Empty for a first start.
+    pub(crate) prior_diagnostics: Vec<crate::diagnostics::Diagnostic>,
 }
 
 impl MatchSetup {
@@ -58,6 +61,7 @@ impl MatchSetup {
             rules: Vec::new(),
             recording_settings: None,
             auto_begin_recording: false,
+            prior_diagnostics: Vec::new(),
         }
     }
 }
@@ -119,6 +123,11 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     let (ingest_tx, ingest_rx) = mpsc::channel(caps.ingest);
 
     let mut pipeline = ChannelPipeline::new(channel_id, caps).with_event_sender(events);
+    // Carry the previous run's diagnostics forward (§88) so a restart keeps its log,
+    // before the pipeline records anything new.
+    if !match_setup.prior_diagnostics.is_empty() {
+        pipeline = pipeline.with_prior_diagnostics(match_setup.prior_diagnostics);
+    }
     // Match Rules (§50.2, §165): compile the rules and supply any Raw recording
     // settings a match-triggered `Record` needs before the pipeline starts.
     pipeline = pipeline.with_match_rules(&match_setup.rules);

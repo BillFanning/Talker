@@ -36,6 +36,9 @@ pub(super) enum AddKind {
 pub(crate) enum ColorScheme {
     BlackOnWhite,
     GreenOnBlack,
+    /// A softer, less saturated phosphor green — easier on the eyes than the bright
+    /// `GreenOnBlack` for long sessions.
+    GreenOnBlackDim,
     AmberOnBlack,
     WhiteOnBlack,
 }
@@ -45,6 +48,7 @@ impl ColorScheme {
         match self {
             ColorScheme::BlackOnWhite => "Black on white",
             ColorScheme::GreenOnBlack => "Green on black",
+            ColorScheme::GreenOnBlackDim => "Green on black (dim)",
             ColorScheme::AmberOnBlack => "Amber on black",
             ColorScheme::WhiteOnBlack => "White on black",
         }
@@ -53,6 +57,7 @@ impl ColorScheme {
         match self {
             ColorScheme::BlackOnWhite => egui::Color32::from_gray(20),
             ColorScheme::GreenOnBlack => egui::Color32::from_rgb(60, 230, 60),
+            ColorScheme::GreenOnBlackDim => egui::Color32::from_rgb(90, 170, 100),
             ColorScheme::AmberOnBlack => egui::Color32::from_rgb(255, 190, 70),
             ColorScheme::WhiteOnBlack => egui::Color32::from_gray(235),
         }
@@ -71,6 +76,7 @@ impl ColorScheme {
         match self {
             ColorScheme::BlackOnWhite => "black_on_white",
             ColorScheme::GreenOnBlack => "green_on_black",
+            ColorScheme::GreenOnBlackDim => "green_on_black_dim",
             ColorScheme::AmberOnBlack => "amber_on_black",
             ColorScheme::WhiteOnBlack => "white_on_black",
         }
@@ -81,6 +87,7 @@ impl ColorScheme {
     pub(super) fn from_name(name: Option<&str>) -> Self {
         match name {
             Some("green_on_black") => ColorScheme::GreenOnBlack,
+            Some("green_on_black_dim") => ColorScheme::GreenOnBlackDim,
             Some("amber_on_black") => ColorScheme::AmberOnBlack,
             Some("white_on_black") => ColorScheme::WhiteOnBlack,
             _ => ColorScheme::BlackOnWhite,

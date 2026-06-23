@@ -124,6 +124,18 @@ impl DiagnosticLog {
         self.warnings.clear();
         self.errors.clear();
     }
+
+    /// Seed this (fresh) log with prior diagnostics, so a restarted Channel keeps the
+    /// previous run's log instead of starting blank (§88, within-session). The entries
+    /// are replayed in chronological order through `record`, so the per-severity caps
+    /// still bound the result (oldest dropped). Intended to be called once, on a freshly
+    /// constructed log.
+    pub fn seed(&mut self, mut prior: Vec<Diagnostic>) {
+        prior.sort_by_key(|d| d.timestamp);
+        for d in prior {
+            self.record(d);
+        }
+    }
 }
 
 /// Initialize diagnostic logging (§114): a `tracing` subscriber filtered by the

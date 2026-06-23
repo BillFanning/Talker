@@ -238,9 +238,23 @@ async fn snapshot_exposes_the_verbatim_stream_of_a_running_channel() {
     assert_eq!(snapshot.channel_id, id);
     assert_eq!(stream_bytes(&listener, id).await, expected);
 
-    // A stopped channel has no live pipeline to snapshot.
+    // A stopped channel serves one final snapshot — the pipeline's last diagnostics,
+    // captured after finalize — so the GUI can show the stop-time notes (the periodic
+    // poll never fires during the synchronous stop). It includes a "Channel stopped"
+    // INFO.
     stop(&mut listener, id).await;
-    assert!(listener.snapshot(id).await.is_none());
+    let final_snapshot = listener
+        .snapshot(id)
+        .await
+        .expect("a stopped channel serves its final snapshot");
+    assert!(
+        final_snapshot
+            .diagnostics
+            .events
+            .iter()
+            .any(|e| e.message == "Channel stopped"),
+        "the final snapshot carries the stop-time diagnostics"
+    );
 }
 
 #[tokio::test]

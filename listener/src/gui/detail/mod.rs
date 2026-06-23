@@ -32,7 +32,7 @@ impl ListenerApp {
             return;
         };
         self.sync_edit_draft(id);
-        let Some((details, status, bytes_total, bps, last_error, recording, rec_dest)) =
+        let Some((details, status, bytes_total, bps, last_error, recording)) =
             self.state.channel(id).map(|v| {
                 (
                     v.details.clone(),
@@ -41,7 +41,6 @@ impl ListenerApp {
                     v.bytes_per_sec,
                     v.last_error.clone(),
                     v.recording,
-                    v.config.raw_recording.destination.clone(),
                 )
             })
         else {
@@ -80,7 +79,7 @@ impl ListenerApp {
                     bytes_total,
                     bps,
                 );
-                self.show_recording_block(&mut cols[1], id, status, recording, &rec_dest);
+                self.show_recording_block(&mut cols[1], id, status, recording);
             });
         });
         if let Some(err) = &last_error {
@@ -208,9 +207,9 @@ impl ListenerApp {
             }
             None => ((0, 0, 0), Vec::new(), 0),
         };
-        // Merge the current fault (Faulted channel with a `last_error`) as an ERROR entry,
-        // unless the snapshot already carries that exact message.
         if let Some(view) = view {
+            // Merge the current fault (Faulted channel with a `last_error`) as an ERROR
+            // entry, unless the snapshot already carries that exact message.
             if view.status == ChannelStatus::Faulted {
                 if let Some(err) = &view.last_error {
                     let dup = entries.iter().any(|(_, _, m)| m == err);
@@ -507,7 +506,6 @@ impl ListenerApp {
         id: ChannelId,
         status: ChannelStatus,
         recording: Option<RecordingState>,
-        rec_dest: &Option<std::path::PathBuf>,
     ) {
         // Header row: title + live state indicator + the Start/Stop recording button on
         // the same line (no expander — the setup is always shown below).
@@ -520,16 +518,6 @@ impl ListenerApp {
             paint_glyph(ui, glyph, recording_glyph_size(glyph), color);
             self.raw_record_button(ui, id, status, recording);
         });
-        if let Some(RecordingState::Enabled) = recording {
-            let dest = rec_dest
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(no destination)".to_string());
-            ui.colored_label(
-                theme::FAULT_RED,
-                format!("\u{25CF} Recording \u{2192} {dest}"),
-            );
-        }
         // Setup: a collapsible block (collapsed by default). Expanded shows the full
         // editor; collapsed shows a one-line summary (path · rotation · on-exists) so
         // the configured destination stays visible without the controls.

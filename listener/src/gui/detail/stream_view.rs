@@ -322,6 +322,7 @@ impl ListenerApp {
                     for scheme in [
                         ColorScheme::BlackOnWhite,
                         ColorScheme::GreenOnBlack,
+                        ColorScheme::GreenOnBlackDim,
                         ColorScheme::AmberOnBlack,
                         ColorScheme::WhiteOnBlack,
                     ] {

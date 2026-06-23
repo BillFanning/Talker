@@ -267,6 +267,14 @@ impl ChannelPipeline {
         self
     }
 
+    /// Seed the diagnostics log with the previous run's entries so a restarted Channel
+    /// keeps its log across a stop/start within a session (§88). Bounded by the same
+    /// per-severity caps. Call before the pipeline records anything new.
+    pub fn with_prior_diagnostics(mut self, prior: Vec<Diagnostic>) -> Self {
+        self.diagnostics.seed(prior);
+        self
+    }
+
     /// Provide the Raw recording settings (§50.2): the recorder is created only when a
     /// `Record { Begin }` action fires, so nothing is written before then.
     pub fn with_recording_settings(mut self, settings: RawRecordingSettings) -> Self {
@@ -646,6 +654,9 @@ impl ChannelPipeline {
         self.begin_faulted = false;
         if let Some(recorder) = self.raw_recorder.take() {
             recorder.finalize(RecordingStopReason::Disabled).await;
+            // Only log when a recording was actually active — a no-op stop is silent.
+            self.diagnostics
+                .record(Diagnostic::event("Raw recording stopped"));
         }
     }
 
@@ -726,11 +737,19 @@ impl ChannelPipeline {
         }
     }
 
+    /// Record an INFO diagnostic (§88) — a lifecycle note for the diagnostics log.
+    fn record_event(&mut self, message: impl Into<String>) {
+        self.diagnostics.record(Diagnostic::event(message));
+    }
+
     /// Called at Channel stop (§110, §112): finalize the recorders — flush and
-    /// close (§56). In-flight bytes already accepted by a recorder are written.
+    /// close (§56). In-flight bytes already accepted by a recorder are written. The
+    /// stop-time INFO notes recorded here reach the GUI because the orchestrator takes
+    /// one final snapshot of the returned pipeline after this runs (see `drain_handle`).
     pub async fn finish(&mut self) {
         if let Some(recorder) = self.raw_recorder.take() {
             recorder.finalize(RecordingStopReason::ChannelStopped).await;
+            self.record_event("Raw recording stopped");
         }
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.take() {
@@ -739,6 +758,7 @@ impl ChannelPipeline {
                     .await;
             }
         }
+        self.record_event("Channel stopped");
     }
 
     // --- Inspection (used by the runtime and tests) ---
@@ -945,6 +965,7 @@ pub async fn run_channel(
     // promptly once the stream goes quiet. Cheap no-op when no idle rule exists.
     let mut idle_check = tokio::time::interval(Duration::from_millis(250));
     idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    pipeline.record_event("Channel started");
     // "Record on start" (§53): begin once at startup through the same path as the live
     // Record toggle, so a failure (e.g. Refuse over an existing file) records a
     // diagnostic and emits RecordingFaulted instead of failing silently.
