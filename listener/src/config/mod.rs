@@ -292,16 +292,11 @@ mod tests {
         let mut channel = templates::serial_template();
         channel.match_rules = vec![
             MatchRule {
-                name: "GGA highlight".to_string(),
+                name: "GGA mark".to_string(),
                 condition: MatchCondition::BytePattern {
                     pattern: b"$GPGGA".to_vec(),
                 },
-                actions: vec![MatchAction::Highlight {
-                    style: HighlightStyle {
-                        background: Some("yellow".to_string()),
-                        ..HighlightStyle::default()
-                    },
-                }],
+                actions: vec![MatchAction::Mark],
                 enabled: true,
             },
             MatchRule {

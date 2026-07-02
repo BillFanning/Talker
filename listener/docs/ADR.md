@@ -437,7 +437,7 @@ Stream-view pause and optional byte/line gutters.
 
 **Status:** Accepted. **Context:** spec **v2.0** (revision note + §17–18, §40–46, §50.2, §51–59), which supersedes the Message-mode half of v1.x. ADR-009 (the Stream display source) was the first step; v2.0 finishes the trajectory by removing the Message half rather than keeping both.
 
-**Decision.** `Listener` is a pure **stream** tool. Received bytes are one verbatim stream that is displayed (Raw/Rendered/Hex), searched (Find & Triggers), and recorded (Raw `.raw` + Display `.disp`). Removed: Message Mode, Message Extraction (delimiter / fixed-length / protocol), Message Numbering, decoders + the `nmea0183` dependency, integrity metadata, message-framed recording (`.ssdat`) + subsampling, the Messages display source, and message-keyed Match conditions. Find & Triggers re-root on the byte stream — `BytePattern` (cross-chunk scan) + `Idle` conditions; `Highlight` (byte range), `Record`, `Notify`, `Mark` actions anchored on **byte offset**.
+**Decision.** `Listener` is a pure **stream** tool. Received bytes are one verbatim stream that is displayed (Raw/Rendered/Hex), searched (Find & Triggers), and recorded (Raw `.raw` + Display `.disp`). Removed: Message Mode, Message Extraction (delimiter / fixed-length / protocol), Message Numbering, decoders + the `nmea0183` dependency, integrity metadata, message-framed recording (`.ssdat`) + subsampling, the Messages display source, and message-keyed Match conditions. Find & Triggers re-root on the byte stream — `BytePattern` (cross-chunk scan) + `Idle` conditions; `Highlight` (byte range), `Record`, `Notify`, `Mark` actions anchored on **byte offset**. *(The `Highlight` action was later removed — see ADR-015.)*
 
 **Why.** The actual use (single-stream troubleshooting; long-run multi-channel logging) is stream-centric. The extraction→decode→message spine added surface (framing config, decode config, numbering, `.ssdat`) the workflow never used, and made the wire view harder to keep faithful (delimiter extraction strips the very bytes that define a sentence). A stream-only tool is simpler, smaller, and a better fit; `nmea0183` lives on for `talker`.
 
@@ -553,6 +553,21 @@ A second, parallel command enum on top of a working method API + a GUI transport
 - No new crate dependency: the advisory lock uses std's `File::try_lock` (stable since 1.89; MSRV is 1.95). `fs4` stays for the disk-space free functions only.
 - The lock feeds the existing `RecordingFaulted` event/diagnostic (ADR-013) — no new GUI surface needed.
 - Tests: a name-uniqueness validation test; a lock-conflict recorder test; an orchestrator test asserting the second channel stays Running while its recording faults on the destination lock.
+
+## ADR-015 — Drop the `Highlight` match action; keep listener simple
+
+**Status:** Accepted. **Context:** spec §50.2/§165 (Find & Triggers actions), ADR-010 (which introduced `Highlight` in the v2.0 stream model). Supersedes the `Highlight` portion of ADR-010.
+
+**Problem.** `Highlight { style }` was one of five `MatchAction` variants — it was meant to style a matched **byte range** in the on-screen scrollback. It was never rendered: the GUI treated it as a no-op (`MatchAction::Highlight { .. } => {}`) and the styling was always "TODO." Making it real requires a **byte→display-position map across all three view modes** (Hex/Raw/Rendered), each with variable-width glyph rendering and soft-wrapping — a genuinely fiddly subsystem. Weighed against listener's "keep it simple" goal, the on-screen styling was disproportionate to the need: the concrete "getting ready to record" use case is served by **`Mark`**, which drops a `‹MARK …›` marker into the display recording (`.disp`) with no rendering machinery at all.
+
+**Decision.** Remove the `Highlight` action and its `HighlightStyle` config type. Keep the rest of Find & Triggers unchanged: `BytePattern`/`Idle` conditions and the `Record`/`Mark`/`Notify`/`PauseDisplay` actions. `Mark` remains the correlation primitive (into `.disp`, never `.raw`, §49). The byte-offset-precise on-screen rendering that `Highlight` would have needed is not built.
+
+**Why not keep it inert.** A no-op variant invites revival and keeps a `HighlightStyle` config type + a spec paragraph that describe behavior that doesn't exist. Removing it makes the code honest and the schema smaller; a profile can no longer carry a `kind = "Highlight"` action.
+
+**Consequences.**
+- `MatchAction::Highlight` and `HighlightStyle` removed from the config schema (§50.2 / §72 struct listing) and the runtime. `MatchAction` is `#[serde(tag = "kind")]`; a profile with a `Highlight` action now fails to parse (profiles are dev-only; consistent with the ADR-013 clean-break precedent — no migration, no `schema_version` bump for a variant removal).
+- Spec §50.2/§165 and the overview drop `Highlight` from the action list; ADR-010's historical text points here.
+- Manual/interactive highlighting (a later, larger idea) is **not** pursued; if on-screen styling is ever wanted, it returns as a fresh decision with the position-map cost understood up front.
 
 ## Open questions
 

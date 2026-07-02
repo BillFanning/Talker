@@ -303,7 +303,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HighlightStyle, MatchRule};
+    use crate::config::MatchRule;
 
     fn rule(name: &str, condition: MatchCondition) -> MatchRule {
         MatchRule {
@@ -464,8 +464,8 @@ mod tests {
             },
         );
         config.actions = vec![
-            MatchAction::Highlight {
-                style: HighlightStyle::default(),
+            MatchAction::Notify {
+                severity: crate::diagnostics::DiagnosticSeverity::Warning,
             },
             MatchAction::Mark,
         ];

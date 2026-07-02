@@ -412,7 +412,7 @@ impl ChannelPipeline {
     }
 
     /// Apply the actions of every rule that fired (§50.2). Synchronous actions —
-    /// `Notify`, `Mark`, `PauseDisplay`, `Highlight` — take effect immediately;
+    /// `Notify`, `Mark`, `PauseDisplay` — take effect immediately;
     /// `Record` actions are queued for asynchronous application (file I/O). Every
     /// firing is observable: it is logged for the snapshot and emits a
     /// `MatchTriggered` event (§137). Each firing carries its own byte offset
@@ -456,10 +456,6 @@ impl ChannelPipeline {
                     }
                     MatchAction::Mark => self.write_mark(rule.id, byte_offset),
                     MatchAction::PauseDisplay { view } => self.pause_views(*view),
-                    // Highlight is presentation-only; the firing is recorded above
-                    // (`recent_matches`) and the UI applies the style. Nothing to do
-                    // headless, and it never touches the bytes (§50.2).
-                    MatchAction::Highlight { .. } => {}
                     MatchAction::Record { target, control } => {
                         self.pending_record_controls.push(PendingRecord {
                             target: *target,

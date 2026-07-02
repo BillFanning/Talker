@@ -68,9 +68,12 @@ Message-model removal). Everything below this block is verified done:
       timestamps; a channel can run both at once. GUI: Raw panel above Configure
       (live on/off + setup), Display under Configure. Pinned by
       `raw_and_display_recording_run_to_independent_destinations`.
-- [ ] Display marks & highlights — see the dedicated phased section below ("Display
-      marks & highlights"). (Folds in the former standalone "highlight rendering" and
-      "`Mark` markers in display/`.disp`" items.)
+- [ ] (Optional) Render existing `Mark` firings in the live stream view. `Mark` already
+      writes a `‹MARK …›` line into the `.disp` recording (`write_mark`) and records a
+      `TriggeredMatch`; the live viewer just doesn't draw a glyph for it. Low priority —
+      kept simple deliberately. (On-screen **Highlight** styling was considered and
+      **dropped** as too complex for the simple goal — the `Highlight` action was removed;
+      see ADR-015.)
 - [ ] Match-`Record` to a Display/`Both` target: arm the display recorder. The
       `RecordTarget::Display`/`Both` variants exist and the pipeline accepts them,
       but only the Raw side is driven today (`apply_pending_records` skips
@@ -93,10 +96,8 @@ Message-model removal). Everything below this block is verified done:
       `set_recording_begins_and_stops_raw_recording_live` (pipeline) +
       `set_recording_toggles_raw_recording_live_through_the_orchestrator` (loopback).
 - [ ] Recording timestamp sidecar for `.raw` (byte-offset keyed, §57)
-- [ ] General match-rule editor UI (rules currently arrive only via profiles): the full
-      `Idle`/`Record`/`Notify`/`PauseDisplay` conditions + actions and compound logic.
-      Distinct from the **minimal** BytePattern→Highlight editor in the "Display marks &
-      highlights" Phase 1 below, which it would supersede.
+- [ ] Match-rule editor UI (rules currently arrive only via profiles): the
+      `Idle`/`Record`/`Notify`/`PauseDisplay` conditions + actions.
 - [x] `RuntimeCommand`'s role (§136) — resolved by ADR-012: removed the vestigial
       `core::RuntimeCommand` enum; the command surface is the `Listener` async method
       API (the GUI's `UiCommand` is the bridge transport). Spec §136 rewritten to
@@ -127,54 +128,6 @@ Message-model removal). Everything below this block is verified done:
       stays Running. An in-process named pre-check at Start was prototyped and removed (it
       faulted the whole channel + showed the bind/port recourse). Tests: name-uniqueness
       validation; recorder lock-conflict; orchestrator two-channel stays-Running.
-
-## Display marks & highlights (§50.2/§165) — phased
-
-Render and create the spec's `Highlight`/`Mark` match actions in the stream view, then
-later add manual (interactive) marking/highlighting. Runtime plumbing already exists
-(`TriggeredMatch` in the snapshot; `write_mark` → `.disp`); the GUI renders neither yet.
-Plan: `~/.claude/plans/mossy-churning-lemon.md`.
-
-### Phase 1 — render rule-triggered highlights/marks (precise, all modes) + minimal editor
-
-- [ ] **Runtime — carry the range.** Add `match_len: Option<usize>` to `FiredRule`
-      (`runtime/matchrule.rs`) and `match_len: Option<u32>` to `TriggeredMatch`
-      (`runtime/snapshot.rs`), populated in `apply_fired_rules` (`runtime/pipeline.rs`):
-      `Some(pattern.len())` for `BytePattern`, `None` for `Idle`. So a highlight knows
-      its byte range `[offset, offset+len)`.
-- [ ] **Renderer — byte→display-position map (the central, riskiest change).** Add
-      `DisplayView::render_text_mapped(&self, bytes) -> (String, Vec<u32>)` to
-      `display/render.rs` (one entry per source byte = its start char index in the
-      rendered string); keep `render_text` as a thin wrapper so recording/tests are
-      unchanged. Per-mode (Hex/Raw/Rendered) handling incl. wrapping + multi-byte chars.
-      Unit-test `map[i]` lands on the right rendered char in each mode.
-- [ ] **GUI stream view (`gui/detail/stream_view.rs`).** Extend `StreamRenderCache` with
-      the byte→char map + row boundaries so an absolute offset → `(row, col_start,
-      col_end)` (`byte_offset − base`, base from `stream_cursor`/`stream_bytes`). In the
-      `show_rows` closure paint highlight background rects (range→cols, from the rule's
-      `HighlightStyle`) and a mark glyph per `Mark` offset — **visible rows only** (keep
-      virtualization). Resolve a firing's style from `rule_id` against the channel's
-      `match_rules`. Pull `matches` from `view.snapshot`.
-- [ ] **Minimal "Highlight rules" editor (detail pane).** List/add/remove a
-      `BytePattern → Highlight` (+ optional `Mark`) rule editing `draft.match_rules`;
-      takes effect via the existing **Apply & Restart** (`config_needs_restart` already
-      includes `match_rules`, so the lifecycle button flips automatically — no new runtime
-      command). Persists via profile Save (`match_rules` ∈ `ChannelConfig`). **Not** the
-      general rule editor (see "General match-rule editor UI" above, which supersedes it).
-
-### Phase 2 — manual Mark (needs a §50.2/§165 spec amendment first)
-
-- [ ] Spec note: `Mark`/`Highlight` may also be **manually** invoked from the display,
-      producing the same artifacts (mark → `.disp`, never `.raw`).
-- [ ] "Mark now" / click-in-stream → `UiCommand::MarkNow(id, offset)` →
-      `Listener::mark_now` → the existing `write_mark` path. (`MarkNow` is referenced in a
-      `gui/bridge.rs` comment but not implemented.)
-
-### Phase 3 — manual highlighting (session-only)
-
-- [ ] Drag-select a byte range in the stream view → apply a `HighlightStyle` as a
-      **session-only** presentation overlay (not persisted). Reuses the Phase 1 render
-      machinery (byte→position map + rect painting).
 
 ## Carried over (still valid under v2)
 

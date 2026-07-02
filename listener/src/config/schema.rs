@@ -368,8 +368,6 @@ pub enum MatchCondition {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum MatchAction {
-    /// Style the matched item in the display (presentation only).
-    Highlight { style: HighlightStyle },
     /// Begin or stop recording **from the match forward** — no pre-match backfill
     /// (§158). Requires the Channel to have a recording destination configured.
     Record {
@@ -403,18 +401,6 @@ pub enum RecordTarget {
 pub enum RecordControl {
     Begin,
     Stop,
-}
-
-/// How a `Highlight` action styles a matched item (§50.2). All fields optional;
-/// colors are presentation-layer strings interpreted by the UI.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HighlightStyle {
-    #[serde(default)]
-    pub foreground: Option<String>,
-    #[serde(default)]
-    pub background: Option<String>,
-    #[serde(default)]
-    pub label: Option<String>,
 }
 
 /// Retention limits (§80). At least one applicable limit must be set — an

@@ -1,9 +1,18 @@
-# Listener Specification v2.0.5
+# Listener Specification v2.0.6
 
 Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
+
+Revision v2.0.6 (drop the Highlight match action):
+
+The `Highlight` match action and its `HighlightStyle` type are removed (§50.2/§165/§72).
+`Highlight` was never rendered — precise on-screen byte-range styling across all view
+modes was disproportionate to listener's simple goal; the `Mark` action already serves
+correlation into the display recording. The remaining Find & Triggers actions
+(`Record`/`Mark`/`Notify`/`PauseDisplay`) and conditions (`BytePattern`/`Idle`) are
+unchanged. No `schema_version` change (variant removal; dev-only profiles). See ADR-015.
 
 Revision v2.0.5 (diagnostics retention across a restart):
 
@@ -71,11 +80,11 @@ Rebased onto the stream:
 - §40–46 — the display renders the verbatim stream (Raw/Rendered/Hex + character
   rendering); §41 has a single source (the stream).
 - §50.2 / §165 — **Find & Triggers**: conditions are `BytePattern` (cross-chunk
-  stream scan) and `Idle`; actions are `Highlight` (a byte range in the scrollback),
+  stream scan) and `Idle`; actions are
   `Record { Begin | Stop, target: Raw | Display | Both }`, `Notify`, and `Mark` (a
   time/offset marker into the display and the display recording). No decoded-field or
-  message-size conditions; highlight/mark anchor on a **byte offset**, not a Message
-  Number.
+  message-size conditions; `Mark` anchors on a **byte offset**, not a Message Number.
+  (An on-screen `Highlight` styling action was considered and dropped — see ADR-015.)
 - §51–59 / §79 / §142 — recording is **Raw** (byte-exact, extension **`.raw`**) and
   **Display** (the rendered output of the active view mode, extension **`.disp`**),
   each with optional timestamps and time-based rotation. `.ssdat` and subsampling are
@@ -963,7 +972,6 @@ enum MatchCondition {
 
 ```rust
 enum MatchAction {
-    Highlight { style: HighlightStyle },                     // presentation only
     Record { target: RecordTarget, control: RecordControl }, // begin/stop, from the match forward
     Mark,                                                     // a time/offset marker + tagged event
     Notify { severity: DiagnosticSeverity },                 // raise an event/warning (§92–94)
@@ -974,7 +982,6 @@ enum RecordTarget { Raw, Display, Both }
 enum RecordControl { Begin, Stop }
 ```
 
-- **Highlight** styles the matched byte range in the stream scrollback, anchored on a **byte offset** (there are no Message Numbers).
 - **Record** begins or stops recording **from the match forward**; there is **no pre-match backfill** (§158). Pre-trigger capture is deferred.
 - **Mark** drops a correlation marker — a byte offset / arrival time — into the display and the Display Recording (`.disp`), plus a tagged event (§137). It is **never** written into the raw `.raw` byte stream, which stays byte-exact (§49, §53).
 - **Notify** raises a diagnostic event/warning (§92–94). **PauseDisplay** freezes a view (or all views, §50); reception and recording continue.
@@ -1608,12 +1615,6 @@ pub struct TimestampDisplay { pub source: TimestampSource, pub resolution: Times
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MatchRuleId(uuid::Uuid); // §50.2
-
-pub struct HighlightStyle {         // §50.2
-    pub foreground: Option<String>,
-    pub background: Option<String>,
-    pub label: Option<String>,
-}
 
 pub struct ReconnectPolicy {        // §9.1; enabled defaults false
     pub enabled: bool,
@@ -2853,8 +2854,8 @@ _Removed in v2.0 (§50.1). Raw recording is byte-exact-or-off; there is no messa
 
 Each match condition (`BytePattern` scanned across the stream, `Idle`) shall fire
 its actions; `Record` shall begin/stop from the match forward with no pre-match
-backfill; `Highlight` shall style the matched byte range; `Mark` shall annotate the
-display / `.disp` / events but never the raw `.raw` stream (§50.2).
+backfill; `Mark` shall annotate the display / `.disp` / events but never the raw
+`.raw` stream (§50.2).
 
 ## 166. Liveness
 

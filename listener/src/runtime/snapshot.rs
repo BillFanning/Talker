@@ -160,10 +160,9 @@ pub struct ChannelSnapshot {
 
 /// A single rule firing (§50.2). Records which rule fired and, for a data
 /// condition, the **stream byte offset** it fired at (`None` for an `Idle`
-/// firing, which is not tied to data). This is the observable record of
-/// `Highlight`/`Mark` (whose visual styling is applied by the UI) and of any
-/// rule's trigger; `Notify` also lands in diagnostics and every firing emits a
-/// `MatchTriggered` event.
+/// firing, which is not tied to data). This is the observable record of a `Mark`
+/// and of any rule's trigger; `Notify` also lands in diagnostics and every firing
+/// emits a `MatchTriggered` event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TriggeredMatch {
     pub rule_id: MatchRuleId,
