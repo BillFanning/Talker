@@ -163,10 +163,26 @@ pub struct ChannelSnapshot {
 /// firing, which is not tied to data). This is the observable record of a `Mark`
 /// and of any rule's trigger; `Notify` also lands in diagnostics and every firing
 /// emits a `MatchTriggered` event.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// When the firing was a `Mark` carrying an inline timestamp, `mark` holds the
+/// formatted local arrival timestamp and where it goes relative to the match, so a
+/// live viewer can splice it into the rendered stream (§50.2) exactly as the
+/// Display Recording does.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TriggeredMatch {
     pub rule_id: MatchRuleId,
     pub byte_offset: Option<u64>,
+    #[allow(clippy::doc_markdown)]
+    pub mark: Option<MarkRender>,
+}
+
+/// The inline timestamp a `Mark` firing contributes to the rendered display and
+/// Display Recording (§50.2). `text` is already formatted in local time; `before`
+/// is its placement relative to the matched byte at `TriggeredMatch::byte_offset`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkRender {
+    pub text: String,
+    pub before: bool,
 }
 
 /// One Display View's snapshot: its identity and pause state (§50). The viewed

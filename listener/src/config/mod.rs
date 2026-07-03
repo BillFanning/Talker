@@ -273,7 +273,7 @@ mod tests {
         channel.match_rules = vec![MatchRule {
             name: "everything".to_string(),
             condition: MatchCondition::BytePattern { pattern: vec![] },
-            actions: vec![MatchAction::Mark],
+            actions: vec![MatchAction::Mark { timestamp: None }],
             enabled: true,
         }];
         let errs = validate_channel(&channel, &DefaultConfig::default()).unwrap_err();
@@ -296,7 +296,7 @@ mod tests {
                 condition: MatchCondition::BytePattern {
                     pattern: b"$GPGGA".to_vec(),
                 },
-                actions: vec![MatchAction::Mark],
+                actions: vec![MatchAction::Mark { timestamp: None }],
                 enabled: true,
             },
             MatchRule {

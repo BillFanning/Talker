@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::{ChannelKind, ChannelName, StableConfigId};
+use crate::core::{ChannelKind, ChannelName, StableConfigId, TimestampConfig};
 use crate::diagnostics::DiagnosticSeverity;
 use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, WrappingMode};
 use crate::record::{FileRotationPolicy, OverwritePolicy};
@@ -298,8 +298,6 @@ pub struct DisplayRecordingConfig {
     #[serde(default)]
     pub destination: Option<PathBuf>,
     #[serde(default)]
-    pub timestamp_enabled: bool,
-    #[serde(default)]
     pub overwrite_policy: OverwritePolicy,
     /// Time-based file rotation (§59); `None` = single file.
     #[serde(default)]
@@ -376,7 +374,15 @@ pub enum MatchAction {
     },
     /// Drop a correlation marker into the display, the Display Recording (`.disp`),
     /// and a tagged event (§137) — **never** into the raw `.raw` stream (§5.6/§49).
-    Mark,
+    ///
+    /// When `timestamp` is `Some`, the marked byte pattern also gets an inline local
+    /// arrival timestamp spliced into the rendered text (display + `.disp`) before or
+    /// after the match (§50.2). A bare `Mark` (no timestamp) keeps the `‹MARK …›`
+    /// marker-line behaviour.
+    Mark {
+        #[serde(default)]
+        timestamp: Option<MarkTimestamp>,
+    },
     /// Raise a diagnostic event/warning of the given severity (§92–§94).
     Notify { severity: DiagnosticSeverity },
     /// Freeze a Display View by index (into `display.views`), or all views when
@@ -386,6 +392,28 @@ pub enum MatchAction {
         #[serde(default)]
         view: Option<usize>,
     },
+}
+
+/// The inline timestamp a `Mark` action splices next to a matched byte pattern
+/// (§50.2). The time is the matched chunk's **arrival** time, formatted in local
+/// time per `format`, and inserted `position` (before/after) the match in the
+/// rendered display and Display Recording (`.disp`) — never in `.raw`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkTimestamp {
+    #[serde(default)]
+    pub position: MarkPosition,
+    #[serde(default)]
+    pub format: TimestampConfig,
+}
+
+/// Where a `Mark` timestamp is spliced relative to the matched bytes (§50.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MarkPosition {
+    /// Immediately before the first byte of the match (e.g. `[17:42:03]$GPGGA…`).
+    #[default]
+    Before,
+    /// Immediately after the last byte of the match.
+    After,
 }
 
 /// Which recording(s) a `Record` action controls (§50.2).

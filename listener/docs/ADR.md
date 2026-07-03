@@ -569,6 +569,24 @@ A second, parallel command enum on top of a working method API + a GUI transport
 - Spec §50.2/§165 and the overview drop `Highlight` from the action list; ADR-010's historical text points here.
 - Manual/interactive highlighting (a later, larger idea) is **not** pursued; if on-screen styling is ever wanted, it returns as a fresh decision with the position-map cost understood up front.
 
+## ADR-016 — `Mark` carries an inline arrival timestamp, rendered by string-splice (no position map)
+
+**Status:** Accepted. **Context:** spec §50.2/§165 (Find & Triggers), §54/§57 (Display Recording & timestamps), §133 (timestamp model), ADR-013 (independent Raw/Display recording), ADR-015 (why `Highlight`'s on-screen styling was dropped). Builds on the "keep listener simple" line ADR-015 drew.
+
+**Problem.** The concrete "getting ready to record" workflow wants a **timestamp next to a byte pattern** — e.g. the local arrival time immediately before each `$GPGGA` — visible both in the live display and in the Display Recording (`.disp`), while the `.raw` stream stays byte-exact (§53). ADR-015 had just rejected `Highlight` because styling a matched **byte range** needs a byte→**screen-coordinate** map across all three view modes. The open question was whether an inline timestamp inherits that same cost.
+
+**Decision.** Give `Mark` an optional `MarkTimestamp { position: Before | After, format: TimestampConfig }`. On a firing, format the matched chunk's **arrival** `wall_clock` (§133) in **local** time (a listener-local `TimestampConfig` mirroring talker's, but `Local` not `Utc`) and **splice that string into the rendered text at the match's byte offset** — before or after the matched bytes. Render it uniformly in Raw/Rendered/Hex via `DisplayView::render_text_annotated`, which walks the bytes (already ordered) and inserts the annotation string when the walk reaches the target offset. The `.disp` recorder writes exactly what the display shows (the splice happens pre-record), so the live view and `.disp` are identical. `.raw` is never touched. A bare `Mark` (no timestamp) keeps the `‹MARK …›` marker-line behaviour.
+
+**Why this is *not* the `Highlight` cost.** Splicing a string during rendering is a **text insertion**, not a coordinate mapping: no glyph-width measurement, no soft-wrap position math, no per-mode screen geometry. The renderers already produce their output by walking bytes/characters in order; "when you reach offset N, emit this string too" is a one-line addition per mode. The one place a byte offset must meet the character stream (multi-byte UTF-8/UTF-16 in Rendered/Raw) is handled by `decode_with_offsets`, which pairs each decoded character with its source byte offset — a small, tested helper, not a subsystem.
+
+**Also removed (one timestamping mechanism, not three).** Two abandoned pieces are deleted so the per-match `Mark` is the *only* timestamp path: (a) the per-chunk Display-Recording timestamp (`DisplayRecordingConfig.timestamp_enabled` + its GUI checkbox), which was never surfaced meaningfully; and (b) the spec-only `TimestampDisplay`/`TimestampSource`/`TimestampResolution` types, which had no implementation. The byte-exact **Raw Recording timestamp sidecar** (`.raw.idx`, §57) is **kept** — it stays out of the `.raw` bytes and is byte-exact-safe — but remains config-only (`RawRecordingConfig.timestamp_enabled`) with a TODO to add a UI toggle.
+
+**Consequences.**
+- `MatchAction::Mark` becomes `Mark { timestamp: Option<MarkTimestamp> }`; new `MarkTimestamp`/`MarkPosition`/`TimestampConfig` config types. `MatchAction` is `#[serde(tag = "kind")]`; a bare `Mark` still parses (the field is `#[serde(default)]`). No `schema_version` bump — additive field plus an additive-safe drop of the display timestamp field (dev-only profiles, ADR-013 precedent).
+- The renderer gains `render_text_annotated`/`render_stream_annotated`; `RenderedOutput.timestamp` is retained (it drives time-based Display rotation, §59) but never carries an inline mark — the inline text lives in `RenderedOutput.text`.
+- The snapshot's `TriggeredMatch` carries an optional `MarkRender { text, before }` so the live viewer splices the same timestamp the `.disp` got, rebasing the absolute match offset onto the scrollback window.
+- A minimal in-app editor creates `BytePattern → Mark(+timestamp)` rules; committing uses the existing Apply & Restart path (`config_needs_restart` counts `match_rules`) — no new runtime command. The general match-rule editor (Idle/Record/Notify/PauseDisplay) remains a separate TODO.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

@@ -5,7 +5,10 @@
 //! `show_rows`, scrollbar handle visibility, viewer height/stick-to-bottom).
 
 use crate::core::ChannelId;
-use crate::display::{CharacterRendering, DisplayEncoding, DisplayMode, DisplayView, WrappingMode};
+use crate::display::{
+    AnnotationPlacement, CharacterRendering, DisplayEncoding, DisplayMode, DisplayView,
+    RenderAnnotation, WrappingMode,
+};
 
 use super::super::bridge::UiCommand;
 use super::super::fonts::{bold, MonoFont};
@@ -383,6 +386,35 @@ impl ListenerApp {
             self.stream_cache = None;
             return;
         };
+        // Inline Mark timestamps (§50.2): rebase each firing's absolute stream offset
+        // onto the accumulated view window (front byte = cursor − buffered len), keep
+        // only those in-window, and splice their local timestamp text before/after the
+        // matched byte — exactly as the Display Recording does.
+        let window_start = view.stream_cursor - view.stream_bytes.len() as u64;
+        let annotations: Vec<RenderAnnotation> = view
+            .snapshot
+            .as_ref()
+            .map(|snap| {
+                snap.matches
+                    .iter()
+                    .filter_map(|m| {
+                        let mark = m.mark.as_ref()?;
+                        let offset = m.byte_offset?;
+                        let within = offset.checked_sub(window_start)? as usize;
+                        (within <= view.stream_bytes.len()).then(|| RenderAnnotation {
+                            offset: within,
+                            placement: if mark.before {
+                                AnnotationPlacement::Before
+                            } else {
+                                AnnotationPlacement::After
+                            },
+                            text: mark.text.clone(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let marks_sig = annotations_signature(&annotations);
         let key = super::super::StreamRenderKey {
             channel: id,
             cursor: view.stream_cursor,
@@ -390,13 +422,29 @@ impl ListenerApp {
             mode: view.view_prefs.mode,
             chars: view.view_prefs.chars,
             wrap_cols,
+            marks_sig,
         };
         if self.stream_cache.as_ref().is_some_and(|c| c.key == key) {
             return; // still valid — reuse the cached rows
         }
-        let rows = split_stream_rows(&renderer.render_text(view.stream_contiguous()), wrap_cols);
+        let text = renderer.render_text_annotated(view.stream_contiguous(), &annotations);
+        let rows = split_stream_rows(&text, wrap_cols);
         self.stream_cache = Some(super::super::StreamRenderCache { key, rows });
     }
+}
+
+/// A cheap order-sensitive hash of the spliced annotations, so the row cache
+/// invalidates when the inline Mark timestamps change but the raw bytes don't.
+fn annotations_signature(annotations: &[RenderAnnotation]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    annotations.len().hash(&mut h);
+    for a in annotations {
+        a.offset.hash(&mut h);
+        matches!(a.placement, AnnotationPlacement::Before).hash(&mut h);
+        a.text.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Scrollbar (track, handle) colors for a viewer whose text background is `bg`. Both

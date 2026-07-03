@@ -424,7 +424,6 @@ async fn raw_and_display_recording_run_to_independent_destinations() {
     config.display_recording = DisplayRecordingConfig {
         enabled: true,
         destination: Some(disp_path.clone()),
-        timestamp_enabled: false,
         overwrite_policy: OverwritePolicy::Overwrite,
         file_rotation: FileRotationPolicy::None,
     };

@@ -1,9 +1,31 @@
-# Listener Specification v2.0.6
+# Listener Specification v2.0.7
 
 Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
+
+Revision v2.0.7 (inline Mark timestamps; remove two abandoned timestamp pieces):
+
+The `Mark` match action may now carry an optional **inline timestamp** (§50.2): the
+matched byte pattern's local **arrival** time is spliced into the rendered display and
+the Display Recording (`.disp`) — configurably **before** or **after** the match —
+never into the byte-exact `.raw` stream (§53). The timestamp format mirrors talker's
+toggleable `TimestampConfig` (time-of-day always shown; date / milliseconds / local UTC
+offset optional), formatted in local time. It is rendered by splicing the timestamp
+string at the match's byte offset in every view mode (Raw/Rendered/Hex) — a text
+insertion, not on-screen byte-range styling (contrast the removed `Highlight`, ADR-015).
+A bare `Mark` (no timestamp) keeps its `‹MARK …›` marker-line behaviour.
+
+Two abandoned, never-completed timestamp pieces are removed so this is the **only**
+timestamping mechanism: (a) the per-chunk Display-Recording timestamp
+(`DisplayRecordingConfig.timestamp_enabled` and its GUI checkbox) — it duplicated
+nothing useful and was never surfaced; and (b) the spec-only
+`TimestampDisplay`/`TimestampSource`/`TimestampResolution` types (§26/§57/§72), which had
+no implementation. The byte-exact **Raw Recording timestamp sidecar** (`.raw.idx`, §57)
+is **kept** — it stays out of the `.raw` bytes — with a TODO to expose it in the UI. No
+`schema_version` change (the removed display field is an additive-safe drop; dev-only
+profiles). See the new ADR.
 
 Revision v2.0.6 (drop the Highlight match action):
 
@@ -111,6 +133,9 @@ this note are superseded by v2.0 above — the supersessions are flagged inline.
 - §75/§76 — **network live adjustment**: SO_RCVBUF, multicast join/leave + interface.
 - §78 — display extras: per-view **source**, **timestamp format**, **hex grouping**, and
   per-message **annotation toggles** (number + timestamp) replacing `metadata_visible`.
+  _v2.0.7: the per-view timestamp-format display extra and its `TimestampDisplay`/
+  `TimestampSource`/`TimestampResolution` types are removed (never implemented); the only
+  display timestamp is the per-match `Mark` timestamp (§50.2)._
 - §9.1 opt-in **auto-reconnect**; §91.1 **liveness / activity monitor**; §56.2
   **disk-space guard** for recording.
 - §136/§137 — command/event vocabulary expanded (incl. a dedicated `ReceptionStalled`
@@ -973,17 +998,23 @@ enum MatchCondition {
 ```rust
 enum MatchAction {
     Record { target: RecordTarget, control: RecordControl }, // begin/stop, from the match forward
-    Mark,                                                     // a time/offset marker + tagged event
+    Mark { timestamp: Option<MarkTimestamp> },               // marker + optional inline arrival timestamp
     Notify { severity: DiagnosticSeverity },                 // raise an event/warning (§92–94)
     PauseDisplay { view: Option<DisplayViewId> },            // freeze a view, or all
 }
 
 enum RecordTarget { Raw, Display, Both }
 enum RecordControl { Begin, Stop }
+
+// The inline timestamp a Mark splices next to the matched pattern (local arrival time).
+struct MarkTimestamp { position: MarkPosition, format: TimestampConfig }
+enum MarkPosition { Before, After }
+// Mirrors talker's TimestampConfig; formatted in **local** time (time-of-day always shown).
+struct TimestampConfig { include_date: bool, include_millis: bool, include_timezone: bool }
 ```
 
 - **Record** begins or stops recording **from the match forward**; there is **no pre-match backfill** (§158). Pre-trigger capture is deferred.
-- **Mark** drops a correlation marker — a byte offset / arrival time — into the display and the Display Recording (`.disp`), plus a tagged event (§137). It is **never** written into the raw `.raw` byte stream, which stays byte-exact (§49, §53).
+- **Mark** correlates the match into the display and the Display Recording (`.disp`), plus a tagged event (§137). It is **never** written into the raw `.raw` byte stream, which stays byte-exact (§49, §53). A bare `Mark` (`timestamp = None`) writes a `‹MARK …›` marker line into each view's `.disp`. When `timestamp` is `Some`, the matched pattern's **local arrival time** is instead spliced **inline** — `position` before or after the match — into the rendered display and `.disp`, formatted per `TimestampConfig` (time-of-day always shown; date, milliseconds, and the local UTC offset independently toggleable). The timestamp is inserted by splicing its text at the match's byte offset during rendering, in every view mode (Raw/Rendered/Hex) — a text insertion, not on-screen byte-range styling (contrast the removed `Highlight`, ADR-015).
 - **Notify** raises a diagnostic event/warning (§92–94). **PauseDisplay** freezes a view (or all views, §50); reception and recording continue.
 
 **Configuration** (persists in profiles):
@@ -1060,8 +1091,11 @@ post-render.
 
 It may include character-rendering transformations, visible control-character
 representations, and display formatting. It is explicitly not byte-exact and is
-not a substitute for Raw Recording. Because the artifact is already formatted,
-optional timestamps may be written inline.
+not a substitute for Raw Recording. Because the artifact is already formatted, any
+inline timestamps a `Mark` produces (§50.2) are already spliced into the rendered
+text — the recorder writes what the display shows, verbatim, with no timestamp logic
+of its own. (There is no separate per-chunk Display-Recording timestamp; the only
+timestamping is the per-match Mark, §50.2.)
 
 A Display Recording is bound to one display view's configuration. Recording a
 different view requires a separate Display Recording.
@@ -1149,9 +1183,14 @@ Rationale: the recorded bytes are self-sufficient; original timing is the one
 fact that cannot be regenerated from them.
 
 - **Raw Recording:** timestamps are `ChunkTime` values (wall clock + monotonic)
-  written to a sidecar index keyed by byte offset; the byte stream stays pure.
-- **Display Recording:** timestamps may be written inline in the rendered
-  artifact.
+  written to a **sidecar index** (`.raw.idx`) keyed by byte offset; the `.raw` byte
+  stream stays pure and byte-exact. The sidecar is written when
+  `RawRecordingConfig.timestamp_enabled` is set — currently a config-only flag with no
+  UI toggle yet (a TODO tracks exposing it).
+- **Display Recording:** the recorder writes the rendered text verbatim and adds **no**
+  timestamps of its own. The only display timestamp is the per-match `Mark` timestamp
+  (§50.2), which is spliced inline into the rendered text *before* the recorder sees it
+  — so it appears identically in the live view and the `.disp` file.
 
 No other metadata shall be recorded by default.
 
@@ -1524,10 +1563,10 @@ struct RawRecordingConfig {            // §53 — the verbatim byte stream (.ra
 struct DisplayRecordingConfig {        // §54 — the rendered view output (.disp)
     enabled: bool,
     destination: Option<PathBuf>,
-    timestamp_enabled: bool,           // §57: inline
     overwrite_policy: OverwritePolicy,
     file_rotation: FileRotationPolicy, // §59; default None
-}
+}                                      // no timestamp field — the only display
+                                       //   timestamp is the per-match Mark (§50.2)
 ```
 
 The single `RecordingConfig`/`RecordingMode` (Disabled/Raw/Display/Both) of v2.0 is
@@ -1610,8 +1649,8 @@ pub struct DefaultConfig {
 // §45; groups_per_line 0 = fit to the display width.
 pub struct HexGrouping { pub bytes_per_group: u8, pub groups_per_line: u8 }
 
-// §57 — timestamp format for the recording sidecar (Raw) / inline (Display).
-pub struct TimestampDisplay { pub source: TimestampSource, pub resolution: TimestampResolution }
+// §50.2 — the inline Mark timestamp format (local time; mirrors talker's config).
+pub struct TimestampConfig { pub include_date: bool, pub include_millis: bool, pub include_timezone: bool }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MatchRuleId(uuid::Uuid); // §50.2
@@ -2435,13 +2474,14 @@ _Removed in v2.0 (see §131)._
 
 ## 133. Timestamp
 
-Internal timing uses one model, not strings: a monotonic `Instant` for ordering and the §125 tie-break, and a wall-clock `SystemTime` for Local/UTC display. The unit is the per-chunk `ChunkTime` (§138); recording timestamps (§57) and the activity monitor (§166) derive from it. Formatting to a display string — source (Local / UTC / Relative) and resolution (seconds / ms / µs) — is done in the display/recording layer, not in stored state.
+Internal timing uses one model, not strings: a monotonic `Instant` for ordering and the §125 tie-break, and a wall-clock `SystemTime` for display. The unit is the per-chunk `ChunkTime` (§138); the raw recording timestamp sidecar (§57), the inline Mark timestamp (§50.2), and the activity monitor (§166) all derive from it. Formatting to a display string is done in the display layer, not in stored state.
+
+The only display timestamp is the per-match **Mark** timestamp (§50.2), formatted in **local** time by a toggleable `TimestampConfig` (mirroring talker's): time-of-day is always shown; date, milliseconds, and the local UTC offset are independently toggleable.
 
 ```rust
-// Display/recording-time selection (formatting only; the captured time is the
-// ChunkTime defined in §138):
-pub enum TimestampSource { Local, Utc, RelativeToStart }
-pub enum TimestampResolution { Seconds, Millis, Micros }
+// The inline Mark timestamp format (§50.2). Formats a chunk's wall-clock arrival time
+// in local time; the captured time itself is the ChunkTime defined in §138.
+pub struct TimestampConfig { pub include_date: bool, pub include_millis: bool, pub include_timezone: bool }
 ```
 
 Timestamp *resolution* is a display/storage precision choice, not an accuracy guarantee; userland serial/UDP arrival times carry OS scheduling jitter that may exceed the displayed resolution.

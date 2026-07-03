@@ -176,7 +176,6 @@ pub struct RotatingDisplayRecorder {
     channel: String,
     ext: String,
     policy: OverwritePolicy,
-    timestamps: bool,
     rotation: FileRotationPolicy,
     current_key: String,
     inner: DisplayFileRecorder,
@@ -188,20 +187,18 @@ impl RotatingDisplayRecorder {
         channel: &str,
         ext: &str,
         policy: OverwritePolicy,
-        timestamps: bool,
         rotation: FileRotationPolicy,
     ) -> Result<Self, RecordError> {
         ensure_rotation_dir(dir).await?;
         let key = period_key(rotation, SystemTime::now())
             .expect("RotatingDisplayRecorder requires a rotation period");
         let path = dir.join(rotation_filename(channel, &key, ext));
-        let inner = DisplayFileRecorder::create(&path, policy, timestamps).await?;
+        let inner = DisplayFileRecorder::create(&path, policy).await?;
         Ok(Self {
             dir: dir.to_owned(),
             channel: channel.to_owned(),
             ext: ext.to_owned(),
             policy,
-            timestamps,
             rotation,
             current_key: key,
             inner,
@@ -215,7 +212,7 @@ impl RotatingDisplayRecorder {
         let path = self
             .dir
             .join(rotation_filename(&self.channel, &key, &self.ext));
-        self.inner = DisplayFileRecorder::create(&path, self.policy, self.timestamps).await?;
+        self.inner = DisplayFileRecorder::create(&path, self.policy).await?;
         self.current_key = key;
         Ok(())
     }
@@ -393,7 +390,6 @@ mod tests {
             "AIS",
             ".disp",
             OverwritePolicy::Overwrite,
-            false,
             FileRotationPolicy::Daily,
         )
         .await

@@ -1,6 +1,6 @@
 //! The Raw and Display recording setup editors (§53–§59): destination, overwrite
-//! policy, rotation, timestamps. Config-driven (applied via a §13 Reconfigure); the
-//! live Record toggle (ADR-012) is separate. Both editors share `recording_file_fields`.
+//! policy, rotation. Config-driven (applied via a §13 Reconfigure); the live Record
+//! toggle (ADR-012) is separate. Both editors share `recording_file_fields`.
 
 use std::path::PathBuf;
 
@@ -11,17 +11,12 @@ use super::super::theme;
 
 /// The shared destination / overwrite / rotation controls for a recording (§55–§59),
 /// used by both the Raw and Display editors (their config structs carry the same
-/// fields; ADR-013). `ext` is the file extension shown in hints (".raw"/".disp").
+/// fields; ADR-013).
 fn recording_file_fields(
     ui: &mut egui::Ui,
-    ext: &str,
     destination: &mut Option<PathBuf>,
     overwrite_policy: &mut OverwritePolicy,
     file_rotation: &mut FileRotationPolicy,
-    // When `Some`, a "Record timestamps" checkbox is shown — Display only. Raw passes
-    // `None`: a `.raw` file is the verbatim byte stream, so it has no timestamp option.
-    // (Raw's "Record on start" toggle lives next to its Record button, not here.)
-    timestamp_enabled: Option<&mut bool>,
 ) {
     // A single file when not rotating; a directory of <channel>_<period> files
     // otherwise (§59). `rotating` reflects this frame's start — a one-frame lag when
@@ -103,27 +98,19 @@ fn recording_file_fields(
                  the channel name filesystem-safe (§59).",
             );
     });
-    if let Some(timestamp_enabled) = timestamp_enabled {
-        ui.checkbox(timestamp_enabled, format!("Record timestamps ({ext})"))
-            .on_hover_text("Prefix each rendered line with its arrival time (§57).");
-    }
 }
 
 /// Edit the channel's **Raw** recording setup (§53): destination, overwrite, rotation.
 /// The byte-exact verbatim stream (§53) — a separate pipeline tap from Display
 /// (ADR-013). The live Record toggle and the "Record on start" flag (`enabled`, ADR-012)
-/// live next to the Record button, not here. No timestamp option — a `.raw` file is the
-/// bytes exactly as received, so the timestamp flag is forced off.
+/// live next to the Record button, not here.
 pub(crate) fn edit_raw_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
     let rec = &mut config.raw_recording;
-    rec.timestamp_enabled = false; // Raw never timestamps; keep the config honest.
     recording_file_fields(
         ui,
-        ".raw",
         &mut rec.destination,
         &mut rec.overwrite_policy,
         &mut rec.file_rotation,
-        None, // Raw: no "Record timestamps" option (verbatim bytes only).
     );
 }
 
@@ -139,10 +126,8 @@ pub(crate) fn edit_display_recording(ui: &mut egui::Ui, config: &mut ChannelConf
     }
     recording_file_fields(
         ui,
-        ".disp",
         &mut rec.destination,
         &mut rec.overwrite_policy,
         &mut rec.file_rotation,
-        Some(&mut rec.timestamp_enabled), // Display can prefix rendered lines with time
     );
 }

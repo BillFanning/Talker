@@ -1,8 +1,28 @@
 //! Raw, Rendered, and Hex rendering plus the four character-rendering modes
 //! and wrapping (spec §42–§46), and the configured [`DisplayView`] renderer.
 
-use super::encoding::decode;
+use super::encoding::decode_with_offsets;
 use super::{CharacterRendering, DisplayEncoding, DisplayMode, RenderedOutput, WrappingMode};
+
+/// Where an inline annotation string is spliced relative to the byte it targets
+/// (§50.2 Mark timestamps). Renderer-local so the pure display layer does not depend
+/// on `config`; the pipeline maps `config::MarkPosition` onto this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnotationPlacement {
+    /// Splice immediately before the target byte's rendering.
+    Before,
+    /// Splice immediately after the target byte's rendering.
+    After,
+}
+
+/// An inline text annotation to splice into rendered output at a byte offset
+/// (§50.2). `offset` is a byte index into the *rendered span's* bytes (0-based).
+#[derive(Clone, Debug)]
+pub struct RenderAnnotation {
+    pub offset: usize,
+    pub placement: AnnotationPlacement,
+    pub text: String,
+}
 
 /// ASCII control mnemonics for 0x00..=0x1F (index == code point).
 const CONTROL_NAMES: [&str; 32] = [
@@ -49,20 +69,54 @@ fn render_char(c: char, mode: CharacterRendering) -> String {
     }
 }
 
+/// Split `annotations` into the strings that fall **before** and **after** the byte
+/// at `offset`. Both lists preserve input order (annotations are pre-sorted by
+/// offset), so multiple marks at one offset stack in a stable order.
+fn splice_at(
+    annotations: &[RenderAnnotation],
+    offset: usize,
+) -> (impl Iterator<Item = &str>, impl Iterator<Item = &str>) {
+    let before = annotations
+        .iter()
+        .filter(move |a| a.offset == offset && a.placement == AnnotationPlacement::Before)
+        .map(|a| a.text.as_str());
+    let after = annotations
+        .iter()
+        .filter(move |a| a.offset == offset && a.placement == AnnotationPlacement::After)
+        .map(|a| a.text.as_str());
+    (before, after)
+}
+
 /// Render bytes as Hex (§45): each byte as two uppercase hex digits, joined by
 /// `separator`. When `bytes_per_line` is `Some`, wrap to that many bytes per
-/// line.
-fn render_hex(bytes: &[u8], separator: &str, bytes_per_line: Option<usize>) -> String {
-    let to_line = |chunk: &[u8]| {
-        chunk
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<Vec<_>>()
-            .join(separator)
-    };
+/// line. `annotations` are spliced as extra cells before/after their target byte.
+fn render_hex(
+    bytes: &[u8],
+    separator: &str,
+    bytes_per_line: Option<usize>,
+    annotations: &[RenderAnnotation],
+) -> String {
+    // Build the ordered list of cells (each an already-formatted token), inserting
+    // annotation strings as their own cells around the target byte's hex pair.
+    let mut cells: Vec<String> = Vec::with_capacity(bytes.len());
+    for (i, b) in bytes.iter().enumerate() {
+        let (before, after) = splice_at(annotations, i);
+        cells.extend(before.map(str::to_string));
+        cells.push(format!("{b:02X}"));
+        cells.extend(after.map(str::to_string));
+    }
+    // Annotations targeting the one-past-the-end offset (an `After` on the final byte
+    // is handled above; a `Before` at len is a trailing mark) attach at the end.
+    let (end_before, _) = splice_at(annotations, bytes.len());
+    cells.extend(end_before.map(str::to_string));
+
     match bytes_per_line.filter(|&n| n > 0) {
-        Some(n) => bytes.chunks(n).map(to_line).collect::<Vec<_>>().join("\n"),
-        None => to_line(bytes),
+        Some(n) => cells
+            .chunks(n)
+            .map(|chunk| chunk.join(separator))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => cells.join(separator),
     }
 }
 
@@ -113,10 +167,20 @@ fn wrap_lines(text: &str, width: Option<usize>) -> String {
 /// dropped (so CRLF collapses to a single break), TAB expands to the next
 /// 8-column tab stop, and other control characters are not printed. v1 does not
 /// emulate cursor movement.
-fn render_rendered(bytes: &[u8], encoding: DisplayEncoding) -> String {
+fn render_rendered(
+    bytes: &[u8],
+    encoding: DisplayEncoding,
+    annotations: &[RenderAnnotation],
+) -> String {
     let mut out = String::new();
     let mut col = 0usize;
-    for c in decode(bytes, encoding) {
+    // Annotation strings are inserted verbatim (they don't shift the tab column
+    // accounting — a timestamp is presentation, not stream content).
+    for (c, offset) in decode_with_offsets(bytes, encoding) {
+        let (before, after) = splice_at(annotations, offset);
+        for s in before {
+            out.push_str(s);
+        }
         match c {
             '\n' => {
                 out.push('\n');
@@ -144,6 +208,15 @@ fn render_rendered(bytes: &[u8], encoding: DisplayEncoding) -> String {
                 col += 1;
             }
         }
+        for s in after {
+            out.push_str(s);
+        }
+    }
+    // A trailing annotation at the one-past-end offset (e.g. an After on the final
+    // byte lands above; a Before at len is a trailing mark).
+    let (end_before, _) = splice_at(annotations, bytes.len());
+    for s in end_before {
+        out.push_str(s);
     }
     out
 }
@@ -181,21 +254,37 @@ impl Default for DisplayView {
 impl DisplayView {
     /// Render raw stream bytes to the view's text representation (§41).
     pub fn render_text(&self, bytes: &[u8]) -> String {
+        self.render_text_annotated(bytes, &[])
+    }
+
+    /// Render raw stream bytes, splicing inline `annotations` (§50.2 Mark
+    /// timestamps) before/after their target byte in every mode. `annotations` must
+    /// be sorted by `offset`; offsets past the span's end are ignored. Text
+    /// insertion only — no byte→coordinate mapping — so it works uniformly across
+    /// Raw, Rendered, and Hex.
+    pub fn render_text_annotated(&self, bytes: &[u8], annotations: &[RenderAnnotation]) -> String {
         let wrap = matches!(self.wrapping, WrappingMode::Wrap);
         match self.mode {
             DisplayMode::Hex => {
                 let bytes_per_line = wrap.then_some(self.hex_bytes_per_line);
-                render_hex(bytes, &self.hex_separator, bytes_per_line)
+                render_hex(bytes, &self.hex_separator, bytes_per_line, annotations)
             }
             DisplayMode::Raw => {
-                let cells: Vec<String> = decode(bytes, self.encoding)
-                    .into_iter()
-                    .map(|c| render_char(c, self.character_rendering))
-                    .collect();
+                // One cell per byte's rendered char, with annotation strings spliced
+                // in as their own cells so wrapping keeps each intact.
+                let mut cells: Vec<String> = Vec::with_capacity(bytes.len());
+                for (c, offset) in decode_with_offsets(bytes, self.encoding) {
+                    let (before, after) = splice_at(annotations, offset);
+                    cells.extend(before.map(str::to_string));
+                    cells.push(render_char(c, self.character_rendering));
+                    cells.extend(after.map(str::to_string));
+                }
+                let (end_before, _) = splice_at(annotations, bytes.len());
+                cells.extend(end_before.map(str::to_string));
                 wrap_cells(&cells, if wrap { self.wrap_width } else { None })
             }
             DisplayMode::Rendered => {
-                let text = render_rendered(bytes, self.encoding);
+                let text = render_rendered(bytes, self.encoding, annotations);
                 if wrap {
                     wrap_lines(&text, self.wrap_width)
                 } else {
@@ -211,9 +300,19 @@ impl DisplayView {
         channel_id: crate::core::ChannelId,
         bytes: &[u8],
     ) -> RenderedOutput {
+        self.render_stream_annotated(channel_id, bytes, &[])
+    }
+
+    /// Render a span of stream bytes with inline `annotations` spliced in (§50.2).
+    pub fn render_stream_annotated(
+        &self,
+        channel_id: crate::core::ChannelId,
+        bytes: &[u8],
+        annotations: &[RenderAnnotation],
+    ) -> RenderedOutput {
         RenderedOutput {
             channel_id,
-            text: self.render_text(bytes),
+            text: self.render_text_annotated(bytes, annotations),
             timestamp: None,
         }
     }
@@ -310,5 +409,83 @@ mod tests {
         let out = view(DisplayMode::Raw, CharacterRendering::Native).render_stream(cid, b"hi");
         assert_eq!(out.channel_id, cid);
         assert_eq!(out.text, "hi");
+    }
+
+    fn ann(offset: usize, placement: AnnotationPlacement, text: &str) -> RenderAnnotation {
+        RenderAnnotation {
+            offset,
+            placement,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn rendered_splices_timestamp_before_the_match() {
+        // The canonical case: `[ts]` immediately before the `$` of a GGA sentence.
+        let v = view(DisplayMode::Rendered, CharacterRendering::Native);
+        let anns = [ann(3, AnnotationPlacement::Before, "[17:42:03]")];
+        assert_eq!(
+            v.render_text_annotated(b"ab\n$GPGGA", &anns),
+            "ab\n[17:42:03]$GPGGA"
+        );
+    }
+
+    #[test]
+    fn rendered_splices_timestamp_after_the_match() {
+        let v = view(DisplayMode::Rendered, CharacterRendering::Native);
+        // After the byte at offset 2 (the second 'b').
+        let anns = [ann(2, AnnotationPlacement::After, "<T>")];
+        assert_eq!(v.render_text_annotated(b"abbc", &anns), "abb<T>c");
+    }
+
+    #[test]
+    fn raw_splices_annotation_as_its_own_cell() {
+        let v = view(DisplayMode::Raw, CharacterRendering::HexEscape);
+        let anns = [ann(1, AnnotationPlacement::Before, "[T]")];
+        // Control bytes still escape; the annotation lands before the byte at 1.
+        assert_eq!(v.render_text_annotated(b"A\nB", &anns), "A[T]<0A>B");
+    }
+
+    #[test]
+    fn raw_annotation_cell_is_kept_intact_when_wrapping() {
+        let mut v = view(DisplayMode::Raw, CharacterRendering::Native);
+        v.wrapping = WrappingMode::Wrap;
+        v.wrap_width = Some(3);
+        // "[TS]" is one cell (4 cols): it forces a wrap before it rather than splitting.
+        let anns = [ann(2, AnnotationPlacement::Before, "[TS]")];
+        assert_eq!(v.render_text_annotated(b"ABCDE", &anns), "AB\n[TS]\nCDE");
+    }
+
+    #[test]
+    fn hex_splices_annotation_as_its_own_cell() {
+        let v = view(DisplayMode::Hex, CharacterRendering::Native);
+        let anns = [ann(1, AnnotationPlacement::Before, "[T]")];
+        assert_eq!(v.render_text_annotated(b"ABC", &anns), "41 [T] 42 43");
+    }
+
+    #[test]
+    fn hex_wrap_counts_annotation_as_a_cell() {
+        let mut v = view(DisplayMode::Hex, CharacterRendering::Native);
+        v.wrapping = WrappingMode::Wrap;
+        v.hex_bytes_per_line = 2;
+        let anns = [ann(1, AnnotationPlacement::Before, "[T]")];
+        // Cells: 41, [T], 42, 43 → 2 per line.
+        assert_eq!(v.render_text_annotated(b"ABC", &anns), "41 [T]\n42 43");
+    }
+
+    #[test]
+    fn annotation_at_end_offset_is_a_trailing_mark() {
+        let v = view(DisplayMode::Rendered, CharacterRendering::Native);
+        let anns = [ann(2, AnnotationPlacement::Before, "<end>")];
+        assert_eq!(v.render_text_annotated(b"ab", &anns), "ab<end>");
+    }
+
+    #[test]
+    fn annotation_maps_onto_multibyte_utf8_boundary() {
+        // "é" is two UTF-8 bytes (0xC3 0xA9) at offset 1; an annotation before the
+        // byte after it (offset 3, 'b') must land after the single 'é' char.
+        let v = view(DisplayMode::Rendered, CharacterRendering::Native);
+        let anns = [ann(3, AnnotationPlacement::Before, "|")];
+        assert_eq!(v.render_text_annotated("aéb".as_bytes(), &anns), "aé|b");
     }
 }

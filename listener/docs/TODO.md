@@ -68,12 +68,19 @@ Message-model removal). Everything below this block is verified done:
       timestamps; a channel can run both at once. GUI: Raw panel above Configure
       (live on/off + setup), Display under Configure. Pinned by
       `raw_and_display_recording_run_to_independent_destinations`.
-- [ ] (Optional) Render existing `Mark` firings in the live stream view. `Mark` already
-      writes a `‹MARK …›` line into the `.disp` recording (`write_mark`) and records a
-      `TriggeredMatch`; the live viewer just doesn't draw a glyph for it. Low priority —
-      kept simple deliberately. (On-screen **Highlight** styling was considered and
-      **dropped** as too complex for the simple goal — the `Highlight` action was removed;
-      see ADR-015.)
+- [x] Inline **`Mark` timestamps** in the live view and `.disp` (§50.2, ADR-016). A
+      `Mark { timestamp: Some(..) }` splices the matched pattern's local arrival time
+      (before/after, talker-style `TimestampConfig`) into the rendered text via
+      `render_text_annotated`; the live viewer rebases the snapshot's `TriggeredMatch`
+      `MarkRender` onto the scrollback window and splices the same text, so display and
+      `.disp` match. `.raw` is untouched. A minimal `BytePattern → Mark(+ts)` editor
+      lives under Configure (Apply & Restart). Pinned by
+      `timestamped_mark_splices_inline_time_into_disp_not_raw` + renderer splice tests.
+      (On-screen **Highlight** byte-range styling was **dropped** as too complex — see
+      ADR-015; ADR-016 explains why the inline timestamp does *not* inherit that cost.)
+- [ ] (Optional) Draw a glyph for a **bare** `Mark` (no timestamp) in the live stream
+      view. A bare `Mark` still only writes the `‹MARK …›` line into `.disp`; the live
+      viewer doesn't render a marker for it. Low priority — kept simple deliberately.
 - [ ] Match-`Record` to a Display/`Both` target: arm the display recorder. The
       `RecordTarget::Display`/`Both` variants exist and the pipeline accepts them,
       but only the Raw side is driven today (`apply_pending_records` skips
@@ -95,9 +102,15 @@ Message-model removal). Everything below this block is verified done:
       not auto-recording, so the toggle controls it. Pinned by
       `set_recording_begins_and_stops_raw_recording_live` (pipeline) +
       `set_recording_toggles_raw_recording_live_through_the_orchestrator` (loopback).
-- [ ] Recording timestamp sidecar for `.raw` (byte-offset keyed, §57)
-- [ ] Match-rule editor UI (rules currently arrive only via profiles): the
-      `Idle`/`Record`/`Notify`/`PauseDisplay` conditions + actions.
+- [ ] Expose the `.raw` timestamp sidecar in the UI (§57). The byte-offset-keyed
+      `.raw.idx` sidecar is **built** (`RawFileRecorder` writes `<offset>,<wall_nanos>`
+      when `RawRecordingConfig.timestamp_enabled`), byte-exact-safe (out of `.raw`), and
+      kept — but the flag is **config-only**: no GUI/CLI toggle sets it, so it never
+      turns on in practice. Add a control (and decide read-side tooling: a companion
+      viewer that pairs `.raw.idx` offsets with `.raw` bytes).
+- [ ] General match-rule editor UI: the `Idle`/`Record`/`Notify`/`PauseDisplay`
+      conditions + actions. The `BytePattern → Mark(+timestamp)` subset now has a
+      minimal editor (ADR-016); the rest still arrive only via profiles.
 - [x] `RuntimeCommand`'s role (§136) — resolved by ADR-012: removed the vestigial
       `core::RuntimeCommand` enum; the command surface is the `Listener` async method
       API (the GUI's `UiCommand` is the bridge transport). Spec §136 rewritten to

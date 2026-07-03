@@ -177,43 +177,27 @@ impl RawRecorder for RawFileRecorder {
 }
 
 /// Display Recording to a file: writes a view's rendered text, one rendered chunk per
-/// write, optionally prefixed with an inline timestamp (§54, §57). Not byte-exact.
+/// write (§54). Not byte-exact. Any timestamps are already spliced into `output.text`
+/// by the renderer (per-match Mark timestamps, §50.2); the recorder writes verbatim.
 pub struct DisplayFileRecorder {
     file: BufWriter<File>,
-    timestamps: bool,
     /// Advisory lock on the destination (§121, ADR-014); see `RawFileRecorder._lock`.
     _lock: std::fs::File,
 }
 
 impl DisplayFileRecorder {
-    pub async fn create(
-        path: &Path,
-        policy: OverwritePolicy,
-        timestamps: bool,
-    ) -> Result<Self, RecordError> {
+    pub async fn create(path: &Path, policy: OverwritePolicy) -> Result<Self, RecordError> {
         // Lock the destination first (§121, ADR-014) — same as Raw, so a `.disp` cannot
         // be shared by two recordings either.
         let lock = lock_recording_destination(path)?;
         let file = BufWriter::new(open_recording_file(path, policy).await?);
-        Ok(Self {
-            file,
-            timestamps,
-            _lock: lock,
-        })
+        Ok(Self { file, _lock: lock })
     }
 }
 
 #[async_trait::async_trait]
 impl DisplayRecorder for DisplayFileRecorder {
     async fn write_rendered(&mut self, output: &RenderedOutput) -> Result<(), RecordError> {
-        // Display Recording is not byte-exact, so inline timestamps are allowed
-        // (§57): they go in the formatted artifact, unlike Raw Recording.
-        if self.timestamps {
-            if let Some(ts) = &output.timestamp {
-                let line = format!("[{}] ", wall_clock_nanos(ts.wall_clock));
-                self.file.write_all(line.as_bytes()).await?;
-            }
-        }
         self.file.write_all(output.text.as_bytes()).await?;
         self.file.write_all(b"\n").await?;
         Ok(())
@@ -364,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn display_recording_writes_rendered_lines() {
         let path = temp_path("display");
-        let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Overwrite, false)
+        let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Overwrite)
             .await
             .unwrap();
         let mut recording = start_display_recording(recorder, 16);

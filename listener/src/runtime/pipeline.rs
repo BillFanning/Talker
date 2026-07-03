@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::matchrule::{FiredRule, MatchRuleSet};
-use super::snapshot::TriggeredMatch;
+use super::snapshot::{MarkRender, TriggeredMatch};
 
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_util::sync::CancellationToken;
@@ -28,12 +28,13 @@ use super::snapshot::{
     QueueDepth, StreamDelta,
 };
 use crate::config::{
-    DiskGuard, DiskThreshold, LowDiskAction, MatchAction, MatchRule, RecordControl, RecordTarget,
+    DiskGuard, DiskThreshold, LowDiskAction, MarkPosition, MatchAction, MatchRule, RecordControl,
+    RecordTarget,
 };
 
-use crate::core::{ChannelId, DisplayViewId, MatchRuleId, RecordingState, RuntimeEvent};
+use crate::core::{ChannelId, ChunkTime, DisplayViewId, MatchRuleId, RecordingState, RuntimeEvent};
 use crate::diagnostics::{Diagnostic, DiagnosticLog};
-use crate::display::{DisplayView, RenderedOutput};
+use crate::display::{AnnotationPlacement, DisplayView, RenderAnnotation, RenderedOutput};
 use crate::record::{
     start_raw_recording, FileRotationPolicy, OverwritePolicy, RawFileRecorder, Recording,
     RecordingStopReason, RotatingRawRecorder,
@@ -41,6 +42,45 @@ use crate::record::{
 use crate::transport::{ReceivedData, TransportNotice};
 
 use super::queue::DropOldestQueue;
+
+/// An inline Mark timestamp produced by a firing this chunk (§50.2): the **absolute**
+/// stream offset of the matched byte, whether the timestamp goes before it, and the
+/// already-formatted local text. The pipeline rebases the offset onto the current
+/// chunk for the `.disp` render and ships the same text to the snapshot for the live
+/// view.
+#[derive(Clone, Debug)]
+struct MarkAnnotation {
+    offset: u64,
+    before: bool,
+    text: String,
+}
+
+/// Rebase this chunk's Mark annotations (absolute offsets) onto within-chunk byte
+/// offsets for the `.disp` render. An annotation whose match began in a *prior* chunk
+/// (a boundary split — absolute offset < `chunk_offset`) cannot be spliced into this
+/// chunk's already-anchored render and is dropped from `.disp`; it still reaches the
+/// snapshot/live view via `TriggeredMatch`. Offsets past the chunk are ignored.
+fn render_annotations_for_chunk(
+    marks: &[MarkAnnotation],
+    chunk_offset: u64,
+    chunk_len: usize,
+) -> Vec<RenderAnnotation> {
+    marks
+        .iter()
+        .filter_map(|m| {
+            let within = m.offset.checked_sub(chunk_offset)? as usize;
+            (within <= chunk_len).then(|| RenderAnnotation {
+                offset: within,
+                placement: if m.before {
+                    AnnotationPlacement::Before
+                } else {
+                    AnnotationPlacement::After
+                },
+                text: m.text.clone(),
+            })
+        })
+        .collect()
+}
 
 /// Bounded capacities for a Channel's fan-out edges (§99, §124).
 #[derive(Clone, Copy, Debug)]
@@ -388,25 +428,36 @@ impl ChannelPipeline {
             }
         }
 
-        // 3. Display Recording (§54, §58): render this chunk per recording view
-        // and record it — regardless of pause (pausing presentation never pauses
-        // recording). Non-blocking; a full queue faults that recording only.
+        // 3. Find/triggers (§50.2): evaluate `BytePattern` rules against this chunk
+        // **before** rendering for Display Recording, so a `Mark` timestamp can be
+        // spliced into this same chunk's `.disp` render. Matching spans the previous
+        // chunk's boundary via the rule set's carry; each firing carries its true
+        // match start offset (which may fall in the prior chunk for a boundary split).
+        let mark_annotations = if !self.match_rules.is_empty() {
+            let fired = self.match_rules.evaluate_stream(bytes, chunk_offset);
+            if fired.is_empty() {
+                Vec::new()
+            } else {
+                self.apply_fired_rules(fired, data.received_at)
+            }
+        } else {
+            Vec::new()
+        };
+
+        // 4. Display Recording (§54, §58): render this chunk per recording view and
+        // record it — regardless of pause (pausing presentation never pauses
+        // recording). Non-blocking; a full queue faults that recording only. Mark
+        // timestamps for this chunk are spliced inline at their within-chunk offset
+        // (§50.2) — the `.disp` mirrors what the live display shows, never `.raw`.
         let channel_id = self.channel_id;
+        let chunk_marks =
+            render_annotations_for_chunk(&mark_annotations, chunk_offset, bytes.len());
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.as_mut() {
-                let rendered = rec.renderer.render_stream(channel_id, bytes);
+                let rendered =
+                    rec.renderer
+                        .render_stream_annotated(channel_id, bytes, &chunk_marks);
                 rec.recording.try_record(rendered);
-            }
-        }
-
-        // 4. Find/triggers (§50.2): evaluate `BytePattern` rules against this chunk,
-        // matching **across the previous chunk's boundary** via the rule set's
-        // carry. Each firing carries its true match start offset (which may fall in
-        // the prior chunk for a boundary split) and a flag the measurement uses.
-        if !self.match_rules.is_empty() {
-            let fired = self.match_rules.evaluate_stream(bytes, chunk_offset);
-            if !fired.is_empty() {
-                self.apply_fired_rules(fired);
             }
         }
     }
@@ -418,13 +469,19 @@ impl ChannelPipeline {
     /// `MatchTriggered` event (§137). Each firing carries its own byte offset
     /// (`None` for an idle firing); a boundary-split firing also records the
     /// where/why measurement diagnostic.
-    fn apply_fired_rules(&mut self, fired: Vec<FiredRule>) {
+    ///
+    /// Returns the inline **Mark timestamp annotations** produced this chunk (absolute
+    /// stream offsets), which the caller splices into the `.disp` render. `arrival` is
+    /// the chunk's arrival time — the source of a Mark timestamp (§50.2).
+    fn apply_fired_rules(
+        &mut self,
+        fired: Vec<FiredRule>,
+        arrival: ChunkTime,
+    ) -> Vec<MarkAnnotation> {
+        let mut annotations = Vec::new();
         for rule in fired {
             let byte_offset = rule.match_offset;
-            self.recent_matches.push(TriggeredMatch {
-                rule_id: rule.id,
-                byte_offset,
-            });
+            let mut mark_render = None;
             if let Some(events) = &self.events {
                 let _ = events.try_send(RuntimeEvent::MatchTriggered(self.channel_id, rule.id));
             }
@@ -454,7 +511,24 @@ impl ChannelPipeline {
                             format!("match rule fired on channel {}{where_}", self.channel_id),
                         ));
                     }
-                    MatchAction::Mark => self.write_mark(rule.id, byte_offset),
+                    // A timestamped Mark splices the inline local arrival time; a bare
+                    // Mark writes the `‹MARK …›` marker line (§50.2). Both only ever
+                    // touch the display and `.disp`, never `.raw` (§5.6/§49).
+                    MatchAction::Mark {
+                        timestamp: Some(ts),
+                    } => {
+                        if let Some(offset) = byte_offset {
+                            let before = matches!(ts.position, MarkPosition::Before);
+                            let text = ts.format.format(arrival.wall_clock);
+                            annotations.push(MarkAnnotation {
+                                offset,
+                                before,
+                                text: text.clone(),
+                            });
+                            mark_render = Some(MarkRender { text, before });
+                        }
+                    }
+                    MatchAction::Mark { timestamp: None } => self.write_mark(rule.id, byte_offset),
                     MatchAction::PauseDisplay { view } => self.pause_views(*view),
                     MatchAction::Record { target, control } => {
                         self.pending_record_controls.push(PendingRecord {
@@ -464,7 +538,13 @@ impl ChannelPipeline {
                     }
                 }
             }
+            self.recent_matches.push(TriggeredMatch {
+                rule_id: rule.id,
+                byte_offset,
+                mark: mark_render,
+            });
         }
+        annotations
     }
 
     /// `Mark` action (§50.2): drop a correlation marker into every Display View's
@@ -520,7 +600,9 @@ impl ChannelPipeline {
         let idle_for = now.saturating_duration_since(last);
         let fired = self.match_rules.evaluate_idle(idle_for);
         if !fired.is_empty() {
-            self.apply_fired_rules(fired);
+            // Idle firings carry no byte offset, so they produce no inline Mark
+            // timestamp; the returned annotations are always empty here.
+            let _ = self.apply_fired_rules(fired, ChunkTime::now());
         }
     }
 
@@ -874,7 +956,7 @@ impl ChannelPipeline {
             },
             raw_recording: self.raw_recording_state(),
             activity: self.activity.snapshot(Instant::now()),
-            matches: self.recent_matches.iter().copied().collect(),
+            matches: self.recent_matches.iter().cloned().collect(),
             match_boundary_saves: self.match_rules.boundary_saves(),
             // The scrollback bytes are fetched incrementally (StreamDelta), not
             // bundled here — only the cursor target travels in the snapshot.
@@ -1206,7 +1288,7 @@ mod tests {
         use crate::record::{start_display_recording, DisplayFileRecorder};
         let cid = ChannelId::new();
         let path = temp_path("disp");
-        let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Refuse, false)
+        let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Refuse)
             .await
             .unwrap();
         let recording = start_display_recording(recorder, 64);
@@ -1227,7 +1309,7 @@ mod tests {
         use crate::record::{start_display_recording, DisplayFileRecorder};
         let cid = ChannelId::new();
         let path = temp_path("disp-paused");
-        let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Refuse, false)
+        let recorder = DisplayFileRecorder::create(&path, OverwritePolicy::Refuse)
             .await
             .unwrap();
         let recording = start_display_recording(recorder, 64);
@@ -1732,12 +1814,16 @@ mod tests {
         let raw = RawFileRecorder::create(&raw_path, OverwritePolicy::Refuse, false)
             .await
             .unwrap();
-        let disp = DisplayFileRecorder::create(&disp_path, OverwritePolicy::Refuse, false)
+        let disp = DisplayFileRecorder::create(&disp_path, OverwritePolicy::Refuse)
             .await
             .unwrap();
         let mut p = pipeline(cid, PipelineCapacities::default())
             .with_raw_recorder(start_raw_recording(raw, 64))
-            .with_match_rules(&[byte_rule("mark", b"HERE", vec![MatchAction::Mark])]);
+            .with_match_rules(&[byte_rule(
+                "mark",
+                b"HERE",
+                vec![MatchAction::Mark { timestamp: None }],
+            )]);
         p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
 
         p.ingest(bytes_chunk(cid, b"data HERE data"));
@@ -1747,6 +1833,67 @@ mod tests {
         assert_eq!(raw_written, b"data HERE data"); // byte-exact, no marker
         let disp_written = tokio::fs::read_to_string(&disp_path).await.unwrap();
         assert!(disp_written.contains("MARK rule="));
+        let _ = tokio::fs::remove_file(&raw_path).await;
+        let _ = tokio::fs::remove_file(&disp_path).await;
+    }
+
+    #[tokio::test]
+    async fn timestamped_mark_splices_inline_time_into_disp_not_raw() {
+        // §50.2: a Mark carrying a timestamp splices the local arrival time inline,
+        // before the matched pattern, into the display recording — never `.raw`.
+        use crate::config::{MarkPosition, MarkTimestamp};
+        use crate::core::TimestampConfig;
+        use crate::record::{start_display_recording, DisplayFileRecorder};
+        let cid = ChannelId::new();
+        let raw_path = temp_path("tsmark-raw");
+        let disp_path = temp_path("tsmark-disp");
+        let raw = RawFileRecorder::create(&raw_path, OverwritePolicy::Refuse, false)
+            .await
+            .unwrap();
+        let disp = DisplayFileRecorder::create(&disp_path, OverwritePolicy::Refuse)
+            .await
+            .unwrap();
+        let mark = MatchAction::Mark {
+            timestamp: Some(MarkTimestamp {
+                position: MarkPosition::Before,
+                format: TimestampConfig::default(), // HH:MM:SS
+            }),
+        };
+        // The default Display view is Raw/Native, so the disp render is the bytes
+        // verbatim with the timestamp spliced before the '$'.
+        let mut p = pipeline(cid, PipelineCapacities::default())
+            .with_raw_recorder(start_raw_recording(raw, 64))
+            .with_match_rules(&[byte_rule("gga", b"$GPGGA", vec![mark])]);
+        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+
+        p.ingest(bytes_chunk(cid, b"xx$GPGGA,1"));
+        let snap = p.snapshot();
+        p.finish().await;
+
+        // Raw is byte-exact — no timestamp, no marker.
+        assert_eq!(tokio::fs::read(&raw_path).await.unwrap(), b"xx$GPGGA,1");
+
+        // The disp has an inline HH:MM:SS immediately before "$GPGGA".
+        let disp_written = tokio::fs::read_to_string(&disp_path).await.unwrap();
+        let at = disp_written.find("$GPGGA").expect("GGA rendered");
+        let prefix = &disp_written[..at];
+        // The 8 chars before "$GPGGA" look like a time (HH:MM:SS).
+        let ts = &prefix[prefix.len() - 8..];
+        let bytes = ts.as_bytes();
+        assert!(
+            bytes[2] == b':' && bytes[5] == b':',
+            "expected HH:MM:SS, got {ts:?}"
+        );
+
+        // The snapshot carries the same inline mark for the live view.
+        let mark = snap
+            .matches
+            .iter()
+            .find_map(|m| m.mark.as_ref())
+            .expect("mark render in snapshot");
+        assert!(mark.before);
+        assert_eq!(mark.text, ts);
+
         let _ = tokio::fs::remove_file(&raw_path).await;
         let _ = tokio::fs::remove_file(&disp_path).await;
     }

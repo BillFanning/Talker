@@ -5,10 +5,12 @@
 //! re-exported flat so callers keep using `widgets::<name>`.
 
 mod format;
+mod match_rule_editor;
 mod recording_editor;
 mod status;
 
 pub(super) use format::{human_bytes, short_id};
+pub(super) use match_rule_editor::edit_mark_rules;
 pub(super) use recording_editor::{edit_display_recording, edit_raw_recording};
 pub(super) use status::{
     line_indicator, line_toggle, paint_glyph, recording_glyph_size, recording_indicator,

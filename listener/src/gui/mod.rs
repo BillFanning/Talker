@@ -244,6 +244,10 @@ struct StreamRenderKey {
     /// row is exactly one visual line (uniform height) — that lets the viewer both
     /// soft-wrap *and* virtualize with `show_rows`. Re-split when the width changes.
     wrap_cols: usize,
+    /// A cheap signature of the inline Mark timestamps (§50.2) currently spliced into
+    /// the view, so the cache re-renders when the marks change even if the bytes
+    /// don't. A hash, not the marks themselves, to keep the key `Copy`.
+    marks_sig: u64,
 }
 
 /// eframe storage key for the persisted recent-profiles list (newline-joined paths).

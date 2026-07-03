@@ -15,7 +15,7 @@
 mod encoding;
 mod render;
 
-pub use render::DisplayView;
+pub use render::{AnnotationPlacement, DisplayView, RenderAnnotation};
 
 use crate::core::{ChannelId, ChunkTimestamp};
 
@@ -61,14 +61,16 @@ pub enum WrappingMode {
 /// (§141).
 ///
 /// Display Recording consumes this *after* rendering (§54) — it is explicitly
-/// not byte-exact and is not a substitute for Raw Recording. Because the
-/// artifact is already formatted, an optional timestamp may be written inline
-/// (§57).
+/// not byte-exact and is not a substitute for Raw Recording. Any inline timestamps
+/// (§50.2 per-match Mark timestamps) are spliced into `text` by the renderer; the
+/// `timestamp` here is the chunk's arrival time, used to drive **time-based rotation**
+/// (§59) — a rotating display recorder picks the period file from it.
 #[derive(Clone, Debug)]
 pub struct RenderedOutput {
     pub channel_id: ChannelId,
     /// The rendered text for this view (Raw/Rendered/Hex, §42).
     pub text: String,
-    /// Arrival timestamp, if the view writes inline timestamps (§57).
+    /// The chunk's arrival time — drives time-based rotation (§59). `None` falls back
+    /// to `now()` for rotation.
     pub timestamp: Option<ChunkTimestamp>,
 }

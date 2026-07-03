@@ -13,9 +13,10 @@ use super::fonts::bold;
 use super::state::ChannelStatus;
 use super::theme;
 use super::widgets::{
-    config_needs_restart, edit_display_recording, edit_interface, edit_raw_recording, human_bytes,
-    line_indicator, line_toggle, paint_glyph, recording_glyph_size, recording_indicator, short_id,
-    start_button, status_color, status_glyph, status_label, stop_enabled,
+    config_needs_restart, edit_display_recording, edit_interface, edit_mark_rules,
+    edit_raw_recording, human_bytes, line_indicator, line_toggle, paint_glyph,
+    recording_glyph_size, recording_indicator, short_id, start_button, status_color, status_glyph,
+    status_label, stop_enabled,
 };
 use super::ListenerApp;
 
@@ -123,6 +124,11 @@ impl ListenerApp {
                     ui.separator();
                     ui.label(bold("Display record"));
                     edit_display_recording(ui, config);
+                    // Inline Mark timestamps (§50.2): a small editor for
+                    // BytePattern → Mark(+timestamp) rules. Applying restarts the
+                    // channel (config_needs_restart counts match_rules).
+                    ui.separator();
+                    edit_mark_rules(ui, config);
                 });
         }
         self.force_config_open = false;

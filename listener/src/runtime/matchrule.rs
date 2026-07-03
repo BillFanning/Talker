@@ -309,7 +309,7 @@ mod tests {
         MatchRule {
             name: name.to_string(),
             condition,
-            actions: vec![MatchAction::Mark],
+            actions: vec![MatchAction::Mark { timestamp: None }],
             enabled: true,
         }
     }
@@ -467,7 +467,7 @@ mod tests {
             MatchAction::Notify {
                 severity: crate::diagnostics::DiagnosticSeverity::Warning,
             },
-            MatchAction::Mark,
+            MatchAction::Mark { timestamp: None },
         ];
         let mut set = MatchRuleSet::compile(&[config]);
         let fired = set.evaluate_stream(b"a hit here", 0);

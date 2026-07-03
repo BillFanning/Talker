@@ -15,4 +15,4 @@ pub use command::RuntimeEvent;
 pub use error::{ErrorCategory, RecordError};
 pub use ids::{ChannelId, ChannelName, DisplayViewId, MatchRuleId, StableConfigId};
 pub use state::{ChannelKind, ChannelState, DisplayState, RecordingState};
-pub use timing::{ChunkTime, ChunkTimestamp};
+pub use timing::{ChunkTime, ChunkTimestamp, TimestampConfig};

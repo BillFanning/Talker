@@ -1098,10 +1098,9 @@ impl Listener {
             .map(build_display_view)
             .unwrap_or_default();
         let policy = recording.overwrite_policy;
-        let ts = recording.timestamp_enabled;
         let cap = self.caps.raw_recording;
         let created = if recording.file_rotation == FileRotationPolicy::None {
-            DisplayFileRecorder::create(destination, policy, ts)
+            DisplayFileRecorder::create(destination, policy)
                 .await
                 .map(|r| start_display_recording(r, cap))
         } else {
@@ -1110,7 +1109,6 @@ impl Listener {
                 name,
                 ".disp",
                 policy,
-                ts,
                 recording.file_rotation,
             )
             .await
