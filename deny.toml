@@ -9,7 +9,19 @@ all-features = true
 [advisories]
 # RustSec advisory DB. Vulnerabilities fail by default; unmaintained/yanked warn.
 # Add advisory IDs here (with a note) only to consciously accept a known issue.
-ignore = []
+ignore = [
+    # quick-xml 0.39.4 DoS advisories (quadratic duplicate-attribute check;
+    # unbounded namespace-declaration allocation). Fixed in quick-xml >= 0.41,
+    # but our only path to it is wayland-scanner (a PROC-MACRO that parses
+    # vendored Wayland protocol XML at BUILD time, Linux targets only) and the
+    # latest wayland-scanner (0.31.10 as of 2026-07) still requires ^0.39 — no
+    # compatible fix exists yet. Not attacker-reachable: no untrusted XML is
+    # ever parsed at runtime by this workspace. Remove both entries when
+    # wayland-scanner releases against quick-xml 0.41 (`cargo update` then
+    # `cargo deny check` to confirm).
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 
 [licenses]
 # Allow-list every license actually present in the tree (verified with
