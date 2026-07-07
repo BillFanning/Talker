@@ -24,11 +24,14 @@
 //! content (ADR-009): a pattern can be split across two reads (`"GG"` ends one
 //! chunk, `"A"` begins the next). A naive per-chunk scan would miss it. So the set
 //! keeps a small **carry** — the last `max_pattern_len - 1` bytes of the prior
-//! chunk — and scans `carry ++ chunk`, reporting only matches whose **end** falls
-//! in the new chunk (the carry's own interior was already scanned last time). A
-//! match that *starts* inside the carry is a **boundary split**: it would have
-//! been missed without the carry. Those are counted and flagged so the pipeline
-//! can measure where, why, and how often splitting actually occurs (§50.2).
+//! chunk — and runs two scans: a bounded **boundary scan** over `carry` plus just
+//! enough of the new chunk for the longest pattern to complete (finding matches
+//! that *start* in the carry and *end* in the chunk), and a zero-copy **chunk
+//! scan** over the chunk slice itself (matches fully inside the carry were
+//! already reported last time). A match found by the boundary scan is a
+//! **boundary split**: it would have been missed without the carry. Those are
+//! counted and flagged so the pipeline can measure where, why, and how often
+//! splitting actually occurs (§50.2).
 
 use std::time::Duration;
 
@@ -36,8 +39,9 @@ use crate::config::{MatchAction, MatchCondition, MatchRule};
 use crate::core::MatchRuleId;
 
 /// One configured rule in runtime form: its minted id, condition, actions, the
-/// enabled flag (live-toggleable via `SetMatchRuleEnabled`, §136), and the small
-/// bit of state the `Idle` condition needs to fire exactly once per quiet episode.
+/// enabled flag (a live toggle is deferred — see [`MatchRuleSet::set_enabled`]),
+/// and the small bit of state the `Idle` condition needs to fire exactly once
+/// per quiet episode.
 struct CompiledRule {
     id: MatchRuleId,
     condition: MatchCondition,
@@ -137,14 +141,17 @@ impl MatchRuleSet {
             .any(|r| r.enabled && matches!(r.condition, MatchCondition::Idle { .. }))
     }
 
-    /// The (id, name-less) ids of every rule, in order, for command routing
-    /// (`SetMatchRuleEnabled`). The name lives in config; the id is the runtime key.
+    /// The ids of every rule, in config order. The name lives in config; the id
+    /// is the runtime key. **Not yet wired** to a runtime command — this is the
+    /// seam the deferred live rule-toggle will route through (ADR-012: a new
+    /// `Listener` method + pipeline command, like `set_recording`).
     pub fn ids(&self) -> Vec<MatchRuleId> {
         self.rules.iter().map(|r| r.id).collect()
     }
 
-    /// Enable or disable a rule by id (§136 `SetMatchRuleEnabled`). Returns whether
-    /// a rule with that id existed.
+    /// Enable or disable a rule by id. Returns whether a rule with that id
+    /// existed. **Not yet wired** — the deferred live rule-toggle's seam
+    /// (ADR-012); today rules change via the config Apply & Restart path.
     pub fn set_enabled(&mut self, id: MatchRuleId, enabled: bool) -> bool {
         if let Some(rule) = self.rules.iter_mut().find(|r| r.id == id) {
             rule.enabled = enabled;
@@ -165,68 +172,81 @@ impl MatchRuleSet {
     /// Evaluate the `BytePattern` conditions against one received chunk (§50.2),
     /// matching **across the previous chunk's boundary** via the retained carry.
     /// `chunk_offset` is the absolute stream offset of `chunk[0]`. `Idle` rules are
-    /// never matched here — they are timer-driven. Returns the rules that fired, in
-    /// rule order, each carrying its match's absolute start offset and whether it
-    /// was a boundary split. The carry is updated for the next chunk.
+    /// never matched here — they are timer-driven. Returns one firing per
+    /// **occurrence** (not per rule): a chunk carrying three `$GPGGA`s fires a GGA
+    /// rule three times, each anchored at its own start offset, so per-match
+    /// actions (a Mark timestamp next to *each* occurrence) see every one.
+    /// Overlapping occurrences all fire (scanning resumes one byte after each
+    /// match start). Firings are rule-major, then in stream order within a rule.
+    /// The carry is updated for the next chunk.
     pub fn evaluate_stream(&mut self, chunk: &[u8], chunk_offset: u64) -> Vec<FiredRule> {
         let mut fired = Vec::new();
         if chunk.is_empty() {
             return fired;
         }
 
-        // Join the carry and this chunk so a pattern straddling the boundary is
-        // visible as one contiguous slice. The carry holds bytes immediately
-        // preceding this chunk, so the joined slice starts at `carry_offset`.
         let carry_len = self.carry.len();
-        let joined: Vec<u8> = if carry_len == 0 {
-            chunk.to_vec()
+        // Boundary region: the carry plus just enough of the chunk for the longest
+        // enabled pattern to complete (`max_pattern_len − 1` bytes). A match that
+        // straddles the boundary — starts in the carry, ends in the chunk — lies
+        // entirely inside it, so this small bounded buffer is the only copy made:
+        // the chunk itself is scanned in place, never cloned.
+        let boundary: Vec<u8> = if carry_len == 0 {
+            Vec::new()
         } else {
-            let mut j = Vec::with_capacity(carry_len + chunk.len());
-            j.extend_from_slice(&self.carry);
-            j.extend_from_slice(chunk);
-            j
-        };
-        // Absolute offset of `joined[0]`: the carry's first byte if we have carry,
-        // else this chunk's first byte.
-        let joined_offset = if carry_len == 0 {
-            chunk_offset
-        } else {
-            self.carry_offset
+            let take = self.max_pattern_len.saturating_sub(1).min(chunk.len());
+            let mut b = Vec::with_capacity(carry_len + take);
+            b.extend_from_slice(&self.carry);
+            b.extend_from_slice(&chunk[..take]);
+            b
         };
 
         for rule in &mut self.rules {
             let MatchCondition::BytePattern { pattern } = &rule.condition else {
                 continue;
             };
-            if !rule.enabled || pattern.is_empty() || pattern.len() > joined.len() {
+            if !rule.enabled || pattern.is_empty() || pattern.len() > carry_len + chunk.len() {
                 continue;
             }
-            // Find the first match whose **end** lands in the new chunk — i.e. the
-            // match was not already fully contained in (and reported from) the
-            // previous chunk. `end_in_joined > carry_len` means at least the last
-            // pattern byte is in `chunk`.
-            let mut start = 0;
-            while let Some(rel) = find_subslice(&joined[start..], pattern) {
-                let match_start = start + rel;
-                let match_end = match_start + pattern.len(); // exclusive
-                if match_end > carry_len {
-                    let abs_start = joined_offset + match_start as u64;
-                    // A boundary split: the match began inside the carry (the prior
-                    // chunk) and only completes now. Per-chunk scanning would miss it.
-                    let boundary_split = match_start < carry_len;
-                    if boundary_split {
-                        rule.boundary_saves += 1;
+            // 1. Boundary splits: matches that start in the carry and end in the
+            // chunk — a per-chunk scan would miss them. Matches fully inside the
+            // carry were reported last chunk; a start at/after the carry belongs
+            // to the chunk scan below (so nothing is double-reported).
+            if carry_len > 0 && pattern.len() >= 2 {
+                let mut start = 0;
+                while start < carry_len {
+                    let Some(rel) = find_subslice(&boundary[start..], pattern) else {
+                        break;
+                    };
+                    let match_start = start + rel;
+                    if match_start >= carry_len {
+                        break; // starts in the chunk — the chunk scan reports it
                     }
-                    fired.push(FiredRule {
-                        id: rule.id,
-                        actions: rule.actions.clone(),
-                        match_offset: Some(abs_start),
-                        boundary_split,
-                    });
-                    break; // one firing per rule per chunk (mirrors prior behavior)
+                    if match_start + pattern.len() > carry_len {
+                        rule.boundary_saves += 1;
+                        fired.push(FiredRule {
+                            id: rule.id,
+                            actions: rule.actions.clone(),
+                            match_offset: Some(self.carry_offset + match_start as u64),
+                            boundary_split: true,
+                        });
+                    }
+                    start = match_start + 1;
                 }
-                // This match ended within the carry (already reported last chunk);
-                // keep scanning past its start for a later, in-chunk occurrence.
+            }
+            // 2. In-chunk matches, one firing per occurrence (a chunk holding
+            // several occurrences fires the rule once per occurrence, so per-match
+            // actions — Mark timestamps, Notify — see each one), scanned on the
+            // chunk slice directly.
+            let mut start = 0;
+            while let Some(rel) = find_subslice(&chunk[start..], pattern) {
+                let match_start = start + rel;
+                fired.push(FiredRule {
+                    id: rule.id,
+                    actions: rule.actions.clone(),
+                    match_offset: Some(chunk_offset + match_start as u64),
+                    boundary_split: false,
+                });
                 start = match_start + 1;
             }
         }
@@ -246,13 +266,6 @@ impl MatchRuleSet {
             self.carry_offset = chunk_end_offset - keep as u64;
         }
         fired
-    }
-
-    /// Reset the cross-chunk carry (e.g. on Stop/Start). The next chunk starts a
-    /// fresh stream with no straddle from before.
-    pub fn reset_stream(&mut self) {
-        self.carry.clear();
-        self.carry_offset = 0;
     }
 
     /// Evaluate the `Idle` condition against the current quiet duration (§50.2). An
@@ -377,6 +390,59 @@ mod tests {
     }
 
     #[test]
+    fn every_occurrence_in_a_chunk_fires() {
+        // §50.2: a chunk carrying several occurrences fires the rule once per
+        // occurrence (a large serial read or UDP datagram can hold many sentences;
+        // a per-match Mark timestamp must land next to each one).
+        let mut set = MatchRuleSet::compile(&[rule(
+            "gga",
+            MatchCondition::BytePattern {
+                pattern: b"GGA".to_vec(),
+            },
+        )]);
+        let fired = set.evaluate_stream(b"$GPGGA,1\r\n$GPGGA,2\r\n$GPGGA,3\r\n", 0);
+        assert_eq!(fired.len(), 3, "one firing per occurrence");
+        let offsets: Vec<_> = fired.iter().map(|f| f.match_offset).collect();
+        assert_eq!(offsets, vec![Some(3), Some(13), Some(23)]);
+        assert!(fired.iter().all(|f| !f.boundary_split));
+    }
+
+    #[test]
+    fn overlapping_occurrences_each_fire() {
+        // Scanning resumes one byte after each match start, so overlapping
+        // occurrences all fire ("AA" in "AAA" → offsets 0 and 1).
+        let mut set = MatchRuleSet::compile(&[rule(
+            "aa",
+            MatchCondition::BytePattern {
+                pattern: b"AA".to_vec(),
+            },
+        )]);
+        let fired = set.evaluate_stream(b"AAA", 0);
+        let offsets: Vec<_> = fired.iter().map(|f| f.match_offset).collect();
+        assert_eq!(offsets, vec![Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn a_boundary_split_and_a_later_in_chunk_occurrence_both_fire() {
+        // The carry-recovered split and a fresh in-chunk occurrence are distinct
+        // firings; only the split increments the boundary-save measurement.
+        let mut set = MatchRuleSet::compile(&[rule(
+            "gga",
+            MatchCondition::BytePattern {
+                pattern: b"GGA".to_vec(),
+            },
+        )]);
+        assert!(set.evaluate_stream(b"$GPGG", 0).is_empty());
+        let fired = set.evaluate_stream(b"A,1,GGA,2", 5);
+        assert_eq!(fired.len(), 2);
+        assert_eq!(fired[0].match_offset, Some(3));
+        assert!(fired[0].boundary_split);
+        assert_eq!(fired[1].match_offset, Some(9));
+        assert!(!fired[1].boundary_split);
+        assert_eq!(set.boundary_saves(), 1);
+    }
+
+    #[test]
     fn a_match_is_not_double_counted_across_the_boundary() {
         // A pattern fully inside chunk 1 ending exactly at the boundary is reported
         // from chunk 1, and must not be re-reported when it reappears in the carry.
@@ -412,20 +478,6 @@ mod tests {
         // "ZZ" begins at chunk index 1 → absolute offset 4; not a split.
         assert_eq!(fired[0].match_offset, Some(4));
         assert!(!fired[0].boundary_split);
-        assert_eq!(set.boundary_saves(), 0);
-    }
-
-    #[test]
-    fn reset_stream_clears_the_carry() {
-        let mut set = MatchRuleSet::compile(&[rule(
-            "gga",
-            MatchCondition::BytePattern {
-                pattern: b"GGA".to_vec(),
-            },
-        )]);
-        assert!(set.evaluate_stream(b"$GPGG", 0).is_empty());
-        set.reset_stream(); // Stop/Start: the straddle does not carry over.
-        assert!(set.evaluate_stream(b"A,123", 0).is_empty());
         assert_eq!(set.boundary_saves(), 0);
     }
 

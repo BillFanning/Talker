@@ -93,6 +93,10 @@ pub struct PipelineCapacities {
     pub stream_display: usize,
     pub raw_recording: usize,
     /// Per-type retained-diagnostic limits (§88): events, warnings, errors.
+    /// `None` falls back to the retention backstop (~1 M entries) — the defaults
+    /// below set real limits instead, because a recurring diagnostic (a flapping
+    /// warning, a per-occurrence `Notify` rule) would otherwise grow the log —
+    /// and the full-log snapshot clone (§137, 5 Hz) — for weeks (§124).
     pub event_retention: Option<usize>,
     pub warning_retention: Option<usize>,
     pub error_retention: Option<usize>,
@@ -100,15 +104,19 @@ pub struct PipelineCapacities {
     pub events: usize,
 }
 
+/// Default per-severity retained-diagnostic limit (§88): plenty of history for
+/// review, small enough that the 5 Hz full-log snapshot clone stays cheap.
+const DIAGNOSTIC_RETENTION: usize = 500;
+
 impl Default for PipelineCapacities {
     fn default() -> Self {
         Self {
             ingest: 256,
             stream_display: 128 * 1024,
             raw_recording: 1024,
-            event_retention: None,
-            warning_retention: None,
-            error_retention: None,
+            event_retention: Some(DIAGNOSTIC_RETENTION),
+            warning_retention: Some(DIAGNOSTIC_RETENTION),
+            error_retention: Some(DIAGNOSTIC_RETENTION),
             events: 256,
         }
     }
@@ -404,11 +412,11 @@ impl ChannelPipeline {
         // trimmed from the front. Honors the default view's pause (§50): a paused
         // view freezes its display while reception and recording keep going.
         let bytes = data.payload.bytes();
-        if !self
+        let view_paused = self
             .display_views
             .first()
-            .is_some_and(|v| v.handle.is_paused())
-        {
+            .is_some_and(|v| v.handle.is_paused());
+        if !view_paused {
             if bytes.len() >= self.stream_cap {
                 // A single chunk already exceeds the cap: keep only its tail. Every
                 // currently-buffered byte plus the dropped prefix of this chunk is
@@ -428,6 +436,14 @@ impl ChannelPipeline {
             }
         }
 
+        // Where chunk[0] sits in **view (scrollback) space** after the append —
+        // the space `StreamDelta` offsets live in. `None` while the view is
+        // paused: those bytes never enter the view, so a firing on them has no
+        // view position (§50). Stream offsets (`chunk_offset`, from the activity
+        // total) count *every* byte, so the two spaces diverge after any pause;
+        // firings are translated so the live viewer's splice stays aligned.
+        let view_chunk_base = (!view_paused).then(|| self.stream_end_offset() - bytes.len() as u64);
+
         // 3. Find/triggers (§50.2): evaluate `BytePattern` rules against this chunk
         // **before** rendering for Display Recording, so a `Mark` timestamp can be
         // spliced into this same chunk's `.disp` render. Matching spans the previous
@@ -438,7 +454,7 @@ impl ChannelPipeline {
             if fired.is_empty() {
                 Vec::new()
             } else {
-                self.apply_fired_rules(fired, data.received_at)
+                self.apply_fired_rules(fired, data.received_at, view_chunk_base, chunk_offset)
             }
         } else {
             Vec::new()
@@ -454,9 +470,15 @@ impl ChannelPipeline {
             render_annotations_for_chunk(&mark_annotations, chunk_offset, bytes.len());
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.as_mut() {
-                let rendered =
-                    rec.renderer
-                        .render_stream_annotated(channel_id, bytes, &chunk_marks);
+                // The chunk's arrival time rides on the rendered output so a
+                // rotating display recorder picks its period file from arrival,
+                // not write time (§59) — the two differ under a backlog.
+                let rendered = rec.renderer.render_stream_annotated(
+                    channel_id,
+                    bytes,
+                    &chunk_marks,
+                    Some(data.received_at),
+                );
                 rec.recording.try_record(rendered);
             }
         }
@@ -473,14 +495,28 @@ impl ChannelPipeline {
     /// Returns the inline **Mark timestamp annotations** produced this chunk (absolute
     /// stream offsets), which the caller splices into the `.disp` render. `arrival` is
     /// the chunk's arrival time — the source of a Mark timestamp (§50.2).
+    /// `view_base`/`chunk_offset` translate each firing's stream offset into view
+    /// (scrollback) space for the live viewer (`view_base` = chunk[0]'s view offset,
+    /// `None` while the view is paused; idle callers pass `None`/`0`).
     fn apply_fired_rules(
         &mut self,
         fired: Vec<FiredRule>,
         arrival: ChunkTime,
+        view_base: Option<u64>,
+        chunk_offset: u64,
     ) -> Vec<MarkAnnotation> {
         let mut annotations = Vec::new();
         for rule in fired {
             let byte_offset = rule.match_offset;
+            // The matched byte's position in view space (§50): stream offsets count
+            // every received byte, but the view skips bytes that arrived while
+            // paused, so the spaces diverge after any pause — translate here so the
+            // live viewer's Mark splice stays aligned. A boundary-split match can
+            // start before the chunk (checked_sub guards the pre-window edge).
+            let view_offset = match (byte_offset, view_base) {
+                (Some(m), Some(base)) => (base + m).checked_sub(chunk_offset),
+                _ => None,
+            };
             let mut mark_render = None;
             if let Some(events) = &self.events {
                 let _ = events.try_send(RuntimeEvent::MatchTriggered(self.channel_id, rule.id));
@@ -541,6 +577,7 @@ impl ChannelPipeline {
             self.recent_matches.push(TriggeredMatch {
                 rule_id: rule.id,
                 byte_offset,
+                view_offset,
                 mark: mark_render,
             });
         }
@@ -601,8 +638,8 @@ impl ChannelPipeline {
         let fired = self.match_rules.evaluate_idle(idle_for);
         if !fired.is_empty() {
             // Idle firings carry no byte offset, so they produce no inline Mark
-            // timestamp; the returned annotations are always empty here.
-            let _ = self.apply_fired_rules(fired, ChunkTime::now());
+            // timestamp (and no view offset); the returned annotations are empty.
+            let _ = self.apply_fired_rules(fired, ChunkTime::now(), None, 0);
         }
     }
 
@@ -1234,6 +1271,19 @@ mod tests {
     }
 
     #[test]
+    fn default_capacities_bound_the_diagnostics_log() {
+        // §88/§124: with no configured limits, the default caps still bound each
+        // severity — a recurring warning can't grow the log (and the 5 Hz snapshot
+        // clone) unbounded over a weeks-long run.
+        let cid = ChannelId::new();
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        for i in 0..(DIAGNOSTIC_RETENTION + 50) {
+            p.diagnostics.record(Diagnostic::warning(format!("w{i}")));
+        }
+        assert_eq!(p.diagnostics().warnings().count(), DIAGNOSTIC_RETENTION);
+    }
+
+    #[test]
     fn diagnostic_warning_retention_limit_is_applied() {
         // §88: the per-type diagnostic limit bounds retained warnings.
         let cid = ChannelId::new();
@@ -1664,6 +1714,89 @@ mod tests {
             }
         }
         assert!(saw_match);
+    }
+
+    #[test]
+    fn match_view_offset_tracks_the_paused_view_not_the_raw_stream() {
+        // §50/§50.2: stream offsets count every received byte, but the view skips
+        // bytes that arrive while paused, so the two spaces diverge after a pause.
+        // A firing carries both — `byte_offset` (stream space, what diagnostics
+        // quote) and `view_offset` (view/scrollback space, where the live viewer
+        // splices a Mark timestamp) — so the splice stays aligned.
+        let cid = ChannelId::new();
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&[byte_rule(
+            "m",
+            b"M",
+            vec![MatchAction::Notify {
+                severity: crate::diagnostics::DiagnosticSeverity::Event,
+            }],
+        )]);
+        let view = p.display_view_handles()[0].clone();
+
+        // Before any pause the two spaces are identical.
+        p.ingest(bytes_chunk(cid, b"aM")); // match at stream offset 1
+        let snap = p.snapshot();
+        assert_eq!(snap.matches[0].byte_offset, Some(1));
+        assert_eq!(snap.matches[0].view_offset, Some(1));
+
+        // Paused: the bytes never enter the view → no view position.
+        view.pause();
+        p.ingest(bytes_chunk(cid, b"cM")); // match at stream offset 3
+        let snap = p.snapshot();
+        assert_eq!(snap.matches[1].byte_offset, Some(3));
+        assert_eq!(snap.matches[1].view_offset, None);
+
+        // Resumed: stream space is now 2 bytes ahead of view space.
+        view.resume();
+        p.ingest(bytes_chunk(cid, b"eM")); // stream offset 5; view holds "aMeM" → 3
+        let snap = p.snapshot();
+        assert_eq!(snap.matches[2].byte_offset, Some(5));
+        assert_eq!(snap.matches[2].view_offset, Some(3));
+        assert_eq!(
+            snap.stream_end_offset, 4,
+            "view space excludes the paused bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_occurrence_in_a_chunk_gets_its_own_mark_timestamp() {
+        // §50.2: a chunk carrying several occurrences fires the rule per occurrence,
+        // so each one gets an inline timestamp in the `.disp` — not just the first.
+        use crate::config::{MarkPosition, MarkTimestamp};
+        use crate::core::TimestampConfig;
+        use crate::record::{start_display_recording, DisplayFileRecorder};
+        let cid = ChannelId::new();
+        let disp_path = temp_path("multi-mark");
+        let disp = DisplayFileRecorder::create(&disp_path, OverwritePolicy::Refuse)
+            .await
+            .unwrap();
+        let mark = MatchAction::Mark {
+            timestamp: Some(MarkTimestamp {
+                position: MarkPosition::Before,
+                format: TimestampConfig::default(), // HH:MM:SS
+            }),
+        };
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&[byte_rule(
+            "dollar",
+            b"$",
+            vec![mark],
+        )]);
+        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+
+        p.ingest(bytes_chunk(cid, b"$GPGGA,1 $GPRMC,2"));
+        let snap = p.snapshot();
+        p.finish().await;
+
+        assert_eq!(snap.matches.len(), 2, "both occurrences fired");
+        assert!(snap.matches.iter().all(|m| m.mark.is_some()));
+        // Two HH:MM:SS splices → four ':' (the data itself has none).
+        let disp_written = tokio::fs::read_to_string(&disp_path).await.unwrap();
+        assert_eq!(
+            disp_written.matches(':').count(),
+            4,
+            "each occurrence carries its own inline timestamp: {disp_written:?}"
+        );
+        let _ = tokio::fs::remove_file(&disp_path).await;
     }
 
     #[test]

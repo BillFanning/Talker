@@ -171,7 +171,17 @@ pub struct ChannelSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TriggeredMatch {
     pub rule_id: MatchRuleId,
+    /// Absolute **stream** offset of the match's first byte — counts every byte
+    /// received since Start (`None` for an `Idle` firing). This is the offset
+    /// diagnostics quote, and it equals the byte's position in a `.raw`
+    /// recording that ran from Start.
     pub byte_offset: Option<u64>,
+    /// The same byte's offset in the **view (scrollback) space** — the space
+    /// `StreamDelta`/`stream_end_offset` use, which skips bytes received while
+    /// the view was paused (§50), so it can lag `byte_offset` after a pause.
+    /// The live viewer anchors inline Mark timestamps here. `None` when the
+    /// byte never entered the view (it arrived while paused) or for `Idle`.
+    pub view_offset: Option<u64>,
     #[allow(clippy::doc_markdown)]
     pub mark: Option<MarkRender>,
 }

@@ -294,26 +294,31 @@ impl DisplayView {
         }
     }
 
-    /// Render a span of stream bytes for this view (§41, §141).
+    /// Render a span of stream bytes for this view (§41, §141). `received_at` is
+    /// the chunk's arrival time, carried on the output to drive time-based
+    /// Display rotation (§59).
     pub fn render_stream(
         &self,
         channel_id: crate::core::ChannelId,
         bytes: &[u8],
+        received_at: Option<crate::core::ChunkTime>,
     ) -> RenderedOutput {
-        self.render_stream_annotated(channel_id, bytes, &[])
+        self.render_stream_annotated(channel_id, bytes, &[], received_at)
     }
 
     /// Render a span of stream bytes with inline `annotations` spliced in (§50.2).
+    /// `received_at` rides along as the output's rotation timestamp (§59).
     pub fn render_stream_annotated(
         &self,
         channel_id: crate::core::ChannelId,
         bytes: &[u8],
         annotations: &[RenderAnnotation],
+        received_at: Option<crate::core::ChunkTime>,
     ) -> RenderedOutput {
         RenderedOutput {
             channel_id,
             text: self.render_text_annotated(bytes, annotations),
-            timestamp: None,
+            timestamp: received_at,
         }
     }
 }
@@ -403,12 +408,16 @@ mod tests {
     }
 
     #[test]
-    fn render_stream_carries_channel_and_text() {
-        use crate::core::ChannelId;
+    fn render_stream_carries_channel_text_and_arrival_time() {
+        use crate::core::{ChannelId, ChunkTime};
         let cid = ChannelId::new();
-        let out = view(DisplayMode::Raw, CharacterRendering::Native).render_stream(cid, b"hi");
+        let at = ChunkTime::now();
+        let out =
+            view(DisplayMode::Raw, CharacterRendering::Native).render_stream(cid, b"hi", Some(at));
         assert_eq!(out.channel_id, cid);
         assert_eq!(out.text, "hi");
+        // The arrival time rides along — it drives Display-rotation periods (§59).
+        assert_eq!(out.timestamp.map(|t| t.wall_clock), Some(at.wall_clock));
     }
 
     fn ann(offset: usize, placement: AnnotationPlacement, text: &str) -> RenderAnnotation {

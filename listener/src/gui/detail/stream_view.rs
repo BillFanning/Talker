@@ -386,10 +386,11 @@ impl ListenerApp {
             self.stream_cache = None;
             return;
         };
-        // Inline Mark timestamps (§50.2): rebase each firing's absolute stream offset
-        // onto the accumulated view window (front byte = cursor − buffered len), keep
-        // only those in-window, and splice their local timestamp text before/after the
-        // matched byte — exactly as the Display Recording does.
+        // Inline Mark timestamps (§50.2): rebase each firing's **view-space** offset
+        // (the `StreamDelta` offset space — not `byte_offset`, which counts bytes the
+        // paused view skipped) onto the accumulated window (front byte = cursor −
+        // buffered len), keep only those in-window, and splice their local timestamp
+        // text before/after the matched byte — exactly as the Display Recording does.
         let window_start = view.stream_cursor - view.stream_bytes.len() as u64;
         let annotations: Vec<RenderAnnotation> = view
             .snapshot
@@ -399,7 +400,7 @@ impl ListenerApp {
                     .iter()
                     .filter_map(|m| {
                         let mark = m.mark.as_ref()?;
-                        let offset = m.byte_offset?;
+                        let offset = m.view_offset?;
                         let within = offset.checked_sub(window_start)? as usize;
                         (within <= view.stream_bytes.len()).then(|| RenderAnnotation {
                             offset: within,

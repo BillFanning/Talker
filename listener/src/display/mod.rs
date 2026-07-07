@@ -17,7 +17,7 @@ mod render;
 
 pub use render::{AnnotationPlacement, DisplayView, RenderAnnotation};
 
-use crate::core::{ChannelId, ChunkTimestamp};
+use crate::core::{ChannelId, ChunkTime};
 
 /// Display Mode — how received data is assembled for a view (§42).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -70,7 +70,9 @@ pub struct RenderedOutput {
     pub channel_id: ChannelId,
     /// The rendered text for this view (Raw/Rendered/Hex, §42).
     pub text: String,
-    /// The chunk's arrival time — drives time-based rotation (§59). `None` falls back
-    /// to `now()` for rotation.
-    pub timestamp: Option<ChunkTimestamp>,
+    /// The rendered chunk's arrival [`ChunkTime`] — drives time-based rotation
+    /// (§59): a rotating display recorder picks the period file from it. `None`
+    /// (e.g. a `‹MARK …›` marker line, which has no source chunk) falls back to
+    /// `now()` for rotation.
+    pub timestamp: Option<ChunkTime>,
 }
