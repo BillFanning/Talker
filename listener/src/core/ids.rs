@@ -75,10 +75,10 @@ impl Default for DisplayViewId {
 }
 
 /// Runtime identity of one Match Rule on a Channel (§50.2). Minted when a
-/// Channel's rules are compiled at Start, so events (`MatchTriggered`) and
-/// commands (`SetMatchRuleEnabled`) can name a specific rule. Runtime-only —
-/// configuration identifies a rule by its `name` (§50.2); this id is never
-/// persisted (§69).
+/// Channel's rules are compiled at Start, so events (`MatchTriggered`) — and,
+/// later, the deferred live rule-toggle — can name a specific rule.
+/// Runtime-only — configuration identifies a rule by its `name` (§50.2); this
+/// id is never persisted (§69).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MatchRuleId(Uuid);
 

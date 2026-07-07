@@ -1,16 +1,19 @@
 //! Channel orchestration: wiring a transport to its pipeline and driving the
 //! Channel lifecycle (spec §10, §97, §110, §111).
 //!
-//! [`start_data_channel`] is the runtime's per-Channel setup for a single
-//! data-bearing transport (Serial, UDP, or a standalone TCP connection): it
+//! [`spawn_monitored_channel`] is the runtime's per-Channel setup for a single
+//! data-bearing transport (Serial, UDP, or an accepted TCP connection): it
 //! creates the bounded Transport→Pipeline queue (§97.2), spawns the pipeline
-//! task, and hands the transport its `out` sender. The returned
-//! [`RunningChannel`] owns the cancellation tokens and join handles for
-//! shutdown, plus its own event receiver.
+//! task, hands the transport its `out` sender, and adds the fault monitor. The
+//! returned [`MonitoredChannel`] owns the cancellation tokens and join handles
+//! for shutdown.
 //!
 //! [`spawn_channel_tasks`] is the lower-level primitive: it takes an externally
 //! supplied event sender (so many channels can share one event stream, as the
-//! TCP listener supervisor does) and returns the raw [`ChannelTasks`].
+//! TCP listener supervisor does) and returns the raw [`ChannelTasks`]. A
+//! test-only `start_data_channel`/`RunningChannel` wrapper runs one standalone
+//! channel with its own event receiver, so the spawn/monitor/stop paths are
+//! testable without a `Listener` registry.
 //!
 //! Two shutdown paths:
 //! - graceful (§110): stop reception first, then let the pipeline drain the
@@ -82,12 +85,6 @@ const SNAPSHOT_REQUESTS: usize = 8;
 /// unattached, so the receiver stays empty for the channel's life.
 pub(crate) const TRANSPORT_NOTICES: usize = 16;
 
-/// How a Channel's data recording (§53) taps the pipeline.
-pub(crate) enum DataRecorder {
-    /// Byte-exact raw `.raw`: tapped on the received-chunk stream.
-    Raw(Recording<Arc<ReceivedData>>),
-}
-
 /// The transport + pipeline tasks for one Channel. A plain holder, destructured
 /// by [`spawn_monitored_channel`] and the TCP listener supervisor (which each do
 /// their own transport-outcome monitoring).
@@ -109,7 +106,9 @@ pub(crate) struct ChannelTasks {
 pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     channel_id: ChannelId,
     runner: R,
-    data_recorder: Option<DataRecorder>,
+    // A pre-built byte-exact Raw recorder (§53); production channels leave this
+    // `None` and begin recording lazily via the recording settings (§55).
+    raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     view_count: usize,
     disk_guard: Option<(DiskGuard, PathBuf)>,
@@ -139,7 +138,7 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     if match_setup.auto_begin_recording {
         pipeline = pipeline.with_auto_begin_recording();
     }
-    if let Some(DataRecorder::Raw(r)) = data_recorder {
+    if let Some(r) = raw_recorder {
         pipeline = pipeline.with_raw_recorder(r);
     }
     // `new` created the default Display View; add the rest to reach the count (§48).
@@ -183,8 +182,14 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
 /// ends on a spontaneous fault (§94/§101) — so `stop`/`abort` synchronize on the
 /// pipeline draining rather than joining the transport directly.
 pub(crate) struct MonitoredChannel {
+    /// Read only by the test-only standalone wrapper (`RunningChannel`).
+    #[cfg_attr(not(test), allow(dead_code))]
     channel_id: ChannelId,
     transport_cancel: CancellationToken,
+    /// Cancels the pipeline half without draining — the §111 forced-stop path,
+    /// reached only through the test-only [`abort`](Self::abort) today
+    /// (production shutdown bounds the graceful drain instead, §113).
+    #[cfg_attr(not(test), allow(dead_code))]
     pipeline_cancel: CancellationToken,
     pipeline_task: JoinHandle<ChannelPipeline>,
     monitor: JoinHandle<()>,
@@ -239,7 +244,7 @@ impl MonitoredChannel {
     /// Begin/stop Raw recording live, without a restart (§50.2, ADR-012). Fire-and-
     /// forget: returns `true` if the command reached the pipeline, `false` if the
     /// task has already ended. The outcome is observed via the next snapshot's
-    /// recording state (and a `WarningRaised` event on a begin failure, §55).
+    /// recording state (and a `RecordingFaulted` event on a begin failure, §55).
     pub(crate) async fn set_recording(
         &self,
         enabled: bool,
@@ -264,6 +269,9 @@ impl MonitoredChannel {
     }
 
     /// Forced stop (§111, §113): cancel both halves; the backlog may be abandoned.
+    /// Test-only today — production shutdown prefers the graceful [`stop`](Self::stop)
+    /// under a timeout (`Listener::shutdown`), never an outright abort.
+    #[cfg(test)]
     pub(crate) async fn abort(self) -> ChannelPipeline {
         self.transport_cancel.cancel();
         self.pipeline_cancel.cancel();
@@ -290,7 +298,7 @@ impl MonitoredChannel {
 pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     channel_id: ChannelId,
     runner: R,
-    data_recorder: Option<DataRecorder>,
+    raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
     view_count: usize,
     disk_guard: Option<(DiskGuard, PathBuf)>,
@@ -312,7 +320,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     } = spawn_channel_tasks(
         channel_id,
         runner,
-        data_recorder,
+        raw_recorder,
         display_recorder,
         view_count,
         disk_guard,
@@ -345,12 +353,19 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
 
 /// A live, standalone Channel: its tasks plus its own event receiver. Returned
 /// by [`start_data_channel`].
+///
+/// Test-only: production channels are orchestrated through
+/// [`Listener`](super::Listener) (the CLI and the GUI driver both go through
+/// it); this standalone wrapper exists so the spawn/monitor/stop paths can be
+/// exercised directly, without a registry.
+#[cfg(test)]
 pub struct RunningChannel {
     tasks: MonitoredChannel,
     events: mpsc::Receiver<RuntimeEvent>,
     faulted: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
 impl RunningChannel {
     pub fn channel_id(&self) -> ChannelId {
         self.tasks.channel_id
@@ -405,7 +420,8 @@ impl RunningChannel {
     }
 }
 
-/// Start a standalone data channel (Serial, UDP, or a lone TCP connection).
+/// Start a standalone data channel (test-only — see [`RunningChannel`]).
+#[cfg(test)]
 pub fn start_data_channel<R: DataTransportRunner>(
     channel_id: ChannelId,
     runner: R,
@@ -420,7 +436,7 @@ pub fn start_data_channel<R: DataTransportRunner>(
     let tasks = spawn_monitored_channel(
         channel_id,
         runner,
-        raw_recorder.map(DataRecorder::Raw),
+        raw_recorder,
         None,               // no display recording on a standalone channel
         1,                  // a single default Display View
         None,               // no disk guard on a standalone channel

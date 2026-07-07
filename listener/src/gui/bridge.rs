@@ -608,9 +608,6 @@ pub fn spawn(repaint: impl Fn() + Send + 'static) -> anyhow::Result<BridgeHandle
                 }
             };
             runtime.block_on(async move {
-                // A roomy recent-message buffer for scrollback — the message view
-                // virtualizes (renders only visible rows), so a large ring is cheap
-                // to display (#4). Other capacities stay at their defaults.
                 let mut listener = Listener::new(PipelineCapacities::default());
                 let events = listener
                     .take_events()

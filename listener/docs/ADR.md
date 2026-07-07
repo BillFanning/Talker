@@ -20,7 +20,7 @@ the same as talker's ADR-001.
 
 **Authoritative text:** spec §97.1 (with §97.2 blocking-to-async handoff, §99 backpressure, §111 shutdown). Summarized here so the decision is discoverable from the ADR index.
 
-**Decision:** A hybrid runtime. Tokio owns orchestration — command handling, cancellation, bounded queues, fan-out, async-native network I/O, shutdown. Continuous blocking serial receive loops run on dedicated OS threads that own the interface handle and hand data to the async side through bounded `tokio::sync::mpsc` channels (`Sender::blocking_send`). `spawn_blocking` is reserved for bounded, finite operations (open/close, file create/flush, port enumeration) — never for continuous receive loops. Transports are push-based: data-bearing transports emit `ReceivedData`, TCP listeners emit `NewConnection`.
+**Decision:** A hybrid runtime. Tokio owns orchestration — command handling, cancellation, bounded queues, fan-out, async-native network I/O, shutdown. Continuous blocking serial receive loops run on dedicated OS threads that own the interface handle and hand data to the async side through bounded `tokio::sync::mpsc` channels (`try_send`, with a bounded retry loop while the queue is full — see ADR-007's refinement: the retry loop lets the stall notice fire mid-stall and observes cancellation). `spawn_blocking` is reserved for bounded, finite operations (open/close, file create/flush, port enumeration) — never for continuous receive loops. Transports are push-based: data-bearing transports emit `ReceivedData`, TCP listeners emit `NewConnection`.
 
 **Contrast with `talker`:** talker deliberately uses **no** async runtime (talker ADR-002 — `std::thread` + `crossbeam-channel`), because it manages a bounded set of *outbound* senders against synchronous `serialport`/`eframe` APIs. Listener faces the opposite shape: many *inbound* network sources, async-native socket I/O, and dynamic TCP-connection fan-in — where Tokio's orchestration earns its keep. The two crates therefore reach opposite conclusions for the same reason (fit the runtime to the I/O shape), and that divergence is intentional.
 
@@ -214,14 +214,18 @@ reporting contract for each.
    inside our queues. But a stall long enough lets the OS/UART receive buffer
    overrun, losing bytes *upstream of us*. We can detect the stall; we cannot
    count the lost bytes (no portable userland signal for UART/driver overrun).
-   **Contract:** the serial reader watches `blocking_send`; a stall beyond a
-   heuristic threshold (`STALL_WARNING`, 250 ms) sends a
+   **Contract:** the serial reader watches its send to the full queue; a stall
+   beyond a heuristic threshold (`STALL_WARNING`, 250 ms) sends a
    `TransportNotice::ReceptionStalled { channel_id, stalled_for }` once per stall
    episode — self-describing, carrying the observed stall **duration** (the honest
    §101 proxy) and **no fabricated byte count**. The pipeline records it as a
    Warning `Diagnostic` and emits `ReceptionStalled` (see the seam below). Momentary
-   backpressure that drains quickly is normal and must not notify.
+   backpressure that drains quickly is normal and must not notify. *(Refined: the
+   stall is a bounded retry loop, not a parked `blocking_send`, so the notice is
+   raised **while the stall is ongoing** — a permanently wedged pipeline is not
+   silent — and cancellation is observed mid-stall, §111.)*
    *Status: implemented and tested* (`sustained_stall_sends_a_reception_stalled_notice`,
+   `a_wedged_pipeline_raises_the_notice_while_still_stalled_and_can_cancel`,
    `momentary_backpressure_sends_no_notice`, `run_channel_records_a_transport_notice_as_a_diagnostic`).
 
 3. **Fundamentally unobservable — pre-receive kernel/NIC loss.** Kernel-dropped
@@ -584,8 +588,31 @@ A second, parallel command enum on top of a working method API + a GUI transport
 **Consequences.**
 - `MatchAction::Mark` becomes `Mark { timestamp: Option<MarkTimestamp> }`; new `MarkTimestamp`/`MarkPosition`/`TimestampConfig` config types. `MatchAction` is `#[serde(tag = "kind")]`; a bare `Mark` still parses (the field is `#[serde(default)]`). No `schema_version` bump — additive field plus an additive-safe drop of the display timestamp field (dev-only profiles, ADR-013 precedent).
 - The renderer gains `render_text_annotated`/`render_stream_annotated`; `RenderedOutput.timestamp` is retained (it drives time-based Display rotation, §59) but never carries an inline mark — the inline text lives in `RenderedOutput.text`.
-- The snapshot's `TriggeredMatch` carries an optional `MarkRender { text, before }` so the live viewer splices the same timestamp the `.disp` got, rebasing the absolute match offset onto the scrollback window.
+- The snapshot's `TriggeredMatch` carries an optional `MarkRender { text, before }` so the live viewer splices the same timestamp the `.disp` got, rebasing the match onto the scrollback window via its view-space `view_offset` (ADR-017 — the stream-space `byte_offset` counts bytes a paused view skipped).
 - A minimal in-app editor creates `BytePattern → Mark(+timestamp)` rules; committing uses the existing Apply & Restart path (`config_needs_restart` counts `match_rules`) — no new runtime command. The general match-rule editor (Idle/Record/Notify/PauseDisplay) remains a separate TODO.
+
+## ADR-017 — Two stream offset spaces: stream (all received bytes) vs. view (pause-gated), translated at fire time
+
+**Status:** Accepted. **Context:** spec §50 (Display Pause: "the view stops accumulating new stream bytes"), §50.2 (match firings anchored on byte offsets), §87 (scrollback), ADR-011 (`StreamDelta` offsets), ADR-016 (live-view Mark splicing).
+
+**Problem.** Two offset spaces coexist by construction, and a bug arose from conflating them:
+
+- **Stream space** — `ActivityMeter::total_bytes()`: every byte received since Start. Match firings are anchored here (`FiredRule::match_offset`), diagnostics quote it, and it equals a byte's position in a `.raw` recording that ran from Start.
+- **View space** — `stream_dropped + stream_buf.len()`: the scrollback's offsets, used by `StreamDelta`/`stream_end_offset` and the GUI's cursor. Per §50, a paused view stops accumulating, so view space **stops advancing during a pause** while stream space keeps counting; after any pause the two diverge permanently.
+
+The live viewer was rebasing `TriggeredMatch.byte_offset` (stream space) onto its accumulated window (view space), so every post-pause Mark timestamp spliced N bytes late (N = bytes skipped while paused) or vanished. A rule combining `PauseDisplay` + `Mark` hit this immediately. (`.disp` was unaffected — its splice rebases per chunk in stream space consistently.)
+
+**Decision.** Keep both spaces — each is authoritative for its consumer — and **translate at fire time**, where the mapping is exact: in `ChannelPipeline::ingest` the chunk's view-space base (`view_chunk_base`) is known right after the scrollback append (`None` while paused — those bytes have no view position). `apply_fired_rules` stamps each firing with both `byte_offset` (stream space, kept for diagnostics/`.raw` correlation) and a new `view_offset: Option<u64>` (view space); the GUI splices Marks at `view_offset` only. Idle firings carry neither.
+
+**Why not the alternatives.**
+- *Unify on one space by making pause advance `stream_dropped` past skipped bytes.* Breaks the ring invariant (`stream_buf[i]` is the byte at offset `dropped + i`) unless the buffer also drops content, which turns pause into a rolling reset and churns the GUI delta protocol.
+- *Move pause out of the pipeline into the GUI (never gate the scrollback).* Makes the spaces identical by construction and is attractive long-term, but §50 defines pause as the view not accumulating, resume as "continues from live data, with no backfill" — relocating that behavior is a spec conversation, deferred to the multi-view-pause decision (TODO).
+- *Anchor firings in view space only.* Loses the stream-space anchor that diagnostics and `.raw` correlation want, and a firing during pause would have no offset at all.
+
+**Consequences.**
+- `TriggeredMatch` gains `view_offset`; a Mark on bytes received while paused is visible in `.disp` (recording never pauses, §58) but not spliced into the live view — the bytes aren't on screen.
+- The edge case of a boundary-split match whose carry bytes straddle a pause transition maps approximately (the prior chunk's bytes may not be in the view); `checked_sub` clamps the pre-window edge. Vanishingly rare and self-limiting — the splice is dropped, never misplaced across the window.
+- Pinned by `match_view_offset_tracks_the_paused_view_not_the_raw_stream` (pipeline).
 
 ## Open questions
 

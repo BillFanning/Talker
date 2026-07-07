@@ -58,10 +58,12 @@ Message-model removal). Everything below this block is verified done:
 - [x] Find & Triggers runtime: cross-chunk `BytePattern` scanner **with carry** —
       a pattern split across two reads now matches (`MatchRuleSet` keeps the prior
       chunk's tail and scans `carry ++ chunk`, reporting only matches ending in the
-      new chunk). Each firing carries its true `match_offset`. **Measurement:** a
-      boundary-split firing records a where/why event diagnostic and increments
-      `match_boundary_saves`, surfaced in both `ChannelStats` and `ChannelSnapshot`
-      (the how-often). `reset_stream` drops the carry on Stop/Start.
+      new chunk). Rules fire **per occurrence** (a chunk holding three `$GPGGA`s
+      fires a GGA rule three times, each at its own `match_offset`) — pinned by
+      `every_occurrence_in_a_chunk_fires`. **Measurement:** a boundary-split firing
+      records a where/why event diagnostic and increments `match_boundary_saves`,
+      surfaced in both `ChannelStats` and `ChannelSnapshot` (the how-often). The
+      carry dies with the pipeline on Stop/Start (pipelines are rebuilt per run).
 - [x] Independent Raw/Display recording config (ADR-013, spec §79 → schema v3).
       `RecordingConfig`/`RecordingMode` split into `RawRecordingConfig` +
       `DisplayRecordingConfig`, each with its own destination/rotation/overwrite/
@@ -72,12 +74,16 @@ Message-model removal). Everything below this block is verified done:
       `Mark { timestamp: Some(..) }` splices the matched pattern's local arrival time
       (before/after, talker-style `TimestampConfig`) into the rendered text via
       `render_text_annotated`; the live viewer rebases the snapshot's `TriggeredMatch`
-      `MarkRender` onto the scrollback window and splices the same text, so display and
-      `.disp` match. `.raw` is untouched. A minimal `BytePattern → Mark(+ts)` editor
-      lives under Configure (Apply & Restart). Pinned by
-      `timestamped_mark_splices_inline_time_into_disp_not_raw` + renderer splice tests.
-      (On-screen **Highlight** byte-range styling was **dropped** as too complex — see
-      ADR-015; ADR-016 explains why the inline timestamp does *not* inherit that cost.)
+      onto the scrollback window via its **`view_offset`** (view/scrollback space —
+      not `byte_offset`, which counts bytes a paused view skipped; ADR-017) and
+      splices the same `MarkRender` text, so display and `.disp` match. `.raw` is
+      untouched. A minimal `BytePattern → Mark(+ts)` editor lives under Configure
+      (Apply & Restart). Pinned by
+      `timestamped_mark_splices_inline_time_into_disp_not_raw`,
+      `match_view_offset_tracks_the_paused_view_not_the_raw_stream` + renderer splice
+      tests. (On-screen **Highlight** byte-range styling was **dropped** as too
+      complex — see ADR-015; ADR-016 explains why the inline timestamp does *not*
+      inherit that cost.)
 - [ ] (Optional) Draw a glyph for a **bare** `Mark` (no timestamp) in the live stream
       view. A bare `Mark` still only writes the `‹MARK …›` line into `.disp`; the live
       viewer doesn't render a marker for it. Low priority — kept simple deliberately.
@@ -145,6 +151,16 @@ Message-model removal). Everything below this block is verified done:
 ## Carried over (still valid under v2)
 
 - [ ] Disk-guard GUI exposure (§56.2)
+- [ ] **TCP connection channels are currently unobservable** (bigger than the
+      recording gap below): each accepted connection runs a full pipeline, but the
+      supervisor drops its `PipelineRequest` sender (`runtime/tcp.rs`), so there is
+      no per-connection snapshot, stream delta, display, or match evaluation — the
+      feature surfaces only connect/disconnect events while paying full pipeline
+      cost per connection. UC1 troubleshooting of a TCP feed is impossible today.
+      Needs: the supervisor retains per-connection handles (shared registry keyed
+      by the minted `ChannelId`), `Listener::snapshot`/`stream_delta` route to
+      them, and a GUI decision on how connections appear (sub-tabs under the
+      listener channel vs. dynamic top-level channels).
 - [ ] Per-connection recording for TCP connection channels (§16.2, deferred §59 naming)
 - [ ] RS-422/485 phases (§14.4)
 - [ ] CLI parity with GUI for the v2 surface
@@ -157,6 +173,12 @@ Message-model removal). Everything below this block is verified done:
       (`pipeline.rs`) and the GUI only surfaces the first snapshot view (`detail.rs`).
       A non-primary view can be marked paused but has no per-view stream state to freeze.
       Needs a decision: per-view render state, or document pause as stream-wide (one view).
+- [ ] `.disp` per-chunk rendering garbles a multi-byte character split across two
+      reads: the display recorder renders each chunk independently, so a UTF-8 code
+      point (or, for odd-length chunks, UTF-16 unit) straddling a chunk boundary
+      becomes `U+FFFD` in the `.disp` — the live view is immune (it re-renders the
+      accumulated buffer). Either carry a partial-sequence tail per recording view,
+      or document `.disp` as chunk-rendered.
 
 ## Future work — deferred (spec Appendix A)
 

@@ -3,9 +3,8 @@
 //! This is `listener-transport` (spec §128). It owns interface handles and
 //! receive buffers and knows nothing about NMEA, display, or recording formats.
 //! This file defines the **push-based transport contract** (§138, ADR-001): the
-//! types every transport emits and the runner traits the runtime drives. The
-//! concrete Serial/UDP/TCP runners are added in later steps; only the contract
-//! lives here for now so the runtime can be wired and tested against it.
+//! types every transport emits and the runner traits the runtime drives; the
+//! concrete Serial/UDP/TCP runners live in the submodules.
 //!
 //! Two output shapes (§138):
 //! - data-bearing sources (Serial, UDP, TCP connection) emit [`ReceivedData`];

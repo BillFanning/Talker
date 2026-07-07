@@ -14,19 +14,9 @@ use std::collections::VecDeque;
 /// hand-edited profile reaches the runtime with every limit unset.
 pub const DEFAULT_BACKSTOP: usize = 1 << 20;
 
-/// A bounded, runtime-only history of items (§143). Eviction is oldest-first
-/// (§89); `clear` discards all retained items (§90).
-pub trait RetentionStore<T> {
-    fn push(&mut self, item: T);
-    fn clear(&mut self);
-    fn len(&self) -> usize;
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-/// A count-limited history for Events, Warnings, or Errors (§86, §88). Oldest
-/// entries are evicted first (§89).
+/// A count-limited, runtime-only history (§86, §88, §143) for Events, Warnings,
+/// or Errors. Eviction is oldest-first (§89); [`clear`](Self::clear) discards
+/// all retained items (§90).
 pub struct CountBounded<T> {
     limit: usize,
     items: VecDeque<T>,
@@ -40,25 +30,27 @@ impl<T> CountBounded<T> {
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.items.iter()
-    }
-}
-
-impl<T> RetentionStore<T> for CountBounded<T> {
-    fn push(&mut self, item: T) {
+    pub fn push(&mut self, item: T) {
         self.items.push_back(item);
         while self.items.len() > self.limit {
             self.items.pop_front();
         }
     }
 
-    fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.items.clear();
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.items.iter()
     }
 }
 

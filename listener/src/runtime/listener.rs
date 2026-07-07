@@ -38,9 +38,7 @@ use crate::transport::{
 
 use super::activity::ChannelActivity;
 use super::build::{build_display_view, build_serial, build_tcp_listener, build_udp, BuildError};
-use super::channel::{
-    spawn_monitored_channel, DataRecorder, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES,
-};
+use super::channel::{spawn_monitored_channel, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES};
 use super::pipeline::{DisplayViewHandle, PipelineCapacities, RawRecordingSettings};
 use super::snapshot::{ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, StreamDelta};
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
@@ -854,14 +852,16 @@ impl Listener {
     }
 
     /// Per-channel pipeline capacities, applying this channel's retention limits
-    /// (§80, §88) on top of the base capacities.
+    /// (§80, §88) on top of the base capacities. A channel that sets no explicit
+    /// diagnostic limit gets the base default (bounded), not the raw backstop —
+    /// so an unconfigured channel can't grow its log unbounded for weeks (§124).
     fn channel_caps(&self, config: &ChannelConfig) -> PipelineCapacities {
         let retention = &config.retention;
         PipelineCapacities {
             stream_display: retention.byte_limit.unwrap_or(self.caps.stream_display),
-            event_retention: retention.event_limit,
-            warning_retention: retention.warning_limit,
-            error_retention: retention.error_limit,
+            event_retention: retention.event_limit.or(self.caps.event_retention),
+            warning_retention: retention.warning_limit.or(self.caps.warning_retention),
+            error_retention: retention.error_limit.or(self.caps.error_retention),
             ..self.caps
         }
     }
@@ -902,7 +902,6 @@ impl Listener {
                     id,
                     opened,
                     config,
-                    None,
                     display,
                     display_diag,
                     faulted,
@@ -930,7 +929,6 @@ impl Listener {
                     id,
                     bound,
                     config,
-                    None,
                     display,
                     display_diag,
                     faulted,
@@ -963,7 +961,6 @@ impl Listener {
         id: ChannelId,
         runner: R,
         config: &ChannelConfig,
-        data_recorder: Option<DataRecorder>,
         display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
         // A diagnostic from building the display recorder (a setup failure) to seed into
         // the new pipeline's log, so a display-recording start failure shows like raw's.
@@ -974,7 +971,10 @@ impl Listener {
         spawn_monitored_channel(
             id,
             runner,
-            data_recorder,
+            // No pre-built Raw recorder: recording begins lazily in the pipeline
+            // (auto-begin / the live toggle), so its failure surfaces as a
+            // recording fault (§55) rather than a start fault.
+            None,
             display_recorder,
             // One runtime Display View per configured view (§48); at least one.
             view_count(config),
@@ -1192,6 +1192,22 @@ mod tests {
             listener.settings_from(&no_rot, "GPS").unwrap().overwrite,
             OverwritePolicy::Refuse
         );
+    }
+
+    #[test]
+    fn unset_diagnostic_limits_fall_back_to_the_bounded_default() {
+        // §88/§124: a channel config with no explicit event/warning/error limits
+        // (the template default) still gets bounded diagnostic retention — the
+        // base-caps default, not the ~1 M backstop. An explicit limit wins.
+        let listener = Listener::with_default_capacities();
+        let caps = listener.channel_caps(&udp_channel());
+        assert!(caps.event_retention.is_some());
+        assert!(caps.warning_retention.is_some());
+        assert!(caps.error_retention.is_some());
+
+        let mut config = udp_channel();
+        config.retention.warning_limit = Some(7);
+        assert_eq!(listener.channel_caps(&config).warning_retention, Some(7));
     }
 
     #[tokio::test]

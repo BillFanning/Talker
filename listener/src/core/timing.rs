@@ -2,9 +2,10 @@
 //!
 //! In the stream-only design (ADR-010) there is no Message model; the only
 //! timing the runtime needs is the per-chunk arrival time. Per-byte arrival time
-//! is not available from the OS, so all timing is chunk-granular (`ChunkTime`,
-//! §138): a chunk's [`ChunkTime`] is captured when the transport reads it, and a
-//! recording timestamp ([`ChunkTimestamp`]) is derived from it.
+//! is not available from the OS, so all timing is chunk-granular: a chunk's
+//! [`ChunkTime`] is captured when the transport reads it and carried through to
+//! recording (the `.raw.idx` sidecar, Display-rotation period keys) and Mark
+//! timestamps.
 
 use std::time::{Instant, SystemTime};
 
@@ -28,25 +29,6 @@ impl ChunkTime {
         Self {
             monotonic: Instant::now(),
             wall_clock: SystemTime::now(),
-        }
-    }
-}
-
-/// A timestamp derived from the `ChunkTime` of a received chunk (§133), carried
-/// alongside rendered/recorded output. Formatting to a display string — source
-/// (Local / UTC / Relative) and resolution (s / ms / µs) — happens in the display
-/// layer, never in stored state.
-#[derive(Clone, Copy, Debug)]
-pub struct ChunkTimestamp {
-    pub monotonic: Instant,
-    pub wall_clock: SystemTime,
-}
-
-impl From<ChunkTime> for ChunkTimestamp {
-    fn from(chunk: ChunkTime) -> Self {
-        Self {
-            monotonic: chunk.monotonic,
-            wall_clock: chunk.wall_clock,
         }
     }
 }
@@ -91,14 +73,6 @@ impl TimestampConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn timestamp_is_taken_from_the_chunk_time() {
-        let chunk = ChunkTime::now();
-        let ts = ChunkTimestamp::from(chunk);
-        assert_eq!(ts.monotonic, chunk.monotonic);
-        assert_eq!(ts.wall_clock, chunk.wall_clock);
-    }
 
     /// A fixed *local* instant (2026-05-22 14:30:45.123 local) round-tripped through
     /// `SystemTime`, so `format` reproduces the same local wall-clock regardless of

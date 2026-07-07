@@ -6,16 +6,6 @@
 //! application-level `anyhow` (which belongs to the runtime/CLI/GUI layers).
 //! The runtime wraps these with `.context()` at the crate boundary.
 
-/// Coarse classification of an error for diagnostics and reporting (§95).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ErrorCategory {
-    Configuration,
-    Resource,
-    Communication,
-    Recording,
-    Internal,
-}
-
 /// A recording subsystem failure (§56, §142). A recording fault is terminal for
 /// the current artifact and never stalls reception (§56.1).
 #[derive(Debug, thiserror::Error)]

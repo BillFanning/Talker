@@ -2,15 +2,13 @@
 //! §114–§118).
 //!
 //! This is `listener-diagnostics` (§128). It owns the diagnostic record model
-//! (Events §92, Warnings §93, Errors §94, with the §95 [`ErrorCategory`]),
-//! bounded per-type history ([`DiagnosticLog`], §86/§88 — each severity count-capped,
-//! oldest evicted), and diagnostic logging ([`init_logging`], §114).
+//! (Events §92, Warnings §93, Errors §94), bounded per-type history
+//! ([`DiagnosticLog`], §86/§88 — each severity count-capped, oldest evicted),
+//! and diagnostic logging ([`init_logging`], §114).
 
 use std::time::SystemTime;
 
-use crate::retention::{CountBounded, RetentionStore, DEFAULT_BACKSTOP};
-
-pub use crate::core::ErrorCategory;
+use crate::retention::{CountBounded, DEFAULT_BACKSTOP};
 
 /// Severity of a diagnostic, ordered low → high priority (§92–§95).
 #[derive(

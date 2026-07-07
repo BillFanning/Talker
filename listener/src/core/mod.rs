@@ -12,7 +12,7 @@ pub mod state;
 pub mod timing;
 
 pub use command::RuntimeEvent;
-pub use error::{ErrorCategory, RecordError};
+pub use error::RecordError;
 pub use ids::{ChannelId, ChannelName, DisplayViewId, MatchRuleId, StableConfigId};
 pub use state::{ChannelKind, ChannelState, DisplayState, RecordingState};
-pub use timing::{ChunkTime, ChunkTimestamp, TimestampConfig};
+pub use timing::{ChunkTime, TimestampConfig};
