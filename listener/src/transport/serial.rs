@@ -2,10 +2,12 @@
 //!
 //! Unlike UDP/TCP, a serial port has no async-native API, so its continuous
 //! blocking receive loop runs on a **dedicated OS thread** that owns the port
-//! handle (ADR-001 / §97.1). That thread hands data to the async runtime via
-//! `Sender::blocking_send` — the one edge permitted to stall the reader (§97.2,
-//! §99): a full Transport→Pipeline queue backpressures the read loop, which can
-//! cause a UART/driver overrun reported as transport-specific loss (§101).
+//! handle (ADR-001 / §97.1). That thread hands data to the async runtime over a
+//! bounded `tokio::sync::mpsc` — the one edge permitted to stall the reader
+//! (§97.2, §99): a full Transport→Pipeline queue backpressures the read loop
+//! (a bounded retry loop, so the stall notice fires mid-stall and cancellation
+//! is observed), which can cause a UART/driver overrun reported as
+//! transport-specific loss (§101).
 //!
 //! Cancellation is cooperative (§111): the port is opened with a bounded read
 //! timeout, so the loop periodically returns from a blocking read to observe the
@@ -82,6 +84,13 @@ const DEFAULT_READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// cry loss. The byte count of any overrun is not observable from userland, so the
 /// notice carries the stall duration, not a fabricated count (§101).
 const STALL_WARNING: Duration = Duration::from_millis(250);
+
+/// Retry cadence while stalled on a full Transport→Pipeline queue. The stall is
+/// a poll loop (not a parked `blocking_send`) so the notice can be raised *while*
+/// the stall is ongoing — a permanently wedged pipeline must not be silent — and
+/// so cancellation still ends the loop (§111). Polling only costs while already
+/// stalled, when reception is degraded anyway.
+const STALL_POLL: Duration = Duration::from_millis(5);
 
 /// An unopened serial transport description (§14, §74). Call
 /// [`open`](Self::open) at Channel Start to acquire the port.
@@ -316,8 +325,10 @@ impl BlockingReader for SerialReader {
 /// reader (§99) — the loop *stalls* rather than drops, so it loses nothing in
 /// process. A stall longer than `stall_warning` means the OS/UART buffer has had
 /// time to overrun, so it sends a `ReceptionStalled` notice through `notices`
-/// (§101, ADR-007), once per stall episode, carrying the observed stall duration.
-/// The lost byte count is not observable from userland, so it is not reported.
+/// (§101, ADR-007) **while the stall is still ongoing** — once per episode,
+/// carrying the stall duration so far — so even a permanently wedged pipeline is
+/// reported. The lost byte count is not observable from userland, so it is not
+/// reported. Cancellation is observed during a stall too (§111).
 fn run_blocking_receive_loop(
     channel_id: ChannelId,
     mut reader: impl BlockingReader,
@@ -352,31 +363,48 @@ fn run_blocking_receive_loop(
                     received_at: ChunkTime::now(),
                 };
                 // Fast path: a non-full queue accepts at once and ends any stall
-                // episode. On Full we stall (blocking_send) rather than drop —
-                // never losing data in process (§97.1, §99). A `Closed` queue (or
-                // a closed-during-stall send) means the pipeline is gone.
+                // episode. On Full we stall — retrying, never dropping (§97.1,
+                // §99) — as a poll loop rather than a parked `blocking_send`, so
+                // the stall notice can be raised while the stall is *ongoing* (a
+                // wedged pipeline must not be silent, ADR-007) and cancellation
+                // still ends the loop (§111). A `Closed` queue means the pipeline
+                // is gone.
                 match out.try_send(data) {
                     Ok(()) => stall_warned = false,
                     Err(TrySendError::Closed(_)) => return TransportOutcome::Completed,
                     Err(TrySendError::Full(data)) => {
                         let stalled_at = Instant::now();
-                        if out.blocking_send(data).is_err() {
-                            return TransportOutcome::Completed;
-                        }
-                        // A sustained stall risks a UART/driver overrun upstream of
-                        // us — transport-specific loss we flag but cannot quantify
-                        // (§101). Momentary backpressure that drains fast is normal.
-                        // The notice send is non-blocking (`try_send`): we never
-                        // block the reader to deliver a stall warning.
-                        let waited = stalled_at.elapsed();
-                        if !stall_warned && waited >= stall_warning {
-                            if let Some(notices) = &notices {
-                                let _ = notices.try_send(TransportNotice::ReceptionStalled {
-                                    channel_id,
-                                    stalled_for: waited,
-                                });
+                        let mut pending = data;
+                        loop {
+                            if cancel.is_cancelled() {
+                                return TransportOutcome::Cancelled;
                             }
-                            stall_warned = true;
+                            std::thread::sleep(STALL_POLL);
+                            match out.try_send(pending) {
+                                Ok(()) => break,
+                                Err(TrySendError::Closed(_)) => return TransportOutcome::Completed,
+                                Err(TrySendError::Full(again)) => {
+                                    pending = again;
+                                    // A sustained stall risks a UART/driver overrun
+                                    // upstream of us — transport-specific loss we flag
+                                    // but cannot quantify (§101); once per episode,
+                                    // non-blocking (we never block the reader to
+                                    // deliver a stall warning). Momentary backpressure
+                                    // that drains fast never reaches the threshold.
+                                    let waited = stalled_at.elapsed();
+                                    if !stall_warned && waited >= stall_warning {
+                                        if let Some(notices) = &notices {
+                                            let _ = notices.try_send(
+                                                TransportNotice::ReceptionStalled {
+                                                    channel_id,
+                                                    stalled_for: waited,
+                                                },
+                                            );
+                                        }
+                                        stall_warned = true;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -669,6 +697,59 @@ mod tests {
         }
 
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn a_wedged_pipeline_raises_the_notice_while_still_stalled_and_can_cancel() {
+        // ADR-007 tier 2: the notice must arrive while the stall is ONGOING — a
+        // permanently wedged pipeline (never drained) must not be silent. And
+        // cancellation must end the stalled reader (§111) even though the queue
+        // never drains.
+        let (tx, rx) = mpsc::channel(1); // held open, never drained
+        let (notice_tx, mut notice_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let cid = ChannelId::new();
+        // Chunk 1 fills the cap-1 queue; chunk 2 stalls the reader forever.
+        let reader = ScriptedReader::new(vec![b"1".to_vec(), b"2".to_vec()]);
+        let threshold = Duration::from_millis(20);
+        let (done_tx, done_rx) = oneshot::channel();
+        let loop_cancel = cancel.clone();
+        std::thread::spawn(move || {
+            let outcome = run_blocking_receive_loop(
+                cid,
+                reader,
+                tx,
+                loop_cancel,
+                threshold,
+                Some(notice_tx),
+                None,
+            );
+            let _ = done_tx.send(outcome);
+        });
+
+        // Without draining anything, the notice arrives mid-stall.
+        let notice = tokio::time::timeout(Duration::from_secs(5), notice_rx.recv())
+            .await
+            .expect("the notice must arrive while the stall is ongoing")
+            .unwrap();
+        match notice {
+            TransportNotice::ReceptionStalled {
+                channel_id,
+                stalled_for,
+            } => {
+                assert_eq!(channel_id, cid);
+                assert!(stalled_for >= threshold);
+            }
+        }
+
+        // Cancel while still stalled: the loop ends as Cancelled, not hung.
+        cancel.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("cancellation must end a stalled reader")
+            .unwrap();
+        assert!(matches!(outcome, TransportOutcome::Cancelled));
+        drop(rx);
     }
 
     #[tokio::test]

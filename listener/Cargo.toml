@@ -37,7 +37,8 @@ tokio-util = { workspace = true }
 # Serial port I/O — runs on a dedicated OS thread (ADR-001 / spec §97.1)
 serialport = { workspace = true }
 
-# Calendar time for time-based recording-file rotation (§59) — UTC period keys
+# Calendar time for time-based recording-file rotation (§59) — local-time period
+# keys, so rotated filenames match the operator's wall clock
 chrono = { workspace = true }
 
 # Raw socket options: SO_RCVBUF to mitigate kernel UDP drops (§167, §101)
@@ -76,4 +77,6 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 # Integration tests (listener/tests/) drive the runtime over loopback sockets.
-tokio = { workspace = true }
+# `test-util` adds the paused-clock (`start_paused` + `advance`) used to test
+# timer-driven behavior (the periodic recorder flush) without real waits.
+tokio = { workspace = true, features = ["test-util"] }

@@ -95,6 +95,7 @@ pub trait DisplayRecorder: Send {
 #[async_trait::async_trait]
 trait RecorderWriter<I: Send>: Send {
     async fn write(&mut self, item: &I) -> Result<(), RecordError>;
+    async fn flush(&mut self) -> Result<(), RecordError>;
     async fn finalize(&mut self, reason: RecordingStopReason) -> Result<(), RecordError>;
 }
 
@@ -102,6 +103,9 @@ trait RecorderWriter<I: Send>: Send {
 impl<R: RawRecorder> RecorderWriter<Arc<ReceivedData>> for R {
     async fn write(&mut self, item: &Arc<ReceivedData>) -> Result<(), RecordError> {
         self.write_chunk(item).await
+    }
+    async fn flush(&mut self) -> Result<(), RecordError> {
+        RawRecorder::flush(self).await
     }
     async fn finalize(&mut self, reason: RecordingStopReason) -> Result<(), RecordError> {
         RawRecorder::finalize(self, reason).await
@@ -113,15 +117,27 @@ impl<R: DisplayRecorder> RecorderWriter<RenderedOutput> for R {
     async fn write(&mut self, item: &RenderedOutput) -> Result<(), RecordError> {
         self.write_rendered(item).await
     }
+    async fn flush(&mut self) -> Result<(), RecordError> {
+        DisplayRecorder::flush(self).await
+    }
     async fn finalize(&mut self, reason: RecordingStopReason) -> Result<(), RecordError> {
         DisplayRecorder::finalize(self, reason).await
     }
 }
 
+/// How often a running recorder flushes its buffered output to the OS (§56).
+/// Without this, bytes sat in the writer's buffer until finalize: on a slow
+/// stream a `.raw`/`.disp` lagged what another tool could read by minutes, and a
+/// crash/power cut lost the whole buffered tail — the wrong trade for a
+/// long-running capture tool. One flush per second is negligible I/O.
+const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The recorder task (§142): drain the bounded queue and write each item until
-/// terminated (fault or stop). On a write error it faults and finalizes at the
-/// truncation point; on graceful stop it drains the accepted backlog first
-/// (§110); a fault never drains (§56.1).
+/// terminated (fault or stop), flushing buffered output on a timer so the file
+/// on disk never lags a slow stream by more than [`FLUSH_INTERVAL`]. On a
+/// write/flush error it faults and finalizes at the truncation point; on
+/// graceful stop it drains the accepted backlog first (§110); a fault never
+/// drains (§56.1).
 async fn run_recorder<I, W>(
     mut writer: W,
     mut items: mpsc::Receiver<I>,
@@ -130,6 +146,11 @@ async fn run_recorder<I, W>(
     I: Send + 'static,
     W: RecorderWriter<I> + 'static,
 {
+    // First flush one interval from now (an immediate tick would flush an empty
+    // file); skipped ticks (a long write) collapse into one.
+    let mut flush_tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + FLUSH_INTERVAL, FLUSH_INTERVAL);
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             biased;
@@ -156,6 +177,13 @@ async fn run_recorder<I, W>(
                 }
                 None => {
                     let _ = writer.finalize(RecordingStopReason::ChannelStopped).await;
+                    return;
+                }
+            },
+            _ = flush_tick.tick() => {
+                if let Err(err) = writer.flush().await {
+                    // A failed flush is a write fault: truncate here (§56.1).
+                    let _ = writer.finalize(RecordingStopReason::Faulted(err)).await;
                     return;
                 }
             }
@@ -381,6 +409,51 @@ mod tests {
         // `notify_one` leaves a stored permit even if the task isn't parked yet, so this
         // can't race ahead of the writer's `.notified().await` and hang.
         release.notify_one();
+        recording.finalize(RecordingStopReason::Disabled).await;
+    }
+
+    /// A recorder that counts flush calls — for the periodic-flush contract.
+    #[derive(Clone, Default)]
+    struct FlushCountingRecorder {
+        flushes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RawRecorder for FlushCountingRecorder {
+        async fn write_chunk(&mut self, _chunk: &ReceivedData) -> Result<(), RecordError> {
+            Ok(())
+        }
+        async fn flush(&mut self) -> Result<(), RecordError> {
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_running_recorder_flushes_on_a_timer() {
+        // §56: buffered output reaches the OS within FLUSH_INTERVAL while the
+        // recording runs — not only at finalize — so a slow stream's file never
+        // lags by more than a tick and a crash loses at most one interval.
+        let recorder = FlushCountingRecorder::default();
+        let flushes = recorder.flushes.clone();
+        let mut recording = start_raw_recording(recorder, 8);
+
+        recording.try_record(chunk(b"x"));
+        tokio::task::yield_now().await; // let the write land
+        let before = flushes.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Paused-clock test: advancing time fires the flush interval.
+        tokio::time::advance(FLUSH_INTERVAL + std::time::Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            flushes.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "a running recorder flushes on the timer, not only at finalize"
+        );
+
         recording.finalize(RecordingStopReason::Disabled).await;
     }
 
