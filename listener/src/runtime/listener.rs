@@ -28,7 +28,7 @@ use crate::config::ChannelConfig;
 use crate::core::{ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
 use crate::display::{DisplayView, RenderedOutput};
 use crate::record::{
-    start_display_recording, DisplayFileRecorder, FileRotationPolicy, OverwritePolicy, Recording,
+    start_display_recording, DisplayFileRecorder, FileRotationPolicy, Recording,
     RotatingDisplayRecorder,
 };
 use crate::transport::{
@@ -377,14 +377,11 @@ impl Listener {
         let Some(channel) = self.channels.get(&id) else {
             return false;
         };
-        let renderer = channel
-            .config
-            .display
-            .views
-            .first()
-            .map(build_display_view)
-            .unwrap_or_default();
-        let settings = self.display_settings_from(&display, channel.config.name.as_str(), renderer);
+        let settings = self.display_settings_from(
+            &display,
+            channel.config.name.as_str(),
+            display_renderer(&channel.config),
+        );
         match channel.handle.as_ref() {
             Some(ChannelHandle::Data(tasks)) => {
                 tasks.set_display_recording(enabled, settings).await
@@ -409,13 +406,10 @@ impl Listener {
             .map(|destination| DisplayRecordingSettings {
                 destination,
                 channel_name: channel_name.to_string(),
-                overwrite: if display.file_rotation != FileRotationPolicy::None
-                    && display.overwrite_policy == OverwritePolicy::Refuse
-                {
-                    OverwritePolicy::AppendIfExists
-                } else {
-                    display.overwrite_policy
-                },
+                overwrite: crate::record::effective_overwrite(
+                    display.overwrite_policy,
+                    display.file_rotation,
+                ),
                 file_rotation: display.file_rotation,
                 capacity: self.caps.raw_recording,
                 renderer,
@@ -1068,6 +1062,13 @@ impl Listener {
             MatchSetup {
                 rules: config.match_rules.clone(),
                 recording_settings: self.recording_settings(config),
+                // ... and the Display settings a `Record { Display | Both }` needs
+                // (§54): same lazy-create-from-destination contract as Raw.
+                display_recording_settings: self.display_settings_from(
+                    &config.display_recording,
+                    config.name.as_str(),
+                    display_renderer(config),
+                ),
                 // "Record on start": begin in the pipeline so a start failure surfaces
                 // like the live toggle (diagnostic + RecordingFaulted), not silently —
                 // including the no-destination case, which `begin_recording` faults.
@@ -1124,15 +1125,12 @@ impl Listener {
                 // `Refuse` is meaningless with rotation: each period is a *new* file, and
                 // re-opening the current period's file on a restart must append, not fail.
                 // Coerce it here — the single funnel for both the live and auto-begin
-                // paths — so a UI that left the policy at Refuse (the default) can't cause
-                // a spurious "file already exists" fault (§59).
-                overwrite: if raw.file_rotation != FileRotationPolicy::None
-                    && raw.overwrite_policy == OverwritePolicy::Refuse
-                {
-                    OverwritePolicy::AppendIfExists
-                } else {
-                    raw.overwrite_policy
-                },
+                // paths — so a UI that left the policy at Refuse can't cause a
+                // spurious "file already exists" fault (§59, `effective_overwrite`).
+                overwrite: crate::record::effective_overwrite(
+                    raw.overwrite_policy,
+                    raw.file_rotation,
+                ),
                 timestamps: raw.timestamp_enabled,
                 file_rotation: raw.file_rotation,
                 capacity: self.caps.raw_recording,
@@ -1218,6 +1216,17 @@ impl Listener {
 /// "Raw recording stopped" — are included). Stashed by `finish_stop` so the GUI's next
 /// poll delivers it even though the 5 Hz poll never fired during the synchronous stop.
 /// `None` for a TCP listener or a start-time fault (no pipeline).
+/// The renderer a Channel's `.disp` records with (§54): its stored primary
+/// display view (kept current by `set_view_config`), or the default view.
+fn display_renderer(config: &ChannelConfig) -> DisplayView {
+    config
+        .display
+        .views
+        .first()
+        .map(build_display_view)
+        .unwrap_or_default()
+}
+
 async fn drain_handle(handle: Option<ChannelHandle>) -> Option<ChannelSnapshot> {
     match handle {
         Some(ChannelHandle::Data(tasks)) => {

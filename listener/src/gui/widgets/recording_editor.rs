@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use crate::config::ChannelConfig;
-use crate::record::{FileRotationPolicy, OverwritePolicy};
+use crate::record::{effective_overwrite, FileRotationPolicy, OverwritePolicy};
 
 use super::super::theme;
 
@@ -57,12 +57,10 @@ fn recording_file_fields(
                 .color(theme::WARNING_AMBER),
         );
     }
-    // With rotation on, each period gets a fresh file, so "Refuse" (fail if the file
-    // exists) makes no sense — disable it, and move a Refuse selection to Append (the
-    // sensible default when re-opening a period's file, e.g. after a restart).
-    if rotating && *overwrite_policy == OverwritePolicy::Refuse {
-        *overwrite_policy = OverwritePolicy::AppendIfExists;
-    }
+    // With rotation on, each period gets a fresh file, so "Refuse" makes no
+    // sense — disable it and move a Refuse selection to Append, via the same
+    // shared §59 rule the runtime settings builders apply.
+    *overwrite_policy = effective_overwrite(*overwrite_policy, *file_rotation);
     ui.horizontal(|ui| {
         ui.label("On exists")
             .on_hover_text("What to do when the destination file already exists.");

@@ -50,6 +50,9 @@ use super::snapshot::{ChannelSnapshot, ChannelStats, PipelineRequest, StreamDelt
 pub(crate) struct MatchSetup {
     pub(crate) rules: Vec<MatchRule>,
     pub(crate) recording_settings: Option<RawRecordingSettings>,
+    /// Display sibling of `recording_settings` (§50.2/§54): what a match-triggered
+    /// `Record { target: Display | Both }` needs to lazily create the `.disp`.
+    pub(crate) display_recording_settings: Option<DisplayRecordingSettings>,
     /// "Record on start" (§53): the pipeline begins recording at startup. Set when the
     /// channel's `raw_recording.enabled` is true and a destination is configured.
     pub(crate) auto_begin_recording: bool,
@@ -64,6 +67,7 @@ impl MatchSetup {
         Self {
             rules: Vec::new(),
             recording_settings: None,
+            display_recording_settings: None,
             auto_begin_recording: false,
             prior_diagnostics: Vec::new(),
         }
@@ -133,6 +137,9 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     pipeline = pipeline.with_match_rules(&match_setup.rules);
     if let Some(settings) = match_setup.recording_settings {
         pipeline = pipeline.with_recording_settings(settings);
+    }
+    if let Some(settings) = match_setup.display_recording_settings {
+        pipeline = pipeline.with_display_recording_settings(settings);
     }
     // "Record on start": the pipeline begins recording at startup (via the same path
     // as the live toggle), so it never pre-builds the recorder for this case.

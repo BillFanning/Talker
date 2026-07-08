@@ -23,6 +23,16 @@ use super::ListenerApp;
 /// min grows the button (so "Apply & Restart" doesn't clip).
 const CONTROL_BUTTON_SIZE: egui::Vec2 = egui::vec2(96.0, 32.0);
 
+/// Which recording tap a shared control targets (ADR-013): the byte-exact Raw
+/// `.raw` or the rendered Display `.disp`. The two blocks are deliberately
+/// symmetric — one enum keeps the header button and the live-persist fold a
+/// single implementation each.
+#[derive(Clone, Copy)]
+enum RecTap {
+    Raw,
+    Display,
+}
+
 impl ListenerApp {
     pub(super) fn show_detail(&mut self, ui: &mut egui::Ui) {
         let Some(id) = self.selected else {
@@ -171,8 +181,10 @@ impl ListenerApp {
             headline: String,
             headline_color: egui::Color32,
             counts: (usize, usize, usize),
-            /// The full diagnostics log, chronological (oldest → newest).
-            entries: Vec<crate::diagnostics::Diagnostic>,
+            /// The full diagnostics log, chronological (oldest → newest) — the
+            /// per-snapshot cache from the view-model (an O(1) `Rc` clone per
+            /// frame; the flatten+sort happens once per poll, not per repaint).
+            entries: std::rc::Rc<Vec<crate::diagnostics::Diagnostic>>,
         }
         let view = self.state.channel(id);
         // The diagnostics log comes *only* from the snapshot — the GUI never synthesizes
@@ -181,15 +193,19 @@ impl ListenerApp {
         // fault (which never ran a pipeline) is retained by the runtime and served via a
         // minimal snapshot for the faulted channel. The snapshot is kept across stop/start
         // so a previous run's messages persist.
-        let (entries, counts) = match view.and_then(|v| v.snapshot.as_ref()) {
-            Some(s) => {
-                let d = &s.diagnostics;
-                let counts = (d.events.len(), d.warnings.len(), d.errors.len());
-                // One chronological timeline across severities (the snapshot owns the
-                // flatten+sort; the GUI just renders it).
-                (d.clone().into_sorted_vec(), counts)
+        let (entries, counts) = match view {
+            Some(v) => {
+                let counts = v
+                    .snapshot
+                    .as_ref()
+                    .map(|s| {
+                        let d = &s.diagnostics;
+                        (d.events.len(), d.warnings.len(), d.errors.len())
+                    })
+                    .unwrap_or((0, 0, 0));
+                (v.sorted_diagnostics.clone(), counts)
             }
-            None => (Vec::new(), (0, 0, 0)),
+            None => (std::rc::Rc::new(Vec::new()), (0, 0, 0)),
         };
         // Always shown — an empty log renders a neutral "no diagnostics yet"
         // headline so the section doesn't pop into existence on the first entry.
@@ -438,11 +454,10 @@ impl ListenerApp {
     /// state glyph + Start/Stop button, over a collapsible setup) and, right under
     /// it, the **Display** section in the same shape (ADR-013 — two independent
     /// recordings, same options). The Raw live toggle reads the settings from the
-    /// editor at click time (ADR-012); Raw setup edits apply live, Display setup
-    /// edits apply via Apply & Restart (the runtime builds the display recorder at
-    /// channel start).
+    /// editor at click time (ADR-012); both taps' setup edits apply live
+    /// (`persist_recording`), never via Apply & Restart.
     ///
-    /// Kept in small pieces (the header rows, `raw_record_button`,
+    /// Kept in small pieces (the header rows, `record_button`,
     /// `recording_setup_section`) because this block is still evolving — add new
     /// recording controls as their own helpers rather than growing this method.
     fn show_recording_block(
@@ -461,7 +476,7 @@ impl ListenerApp {
             // ■/●/⚠ carries the state.
             let (glyph, color, _text) = recording_indicator(recording);
             paint_glyph(ui, glyph, recording_glyph_size(glyph), color);
-            self.raw_record_button(ui, id, status, recording);
+            self.record_button(ui, id, status, recording, RecTap::Raw);
         });
         if self.edit_draft.as_ref().map(|(eid, _)| *eid) != Some(id) {
             ui.label(egui::RichText::new("(select the channel to edit)").weak());
@@ -476,7 +491,7 @@ impl ListenerApp {
                 edit_raw_recording(ui, config)
             });
         }
-        self.persist_raw_recording(id);
+        self.persist_recording(id, RecTap::Raw);
 
         // Display recording (§54): the sibling tap, same options, same layout, same
         // live toggle (ADR-012/-013) — begin/stop mid-run from click-time settings.
@@ -486,7 +501,7 @@ impl ListenerApp {
             ui.label(bold("Record Display"));
             let (glyph, color, _text) = recording_indicator(display_recording);
             paint_glyph(ui, glyph, recording_glyph_size(glyph), color);
-            self.display_record_button(ui, id, status, display_recording);
+            self.record_button(ui, id, status, display_recording, RecTap::Display);
         });
         if let Some((_, config)) = &mut self.edit_draft {
             let summary = {
@@ -497,126 +512,50 @@ impl ListenerApp {
                 edit_display_recording(ui, config)
             });
         }
-        self.persist_display_recording(id);
+        self.persist_recording(id, RecTap::Display);
     }
 
-    /// The Display-recording controls on its header row: "Record on start"
-    /// (`display_recording.enabled` — begins when the channel next starts, §54) and,
-    /// for a running channel, the live Record/Stop button reading the on-screen
-    /// settings at click time — `raw_record_button`'s sibling (ADR-012).
-    fn display_record_button(
+    /// The recording controls on a tap's header row: a "Record on start" toggle
+    /// (begins recording when the channel next starts, §53/§54) and, for a running
+    /// channel, the live Record/Stop button (ADR-012). The button reads the
+    /// on-screen settings *at click time* (from the edit draft) and sends them with
+    /// the command, so recording goes exactly where the controls say — no restart,
+    /// no Apply. One implementation for both taps (ADR-013 symmetry).
+    fn record_button(
         &mut self,
         ui: &mut egui::Ui,
         id: ChannelId,
         status: ChannelStatus,
         recording: Option<RecordingState>,
+        tap: RecTap,
     ) {
+        // "Record on start" — the auto-start flag, editable whether or not the
+        // channel is running (it governs the next start).
         if let Some((_, config)) = &mut self.edit_draft {
-            ui.checkbox(&mut config.display_recording.enabled, "Record on start")
-                .on_hover_text(
-                    "Record the rendered view output (.disp) — what the display shows, \
-                     not the raw bytes (§54) — automatically when the channel starts.",
-                );
+            let (flag, hover) = match tap {
+                RecTap::Raw => (
+                    &mut config.raw_recording.enabled,
+                    "Begin recording automatically when the channel starts (§53).",
+                ),
+                RecTap::Display => (
+                    &mut config.display_recording.enabled,
+                    "Record the rendered view output (.disp) — what the display shows,                      not the raw bytes (§54) — automatically when the channel starts.",
+                ),
+            };
+            ui.checkbox(flag, "Record on start").on_hover_text(hover);
         }
         if status != ChannelStatus::Running {
             return;
         }
-        let draft_display = self
-            .edit_draft
-            .as_ref()
-            .filter(|(eid, _)| *eid == id)
-            .map(|(_, cfg)| cfg.display_recording.clone());
-        let has_dest = draft_display
-            .as_ref()
-            .is_some_and(|r| r.destination.is_some());
-        let recording_now = matches!(recording, Some(RecordingState::Enabled));
-        let label = if recording_now { "Stop" } else { "Record" };
-        let resp = ui.add_enabled(
-            has_dest || recording_now,
-            egui::Button::new(label).min_size(egui::vec2(CONTROL_BUTTON_SIZE.x, 0.0)),
-        );
-        let resp = if !has_dest && !recording_now {
-            resp.on_hover_text("Set a destination below first")
-        } else {
-            resp
-        };
-        if resp.clicked() {
-            let display = draft_display.unwrap_or_default();
-            self.send(UiCommand::SetDisplayRecording(
-                id,
-                !recording_now,
-                Box::new(display),
-            ));
-        }
-    }
-
-    /// Persist Display recording edits into the stored config and runtime — the
-    /// sibling of [`persist_raw_recording`](Self::persist_raw_recording): Display
-    /// recording is live now (ADR-012), so its edits never travel through Apply &
-    /// Restart; without this, a profile save wouldn't capture them.
-    fn persist_display_recording(&mut self, id: ChannelId) {
         let draft = self
             .edit_draft
             .as_ref()
             .filter(|(eid, _)| *eid == id)
-            .map(|(_, cfg)| cfg.display_recording.clone());
-        let Some(draft) = draft else { return };
-        if let Some(view) = self.state.channel_mut(id) {
-            if view.config.display_recording != draft {
-                view.config.display_recording = draft.clone();
-                self.send(UiCommand::SetDisplayRecordingConfig(id, Box::new(draft)));
-            }
-        }
-    }
-
-    /// Persist Raw recording edits (destination/rotation/overwrite/"record on start").
-    /// Raw recording is applied live (no restart), so its edits never travel through
-    /// the Apply & Restart path — without this, a profile save wouldn't capture them.
-    /// When the draft's `raw_recording` differs from the channel's stored config, fold
-    /// it into the stored config and sync the runtime (`SetRawRecordingConfig`).
-    fn persist_raw_recording(&mut self, id: ChannelId) {
-        let draft = self
-            .edit_draft
-            .as_ref()
-            .filter(|(eid, _)| *eid == id)
-            .map(|(_, cfg)| cfg.raw_recording.clone());
-        let Some(draft) = draft else { return };
-        if let Some(view) = self.state.channel_mut(id) {
-            if view.config.raw_recording != draft {
-                view.config.raw_recording = draft.clone();
-                self.send(UiCommand::SetRawRecordingConfig(id, Box::new(draft)));
-            }
-        }
-    }
-
-    /// The Raw-recording controls on the header row: a "Record on start" toggle (the
-    /// `raw_recording.enabled` flag — begins recording when the channel next starts,
-    /// §53) and, for a running channel, the live Start/Stop Record button (ADR-012).
-    /// The button reads the on-screen settings *at click time* (from the edit draft) and
-    /// sends them with the command, so recording goes exactly where the controls say —
-    /// no restart, no Apply.
-    fn raw_record_button(
-        &mut self,
-        ui: &mut egui::Ui,
-        id: ChannelId,
-        status: ChannelStatus,
-        recording: Option<RecordingState>,
-    ) {
-        // "Record on start" — the auto-start flag, editable whether or not the channel
-        // is running (it governs the next start). Edits the draft's raw_recording.enabled.
-        if let Some((_, config)) = &mut self.edit_draft {
-            ui.checkbox(&mut config.raw_recording.enabled, "Record on start")
-                .on_hover_text("Begin recording automatically when the channel starts (§53).");
-        }
-        if status != ChannelStatus::Running {
-            return;
-        }
-        let draft_raw = self
-            .edit_draft
-            .as_ref()
-            .filter(|(eid, _)| *eid == id)
-            .map(|(_, cfg)| cfg.raw_recording.clone());
-        let has_dest = draft_raw.as_ref().is_some_and(|r| r.destination.is_some());
+            .map(|(_, cfg)| cfg);
+        let has_dest = draft.is_some_and(|cfg| match tap {
+            RecTap::Raw => cfg.raw_recording.destination.is_some(),
+            RecTap::Display => cfg.display_recording.destination.is_some(),
+        });
         let recording_now = matches!(recording, Some(RecordingState::Enabled));
         let label = if recording_now { "Stop" } else { "Record" };
         // Match the start-channel button's *width* (96) but keep the default height —
@@ -632,8 +571,58 @@ impl ListenerApp {
             resp
         };
         if resp.clicked() {
-            let raw = draft_raw.unwrap_or_default();
-            self.send(UiCommand::SetRecording(id, !recording_now, Box::new(raw)));
+            let begin = !recording_now;
+            let cmd = match tap {
+                RecTap::Raw => UiCommand::SetRecording(
+                    id,
+                    begin,
+                    Box::new(draft.map(|c| c.raw_recording.clone()).unwrap_or_default()),
+                ),
+                RecTap::Display => UiCommand::SetDisplayRecording(
+                    id,
+                    begin,
+                    Box::new(
+                        draft
+                            .map(|c| c.display_recording.clone())
+                            .unwrap_or_default(),
+                    ),
+                ),
+            };
+            self.send(cmd);
+        }
+    }
+
+    /// Persist a tap's recording edits into the stored config and runtime. Both
+    /// recordings are live fields (ADR-012), so their edits never travel through
+    /// the Apply & Restart path — without this, a profile save wouldn't capture
+    /// them. When the draft differs from the channel's stored config, fold it in
+    /// and sync the runtime.
+    fn persist_recording(&mut self, id: ChannelId, tap: RecTap) {
+        let Some((eid, cfg)) = self.edit_draft.as_ref() else {
+            return;
+        };
+        if *eid != id {
+            return;
+        }
+        match tap {
+            RecTap::Raw => {
+                let draft = cfg.raw_recording.clone();
+                if let Some(view) = self.state.channel_mut(id) {
+                    if view.config.raw_recording != draft {
+                        view.config.raw_recording = draft.clone();
+                        self.send(UiCommand::SetRawRecordingConfig(id, Box::new(draft)));
+                    }
+                }
+            }
+            RecTap::Display => {
+                let draft = cfg.display_recording.clone();
+                if let Some(view) = self.state.channel_mut(id) {
+                    if view.config.display_recording != draft {
+                        view.config.display_recording = draft.clone();
+                        self.send(UiCommand::SetDisplayRecordingConfig(id, Box::new(draft)));
+                    }
+                }
+            }
         }
     }
 }

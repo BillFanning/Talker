@@ -24,12 +24,16 @@ pub struct RenderAnnotation {
     pub text: String,
 }
 
-/// ASCII control mnemonics for 0x00..=0x1F (index == code point).
-const CONTROL_NAMES: [&str; 32] = [
-    "NUL", "SOH", "STX", "ETX", "EOT", "ENQ", "ACK", "BEL", "BS", "TAB", "LF", "VT", "FF", "CR",
-    "SO", "SI", "DLE", "DC1", "DC2", "DC3", "DC4", "NAK", "SYN", "ETB", "CAN", "EM", "SUB", "ESC",
-    "FS", "GS", "RS", "US",
+/// Bracketed ASCII control tokens for 0x00..=0x1F (index == code point),
+/// pre-formed so Token rendering never allocates per character.
+const CONTROL_TOKENS: [&str; 32] = [
+    "[NUL]", "[SOH]", "[STX]", "[ETX]", "[EOT]", "[ENQ]", "[ACK]", "[BEL]", "[BS]", "[TAB]",
+    "[LF]", "[VT]", "[FF]", "[CR]", "[SO]", "[SI]", "[DLE]", "[DC1]", "[DC2]", "[DC3]", "[DC4]",
+    "[NAK]", "[SYN]", "[ETB]", "[CAN]", "[EM]", "[SUB]", "[ESC]", "[FS]", "[GS]", "[RS]", "[US]",
 ];
+
+/// Uppercase hex digits for direct two-digit emission (no `format!`).
+const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
 
 /// Whether a character is "special" — a control character or the space — and so
 /// gets replaced by the Token/Glyph/HexEscape renderings (§43, §46). Space is
@@ -39,31 +43,79 @@ fn is_special(c: char) -> bool {
     cp <= 0x20 || cp == 0x7F
 }
 
-/// Render one character under a character-rendering mode (§46).
-fn render_char(c: char, mode: CharacterRendering) -> String {
-    match mode {
-        // Pass the character through unchanged — including control characters,
-        // which Raw display does not interpret (§43). Use the other modes to
-        // make them visible.
-        CharacterRendering::Native => c.to_string(),
-        CharacterRendering::Token => match c {
-            _ if !is_special(c) => c.to_string(),
-            ' ' => "[SP]".to_string(),
-            '\u{7F}' => "[DEL]".to_string(),
-            c => format!("[{}]", CONTROL_NAMES[c as usize]),
-        },
-        CharacterRendering::Glyph => match c as u32 {
-            // Control Pictures block: U+2400 + code point covers 0x00..=0x20
-            // (so space → U+2420 ␠); DEL → U+2421 ␡.
-            cp @ 0..=0x20 => char::from_u32(0x2400 + cp).unwrap().to_string(),
-            0x7F => '\u{2421}'.to_string(),
-            _ => c.to_string(),
-        },
-        CharacterRendering::HexEscape => {
-            if is_special(c) {
-                format!("<{:02X}>", c as u32)
-            } else {
-                c.to_string()
+/// Direct cell emitter for Raw mode: writes cells (each kept intact) straight
+/// into the output, soft-wrapping at `width` columns (§43). Replaces the former
+/// per-cell `Vec<String>` — one allocation per *render*, not per byte.
+struct CellWriter {
+    out: String,
+    width: Option<usize>,
+    line_len: usize,
+}
+
+impl CellWriter {
+    fn new(width: Option<usize>, capacity: usize) -> Self {
+        Self {
+            out: String::with_capacity(capacity),
+            width: width.filter(|&w| w > 0),
+            line_len: 0,
+        }
+    }
+
+    /// Account for a cell of `len` columns, wrapping first if it won't fit —
+    /// the cell itself stays intact (§43 wrapping).
+    fn start_cell(&mut self, len: usize) {
+        if let Some(w) = self.width {
+            if self.line_len > 0 && self.line_len + len > w {
+                self.out.push('\n');
+                self.line_len = 0;
+            }
+        }
+        self.line_len += len;
+    }
+
+    /// An annotation cell (an already-formatted string, e.g. a Mark timestamp).
+    fn cell_str(&mut self, s: &str) {
+        self.start_cell(s.chars().count());
+        self.out.push_str(s);
+    }
+
+    fn cell_char(&mut self, c: char) {
+        self.start_cell(1);
+        self.out.push(c);
+    }
+
+    /// One rendered character cell (§46) — allocation-free per character.
+    fn cell_rendered(&mut self, c: char, mode: CharacterRendering) {
+        match mode {
+            // Pass the character through unchanged — including control characters,
+            // which Raw display does not interpret (§43). Use the other modes to
+            // make them visible.
+            CharacterRendering::Native => self.cell_char(c),
+            CharacterRendering::Token => match c {
+                _ if !is_special(c) => self.cell_char(c),
+                ' ' => self.cell_str("[SP]"),
+                '\u{7F}' => self.cell_str("[DEL]"),
+                c => self.cell_str(CONTROL_TOKENS[c as usize]),
+            },
+            CharacterRendering::Glyph => match c as u32 {
+                // Control Pictures block: U+2400 + code point covers 0x00..=0x20
+                // (so space → U+2420 ␠); DEL → U+2421 ␡.
+                cp @ 0..=0x20 => self.cell_char(char::from_u32(0x2400 + cp).unwrap()),
+                0x7F => self.cell_char('\u{2421}'),
+                _ => self.cell_char(c),
+            },
+            CharacterRendering::HexEscape => {
+                if is_special(c) {
+                    // `<XX>` — is_special caps the code point at 0x7F, two digits.
+                    let cp = c as usize;
+                    self.start_cell(4);
+                    self.out.push('<');
+                    self.out.push(HEX_DIGITS[(cp >> 4) & 0xF] as char);
+                    self.out.push(HEX_DIGITS[cp & 0xF] as char);
+                    self.out.push('>');
+                } else {
+                    self.cell_char(c)
+                }
             }
         }
     }
@@ -124,59 +176,54 @@ fn split_run(
 }
 
 /// Render bytes as Hex (§45): each byte as two uppercase hex digits, joined by
-/// `separator`. When `bytes_per_line` is `Some`, wrap to that many bytes per
-/// line. `annotations` are spliced as extra cells before/after their target byte.
+/// `separator`. When `bytes_per_line` is `Some`, wrap to that many *cells* per
+/// line (annotation cells count, matching the old per-cell chunking).
+/// `annotations` are spliced as extra cells before/after their target byte.
+/// Emits directly into one pre-sized `String` — no per-byte allocation.
 fn render_hex(
     bytes: &[u8],
     separator: &str,
     bytes_per_line: Option<usize>,
     annotations: &[RenderAnnotation],
 ) -> String {
-    // Build the ordered list of cells (each an already-formatted token), inserting
-    // annotation strings as their own cells around the target byte's hex pair.
+    let per_line = bytes_per_line.filter(|&n| n > 0);
     let mut walker = AnnotationWalker::new(annotations);
-    let mut cells: Vec<String> = Vec::with_capacity(bytes.len());
+    let mut out = String::with_capacity(bytes.len() * (2 + separator.len()));
+    let mut cells_on_line = 0usize;
+    // Start a new cell: a newline once the line is full, else the separator.
+    let start_cell = |out: &mut String, cells_on_line: &mut usize| {
+        if *cells_on_line > 0 {
+            if per_line.is_some_and(|n| *cells_on_line >= n) {
+                out.push('\n');
+                *cells_on_line = 0;
+            } else {
+                out.push_str(separator);
+            }
+        }
+        *cells_on_line += 1;
+    };
     for (i, b) in bytes.iter().enumerate() {
         let (before, after) = split_run(walker.run_at(i));
-        cells.extend(before.map(str::to_string));
-        cells.push(format!("{b:02X}"));
-        cells.extend(after.map(str::to_string));
+        for s in before {
+            start_cell(&mut out, &mut cells_on_line);
+            out.push_str(s);
+        }
+        start_cell(&mut out, &mut cells_on_line);
+        out.push(HEX_DIGITS[(b >> 4) as usize] as char);
+        out.push(HEX_DIGITS[(b & 0xF) as usize] as char);
+        for s in after {
+            start_cell(&mut out, &mut cells_on_line);
+            out.push_str(s);
+        }
     }
     // Annotations targeting the one-past-the-end offset (an `After` on the final byte
     // is handled above; a `Before` at len is a trailing mark) attach at the end.
     let (end_before, _) = split_run(walker.run_at(bytes.len()));
-    cells.extend(end_before.map(str::to_string));
-
-    match bytes_per_line.filter(|&n| n > 0) {
-        Some(n) => cells
-            .chunks(n)
-            .map(|chunk| chunk.join(separator))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => cells.join(separator),
+    for s in end_before {
+        start_cell(&mut out, &mut cells_on_line);
+        out.push_str(s);
     }
-}
-
-/// Join per-character cells, soft-wrapping at `width` columns while keeping each
-/// cell (which may be a multi-character token) intact (§43 wrapping).
-fn wrap_cells(cells: &[String], width: Option<usize>) -> String {
-    match width.filter(|&w| w > 0) {
-        None => cells.concat(),
-        Some(w) => {
-            let mut out = String::new();
-            let mut line_len = 0usize;
-            for cell in cells {
-                let len = cell.chars().count();
-                if line_len > 0 && line_len + len > w {
-                    out.push('\n');
-                    line_len = 0;
-                }
-                out.push_str(cell);
-                line_len += len;
-            }
-            out
-        }
-    }
+    out
 }
 
 /// Hard-wrap each existing line of `text` to `width` characters.
@@ -296,11 +343,29 @@ impl DisplayView {
     }
 
     /// Render raw stream bytes, splicing inline `annotations` (§50.2 Mark
-    /// timestamps) before/after their target byte in every mode. `annotations` must
-    /// be sorted by `offset`; offsets past the span's end are ignored. Text
-    /// insertion only — no byte→coordinate mapping — so it works uniformly across
-    /// Raw, Rendered, and Hex.
+    /// timestamps) before/after their target byte in every mode. Annotations may
+    /// arrive in any order (sorted internally); offsets past the span's end are
+    /// ignored. Text insertion only — no byte→coordinate mapping — so it works
+    /// uniformly across Raw, Rendered, and Hex.
     pub fn render_text_annotated(&self, bytes: &[u8], annotations: &[RenderAnnotation]) -> String {
+        // The forward-only AnnotationWalker needs offset-sorted input and would
+        // silently drop an out-of-order (lower-offset) annotation. Callers mostly
+        // pass sorted lists, but a chunk where several rules fired collects its
+        // annotations rule-major, which can interleave offsets — enforce the
+        // invariant here (O(n) check when already sorted; stable sort otherwise,
+        // so equal-offset marks keep their arrival order) rather than make every
+        // call site re-prove it.
+        let sorted_buf: Vec<RenderAnnotation>;
+        let annotations = if annotations.is_sorted_by_key(|a| a.offset) {
+            annotations
+        } else {
+            sorted_buf = {
+                let mut v = annotations.to_vec();
+                v.sort_by_key(|a| a.offset);
+                v
+            };
+            &sorted_buf
+        };
         let wrap = matches!(self.wrapping, WrappingMode::Wrap);
         match self.mode {
             DisplayMode::Hex => {
@@ -309,18 +374,25 @@ impl DisplayView {
             }
             DisplayMode::Raw => {
                 // One cell per byte's rendered char, with annotation strings spliced
-                // in as their own cells so wrapping keeps each intact.
+                // in as their own cells so wrapping keeps each intact — emitted
+                // straight into the output (no per-byte allocation).
                 let mut walker = AnnotationWalker::new(annotations);
-                let mut cells: Vec<String> = Vec::with_capacity(bytes.len());
+                let mut w = CellWriter::new(if wrap { self.wrap_width } else { None }, bytes.len());
                 for (c, offset) in decode_with_offsets(bytes, self.encoding) {
                     let (before, after) = split_run(walker.run_at(offset));
-                    cells.extend(before.map(str::to_string));
-                    cells.push(render_char(c, self.character_rendering));
-                    cells.extend(after.map(str::to_string));
+                    for s in before {
+                        w.cell_str(s);
+                    }
+                    w.cell_rendered(c, self.character_rendering);
+                    for s in after {
+                        w.cell_str(s);
+                    }
                 }
                 let (end_before, _) = split_run(walker.run_at(bytes.len()));
-                cells.extend(end_before.map(str::to_string));
-                wrap_cells(&cells, if wrap { self.wrap_width } else { None })
+                for s in end_before {
+                    w.cell_str(s);
+                }
+                w.out
             }
             DisplayMode::Rendered => {
                 let text = render_rendered(bytes, self.encoding, annotations);
@@ -519,6 +591,34 @@ mod tests {
         let anns = [ann(1, AnnotationPlacement::Before, "[T]")];
         // Cells: 41, [T], 42, 43 → 2 per line.
         assert_eq!(v.render_text_annotated(b"ABC", &anns), "41 [T]\n42 43");
+    }
+
+    #[test]
+    fn unsorted_annotations_all_splice() {
+        // Regression: annotations collected rule-major can interleave offsets
+        // (rule A at 5, rule B at 2). The forward-only walker would silently drop
+        // the lower one; the renderer sorts internally so both splice.
+        let v = view(DisplayMode::Rendered, CharacterRendering::Native);
+        let anns = [
+            ann(5, AnnotationPlacement::Before, "[B]"),
+            ann(2, AnnotationPlacement::Before, "[A]"),
+        ];
+        assert_eq!(
+            v.render_text_annotated(b"xxAxxBxx", &anns),
+            "xx[A]Axx[B]Bxx"
+        );
+        // Same guarantee in Hex and Raw modes.
+        let v = view(DisplayMode::Hex, CharacterRendering::Native);
+        assert_eq!(
+            v.render_text_annotated(
+                b"abc",
+                &[
+                    ann(2, AnnotationPlacement::Before, "[2]"),
+                    ann(0, AnnotationPlacement::Before, "[0]"),
+                ]
+            ),
+            "[0] 61 62 [2] 63"
+        );
     }
 
     #[test]

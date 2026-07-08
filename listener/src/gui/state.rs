@@ -6,9 +6,11 @@
 //! update it drains, then lays widgets out by reading the resulting views.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::config::ChannelConfig;
 use crate::core::{ChannelId, MatchRuleId, RecordingState, RuntimeEvent};
+use crate::diagnostics::Diagnostic;
 use crate::runtime::{ChannelSnapshot, TriggeredMatch};
 use crate::transport::SerialControlLines;
 
@@ -81,6 +83,11 @@ pub struct ChannelView {
     /// accumulate separately in `stream_bytes` from incremental deltas. `None` until
     /// the first poll arrives.
     pub snapshot: Option<ChannelSnapshot>,
+    /// The snapshot's diagnostics flattened into one chronological timeline,
+    /// computed **once per snapshot arrival** (5 Hz) and shared by `Rc` — the
+    /// detail pane reads it every frame, and clone+sorting ~1.5 k entries at
+    /// repaint rate was the largest per-frame cost.
+    pub sorted_diagnostics: Rc<Vec<Diagnostic>>,
     /// Live serial control/status lines (§161) while running; `None` otherwise.
     pub control_lines: Option<SerialControlLines>,
     /// Raw-recording state from the latest snapshot/stats (§53), or `None` when no
@@ -130,6 +137,7 @@ impl ChannelView {
             errors: 0,
             last_error: None,
             snapshot: None,
+            sorted_diagnostics: Rc::new(Vec::new()),
             control_lines: None,
             recording: None,
             display_recording: None,
@@ -349,6 +357,9 @@ impl AppState {
                     // Pin this window's Mark timestamps before the snapshot is
                     // replaced — the snapshot's matches roll over, the pins stay.
                     view.merge_marks(&snapshot.matches);
+                    // Flatten+sort once per poll; the detail pane reads per frame.
+                    view.sorted_diagnostics =
+                        Rc::new(snapshot.diagnostics.clone().into_sorted_vec());
                     view.snapshot = Some(*snapshot);
                     clear_error_if_recording_ok(view);
                 }
@@ -577,6 +588,22 @@ mod tests {
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
         state.apply(UiUpdate::Event(RuntimeEvent::ChannelReconnectGaveUp(id)));
         assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Faulted);
+    }
+
+    #[test]
+    fn snapshot_fold_caches_the_sorted_diagnostics() {
+        // The chronological flatten+sort happens once per snapshot arrival, not
+        // per frame — the detail pane reads this cache.
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+        assert!(state.channel(id).unwrap().sorted_diagnostics.is_empty());
+
+        state.apply(UiUpdate::Snapshot(
+            id,
+            Box::new(snapshot_with(id, 1, 0.0, 2)),
+        ));
+        assert_eq!(state.channel(id).unwrap().sorted_diagnostics.len(), 2);
     }
 
     #[test]

@@ -54,6 +54,22 @@ pub enum OverwritePolicy {
     AppendIfExists,
 }
 
+/// The §59 on-exists rule under rotation, in one place: `Refuse` is meaningless
+/// when each period opens a fresh file — and re-opening the current period's
+/// file (e.g. after a restart) must append, not fail — so it coerces to
+/// `AppendIfExists`. Every other combination passes through. Shared by the
+/// runtime settings builders and the GUI editor so the rule cannot drift.
+pub fn effective_overwrite(
+    policy: OverwritePolicy,
+    rotation: FileRotationPolicy,
+) -> OverwritePolicy {
+    if rotation != FileRotationPolicy::None && policy == OverwritePolicy::Refuse {
+        OverwritePolicy::AppendIfExists
+    } else {
+        policy
+    }
+}
+
 /// Why a recording stopped (§56). In every case data received after the
 /// stopping instant is not written and the file is finalized.
 #[derive(Debug)]

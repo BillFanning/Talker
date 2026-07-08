@@ -87,10 +87,14 @@ Message-model removal). Everything below this block is verified done:
 - [ ] (Optional) Draw a glyph for a **bare** `Mark` (no timestamp) in the live stream
       view. A bare `Mark` still only writes the `‹MARK …›` line into `.disp`; the live
       viewer doesn't render a marker for it. Low priority — kept simple deliberately.
-- [ ] Match-`Record` to a Display/`Both` target: arm the display recorder. The
-      `RecordTarget::Display`/`Both` variants exist and the pipeline accepts them,
-      but only the Raw side is driven today (`apply_pending_records` skips
-      display-only); the display portion needs per-view display-recorder arming.
+- [x] Match-`Record` to a Display/`Both` target: `apply_pending_records` now routes
+      `Display`/`Both` through the same lazy begin / clean finalize path as the live
+      Display toggle (ADR-012's `set_display_recording`), with spawn-time
+      `DisplayRecordingSettings` built from the channel's display-recording config +
+      its primary view renderer. Pinned by
+      `record_action_display_target_begins_and_stops_display_recording`,
+      `record_action_both_target_drives_raw_and_display_together`, and the loopback
+      `set_display_recording_toggles_display_recording_live_through_the_orchestrator`.
 - [x] `DisplayViewConfig.hex_grouping` schema field (spec §45/§78) — `HexGrouping
       { bytes_per_group, groups_per_line }` added with `#[serde(default)]`, so
       profiles round-trip it (`b8960a1`). Pinned by `hex_grouping_round_trips_through_

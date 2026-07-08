@@ -389,6 +389,92 @@ async fn set_recording_toggles_raw_recording_live_through_the_orchestrator() {
 }
 
 #[tokio::test]
+async fn set_display_recording_toggles_display_recording_live_through_the_orchestrator() {
+    // ADR-012 (Display sibling): a running channel writes no .disp until
+    // set_display_recording(true), then the rendered view is captured from that
+    // point, and set_display_recording(false) finalizes it — no restart. The
+    // settings are supplied at call time, proving a destination set after start
+    // records live.
+    use listener::config::DisplayRecordingConfig;
+    use listener::record::{FileRotationPolicy, OverwritePolicy};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "listener-livedisp-it-{}-{}.disp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let port = free_udp_port();
+    let mut config = listener::config::templates::udp_template();
+    if let InterfaceConfig::Udp(udp) = &mut config.interface {
+        udp.bind_address = "127.0.0.1".to_string();
+        udp.port = port;
+    }
+    let live_display = DisplayRecordingConfig {
+        enabled: false,
+        destination: Some(path.clone()),
+        overwrite_policy: OverwritePolicy::Overwrite,
+        file_rotation: FileRotationPolicy::None,
+    };
+
+    let mut listener = Listener::with_default_capacities();
+    let id = listener.add_channel(config);
+    listener.start(id).await.unwrap();
+
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // Data before enabling: received, but not display-recorded.
+    client
+        .send_to(b"before", ("127.0.0.1", port))
+        .await
+        .unwrap();
+    let _ = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 6).await;
+    assert!(listener
+        .snapshot(id)
+        .await
+        .unwrap()
+        .display_recording
+        .is_none());
+
+    // Live Begin with the settings supplied now (no restart), then data to capture.
+    assert!(
+        listener
+            .set_display_recording(id, true, live_display.clone())
+            .await
+    );
+    let _ = await_snapshot(&listener, id, |s| s.display_recording.is_some()).await;
+    client
+        .send_to(b"DURING", ("127.0.0.1", port))
+        .await
+        .unwrap();
+    let _ = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 12).await;
+
+    // Live Stop finalizes; later data is not written.
+    assert!(
+        listener
+            .set_display_recording(id, false, live_display)
+            .await
+    );
+    let _ = await_snapshot(&listener, id, |s| s.display_recording.is_none()).await;
+    client.send_to(b"after", ("127.0.0.1", port)).await.unwrap();
+    let _ = await_snapshot(&listener, id, |s| s.activity.total_bytes >= 17).await;
+
+    stop(&mut listener, id).await;
+
+    // The .disp holds only the span recorded while on (default view renders
+    // ASCII verbatim; the recorder writes one rendered chunk per line).
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("DURING"), "{written:?}");
+    assert!(
+        !written.contains("before") && !written.contains("after"),
+        "{written:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn raw_and_display_recording_run_to_independent_destinations() {
     // ADR-013: Raw and Display recording are independently configured and run
     // simultaneously to *different* files — the "Both" case the merged config could

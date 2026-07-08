@@ -352,6 +352,14 @@ impl ChannelPipeline {
         self
     }
 
+    /// Provide the Display recording settings (§50.2/§54) — the Raw sibling: a
+    /// match-triggered `Record { target: Display | Both, Begin }` lazily creates
+    /// the `.disp` from these; nothing is written before a firing.
+    pub fn with_display_recording_settings(mut self, settings: DisplayRecordingSettings) -> Self {
+        self.display_recording_settings = Some(settings);
+        self
+    }
+
     /// Mark "Record on start" (§53): `run_channel` begins recording once at startup,
     /// via the same path as the live toggle. Pair with `with_recording_settings`.
     pub fn with_auto_begin_recording(mut self) -> Self {
@@ -670,22 +678,35 @@ impl ChannelPipeline {
     }
 
     /// Apply queued `Record` actions (§50.2). Called from the async ingest loop,
-    /// since recorder creation/finalization is async. Raw/`Both` targets are
-    /// honoured by the byte-exact recorder; the display portion of `Display`/`Both`
-    /// is deferred (it needs per-view display-recorder wiring).
+    /// since recorder creation/finalization is async. `Raw` drives the byte-exact
+    /// recorder, `Display` the rendered `.disp`, `Both` drives both — each through
+    /// the same lazy begin / clean finalize paths as the live toggles (ADR-012),
+    /// so a missing destination faults with a clear diagnostic, never silently.
     pub async fn apply_pending_records(&mut self) {
         if self.pending_record_controls.is_empty() {
             return;
         }
         let pending = std::mem::take(&mut self.pending_record_controls);
         for req in pending {
-            let raw_targeted = matches!(req.target, RecordTarget::Raw | RecordTarget::Both);
-            if !raw_targeted {
-                continue; // Display-only target: deferred (no raw recorder to drive)
-            }
+            let raw = matches!(req.target, RecordTarget::Raw | RecordTarget::Both);
+            let display = matches!(req.target, RecordTarget::Display | RecordTarget::Both);
             match req.control {
-                RecordControl::Begin => self.begin_recording().await,
-                RecordControl::Stop => self.stop_recording().await,
+                RecordControl::Begin => {
+                    if raw {
+                        self.begin_recording().await;
+                    }
+                    if display {
+                        self.begin_display_recording().await;
+                    }
+                }
+                RecordControl::Stop => {
+                    if raw {
+                        self.stop_recording().await;
+                    }
+                    if display {
+                        self.stop_display_recording().await;
+                    }
+                }
             }
         }
     }
@@ -1140,7 +1161,7 @@ impl ChannelPipeline {
             match_boundary_saves: self.match_rules.boundary_saves(),
             // The scrollback bytes are fetched incrementally (StreamDelta), not
             // bundled here — only the cursor target travels in the snapshot.
-            stream_end_offset: self.stream_dropped + self.stream_buf.len() as u64,
+            stream_end_offset: self.stream_end_offset(),
             ingest_queue: self.ingest_queue(),
             raw_recording_queue: self.raw_recording_queue(),
         }
@@ -1166,7 +1187,17 @@ impl ChannelPipeline {
         // Clamp the requested cursor into the retained window.
         let from = since.clamp(start, end);
         let skip = (from - start) as usize;
-        let bytes: Arc<[u8]> = self.stream_buf.iter().skip(skip).copied().collect();
+        // Bulk-copy the two ring segments (one memcpy each) instead of a per-byte
+        // iterator walk.
+        let (front, back) = self.stream_buf.as_slices();
+        let mut out = Vec::with_capacity(self.stream_buf.len() - skip);
+        if skip < front.len() {
+            out.extend_from_slice(&front[skip..]);
+            out.extend_from_slice(back);
+        } else {
+            out.extend_from_slice(&back[skip - front.len()..]);
+        }
+        let bytes: Arc<[u8]> = out.into();
         StreamDelta {
             base_offset: from,
             bytes,
@@ -2087,6 +2118,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_action_display_target_begins_and_stops_display_recording() {
+        // §50.2/§54: Record { target: Display } drives the .disp — lazily created
+        // at BEGIN from the spawn-time settings, finalized at STOP — while the
+        // Raw side is untouched (no raw recorder ever attaches).
+        let cid = ChannelId::new();
+        let path = temp_path("armed-disp");
+        let mut p = pipeline(cid, PipelineCapacities::default())
+            .with_match_rules(&[
+                byte_rule(
+                    "begin",
+                    b"BEGIN",
+                    vec![MatchAction::Record {
+                        target: RecordTarget::Display,
+                        control: RecordControl::Begin,
+                    }],
+                ),
+                byte_rule(
+                    "stop",
+                    b"STOP",
+                    vec![MatchAction::Record {
+                        target: RecordTarget::Display,
+                        control: RecordControl::Stop,
+                    }],
+                ),
+            ])
+            .with_display_recording_settings(DisplayRecordingSettings {
+                destination: path.clone(),
+                channel_name: "armed-disp".to_string(),
+                overwrite: OverwritePolicy::Refuse,
+                file_rotation: FileRotationPolicy::None,
+                capacity: 64,
+                renderer: DisplayView::default(),
+            });
+
+        p.ingest(bytes_chunk(cid, b"before "));
+        p.apply_pending_records().await;
+        assert!(p.display_recording_state().is_none());
+
+        p.ingest(bytes_chunk(cid, b"BEGIN"));
+        p.apply_pending_records().await;
+        assert_eq!(p.display_recording_state(), Some(RecordingState::Enabled));
+        assert!(p.raw_recording_state().is_none(), "Raw is untouched");
+        p.ingest(bytes_chunk(cid, b"captured"));
+
+        p.ingest(bytes_chunk(cid, b"STOP"));
+        p.apply_pending_records().await;
+        assert!(p.display_recording_state().is_none());
+        p.ingest(bytes_chunk(cid, b"after"));
+        p.finish().await;
+
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(written.contains("captured"), "{written:?}");
+        assert!(
+            !written.contains("before") && !written.contains("after"),
+            "{written:?}"
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn record_action_both_target_drives_raw_and_display_together() {
+        // §50.2: Record { target: Both } begins/stops the byte-exact .raw and the
+        // rendered .disp in one firing — each via its own lazy-create settings.
+        let cid = ChannelId::new();
+        let raw_path = temp_path("both-raw");
+        let disp_path = temp_path("both-disp");
+        let mut p = pipeline(cid, PipelineCapacities::default())
+            .with_match_rules(&[
+                byte_rule(
+                    "begin",
+                    b"BEGIN",
+                    vec![MatchAction::Record {
+                        target: RecordTarget::Both,
+                        control: RecordControl::Begin,
+                    }],
+                ),
+                byte_rule(
+                    "stop",
+                    b"STOP",
+                    vec![MatchAction::Record {
+                        target: RecordTarget::Both,
+                        control: RecordControl::Stop,
+                    }],
+                ),
+            ])
+            .with_recording_settings(RawRecordingSettings {
+                destination: raw_path.clone(),
+                channel_name: "both".to_string(),
+                overwrite: OverwritePolicy::Refuse,
+                timestamps: false,
+                file_rotation: FileRotationPolicy::None,
+                capacity: 64,
+            })
+            .with_display_recording_settings(DisplayRecordingSettings {
+                destination: disp_path.clone(),
+                channel_name: "both".to_string(),
+                overwrite: OverwritePolicy::Refuse,
+                file_rotation: FileRotationPolicy::None,
+                capacity: 64,
+                renderer: DisplayView::default(),
+            });
+
+        p.ingest(bytes_chunk(cid, b"BEGIN"));
+        p.apply_pending_records().await;
+        assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
+        assert_eq!(p.display_recording_state(), Some(RecordingState::Enabled));
+        p.ingest(bytes_chunk(cid, b"captured"));
+
+        p.ingest(bytes_chunk(cid, b"STOP"));
+        p.apply_pending_records().await;
+        assert!(p.raw_recording_state().is_none());
+        assert!(p.display_recording_state().is_none());
+        p.finish().await;
+
+        // Raw is byte-exact from the match forward (the BEGIN chunk itself is not
+        // backfilled, §158); the .disp rendered the same span.
+        assert_eq!(tokio::fs::read(&raw_path).await.unwrap(), b"capturedSTOP");
+        let disp = tokio::fs::read_to_string(&disp_path).await.unwrap();
+        assert!(disp.contains("captured"), "{disp:?}");
+        let _ = tokio::fs::remove_file(&raw_path).await;
+        let _ = tokio::fs::remove_file(&disp_path).await;
+    }
+
+    #[tokio::test]
     async fn set_recording_begins_and_stops_raw_recording_live() {
         // ADR-012: live Record begin/stop without a restart, driven by set_recording
         // (no match rules). Shares the lazy begin / clean finalize path with the
@@ -2128,6 +2283,47 @@ mod tests {
         let written = tokio::fs::read(&path).await.unwrap();
         assert_eq!(written, b"capturedmore");
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn two_rules_with_interleaved_offsets_both_splice_into_disp() {
+        // Regression (renderer walker): apply_fired_rules collects annotations
+        // rule-major, so two timestamped Mark rules firing in one chunk can
+        // interleave offsets (rule ZZ at 5 collected before rule AA at 2). Both
+        // timestamps must land in the .disp — the renderer sorts internally.
+        use crate::config::{MarkPosition, MarkTimestamp};
+        use crate::core::TimestampConfig;
+        use crate::record::{start_display_recording, DisplayFileRecorder};
+        let cid = ChannelId::new();
+        let disp_path = temp_path("interleaved-marks");
+        let disp = DisplayFileRecorder::create(&disp_path, OverwritePolicy::Refuse)
+            .await
+            .unwrap();
+        let mark = |sep: &str| MatchAction::Mark {
+            timestamp: Some(MarkTimestamp {
+                position: MarkPosition::Before,
+                format: TimestampConfig::default(), // HH:MM:SS
+                separator: sep.to_string(),
+            }),
+        };
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&[
+            byte_rule("zz", b"ZZ", vec![mark("|z|")]),
+            byte_rule("aa", b"AA", vec![mark("|a|")]),
+        ]);
+        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+
+        // "AA" at offset 1 fires the SECOND rule; "ZZ" at offset 4 fires the
+        // first — collected order [ZZ@4, AA@1], i.e. offsets out of order.
+        p.ingest(bytes_chunk(cid, b"xAAxZZx"));
+        p.finish().await;
+
+        let disp_written = tokio::fs::read_to_string(&disp_path).await.unwrap();
+        assert!(
+            disp_written.contains("|a|AA"),
+            "the lower-offset rule's timestamp splices too: {disp_written:?}"
+        );
+        assert!(disp_written.contains("|z|ZZ"), "{disp_written:?}");
+        let _ = tokio::fs::remove_file(&disp_path).await;
     }
 
     #[tokio::test]
