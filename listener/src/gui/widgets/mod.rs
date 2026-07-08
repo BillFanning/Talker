@@ -9,7 +9,7 @@ mod match_rule_editor;
 mod recording_editor;
 mod status;
 
-pub(super) use format::{human_bytes, short_id};
+pub(super) use format::human_bytes;
 pub(super) use match_rule_editor::edit_mark_rules;
 pub(super) use recording_editor::{edit_display_recording, edit_raw_recording};
 pub(super) use status::{
@@ -436,6 +436,7 @@ pub(super) fn config_needs_restart(draft: &ChannelConfig, committed: &ChannelCon
     // Neutralize the live-applied fields so only restart-worthy edits register.
     a.name = committed.name.clone();
     a.raw_recording = committed.raw_recording.clone();
+    a.display_recording = committed.display_recording.clone();
     a.display = committed.display.clone();
     a.retention = committed.retention.clone();
     &a != committed
@@ -542,6 +543,14 @@ mod tests {
             "editing raw recording must not require an Apply & Restart"
         );
 
+        let mut disp = base.clone();
+        disp.display_recording.destination = Some(std::path::PathBuf::from("/tmp/x.disp"));
+        disp.display_recording.enabled = true;
+        assert!(
+            !config_needs_restart(&disp, &base),
+            "editing display recording must not require an Apply & Restart (ADR-012)"
+        );
+
         let mut view = base.clone();
         view.retention.byte_limit = Some(256 * 1024);
         if let Some(v) = view.display.views.first_mut() {
@@ -555,10 +564,5 @@ mod tests {
             udp.port = udp.port.wrapping_add(1);
         }
         assert!(config_needs_restart(&iface, &base));
-
-        // Display *recording* is config-driven (a restart), so it still registers.
-        let mut disp = base.clone();
-        disp.display_recording.destination = Some(std::path::PathBuf::from("/tmp/x.disp"));
-        assert!(config_needs_restart(&disp, &base));
     }
 }

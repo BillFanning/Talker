@@ -16,7 +16,7 @@ use super::super::view_prefs::{
     scroll_buffer_label, ViewPrefs, MAX_SCROLL_BUFFER_BYTES, MIN_SCROLL_BUFFER_BYTES,
     SCROLL_BUFFER_PRESETS_KB,
 };
-use super::super::widgets::{human_bytes, ColorScheme, MSG_FONT_SIZES};
+use super::super::widgets::{edit_mark_rules, human_bytes, ColorScheme, MSG_FONT_SIZES};
 use super::super::ListenerApp;
 
 impl ListenerApp {
@@ -60,7 +60,7 @@ impl ListenerApp {
         .show_header(ui, |ui| {
             // The collapse arrow is drawn by show_header; add the title + the
             // Pause/Resume button on the same row.
-            ui.label(bold("Configure view"));
+            ui.label(bold("Configure display"));
             if let Some((view_id, is_paused)) = view0 {
                 if is_paused {
                     if ui.button("Resume").clicked() {
@@ -78,7 +78,18 @@ impl ListenerApp {
                 }
             }
         })
-        .body(|ui| self.show_view_controls(ui, &mut prefs, stream_len));
+        .body(|ui| {
+            self.show_view_controls(ui, &mut prefs, stream_len);
+            // Inline Mark timestamps (§50.2) live here — they shape what the view
+            // (and `.disp`) show. They edit the draft config; committing goes
+            // through Apply & Restart (config_needs_restart counts match_rules).
+            ui.separator();
+            if let Some((eid, config)) = &mut self.edit_draft {
+                if *eid == id {
+                    edit_mark_rules(ui, config);
+                }
+            }
+        });
 
         // Persist any edit: update this channel's prefs + config and sync the runtime
         // (display + scroll-buffer retention; no restart — see SetViewConfig).
@@ -355,6 +366,11 @@ impl ListenerApp {
                 .on_hover_text(SCROLL_BUFFER_HINT);
             egui::ComboBox::from_id_salt("scroll_buffer")
                 .selected_text(scroll_buffer_label(prefs.scroll_buffer_bytes))
+                // Tall enough for every preset: the default popup max height sat
+                // right at the content height, so its (floating) scrollbar
+                // flashed in and out on hover. With room to spare the popup
+                // never scrolls and no scrollbar can appear.
+                .height(280.0)
                 .show_ui(ui, |ui| {
                     for &kb in SCROLL_BUFFER_PRESETS_KB {
                         let bytes =
@@ -386,36 +402,9 @@ impl ListenerApp {
             self.stream_cache = None;
             return;
         };
-        // Inline Mark timestamps (§50.2): rebase each firing's **view-space** offset
-        // (the `StreamDelta` offset space — not `byte_offset`, which counts bytes the
-        // paused view skipped) onto the accumulated window (front byte = cursor −
-        // buffered len), keep only those in-window, and splice their local timestamp
-        // text before/after the matched byte — exactly as the Display Recording does.
-        let window_start = view.stream_cursor - view.stream_bytes.len() as u64;
-        let annotations: Vec<RenderAnnotation> = view
-            .snapshot
-            .as_ref()
-            .map(|snap| {
-                snap.matches
-                    .iter()
-                    .filter_map(|m| {
-                        let mark = m.mark.as_ref()?;
-                        let offset = m.view_offset?;
-                        let within = offset.checked_sub(window_start)? as usize;
-                        (within <= view.stream_bytes.len()).then(|| RenderAnnotation {
-                            offset: within,
-                            placement: if mark.before {
-                                AnnotationPlacement::Before
-                            } else {
-                                AnnotationPlacement::After
-                            },
-                            text: mark.text.clone(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let marks_sig = annotations_signature(&annotations);
+        // The cache key hashes the pinned marks directly (no allocation) — the
+        // annotation list itself is only built below, on a cache miss.
+        let marks_sig = marks_signature(&view.marks);
         let key = super::super::StreamRenderKey {
             channel: id,
             cursor: view.stream_cursor,
@@ -428,22 +417,49 @@ impl ListenerApp {
         if self.stream_cache.as_ref().is_some_and(|c| c.key == key) {
             return; // still valid — reuse the cached rows
         }
+        // Inline Mark timestamps (§50.2): rebase each pinned mark's **view-space**
+        // offset onto the accumulated window (front byte = cursor − buffered len)
+        // and splice its text before/after the annotated byte — exactly as the
+        // Display Recording does. The source is the channel's persistent
+        // `marks` (folded from snapshot firings, lifetime tied to the bytes),
+        // NOT the snapshot's bounded rolling `matches` window — deriving from
+        // that made timestamps vanish from a paused view as firings churned.
+        // `marks` is offset-sorted, so the annotations come out sorted, which the
+        // renderer's forward-only walker requires.
+        let window_start = view.stream_cursor - view.stream_bytes.len() as u64;
+        let annotations: Vec<RenderAnnotation> = view
+            .marks
+            .iter()
+            .filter_map(|m| {
+                let within = m.offset.checked_sub(window_start)? as usize;
+                (within <= view.stream_bytes.len()).then(|| RenderAnnotation {
+                    offset: within,
+                    placement: if m.before {
+                        AnnotationPlacement::Before
+                    } else {
+                        AnnotationPlacement::After
+                    },
+                    text: m.text.clone(),
+                })
+            })
+            .collect();
         let text = renderer.render_text_annotated(view.stream_contiguous(), &annotations);
         let rows = split_stream_rows(&text, wrap_cols);
         self.stream_cache = Some(super::super::StreamRenderCache { key, rows });
     }
 }
 
-/// A cheap order-sensitive hash of the spliced annotations, so the row cache
-/// invalidates when the inline Mark timestamps change but the raw bytes don't.
-fn annotations_signature(annotations: &[RenderAnnotation]) -> u64 {
+/// A cheap order-sensitive hash of the pinned marks, so the row cache invalidates
+/// when the inline Mark timestamps change even though the raw bytes didn't —
+/// computed straight off the mark list, with no per-frame allocation.
+fn marks_signature(marks: &[crate::gui::state::StreamMark]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    annotations.len().hash(&mut h);
-    for a in annotations {
-        a.offset.hash(&mut h);
-        matches!(a.placement, AnnotationPlacement::Before).hash(&mut h);
-        a.text.hash(&mut h);
+    marks.len().hash(&mut h);
+    for m in marks {
+        m.offset.hash(&mut h);
+        m.before.hash(&mut h);
+        m.text.hash(&mut h);
     }
     h.finish()
 }

@@ -398,12 +398,19 @@ pub enum MatchAction {
 /// (§50.2). The time is the matched chunk's **arrival** time, formatted in local
 /// time per `format`, and inserted `position` (before/after) the match in the
 /// rendered display and Display Recording (`.disp`) — never in `.raw`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MarkTimestamp {
     #[serde(default)]
     pub position: MarkPosition,
     #[serde(default)]
     pub format: TimestampConfig,
+    /// Text appended immediately **after** the formatted timestamp (e.g. a space
+    /// or `", "`) to separate it from the adjacent data, in both positions:
+    /// `Before` renders `[ts][sep]match…`, `After` renders `…match[ts][sep]`.
+    /// Empty = nothing appended. Additive (`#[serde(default)]`), so profiles
+    /// written before this field round-trip (§72.1).
+    #[serde(default)]
+    pub separator: String,
 }
 
 /// Where a `Mark` timestamp is spliced relative to the matched bytes (§50.2).

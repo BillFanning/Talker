@@ -8,11 +8,35 @@
 use std::collections::HashMap;
 
 use crate::config::ChannelConfig;
-use crate::core::{ChannelId, RecordingState, RuntimeEvent};
-use crate::runtime::ChannelSnapshot;
+use crate::core::{ChannelId, MatchRuleId, RecordingState, RuntimeEvent};
+use crate::runtime::{ChannelSnapshot, TriggeredMatch};
 use crate::transport::SerialControlLines;
 
 use super::bridge::UiUpdate;
+
+/// One inline Mark timestamp pinned to a view-space byte offset (§50.2), owned by
+/// the GUI. The snapshot's `matches` is a bounded **rolling window** (the runtime
+/// keeps the last 256 firings): deriving the on-screen splices from it directly
+/// made a timestamp vanish as soon as its firing aged out — visibly, on a paused
+/// view, where the bytes stay frozen while firings keep churning off-screen. So
+/// firings are folded into this per-channel list instead, which lives exactly as
+/// long as the annotated byte is in `stream_bytes`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StreamMark {
+    /// Absolute view-space offset of the annotated byte
+    /// (`TriggeredMatch::view_offset` — the `StreamDelta` offset space).
+    pub offset: u64,
+    /// The firing rule — with `offset`, the dedup key across snapshots.
+    pub rule_id: MatchRuleId,
+    /// Splice the text before (`true`) or after the annotated byte.
+    pub before: bool,
+    /// The formatted timestamp text (separator included).
+    pub text: String,
+}
+
+/// Safety cap on retained marks per channel, alongside the byte-window trim —
+/// bounds memory if a dense rule marks nearly every byte of a large window.
+const MAX_STREAM_MARKS: usize = 4096;
 
 /// A Channel's lifecycle as the GUI understands it, derived from the event stream
 /// (the authoritative push surface, ADR-006).
@@ -62,10 +86,9 @@ pub struct ChannelView {
     /// Raw-recording state from the latest snapshot/stats (§53), or `None` when no
     /// recorder is attached. Drives the recording indicator in the detail pane.
     pub recording: Option<RecordingState>,
-    /// How many `BytePattern` matches were recovered across a read-chunk boundary
-    /// (§50.2) — the cross-chunk-carry measurement. From the latest snapshot/stats;
-    /// shown per-tab so it's visible even when the channel isn't selected.
-    pub boundary_saves: u64,
+    /// Display-recording state from the latest snapshot/stats (§54) — the Record
+    /// Display block's indicator. `None` when it isn't attached.
+    pub display_recording: Option<RecordingState>,
     /// Bounded-queue occupancy from the latest snapshot/stats (§99) — for stress
     /// testing / backpressure diagnosis. Shown in the detail pane.
     pub ingest_queue: crate::runtime::QueueDepth,
@@ -75,6 +98,12 @@ pub struct ChannelView {
     /// re-ships the whole buffer each poll. Capped (oldest dropped) at this channel's
     /// `view_prefs.scroll_buffer_bytes` — the same value the runtime retains.
     pub stream_bytes: std::collections::VecDeque<u8>,
+    /// Inline Mark timestamps pinned to the accumulated bytes (§50.2), sorted by
+    /// `offset` (the renderer needs ascending annotations). Folded from snapshot
+    /// firings by [`merge_marks`](Self::merge_marks); trimmed with the window;
+    /// cleared on restart. See [`StreamMark`] for why this outlives the
+    /// snapshot's bounded `matches` window.
+    pub marks: Vec<StreamMark>,
     /// Next absolute stream offset to request — the cursor handed to
     /// `Listener::stream_delta`. Advances as deltas are folded.
     pub stream_cursor: u64,
@@ -103,11 +132,52 @@ impl ChannelView {
             snapshot: None,
             control_lines: None,
             recording: None,
-            boundary_saves: 0,
+            display_recording: None,
             ingest_queue: crate::runtime::QueueDepth::default(),
             raw_recording_queue: None,
             stream_bytes: std::collections::VecDeque::new(),
+            marks: Vec::new(),
             stream_cursor: 0,
+        }
+    }
+
+    /// Fold a snapshot's recent firings into the persistent mark list. The
+    /// snapshot window is bounded and rolling, so this must be **idempotent** (a
+    /// firing appears in many consecutive snapshots — dedup on `(offset,
+    /// rule_id)`) and **additive** (a firing evicted from the window must not
+    /// take its on-screen timestamp with it). Firings without a mark or without
+    /// a view position (paused-view bytes, idle rules) contribute nothing.
+    fn merge_marks(&mut self, matches: &[TriggeredMatch]) {
+        for m in matches {
+            let (Some(offset), Some(mark)) = (m.view_offset, m.mark.as_ref()) else {
+                continue;
+            };
+            // Sorted by offset: binary-search the equal-offset run for the dedup
+            // check, and insert at its end to keep arrival order stable.
+            let lo = self.marks.partition_point(|s| s.offset < offset);
+            let run = self.marks[lo..]
+                .iter()
+                .take_while(|s| s.offset == offset)
+                .count();
+            if self.marks[lo..lo + run]
+                .iter()
+                .any(|s| s.rule_id == m.rule_id)
+            {
+                continue;
+            }
+            self.marks.insert(
+                lo + run,
+                StreamMark {
+                    offset,
+                    rule_id: m.rule_id,
+                    before: mark.before,
+                    text: mark.text.clone(),
+                },
+            );
+        }
+        if self.marks.len() > MAX_STREAM_MARKS {
+            let excess = self.marks.len() - MAX_STREAM_MARKS;
+            self.marks.drain(..excess); // oldest (lowest offsets) first
         }
     }
 
@@ -129,6 +199,13 @@ impl ChannelView {
         let overflow = self.stream_bytes.len().saturating_sub(cap);
         if overflow > 0 {
             self.stream_bytes.drain(..overflow);
+        }
+        // Marks live exactly as long as their annotated byte: drop those whose
+        // offset slid off the front of the window (including after a reset).
+        let window_start = self.stream_cursor - self.stream_bytes.len() as u64;
+        let evicted = self.marks.partition_point(|s| s.offset < window_start);
+        if evicted > 0 {
+            self.marks.drain(..evicted);
         }
     }
 
@@ -266,9 +343,12 @@ impl AppState {
                     view.warnings = snapshot.diagnostics.warnings.len();
                     view.errors = snapshot.diagnostics.errors.len();
                     view.recording = snapshot.raw_recording;
-                    view.boundary_saves = snapshot.match_boundary_saves;
+                    view.display_recording = snapshot.display_recording;
                     view.ingest_queue = snapshot.ingest_queue;
                     view.raw_recording_queue = snapshot.raw_recording_queue;
+                    // Pin this window's Mark timestamps before the snapshot is
+                    // replaced — the snapshot's matches roll over, the pins stay.
+                    view.merge_marks(&snapshot.matches);
                     view.snapshot = Some(*snapshot);
                     clear_error_if_recording_ok(view);
                 }
@@ -282,7 +362,7 @@ impl AppState {
                     view.warnings = stats.warning_count;
                     view.errors = stats.error_count;
                     view.recording = stats.raw_recording;
-                    view.boundary_saves = stats.match_boundary_saves;
+                    view.display_recording = stats.display_recording;
                     view.ingest_queue = stats.ingest_queue;
                     view.raw_recording_queue = stats.raw_recording_queue;
                     clear_error_if_recording_ok(view);
@@ -329,9 +409,10 @@ impl AppState {
                 if let Some(view) = self.views.get_mut(&id) {
                     view.last_error = None; // a successful start clears the prior error
                                             // A fresh Start resets the runtime's stream offset to 0, so drop
-                                            // any accumulated bytes/cursor from a previous run to avoid mixing
-                                            // old and new streams (§8.5).
+                                            // any accumulated bytes/cursor/marks from a previous run to avoid
+                                            // mixing old and new streams (§8.5).
                     view.stream_bytes.clear();
+                    view.marks.clear();
                     view.stream_cursor = 0;
                 }
             }
@@ -414,6 +495,7 @@ fn clear_error_if_recording_ok(view: &mut ChannelView) {
 /// as-is.
 fn clear_live_pipeline_state(view: &mut ChannelView) {
     view.recording = None;
+    view.display_recording = None;
     view.ingest_queue = crate::runtime::QueueDepth::default();
     view.raw_recording_queue = None;
 }
@@ -450,6 +532,7 @@ mod tests {
                 ..DiagnosticsSnapshot::default()
             },
             raw_recording: None,
+            display_recording: None,
             activity: ChannelActivity {
                 last_data_at: None,
                 bytes_per_sec: bps,
@@ -541,19 +624,6 @@ mod tests {
         assert_eq!(view.bytes_total, 4096, "byte liveness is kept");
     }
 
-    #[test]
-    fn snapshot_surfaces_cross_chunk_boundary_saves() {
-        let mut state = AppState::default();
-        let id = ChannelId::new();
-        state.apply(added(id, "udp", "UDP · test"));
-
-        // The cross-chunk measurement (§50.2) folds through to the per-tab view.
-        let mut snap = snapshot_with(id, 100, 0.0, 0);
-        snap.match_boundary_saves = 3;
-        state.apply(UiUpdate::Snapshot(id, Box::new(snap)));
-        assert_eq!(state.channel(id).unwrap().boundary_saves, 3);
-    }
-
     fn delta(base: u64, bytes: &[u8], end: u64) -> crate::runtime::StreamDelta {
         crate::runtime::StreamDelta {
             base_offset: base,
@@ -588,6 +658,88 @@ mod tests {
         let view = state.channel_mut(id).unwrap();
         assert_eq!(view.stream_contiguous(), b"new");
         assert_eq!(view.stream_cursor, 13);
+    }
+
+    fn mark_match(rule: MatchRuleId, view_offset: u64, text: &str) -> TriggeredMatch {
+        TriggeredMatch {
+            rule_id: rule,
+            byte_offset: Some(view_offset),
+            view_offset: Some(view_offset),
+            mark: Some(crate::runtime::snapshot::MarkRender {
+                text: text.into(),
+                before: true,
+            }),
+        }
+    }
+
+    #[test]
+    fn marks_outlive_the_snapshot_match_window() {
+        // The runtime's recent-matches ring is bounded and rolling: while a view
+        // is paused, firings on invisible bytes churn the ring and evict the
+        // visible firings — which used to make their on-screen timestamps vanish.
+        // The GUI pins marks to its accumulated bytes, so the splice survives.
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(0, b"abcdef", 6))));
+
+        let rule = MatchRuleId::new();
+        let mut snap = snapshot_with(id, 6, 0.0, 0);
+        snap.matches = vec![mark_match(rule, 2, "[12:00:00]")];
+        state.apply(UiUpdate::Snapshot(id, Box::new(snap)));
+        assert_eq!(state.channel(id).unwrap().marks.len(), 1);
+
+        // Re-delivering the same firing (it stays in the window across polls)
+        // must not duplicate the pin.
+        let mut again = snapshot_with(id, 6, 0.0, 0);
+        again.matches = vec![mark_match(rule, 2, "[12:00:00]")];
+        state.apply(UiUpdate::Snapshot(id, Box::new(again)));
+        assert_eq!(
+            state.channel(id).unwrap().marks.len(),
+            1,
+            "idempotent merge"
+        );
+
+        // Next poll: the firing has rolled out of the snapshot window (empty
+        // matches) — the pinned mark stays with its byte.
+        state.apply(UiUpdate::Snapshot(
+            id,
+            Box::new(snapshot_with(id, 6, 0.0, 0)),
+        ));
+        let view = state.channel(id).unwrap();
+        assert_eq!(view.marks.len(), 1, "the mark outlives the rolling window");
+        assert_eq!(view.marks[0].offset, 2);
+    }
+
+    #[test]
+    fn marks_trim_with_the_window_and_clear_on_restart() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(0, b"abc", 3))));
+        let mut snap = snapshot_with(id, 3, 0.0, 0);
+        snap.matches = vec![mark_match(MatchRuleId::new(), 1, "[t]")];
+        state.apply(UiUpdate::Snapshot(id, Box::new(snap)));
+        assert_eq!(state.channel(id).unwrap().marks.len(), 1);
+
+        // An eviction reset (base jumped past our cursor) replaces the window;
+        // the mark's byte is gone, so the mark goes with it.
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(10, b"xyz", 13))));
+        assert!(
+            state.channel(id).unwrap().marks.is_empty(),
+            "trimmed with its byte"
+        );
+
+        // A pinned mark in the new window is dropped by a restart, like the bytes.
+        let mut snap = snapshot_with(id, 13, 0.0, 0);
+        snap.matches = vec![mark_match(MatchRuleId::new(), 11, "[t]")];
+        state.apply(UiUpdate::Snapshot(id, Box::new(snap)));
+        assert_eq!(state.channel(id).unwrap().marks.len(), 1);
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(id)));
+        assert!(
+            state.channel(id).unwrap().marks.is_empty(),
+            "cleared on restart"
+        );
     }
 
     #[test]

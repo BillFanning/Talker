@@ -296,7 +296,19 @@ mod tests {
                 condition: MatchCondition::BytePattern {
                     pattern: b"$GPGGA".to_vec(),
                 },
-                actions: vec![MatchAction::Mark { timestamp: None }],
+                // A timestamped Mark with a separator, so the full MarkTimestamp
+                // shape (incl. the additive `separator`) round-trips (§72.1).
+                actions: vec![MatchAction::Mark {
+                    timestamp: Some(MarkTimestamp {
+                        position: MarkPosition::After,
+                        format: crate::core::TimestampConfig {
+                            include_date: false,
+                            include_millis: true,
+                            include_timezone: false,
+                        },
+                        separator: ", ".to_string(),
+                    }),
+                }],
                 enabled: true,
             },
             MatchRule {

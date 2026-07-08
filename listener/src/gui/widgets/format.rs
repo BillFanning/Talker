@@ -16,8 +16,3 @@ pub(crate) fn human_bytes(n: u64) -> String {
         format!("{v:.3} {}", UNITS[u])
     }
 }
-
-/// Shorten a UUID string to its first segment, enough to disambiguate at a glance.
-pub(crate) fn short_id(id: &str) -> &str {
-    id.split('-').next().unwrap_or(id)
-}

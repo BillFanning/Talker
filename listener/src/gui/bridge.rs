@@ -16,7 +16,8 @@ use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::config::{
-    ChannelConfig, DisplayConfig, InterfaceConfig, Profile, RawRecordingConfig, RetentionConfig,
+    ChannelConfig, DisplayConfig, DisplayRecordingConfig, InterfaceConfig, Profile,
+    RawRecordingConfig, RetentionConfig,
 };
 use crate::core::{ChannelId, ChannelName, DisplayViewId, RuntimeEvent};
 use crate::runtime::{ChannelSnapshot, ChannelStats, Listener, PipelineCapacities, StreamDelta};
@@ -89,6 +90,13 @@ pub enum UiCommand {
     /// live field (ADR-012/-013). Keeps the runtime's config current so a profile save
     /// captures the settings; the live recorder is (re)armed separately by `SetRecording`.
     SetRawRecordingConfig(ChannelId, Box<RawRecordingConfig>),
+    /// Begin (`true`) or stop (`false`) **Display** recording live (§54, ADR-012) —
+    /// `SetRecording`'s sibling, carrying the display settings read from the editor
+    /// at click time.
+    SetDisplayRecording(ChannelId, bool, Box<DisplayRecordingConfig>),
+    /// Persist a channel's Display recording settings into the stored config without
+    /// a restart — `SetRawRecordingConfig`'s sibling (ADR-012/-013).
+    SetDisplayRecordingConfig(ChannelId, Box<DisplayRecordingConfig>),
     /// Update a channel's per-channel view settings in the stored config without a
     /// restart: the display config (mode, font, colors — §78) and the scroll-buffer
     /// `retention` (§87). The viewer renders these GUI-side and the GUI caps its own
@@ -401,6 +409,23 @@ impl Driver {
                 // so a profile save captures them. Arming the live recorder is separate
                 // (SetRecording).
                 self.listener.set_raw_recording_config(id, *raw);
+            }
+            UiCommand::SetDisplayRecording(id, enabled, display) => {
+                // The Raw toggle's sibling (§54): arm from click-time settings; a begin
+                // that can't open the file reports via RecordingFaulted (§55).
+                if !self
+                    .listener
+                    .set_display_recording(id, enabled, *display)
+                    .await
+                {
+                    self.push_channel_error(
+                        id,
+                        "can't change display recording — channel isn't running",
+                    );
+                }
+            }
+            UiCommand::SetDisplayRecordingConfig(id, display) => {
+                self.listener.set_display_recording_config(id, *display);
             }
             UiCommand::SetViewConfig(id, display, retention) => {
                 // View settings render GUI-side and the scroll buffer is capped GUI-side

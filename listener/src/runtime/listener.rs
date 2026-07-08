@@ -39,7 +39,9 @@ use crate::transport::{
 use super::activity::ChannelActivity;
 use super::build::{build_display_view, build_serial, build_tcp_listener, build_udp, BuildError};
 use super::channel::{spawn_monitored_channel, MatchSetup, MonitoredChannel, TRANSPORT_NOTICES};
-use super::pipeline::{DisplayViewHandle, PipelineCapacities, RawRecordingSettings};
+use super::pipeline::{
+    DisplayRecordingSettings, DisplayViewHandle, PipelineCapacities, RawRecordingSettings,
+};
 use super::snapshot::{ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, StreamDelta};
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
 
@@ -61,6 +63,7 @@ fn retained_snapshot(
         display_views: Vec::new(),
         diagnostics: DiagnosticsSnapshot::from_diagnostics(diagnostics.iter().cloned()),
         raw_recording: None,
+        display_recording: None,
         activity: ChannelActivity {
             last_data_at: None,
             bytes_per_sec: 0.0,
@@ -269,6 +272,21 @@ impl Listener {
         }
     }
 
+    /// Update a Channel's stored **Display recording** config in place, without a
+    /// restart — the Raw sibling (ADR-012/-013). The live recorder is (re)armed
+    /// separately by [`set_display_recording`](Self::set_display_recording); this
+    /// keeps the stored config current so a profile save captures the settings and
+    /// "record on start" applies on the next start. Unknown id is ignored.
+    pub fn set_display_recording_config(
+        &mut self,
+        id: ChannelId,
+        display: crate::config::DisplayRecordingConfig,
+    ) {
+        if let Some(channel) = self.channels.get_mut(&id) {
+            channel.config.display_recording = display;
+        }
+    }
+
     /// Request an on-demand snapshot of a running Channel's *small* observable state
     /// (§137, ADR-006): diagnostics, recent match firings, per-view pause state,
     /// recording state, liveness, and the stream end offset. The scrollback bytes
@@ -342,6 +360,66 @@ impl Listener {
             Some(ChannelHandle::Data(tasks)) => tasks.set_recording(enabled, settings).await,
             _ => false,
         }
+    }
+
+    /// Begin or stop **Display** recording on a running data Channel live, without
+    /// a restart (§54, ADR-012) — the Raw toggle's sibling, same return and fault
+    /// contract as [`set_recording`](Self::set_recording). Settings come from the
+    /// caller's click-time config; the renderer comes from the channel's stored
+    /// primary display view (kept current by `set_view_config`), so the `.disp`
+    /// records what the view shows.
+    pub async fn set_display_recording(
+        &self,
+        id: ChannelId,
+        enabled: bool,
+        display: crate::config::DisplayRecordingConfig,
+    ) -> bool {
+        let Some(channel) = self.channels.get(&id) else {
+            return false;
+        };
+        let renderer = channel
+            .config
+            .display
+            .views
+            .first()
+            .map(build_display_view)
+            .unwrap_or_default();
+        let settings = self.display_settings_from(&display, channel.config.name.as_str(), renderer);
+        match channel.handle.as_ref() {
+            Some(ChannelHandle::Data(tasks)) => {
+                tasks.set_display_recording(enabled, settings).await
+            }
+            _ => false,
+        }
+    }
+
+    /// Build [`DisplayRecordingSettings`] from a Display recording config + channel
+    /// name + renderer — [`settings_from`](Self::settings_from)'s Display sibling,
+    /// with the same rotation Refuse→Append coercion (§59). `None` when no
+    /// destination is set (the pipeline faults the begin with a clear message).
+    fn display_settings_from(
+        &self,
+        display: &crate::config::DisplayRecordingConfig,
+        channel_name: &str,
+        renderer: DisplayView,
+    ) -> Option<DisplayRecordingSettings> {
+        display
+            .destination
+            .clone()
+            .map(|destination| DisplayRecordingSettings {
+                destination,
+                channel_name: channel_name.to_string(),
+                overwrite: if display.file_rotation != FileRotationPolicy::None
+                    && display.overwrite_policy == OverwritePolicy::Refuse
+                {
+                    OverwritePolicy::AppendIfExists
+                } else {
+                    display.overwrite_policy
+                },
+                file_rotation: display.file_rotation,
+                capacity: self.caps.raw_recording,
+                renderer,
+            })
     }
 
     /// Drive the RTS output line of a running serial Channel (§161).

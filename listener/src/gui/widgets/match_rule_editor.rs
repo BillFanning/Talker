@@ -55,10 +55,18 @@ pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
             continue;
         };
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(false, |ui| ui.checkbox(&mut rule.enabled, ""));
+            // The enabled flag is honored when the channel (re)starts, so the
+            // checkbox edits it like any other rule field — committed via
+            // Apply & Restart. (A *live* toggle without a restart is the
+            // deferred ADR-012 seam; this is not that.)
+            ui.checkbox(&mut rule.enabled, "").on_hover_text(
+                "Evaluate this rule. Uncheck to keep it configured but inactive. \
+                 Applying restarts the channel.",
+            );
             mark_pattern_field(ui, pattern);
             mark_position_selector(ui, &mut ts.position);
             mark_format_toggles(ui, &mut ts.format);
+            mark_separator_field(ui, &mut ts.separator);
             if ui
                 .button("🗑")
                 .on_hover_text("Delete this mark rule")
@@ -94,6 +102,7 @@ pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
                 timestamp: Some(MarkTimestamp {
                     position: MarkPosition::Before,
                     format: TimestampConfig::default(),
+                    separator: String::new(),
                 }),
             }],
             enabled: true,
@@ -101,18 +110,87 @@ pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
     }
 }
 
-/// The pattern field: edit the byte pattern as text (UTF-8), the common case for NMEA
-/// (`$GPGGA`). Non-UTF-8 patterns from a profile are shown as a lossy string and left
-/// unchanged unless the user edits (then they become the typed UTF-8).
+/// Parse editor text into bytes, interpreting `<XX>` (exactly two hex digits —
+/// the same notation the view's HexEscape mode renders, e.g. `<0D><0A>` for CRLF)
+/// as a single byte. Everything else is literal UTF-8. An incomplete or
+/// non-hex `<…` stays literal, so the field is stable while an escape is being
+/// typed. (Consequence: a *literal* `<XX>` five-character string can't be
+/// expressed — it always reads as the byte.)
+fn parse_escaped_bytes(text: &str) -> Vec<u8> {
+    fn hex(b: u8) -> Option<u8> {
+        (b as char).to_digit(16).map(|v| v as u8)
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' && i + 3 < bytes.len() && bytes[i + 3] == b'>' {
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Render bytes as editor text — the inverse of [`parse_escaped_bytes`]:
+/// printable characters pass through; control bytes (≤ 0x1F, 0x7F) and bytes
+/// that aren't valid UTF-8 become `<XX>`, matching the view's HexEscape
+/// rendering. `parse_escaped_bytes(format_escaped_bytes(b)) == b`.
+fn format_escaped_bytes(bytes: &[u8]) -> String {
+    fn push_chars(out: &mut String, s: &str) {
+        for c in s.chars() {
+            let cp = c as u32;
+            if cp <= 0x1F || cp == 0x7F {
+                out.push_str(&format!("<{cp:02X}>"));
+            } else {
+                out.push(c);
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match std::str::from_utf8(&bytes[i..]) {
+            Ok(s) => {
+                push_chars(&mut out, s);
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                push_chars(&mut out, std::str::from_utf8(&bytes[i..i + valid]).unwrap());
+                i += valid;
+                out.push_str(&format!("<{:02X}>", bytes[i]));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The pattern field: edit the byte pattern as text. Control (and non-UTF-8)
+/// bytes read and write as `<XX>` hex escapes — the view's own HexEscape
+/// notation — so a CRLF-anchored pattern is typed as e.g. `GGA<0D><0A>`. A
+/// non-UTF-8 pattern from a profile round-trips through edits instead of being
+/// lossily replaced.
 fn mark_pattern_field(ui: &mut egui::Ui, pattern: &mut Vec<u8>) {
-    let mut text = String::from_utf8_lossy(pattern).into_owned();
-    let resp = ui.add(
-        egui::TextEdit::singleline(&mut text)
-            .desired_width(120.0)
-            .hint_text("pattern e.g. $GPGGA"),
-    );
+    let mut text = format_escaped_bytes(pattern);
+    let resp = ui
+        .add(
+            egui::TextEdit::singleline(&mut text)
+                .desired_width(120.0)
+                .hint_text("pattern e.g. $GPGGA"),
+        )
+        .on_hover_text(
+            "Byte pattern to match. Control bytes as <XX> hex escapes, e.g. \
+             $GPGGA or GGA<0D><0A> — the same notation the Hex-escape view shows.",
+        );
     if resp.changed() {
-        *pattern = text.into_bytes();
+        *pattern = parse_escaped_bytes(&text);
     }
     if pattern.is_empty() {
         ui.label(egui::RichText::new("⚠ empty").weak());
@@ -131,6 +209,30 @@ fn mark_position_selector(ui: &mut egui::Ui, position: &mut MarkPosition) {
             ui.selectable_value(position, MarkPosition::Before, "before");
             ui.selectable_value(position, MarkPosition::After, "after");
         });
+}
+
+/// Free-text separator appended right after the timestamp — a space, `", "`, or
+/// a control byte as a `<XX>` hex escape (`<0A>` puts the data on a new line) —
+/// so the time stands apart from the adjacent data in the view and `.disp`.
+fn mark_separator_field(ui: &mut egui::Ui, separator: &mut String) {
+    ui.label("sep");
+    let mut text = format_escaped_bytes(separator.as_bytes());
+    let resp = ui
+        .add(
+            egui::TextEdit::singleline(&mut text)
+                .desired_width(100.0)
+                .hint_text("␣ ,"),
+        )
+        .on_hover_text(
+            "Text added immediately after the timestamp to separate it from the \
+             data — e.g. a space, \", \", or a control byte as a <XX> hex escape \
+             (<0A> = newline). Empty = nothing added.",
+        );
+    if resp.changed() {
+        // The separator is spliced into rendered text, so it stays a String;
+        // escapes that don't decode to valid UTF-8 become U+FFFD.
+        *separator = String::from_utf8_lossy(&parse_escaped_bytes(&text)).into_owned();
+    }
 }
 
 /// The three independent format toggles (date / millis / timezone). Time-of-day is
@@ -160,6 +262,7 @@ mod tests {
                 timestamp: Some(MarkTimestamp {
                     position: MarkPosition::Before,
                     format: TimestampConfig::default(),
+                    separator: String::new(),
                 }),
             }],
             enabled: true,
@@ -173,6 +276,41 @@ mod tests {
         // An Idle condition is not owned either.
         rule.condition = MatchCondition::Idle { timeout_ms: 1000 };
         assert!(!is_mark_timestamp_rule(&rule));
+    }
+
+    #[test]
+    fn hex_escapes_parse_to_bytes_and_incomplete_ones_stay_literal() {
+        assert_eq!(parse_escaped_bytes("$GPGGA"), b"$GPGGA");
+        assert_eq!(parse_escaped_bytes("GGA<0D><0A>"), b"GGA\r\n");
+        assert_eq!(parse_escaped_bytes("a<0d>b"), b"a\rb"); // lowercase hex too
+        assert_eq!(parse_escaped_bytes("<FF>"), &[0xFF]);
+        // Mid-typing stability: an incomplete or non-hex escape is literal.
+        assert_eq!(parse_escaped_bytes("<0"), b"<0");
+        assert_eq!(parse_escaped_bytes("<ZZ>"), b"<ZZ>");
+        assert_eq!(parse_escaped_bytes("a<b"), b"a<b");
+    }
+
+    #[test]
+    fn format_escapes_controls_and_round_trips() {
+        assert_eq!(format_escaped_bytes(b"$GPGGA\r\n"), "$GPGGA<0D><0A>");
+        assert_eq!(format_escaped_bytes(&[0x00, 0x7F]), "<00><7F>");
+        assert_eq!(format_escaped_bytes(&[0xFF]), "<FF>"); // not valid UTF-8
+        assert_eq!(format_escaped_bytes(" ok".as_bytes()), " ok"); // space stays
+
+        // parse(format(bytes)) is identity — controls, non-UTF-8, multi-byte
+        // UTF-8, and a partially-typed escape all round-trip.
+        for bytes in [
+            &b"$GPGGA\r\n"[..],
+            &[0x00, 0x1F, 0x7F, 0xFF],
+            "aéb".as_bytes(),
+            b"$GP<0",
+        ] {
+            assert_eq!(
+                parse_escaped_bytes(&format_escaped_bytes(bytes)),
+                bytes,
+                "round trip failed for {bytes:?}"
+            );
+        }
     }
 
     #[test]

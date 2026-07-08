@@ -39,7 +39,8 @@ use crate::transport::{
 };
 
 use super::pipeline::{
-    run_channel, ChannelPipeline, DisplayViewHandle, PipelineCapacities, RawRecordingSettings,
+    run_channel, ChannelPipeline, DisplayRecordingSettings, DisplayViewHandle, PipelineCapacities,
+    RawRecordingSettings,
 };
 use super::snapshot::{ChannelSnapshot, ChannelStats, PipelineRequest, StreamDelta};
 
@@ -252,6 +253,19 @@ impl MonitoredChannel {
     ) -> bool {
         self.requests
             .send(PipelineRequest::SetRecording { enabled, settings })
+            .await
+            .is_ok()
+    }
+
+    /// Begin/stop **Display** recording live (§54, ADR-012) — the Raw variant's
+    /// sibling; same fire-and-forget contract.
+    pub(crate) async fn set_display_recording(
+        &self,
+        enabled: bool,
+        settings: Option<DisplayRecordingSettings>,
+    ) -> bool {
+        self.requests
+            .send(PipelineRequest::SetDisplayRecording { enabled, settings })
             .await
             .is_ok()
     }

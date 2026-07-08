@@ -13,10 +13,9 @@ use super::fonts::bold;
 use super::state::ChannelStatus;
 use super::theme;
 use super::widgets::{
-    config_needs_restart, edit_display_recording, edit_interface, edit_mark_rules,
-    edit_raw_recording, human_bytes, line_indicator, line_toggle, paint_glyph,
-    recording_glyph_size, recording_indicator, short_id, start_button, status_color, status_glyph,
-    status_label, stop_enabled,
+    config_needs_restart, edit_display_recording, edit_interface, edit_raw_recording, human_bytes,
+    line_indicator, line_toggle, paint_glyph, recording_glyph_size, recording_indicator,
+    start_button, status_color, status_glyph, status_label, stop_enabled,
 };
 use super::ListenerApp;
 
@@ -105,7 +104,7 @@ impl ListenerApp {
         // Configure is edit-only: there's no Apply button here. Edits commit via the
         // Start / Apply & Restart button at the top, which applies the pending draft.
         if let Some((_, config)) = &mut self.edit_draft {
-            egui::CollapsingHeader::new("Configure channel")
+            egui::CollapsingHeader::new(bold("Configure channel"))
                 // A STABLE id (not per-channel) so switching channels doesn't create a
                 // "new" header each time — that re-triggered a focus/animation highlight
                 // that flashed a rectangle around the label on every channel switch. The
@@ -118,17 +117,10 @@ impl ListenerApp {
                     refresh = ui
                         .push_id("edit_iface", |ui| edit_interface(ui, id, config, &ports))
                         .inner;
-                    // Display (.disp) recording is part of display config, so it lives
-                    // here under Configure — Raw recording is the separate panel above
-                    // (ADR-013).
-                    ui.separator();
-                    ui.label(bold("Display record"));
-                    edit_display_recording(ui, config);
-                    // Inline Mark timestamps (§50.2): a small editor for
-                    // BytePattern → Mark(+timestamp) rules. Applying restarts the
-                    // channel (config_needs_restart counts match_rules).
-                    ui.separator();
-                    edit_mark_rules(ui, config);
+                    // Display (.disp) recording lives in the recording block on the
+                    // right, under Record Raw Data (ADR-013); the inline Mark
+                    // timestamp editor lives under Configure display (it shapes what
+                    // the view and .disp show).
                 });
         }
         self.force_config_open = false;
@@ -165,11 +157,13 @@ impl ListenerApp {
         self.show_stream_view(ui, id);
     }
 
-    /// Diagnostics + match-firings for the selected channel (snapshot-driven): a
-    /// color-coded headline that opens a filterable, ms-timestamped log, plus the
-    /// cross-chunk match measurement. Split out of `show_detail`.
+    /// Diagnostics for the selected channel (snapshot-driven): a color-coded
+    /// headline that opens a filterable, ms-timestamped log. Split out of
+    /// `show_detail`. (Match-rule activity surfaces through its effects — inline
+    /// Mark timestamps, recording state, the diagnostics entries Notify and
+    /// boundary-split recoveries write — not a firing list of its own.)
     fn show_diagnostics(&mut self, ui: &mut egui::Ui, id: ChannelId) {
-        // Diagnostics / matches — only meaningful once there's a snapshot. Pull the
+        // Diagnostics — only meaningful once there's a snapshot. Pull the
         // data into owned locals so the filter checkboxes can mutate `self` without a
         // live `self.state` borrow.
         struct DiagView {
@@ -179,10 +173,6 @@ impl ListenerApp {
             counts: (usize, usize, usize),
             /// The full diagnostics log, chronological (oldest → newest).
             entries: Vec<crate::diagnostics::Diagnostic>,
-            matches: Vec<(Option<u64>, String)>,
-            /// How many matches were recovered across a read-chunk boundary (§50.2):
-            /// the cross-chunk-carry measurement (where/why land in the diag log).
-            boundary_saves: u64,
         }
         let view = self.state.channel(id);
         // The diagnostics log comes *only* from the snapshot — the GUI never synthesizes
@@ -191,52 +181,39 @@ impl ListenerApp {
         // fault (which never ran a pipeline) is retained by the runtime and served via a
         // minimal snapshot for the faulted channel. The snapshot is kept across stop/start
         // so a previous run's messages persist.
-        let (entries, counts, matches, boundary_saves) =
-            match view.and_then(|v| v.snapshot.as_ref()) {
-                Some(s) => {
-                    let d = &s.diagnostics;
-                    let counts = (d.events.len(), d.warnings.len(), d.errors.len());
-                    // One chronological timeline across severities (the snapshot owns the
-                    // flatten+sort; the GUI just renders it).
-                    let entries = d.clone().into_sorted_vec();
-                    let matches = s
-                        .matches
-                        .iter()
-                        .rev()
-                        .take(20)
-                        .map(|m| (m.byte_offset, short_id(&m.rule_id.to_string()).to_string()))
-                        .collect();
-                    (entries, counts, matches, s.match_boundary_saves)
-                }
-                None => (Vec::new(), (0, 0, 0), Vec::new(), 0),
-            };
-        let diag_view = if entries.is_empty() {
-            None
-        } else {
-            // The headline is the latest entry, so the newest diagnostic leads — a fresh
-            // INFO supersedes an older ERROR, and a just-recorded fault (newest) leads.
-            let (headline_level, headline, headline_color) = match entries.last() {
-                Some(d) => {
-                    let (level, color) = match d.severity {
-                        DiagnosticSeverity::Event => ("INFO", theme::EVENT_GREY),
-                        DiagnosticSeverity::Warning => ("WARN", theme::WARNING_AMBER),
-                        DiagnosticSeverity::Error => ("ERROR", theme::FAULT_RED),
-                    };
-                    (level, d.message.clone(), color)
-                }
-                None => ("", "no activity yet".to_string(), theme::IDLE_GREY),
-            };
-            Some(DiagView {
-                headline_level,
-                headline,
-                headline_color,
-                counts,
-                entries,
-                matches,
-                boundary_saves,
-            })
+        let (entries, counts) = match view.and_then(|v| v.snapshot.as_ref()) {
+            Some(s) => {
+                let d = &s.diagnostics;
+                let counts = (d.events.len(), d.warnings.len(), d.errors.len());
+                // One chronological timeline across severities (the snapshot owns the
+                // flatten+sort; the GUI just renders it).
+                (d.clone().into_sorted_vec(), counts)
+            }
+            None => (Vec::new(), (0, 0, 0)),
         };
-        if let Some(dv) = diag_view {
+        // Always shown — an empty log renders a neutral "no diagnostics yet"
+        // headline so the section doesn't pop into existence on the first entry.
+        // The headline is the latest entry, so the newest diagnostic leads — a fresh
+        // INFO supersedes an older ERROR, and a just-recorded fault (newest) leads.
+        let (headline_level, headline, headline_color) = match entries.last() {
+            Some(d) => {
+                let (level, color) = match d.severity {
+                    DiagnosticSeverity::Event => ("INFO", theme::EVENT_GREY),
+                    DiagnosticSeverity::Warning => ("WARN", theme::WARNING_AMBER),
+                    DiagnosticSeverity::Error => ("ERROR", theme::FAULT_RED),
+                };
+                (level, d.message.clone(), color)
+            }
+            None => ("", "no diagnostics yet".to_string(), theme::IDLE_GREY),
+        };
+        let dv = DiagView {
+            headline_level,
+            headline,
+            headline_color,
+            counts,
+            entries,
+        };
+        {
             // The diagnostics header is a single line: "Diagnostics (counts)  LEVEL phrase"
             // — the live headline (chronologically latest diagnostic) sits to the right of
             // the title and score, shortened to a clean phrase (headline_phrase) and
@@ -321,32 +298,6 @@ impl ListenerApp {
                         }
                     });
             });
-            if !dv.matches.is_empty() || dv.boundary_saves > 0 {
-                egui::CollapsingHeader::new(format!("Match firings ({})", dv.matches.len()))
-                    .id_salt("matches")
-                    .show(ui, |ui| {
-                        // Cross-chunk measurement (§50.2): how often a pattern was
-                        // recovered across a read boundary. The where/why per
-                        // occurrence is in the Diagnostics log above.
-                        if dv.boundary_saves > 0 {
-                            ui.colored_label(
-                                theme::WARNING_AMBER,
-                                format!(
-                                    "⮧ {} match{} spanned a read-chunk boundary \
-                                     (recovered; see Diagnostics for where)",
-                                    dv.boundary_saves,
-                                    if dv.boundary_saves == 1 { "" } else { "es" },
-                                ),
-                            );
-                        }
-                        for (offset, rule) in &dv.matches {
-                            let on = offset
-                                .map(|n| format!("@{n}"))
-                                .unwrap_or_else(|| "(idle)".to_string());
-                            ui.monospace(format!("{on}  rule {rule}"));
-                        }
-                    });
-            }
         }
     }
 
@@ -432,30 +383,32 @@ impl ListenerApp {
         // The peak is the value that matters; near capacity means backpressure is
         // imminent (a reception stall or a recording-queue-overflow fault).
         if let Some(view) = self.state.channel(id) {
-            let iq = view.ingest_queue;
-            let mut line = format!(
-                "Ingest queue: {}/{} (peak {})",
-                iq.current, iq.capacity, iq.peak
-            );
-            if let Some(rq) = view.raw_recording_queue {
-                line.push_str(&format!(
-                    "    Rec queue: {}/{} (peak {})",
-                    rq.current, rq.capacity, rq.peak
-                ));
+            // Amber once a queue's peak has reached half its capacity — an early
+            // backpressure warning while stress testing. One line per queue (rec
+            // under ingest), each colored by its own pressure.
+            let queue_line = |ui: &mut egui::Ui, name: &str, q: crate::runtime::QueueDepth| {
+                let text = egui::RichText::new(format!(
+                    "{name}: {}/{} (peak {})",
+                    q.current, q.capacity, q.peak
+                ))
+                .weak();
+                ui.label(if q.peak * 2 >= q.capacity.max(1) {
+                    text.color(theme::WARNING_AMBER)
+                } else {
+                    text
+                });
+            };
+            queue_line(ui, "Ingest queue", view.ingest_queue);
+            // Always show the raw-record line so the readout doesn't jump when a
+            // recording starts; without a recorder there are no numbers to show.
+            match view.raw_recording_queue {
+                Some(rq) => queue_line(ui, "Raw record queue", rq),
+                None => {
+                    ui.label(egui::RichText::new("Raw record queue: (not recording)").weak());
+                }
             }
-            // Amber once any queue's peak has reached half its capacity — an early
-            // backpressure warning while stress testing.
-            let pressured = iq.peak * 2 >= iq.capacity.max(1)
-                || view
-                    .raw_recording_queue
-                    .is_some_and(|rq| rq.peak * 2 >= rq.capacity.max(1));
-            let text = egui::RichText::new(line).weak();
-            ui.label(if pressured {
-                text.color(theme::WARNING_AMBER)
-            } else {
-                text
-            });
         }
+        ui.add_space(12.0); // a blank line between the readouts and the buttons
         let size = CONTROL_BUTTON_SIZE;
         ui.horizontal(|ui| {
             let (start_label, start_enabled) = start_button(status, config_changed);
@@ -481,13 +434,17 @@ impl ListenerApp {
         });
     }
 
-    /// Raw recording block: a header row ("Record Raw Data" + live state glyph + the
-    /// Start/Stop recording button) over the always-shown setup fields. The live toggle
-    /// reads the recording settings from the editor at click time (ADR-012).
+    /// Recording block (right column): the **Raw** section (header row with live
+    /// state glyph + Start/Stop button, over a collapsible setup) and, right under
+    /// it, the **Display** section in the same shape (ADR-013 — two independent
+    /// recordings, same options). The Raw live toggle reads the settings from the
+    /// editor at click time (ADR-012); Raw setup edits apply live, Display setup
+    /// edits apply via Apply & Restart (the runtime builds the display recorder at
+    /// channel start).
     ///
-    /// Kept in small pieces (the header row, `raw_record_button`, the setup) because
-    /// this block is still evolving — add new recording controls as their own helpers
-    /// rather than growing this method.
+    /// Kept in small pieces (the header rows, `raw_record_button`,
+    /// `recording_setup_section`) because this block is still evolving — add new
+    /// recording controls as their own helpers rather than growing this method.
     fn show_recording_block(
         &mut self,
         ui: &mut egui::Ui,
@@ -495,8 +452,8 @@ impl ListenerApp {
         status: ChannelStatus,
         recording: Option<RecordingState>,
     ) {
-        // Header row: title + live state indicator + the Start/Stop recording button on
-        // the same line (no expander — the setup is always shown below).
+        // Raw header row: title + live state indicator + the Start/Stop recording
+        // button on the same line (no expander — the setup follows below).
         ui.horizontal(|ui| {
             ui.label(bold("Record Raw Data"));
             // Status glyph only (same symbol set/colors as channel status) — the word
@@ -506,32 +463,110 @@ impl ListenerApp {
             paint_glyph(ui, glyph, recording_glyph_size(glyph), color);
             self.raw_record_button(ui, id, status, recording);
         });
-        // Setup: a collapsible block (collapsed by default). Expanded shows the full
-        // editor; collapsed shows a one-line summary (path · rotation · on-exists) so
-        // the configured destination stays visible without the controls.
-        let Some((_, config)) = &mut self.edit_draft else {
+        if self.edit_draft.as_ref().map(|(eid, _)| *eid) != Some(id) {
             ui.label(egui::RichText::new("(select the channel to edit)").weak());
             return;
-        };
-        let setup_id = ui.make_persistent_id(("raw_rec_setup", id));
-        let state = egui::collapsing_header::CollapsingState::load_with_default_open(
-            ui.ctx(),
-            setup_id,
-            false,
-        );
-        let open = state.is_open();
-        state
-            .show_header(ui, |ui| {
-                ui.label(bold("Setup"));
-                // Show the summary on the (closed) header so it reads as one line; when
-                // open, the full editor is in the body below, so keep the header terse.
-                if !open {
-                    ui.label(egui::RichText::new(raw_record_summary(&config.raw_recording)).weak());
-                }
-            })
-            .body(|ui| edit_raw_recording(ui, config));
-
+        }
+        if let Some((_, config)) = &mut self.edit_draft {
+            let summary = {
+                let rec = &config.raw_recording;
+                record_summary(&rec.destination, rec.file_rotation, rec.overwrite_policy)
+            };
+            recording_setup_section(ui, ("raw_rec_setup", id), &summary, |ui| {
+                edit_raw_recording(ui, config)
+            });
+        }
         self.persist_raw_recording(id);
+
+        // Display recording (§54): the sibling tap, same options, same layout, same
+        // live toggle (ADR-012/-013) — begin/stop mid-run from click-time settings.
+        ui.separator();
+        let display_recording = self.state.channel(id).and_then(|v| v.display_recording);
+        ui.horizontal(|ui| {
+            ui.label(bold("Record Display"));
+            let (glyph, color, _text) = recording_indicator(display_recording);
+            paint_glyph(ui, glyph, recording_glyph_size(glyph), color);
+            self.display_record_button(ui, id, status, display_recording);
+        });
+        if let Some((_, config)) = &mut self.edit_draft {
+            let summary = {
+                let rec = &config.display_recording;
+                record_summary(&rec.destination, rec.file_rotation, rec.overwrite_policy)
+            };
+            recording_setup_section(ui, ("disp_rec_setup", id), &summary, |ui| {
+                edit_display_recording(ui, config)
+            });
+        }
+        self.persist_display_recording(id);
+    }
+
+    /// The Display-recording controls on its header row: "Record on start"
+    /// (`display_recording.enabled` — begins when the channel next starts, §54) and,
+    /// for a running channel, the live Record/Stop button reading the on-screen
+    /// settings at click time — `raw_record_button`'s sibling (ADR-012).
+    fn display_record_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: ChannelId,
+        status: ChannelStatus,
+        recording: Option<RecordingState>,
+    ) {
+        if let Some((_, config)) = &mut self.edit_draft {
+            ui.checkbox(&mut config.display_recording.enabled, "Record on start")
+                .on_hover_text(
+                    "Record the rendered view output (.disp) — what the display shows, \
+                     not the raw bytes (§54) — automatically when the channel starts.",
+                );
+        }
+        if status != ChannelStatus::Running {
+            return;
+        }
+        let draft_display = self
+            .edit_draft
+            .as_ref()
+            .filter(|(eid, _)| *eid == id)
+            .map(|(_, cfg)| cfg.display_recording.clone());
+        let has_dest = draft_display
+            .as_ref()
+            .is_some_and(|r| r.destination.is_some());
+        let recording_now = matches!(recording, Some(RecordingState::Enabled));
+        let label = if recording_now { "Stop" } else { "Record" };
+        let resp = ui.add_enabled(
+            has_dest || recording_now,
+            egui::Button::new(label).min_size(egui::vec2(CONTROL_BUTTON_SIZE.x, 0.0)),
+        );
+        let resp = if !has_dest && !recording_now {
+            resp.on_hover_text("Set a destination below first")
+        } else {
+            resp
+        };
+        if resp.clicked() {
+            let display = draft_display.unwrap_or_default();
+            self.send(UiCommand::SetDisplayRecording(
+                id,
+                !recording_now,
+                Box::new(display),
+            ));
+        }
+    }
+
+    /// Persist Display recording edits into the stored config and runtime — the
+    /// sibling of [`persist_raw_recording`](Self::persist_raw_recording): Display
+    /// recording is live now (ADR-012), so its edits never travel through Apply &
+    /// Restart; without this, a profile save wouldn't capture them.
+    fn persist_display_recording(&mut self, id: ChannelId) {
+        let draft = self
+            .edit_draft
+            .as_ref()
+            .filter(|(eid, _)| *eid == id)
+            .map(|(_, cfg)| cfg.display_recording.clone());
+        let Some(draft) = draft else { return };
+        if let Some(view) = self.state.channel_mut(id) {
+            if view.config.display_recording != draft {
+                view.config.display_recording = draft.clone();
+                self.send(UiCommand::SetDisplayRecordingConfig(id, Box::new(draft)));
+            }
+        }
     }
 
     /// Persist Raw recording edits (destination/rotation/overwrite/"record on start").
@@ -633,22 +668,52 @@ fn headline_phrase(message: &str) -> String {
     head[..cut].trim_end().to_string()
 }
 
-/// A one-line summary of a Raw recording config for the collapsed Setup header:
+/// A collapsible "Setup" section for one recording (collapsed by default): the
+/// closed header carries a one-line `path · rotation · on-exists` summary so the
+/// configured destination stays visible without the controls; open shows the full
+/// editor. Shared by the Raw and Display blocks (ADR-013 — same options).
+fn recording_setup_section(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
+    summary: &str,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    let setup_id = ui.make_persistent_id(salt);
+    let state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), setup_id, false);
+    let open = state.is_open();
+    state
+        .show_header(ui, |ui| {
+            ui.label(bold("Setup"));
+            // The summary rides the (closed) header so it reads as one line; when
+            // open, the full editor is in the body below, so keep the header terse.
+            if !open {
+                ui.label(egui::RichText::new(summary).weak());
+            }
+        })
+        .body(body);
+}
+
+/// A one-line summary of a recording setup for the collapsed Setup header:
 /// `path · rotation · on-exists` (e.g. `C:\logs\gps.raw · Daily · Append`). The path
-/// reads "(no destination)" when unset; rotation/on-exists use short words.
-fn raw_record_summary(rec: &crate::config::RawRecordingConfig) -> String {
+/// reads "(no destination)" when unset; rotation/on-exists use short words. Shared
+/// by the Raw and Display blocks — their configs carry the same fields (ADR-013).
+fn record_summary(
+    destination: &Option<std::path::PathBuf>,
+    file_rotation: crate::record::FileRotationPolicy,
+    overwrite_policy: crate::record::OverwritePolicy,
+) -> String {
     use crate::record::{FileRotationPolicy, OverwritePolicy};
-    let path = rec
-        .destination
+    let path = destination
         .as_ref()
         .map(|p| shorten_path(p))
         .unwrap_or_else(|| "(no destination)".to_string());
-    let rotation = match rec.file_rotation {
+    let rotation = match file_rotation {
         FileRotationPolicy::None => "no rotation",
         FileRotationPolicy::Hourly => "Hourly",
         FileRotationPolicy::Daily => "Daily",
     };
-    let on_exists = match rec.overwrite_policy {
+    let on_exists = match overwrite_policy {
         OverwritePolicy::Refuse => "Refuse",
         OverwritePolicy::Overwrite => "Overwrite",
         OverwritePolicy::AppendIfExists => "Append",

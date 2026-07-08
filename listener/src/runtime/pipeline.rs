@@ -36,8 +36,9 @@ use crate::core::{ChannelId, ChunkTime, DisplayViewId, MatchRuleId, RecordingSta
 use crate::diagnostics::{Diagnostic, DiagnosticLog};
 use crate::display::{AnnotationPlacement, DisplayView, RenderAnnotation, RenderedOutput};
 use crate::record::{
-    start_raw_recording, FileRotationPolicy, OverwritePolicy, RawFileRecorder, Recording,
-    RecordingStopReason, RotatingRawRecorder,
+    start_display_recording, start_raw_recording, DisplayFileRecorder, FileRotationPolicy,
+    OverwritePolicy, RawFileRecorder, Recording, RecordingStopReason, RotatingDisplayRecorder,
+    RotatingRawRecorder,
 };
 use crate::transport::{ReceivedData, TransportNotice};
 
@@ -197,6 +198,11 @@ pub struct ChannelPipeline {
     /// read `Faulted` instead (so the GUI shows ⚠, not ■). Cleared on a successful
     /// begin or a stop.
     begin_faulted: bool,
+    /// Display-recording sibling of `begin_faulted` (§54, ADR-012).
+    display_begin_faulted: bool,
+    /// Display-recording sibling of `recording_settings`: the settings a live
+    /// Display begin uses (§54). `None` = no destination set, so a begin faults.
+    display_recording_settings: Option<DisplayRecordingSettings>,
     /// Disk-space guard for recording (§56.2, §168): the policy and the path whose
     /// filesystem free space is polled. `None` = no guard.
     disk_guard: Option<(DiskGuard, PathBuf)>,
@@ -264,6 +270,20 @@ pub struct RawRecordingSettings {
     pub capacity: usize,
 }
 
+/// The Display recording settings for a live begin (§54, ADR-012/-013): the Raw
+/// fields' sibling, plus the renderer — the `.disp` records a *view's* rendered
+/// output, so the begin must know how that view renders. Packaged like
+/// [`RawRecordingSettings`] so the pipeline task never reads config directly.
+#[derive(Clone, Debug)]
+pub struct DisplayRecordingSettings {
+    pub destination: PathBuf,
+    pub channel_name: String,
+    pub overwrite: OverwritePolicy,
+    pub file_rotation: FileRotationPolicy,
+    pub capacity: usize,
+    pub renderer: DisplayView,
+}
+
 /// Bound on the retained recent-match log (§165) — generous but constant (§124).
 const RECENT_MATCHES_CAP: usize = 256;
 
@@ -280,6 +300,8 @@ impl ChannelPipeline {
             raw_recorder: None,
             recording_fault_reported: false,
             begin_faulted: false,
+            display_begin_faulted: false,
+            display_recording_settings: None,
             disk_guard: None,
             disk_low_reported: false,
             activity: ActivityMeter::new(),
@@ -555,7 +577,11 @@ impl ChannelPipeline {
                     } => {
                         if let Some(offset) = byte_offset {
                             let before = matches!(ts.position, MarkPosition::Before);
-                            let text = ts.format.format(arrival.wall_clock);
+                            // The separator trails the timestamp in both positions
+                            // (`[ts][sep]match…` / `…match[ts][sep]`), keeping the
+                            // time visually apart from the adjacent data (§50.2).
+                            let text =
+                                format!("{}{}", ts.format.format(arrival.wall_clock), ts.separator);
                             annotations.push(MarkAnnotation {
                                 offset,
                                 before,
@@ -775,6 +801,110 @@ impl ChannelPipeline {
         }
     }
 
+    /// Begin or stop **Display** recording live, without a restart (§54, ADR-012)
+    /// — the Raw toggle's sibling, driving the same lazy begin / clean finalize
+    /// shape. `settings`, when present, replace the stored display settings first;
+    /// they're only swapped in while not actively recording, so a begin can't
+    /// change the destination out from under an open file.
+    pub async fn set_display_recording(
+        &mut self,
+        enabled: bool,
+        settings: Option<DisplayRecordingSettings>,
+    ) {
+        if let Some(settings) = settings {
+            if self
+                .display_views
+                .first()
+                .is_none_or(|v| v.recorder.is_none())
+            {
+                self.display_recording_settings = Some(settings);
+            }
+        }
+        if enabled {
+            self.begin_display_recording().await;
+        } else {
+            self.stop_display_recording().await;
+        }
+    }
+
+    /// Lazily create the Display recording on a begin (§54, §55): a no-op if one
+    /// is already active; no destination reports a fault rather than a silent
+    /// no-op; an open failure reports the reason without faulting the Channel.
+    async fn begin_display_recording(&mut self) {
+        if self
+            .display_views
+            .first()
+            .is_some_and(|v| v.recorder.is_some())
+        {
+            return; // already recording — begin is idempotent
+        }
+        let Some(settings) = self.display_recording_settings.clone() else {
+            self.display_begin_faulted = true;
+            self.diagnostics.record(Diagnostic::error(
+                "can't begin Display recording: no destination is set — set one in the                  Record Display setup, then press Record again",
+            ));
+            if let Some(events) = &self.events {
+                let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+            }
+            return;
+        };
+        let created = if settings.file_rotation == FileRotationPolicy::None {
+            DisplayFileRecorder::create(&settings.destination, settings.overwrite)
+                .await
+                .map(|r| start_display_recording(r, settings.capacity))
+        } else {
+            RotatingDisplayRecorder::create(
+                &settings.destination,
+                &settings.channel_name,
+                ".disp",
+                settings.overwrite,
+                settings.file_rotation,
+            )
+            .await
+            .map(|r| start_display_recording(r, settings.capacity))
+        };
+        match created {
+            Ok(rec) => {
+                self.set_display_recorder(settings.renderer.clone(), rec);
+                self.display_begin_faulted = false;
+                self.diagnostics.record(Diagnostic::event(format!(
+                    "Display recording started → {}",
+                    settings.destination.display(),
+                )));
+                if let Some(events) = &self.events {
+                    let _ = events.try_send(RuntimeEvent::RecordingStarted(self.channel_id));
+                }
+            }
+            Err(err) => {
+                self.display_begin_faulted = true;
+                self.diagnostics.record(Diagnostic::error(format!(
+                    "could not begin Display recording to {} (on-exists: {:?}): {err}",
+                    settings.destination.display(),
+                    settings.overwrite,
+                )));
+                if let Some(events) = &self.events {
+                    let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+                }
+            }
+        }
+    }
+
+    /// Stop and finalize the Display recording (§54): a clean finalize; reception
+    /// and the Raw recording continue. A no-op if none is active. Clears a prior
+    /// begin-fault so the state reads "off" again, not ⚠.
+    async fn stop_display_recording(&mut self) {
+        self.display_begin_faulted = false;
+        let taken = self
+            .display_views
+            .first_mut()
+            .and_then(|v| v.recorder.take());
+        if let Some(rec) = taken {
+            rec.recording.finalize(RecordingStopReason::Disabled).await;
+            self.diagnostics
+                .record(Diagnostic::event("Display recording stopped"));
+        }
+    }
+
     /// Record a non-terminal transport notice (§95, §101; ADR-007). The transport
     /// states *what happened*; the pipeline — the channel's `DiagnosticLog` owner —
     /// decides how it is recorded and reported, keeping the §95 diagnostic and the
@@ -930,6 +1060,17 @@ impl ChannelPipeline {
         }
     }
 
+    /// Current display-recording state (§54), mirroring
+    /// [`raw_recording_state`](Self::raw_recording_state): the primary view's
+    /// recorder state, `Some(Faulted)` after a failed begin, `None` when off.
+    pub fn display_recording_state(&self) -> Option<RecordingState> {
+        match self.display_views.first().and_then(|v| v.recorder.as_ref()) {
+            Some(rec) => Some(rec.recording.state()),
+            None if self.display_begin_faulted => Some(RecordingState::Faulted),
+            None => None,
+        }
+    }
+
     /// Cheap O(1) counters for a multi-channel overview (§91.1): liveness plus
     /// per-severity diagnostic counts and the boundary-save total. Polled
     /// per-Channel each tick; [`snapshot`](Self::snapshot) (the full diagnostic/match
@@ -943,6 +1084,7 @@ impl ChannelPipeline {
             warning_count: self.diagnostics.warnings().count(),
             error_count: self.diagnostics.errors().count(),
             raw_recording: self.raw_recording_state(),
+            display_recording: self.display_recording_state(),
             match_boundary_saves: self.match_rules.boundary_saves(),
             ingest_queue: self.ingest_queue(),
             raw_recording_queue: self.raw_recording_queue(),
@@ -992,6 +1134,7 @@ impl ChannelPipeline {
                 errors: self.diagnostics.errors().cloned().collect(),
             },
             raw_recording: self.raw_recording_state(),
+            display_recording: self.display_recording_state(),
             activity: self.activity.snapshot(Instant::now()),
             matches: self.recent_matches.iter().cloned().collect(),
             match_boundary_saves: self.match_rules.boundary_saves(),
@@ -1103,6 +1246,9 @@ pub async fn run_channel(
                 }
                 Some(PipelineRequest::SetRecording { enabled, settings }) => {
                     pipeline.set_recording(enabled, settings).await;
+                }
+                Some(PipelineRequest::SetDisplayRecording { enabled, settings }) => {
+                    pipeline.set_display_recording(enabled, settings).await;
                 }
                 None => requests_open = false, // all requesters gone; keep running
             },
@@ -1774,6 +1920,7 @@ mod tests {
             timestamp: Some(MarkTimestamp {
                 position: MarkPosition::Before,
                 format: TimestampConfig::default(), // HH:MM:SS
+                separator: String::new(),
             }),
         };
         let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&[byte_rule(
@@ -1795,6 +1942,53 @@ mod tests {
             disp_written.matches(':').count(),
             4,
             "each occurrence carries its own inline timestamp: {disp_written:?}"
+        );
+        let _ = tokio::fs::remove_file(&disp_path).await;
+    }
+
+    #[tokio::test]
+    async fn mark_separator_trails_the_timestamp_in_disp_and_snapshot() {
+        // §50.2: the optional separator is appended to the formatted timestamp —
+        // `[ts][sep]match…` for Before — in both the .disp and the snapshot's
+        // MarkRender (so the live view shows the same text).
+        use crate::config::{MarkPosition, MarkTimestamp};
+        use crate::core::TimestampConfig;
+        use crate::record::{start_display_recording, DisplayFileRecorder};
+        let cid = ChannelId::new();
+        let disp_path = temp_path("sep-mark");
+        let disp = DisplayFileRecorder::create(&disp_path, OverwritePolicy::Refuse)
+            .await
+            .unwrap();
+        let mark = MatchAction::Mark {
+            timestamp: Some(MarkTimestamp {
+                position: MarkPosition::Before,
+                format: TimestampConfig::default(), // HH:MM:SS
+                separator: ", ".to_string(),
+            }),
+        };
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&[byte_rule(
+            "gga",
+            b"$GPGGA",
+            vec![mark],
+        )]);
+        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+
+        p.ingest(bytes_chunk(cid, b"xx$GPGGA,1"));
+        let snap = p.snapshot();
+        p.finish().await;
+
+        let mark = snap.matches[0].mark.as_ref().expect("mark render");
+        assert!(
+            mark.text.ends_with(", "),
+            "separator trails the timestamp: {:?}",
+            mark.text
+        );
+        // The .disp shows `HH:MM:SS, ` immediately before the matched pattern.
+        let disp_written = tokio::fs::read_to_string(&disp_path).await.unwrap();
+        let at = disp_written.find("$GPGGA").expect("match rendered");
+        assert!(
+            disp_written[..at].ends_with(", "),
+            "separator sits between the timestamp and the match: {disp_written:?}"
         );
         let _ = tokio::fs::remove_file(&disp_path).await;
     }
@@ -1937,6 +2131,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_display_recording_begins_and_stops_display_recording_live() {
+        // §54/ADR-012: the Display sibling of the live Raw toggle — lazy begin
+        // from click-time settings, clean finalize on stop; the .disp captures
+        // only the span in between.
+        let cid = ChannelId::new();
+        let path = temp_path("disp-live");
+        let mut p = pipeline(cid, PipelineCapacities::default());
+
+        p.ingest(bytes_chunk(cid, b"before "));
+        assert!(p.display_recording_state().is_none());
+
+        let settings = DisplayRecordingSettings {
+            destination: path.clone(),
+            channel_name: "disp-live".to_string(),
+            overwrite: OverwritePolicy::Refuse,
+            file_rotation: FileRotationPolicy::None,
+            capacity: 64,
+            renderer: DisplayView::default(),
+        };
+        p.set_display_recording(true, Some(settings)).await;
+        assert_eq!(p.display_recording_state(), Some(RecordingState::Enabled));
+        p.ingest(bytes_chunk(cid, b"captured"));
+
+        // Begin is idempotent — a second enable while recording is a no-op.
+        p.set_display_recording(true, None).await;
+        assert_eq!(p.display_recording_state(), Some(RecordingState::Enabled));
+
+        // Stop finalizes; later data is not written.
+        p.set_display_recording(false, None).await;
+        assert!(p.display_recording_state().is_none());
+        p.ingest(bytes_chunk(cid, b"after"));
+        p.finish().await;
+
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(written.contains("captured"), "{written:?}");
+        assert!(
+            !written.contains("before") && !written.contains("after"),
+            "only the toggled span is recorded: {written:?}"
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
     async fn mark_action_annotates_the_display_recording_not_the_raw_stream() {
         // §50.2: Mark writes a marker into the display recording (`.disp`) but
         // never the raw byte stream, which stays byte-exact.
@@ -1990,6 +2227,7 @@ mod tests {
             timestamp: Some(MarkTimestamp {
                 position: MarkPosition::Before,
                 format: TimestampConfig::default(), // HH:MM:SS
+                separator: String::new(),
             }),
         };
         // The default Display view is Raw/Native, so the disp render is the bytes

@@ -69,20 +69,56 @@ fn render_char(c: char, mode: CharacterRendering) -> String {
     }
 }
 
-/// Split `annotations` into the strings that fall **before** and **after** the byte
-/// at `offset`. Both lists preserve input order (annotations are pre-sorted by
-/// offset), so multiple marks at one offset stack in a stable order.
-fn splice_at(
-    annotations: &[RenderAnnotation],
-    offset: usize,
-) -> (impl Iterator<Item = &str>, impl Iterator<Item = &str>) {
-    let before = annotations
+/// Forward-only cursor over offset-sorted `annotations`. The render walks visit
+/// offsets in ascending order, so the run of annotations at each offset is found
+/// by advancing a pointer — O(bytes + annotations) overall. (The previous
+/// per-offset filter rescanned the whole list for **every byte**: O(bytes ×
+/// annotations), which froze the UI once a dense Mark rule had pinned thousands
+/// of timestamps into a large scrollback window.)
+struct AnnotationWalker<'a> {
+    annotations: &'a [RenderAnnotation],
+    next: usize,
+}
+
+impl<'a> AnnotationWalker<'a> {
+    fn new(annotations: &'a [RenderAnnotation]) -> Self {
+        Self {
+            annotations,
+            next: 0,
+        }
+    }
+
+    /// The annotations at exactly `offset`, in input order (stable stacking for
+    /// multiple marks on one byte). Must be called with non-decreasing offsets;
+    /// annotations at offsets the walk never visits (e.g. pointing mid-way into
+    /// a multi-byte character) are skipped — same as the old behavior.
+    fn run_at(&mut self, offset: usize) -> &'a [RenderAnnotation] {
+        while self.next < self.annotations.len() && self.annotations[self.next].offset < offset {
+            self.next += 1;
+        }
+        let start = self.next;
+        while self.next < self.annotations.len() && self.annotations[self.next].offset == offset {
+            self.next += 1;
+        }
+        &self.annotations[start..self.next]
+    }
+}
+
+/// Split the annotation run at one offset into the texts spliced **before** and
+/// **after** that byte, preserving input order.
+fn split_run(
+    run: &[RenderAnnotation],
+) -> (
+    impl Iterator<Item = &str> + '_,
+    impl Iterator<Item = &str> + '_,
+) {
+    let before = run
         .iter()
-        .filter(move |a| a.offset == offset && a.placement == AnnotationPlacement::Before)
+        .filter(|a| a.placement == AnnotationPlacement::Before)
         .map(|a| a.text.as_str());
-    let after = annotations
+    let after = run
         .iter()
-        .filter(move |a| a.offset == offset && a.placement == AnnotationPlacement::After)
+        .filter(|a| a.placement == AnnotationPlacement::After)
         .map(|a| a.text.as_str());
     (before, after)
 }
@@ -98,16 +134,17 @@ fn render_hex(
 ) -> String {
     // Build the ordered list of cells (each an already-formatted token), inserting
     // annotation strings as their own cells around the target byte's hex pair.
+    let mut walker = AnnotationWalker::new(annotations);
     let mut cells: Vec<String> = Vec::with_capacity(bytes.len());
     for (i, b) in bytes.iter().enumerate() {
-        let (before, after) = splice_at(annotations, i);
+        let (before, after) = split_run(walker.run_at(i));
         cells.extend(before.map(str::to_string));
         cells.push(format!("{b:02X}"));
         cells.extend(after.map(str::to_string));
     }
     // Annotations targeting the one-past-the-end offset (an `After` on the final byte
     // is handled above; a `Before` at len is a trailing mark) attach at the end.
-    let (end_before, _) = splice_at(annotations, bytes.len());
+    let (end_before, _) = split_run(walker.run_at(bytes.len()));
     cells.extend(end_before.map(str::to_string));
 
     match bytes_per_line.filter(|&n| n > 0) {
@@ -174,10 +211,11 @@ fn render_rendered(
 ) -> String {
     let mut out = String::new();
     let mut col = 0usize;
+    let mut walker = AnnotationWalker::new(annotations);
     // Annotation strings are inserted verbatim (they don't shift the tab column
     // accounting — a timestamp is presentation, not stream content).
     for (c, offset) in decode_with_offsets(bytes, encoding) {
-        let (before, after) = splice_at(annotations, offset);
+        let (before, after) = split_run(walker.run_at(offset));
         for s in before {
             out.push_str(s);
         }
@@ -214,7 +252,7 @@ fn render_rendered(
     }
     // A trailing annotation at the one-past-end offset (e.g. an After on the final
     // byte lands above; a Before at len is a trailing mark).
-    let (end_before, _) = splice_at(annotations, bytes.len());
+    let (end_before, _) = split_run(walker.run_at(bytes.len()));
     for s in end_before {
         out.push_str(s);
     }
@@ -272,14 +310,15 @@ impl DisplayView {
             DisplayMode::Raw => {
                 // One cell per byte's rendered char, with annotation strings spliced
                 // in as their own cells so wrapping keeps each intact.
+                let mut walker = AnnotationWalker::new(annotations);
                 let mut cells: Vec<String> = Vec::with_capacity(bytes.len());
                 for (c, offset) in decode_with_offsets(bytes, self.encoding) {
-                    let (before, after) = splice_at(annotations, offset);
+                    let (before, after) = split_run(walker.run_at(offset));
                     cells.extend(before.map(str::to_string));
                     cells.push(render_char(c, self.character_rendering));
                     cells.extend(after.map(str::to_string));
                 }
-                let (end_before, _) = splice_at(annotations, bytes.len());
+                let (end_before, _) = split_run(walker.run_at(bytes.len()));
                 cells.extend(end_before.map(str::to_string));
                 wrap_cells(&cells, if wrap { self.wrap_width } else { None })
             }

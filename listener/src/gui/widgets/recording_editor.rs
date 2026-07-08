@@ -114,16 +114,12 @@ pub(crate) fn edit_raw_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) 
     );
 }
 
-/// Edit the channel's **Display** recording setup (§54): records the rendered view
-/// output (`.disp`) — a separate pipeline tap from Raw (ADR-013). Config-driven:
-/// applied via a §13 Reconfigure.
+/// Edit the channel's **Display** recording setup (§54): destination, overwrite,
+/// rotation — the same fields as Raw (ADR-013), records the rendered view output
+/// (`.disp`). The "Record on start" flag (`enabled`) lives on the block's header
+/// row, like Raw's. Config-driven: applied via a §13 Reconfigure.
 pub(crate) fn edit_display_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
     let rec = &mut config.display_recording;
-    ui.checkbox(&mut rec.enabled, "Record display output (.disp)")
-        .on_hover_text("Record the rendered view, not the raw bytes (§54)");
-    if !rec.enabled {
-        return;
-    }
     recording_file_fields(
         ui,
         &mut rec.destination,

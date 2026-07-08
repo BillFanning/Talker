@@ -23,7 +23,7 @@ use crate::core::{ChannelId, DisplayViewId, MatchRuleId, RecordingState};
 use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
 
 use super::activity::ChannelActivity;
-use super::pipeline::RawRecordingSettings;
+use super::pipeline::{DisplayRecordingSettings, RawRecordingSettings};
 
 /// A query the pipeline task answers from its current state, replying on a
 /// oneshot. Dropping the reply sender simply yields nothing.
@@ -58,6 +58,12 @@ pub enum PipelineRequest {
     SetRecording {
         enabled: bool,
         settings: Option<RawRecordingSettings>,
+    },
+    /// Begin or stop **Display** recording live (§54, ADR-012): the Raw variant's
+    /// sibling, same lazy begin/finalize contract and fire-and-forget semantics.
+    SetDisplayRecording {
+        enabled: bool,
+        settings: Option<DisplayRecordingSettings>,
     },
 }
 
@@ -104,6 +110,8 @@ pub struct ChannelStats {
     pub error_count: usize,
     /// Raw-recording state, or `None` when raw recording isn't attached (§53).
     pub raw_recording: Option<RecordingState>,
+    /// Display-recording state (§54), or `None` when it isn't attached.
+    pub display_recording: Option<RecordingState>,
     /// How many `BytePattern` matches were recovered only because a pattern spanned
     /// a read-chunk boundary (§50.2) — the cross-chunk-carry measurement. A nonzero,
     /// rising count tells an operator that read boundaries are routinely splitting
@@ -135,11 +143,14 @@ pub struct ChannelSnapshot {
     pub diagnostics: DiagnosticsSnapshot,
     /// Raw-recording state, or `None` when raw recording isn't attached (§53).
     pub raw_recording: Option<RecordingState>,
+    /// Display-recording state (§54), or `None` when it isn't attached.
+    pub display_recording: Option<RecordingState>,
     /// Liveness facts: rolling throughput + last-data time (§91.1, §166).
     pub activity: ChannelActivity,
-    /// Recent Match Rule firings, oldest → newest, bounded (§50.2, §165). A GUI
-    /// cross-references these (by `byte_offset`) against the accumulated stream to
-    /// highlight/annotate.
+    /// Recent Match Rule firings, oldest → newest, bounded (§50.2, §165) — a
+    /// rolling window (the runtime keeps the last 256), not the full history. A
+    /// GUI cross-references these (by `view_offset`) against the accumulated
+    /// stream to annotate, and folds them into its own longer-lived store.
     pub matches: Vec<TriggeredMatch>,
     /// How many `BytePattern` matches were recovered only because a pattern spanned
     /// a read-chunk boundary (§50.2). The aggregate "how often" of the cross-chunk
