@@ -334,6 +334,25 @@ mod tests {
     }
 
     #[test]
+    fn recording_defaults_arm_a_new_channel() {
+        // New channels are ready to record once asked: a writable home-area
+        // destination, Hourly rotation, Append on-exists — both taps (ADR-013).
+        // Recording itself stays off until the user enables it.
+        use crate::record::{FileRotationPolicy, OverwritePolicy};
+        let raw = RawRecordingConfig::default();
+        assert!(raw.destination.is_some(), "a writable default destination");
+        assert_eq!(raw.overwrite_policy, OverwritePolicy::AppendIfExists);
+        assert_eq!(raw.file_rotation, FileRotationPolicy::Hourly);
+        assert!(!raw.enabled);
+
+        let disp = DisplayRecordingConfig::default();
+        assert_eq!(disp.destination, raw.destination, "shared default folder");
+        assert_eq!(disp.overwrite_policy, OverwritePolicy::AppendIfExists);
+        assert_eq!(disp.file_rotation, FileRotationPolicy::Hourly);
+        assert!(!disp.enabled);
+    }
+
+    #[test]
     fn templates_are_valid() {
         let mut profile = Profile::new("templates");
         profile.channels = vec![

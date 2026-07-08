@@ -269,17 +269,40 @@ pub struct RawRecordingConfig {
     pub disk_guard: Option<DiskGuard>,
 }
 
+/// The default recording destination for a **new** channel: a `listener` folder
+/// in the user's home area (`%USERPROFILE%\Documents\listener` on Windows,
+/// `$HOME/listener` elsewhere) — writable without elevation, and created on the
+/// first recording begin (the rotating recorder `create_dir_all`s its folder).
+/// `None` only if the home environment variable is unset (rare; the user then
+/// picks a destination by hand, exactly as before).
+///
+/// This is the **struct-`Default`** (new channels / templates) only — the
+/// per-field `#[serde(default)]`s are untouched, so a loaded profile keeps
+/// exactly what it says (a saved "no destination" stays "no destination").
+fn default_recording_destination() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join("Documents/listener"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("listener"))
+    }
+}
+
 impl Default for RawRecordingConfig {
-    /// Defaults to **Append** on-exists (not the global `Refuse`): re-recording to the
-    /// same `.raw` file extends it rather than failing, which is the friendly default
-    /// for a capture tool. Everything else is off/none.
+    /// A new channel is armed to record out of the box: a writable default
+    /// destination folder, **Hourly** rotation (bounded files for long runs, §59),
+    /// and **Append** on-exists (re-opening a period's file extends it rather than
+    /// failing — the friendly default for a capture tool). Recording itself stays
+    /// off (`enabled: false`) until the user asks.
     fn default() -> Self {
         Self {
             enabled: false,
-            destination: None,
+            destination: default_recording_destination(),
             timestamp_enabled: false,
             overwrite_policy: OverwritePolicy::AppendIfExists,
-            file_rotation: FileRotationPolicy::None,
+            file_rotation: FileRotationPolicy::Hourly,
             disk_guard: None,
         }
     }
@@ -288,7 +311,7 @@ impl Default for RawRecordingConfig {
 /// Display recording configuration (§54, §79). Display recording records the
 /// **rendered view** output (`.disp`) — a separate pipeline tap from Raw recording
 /// (ADR-013), with its own destination and options.
-#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DisplayRecordingConfig {
     /// Whether to begin Display recording automatically when the Channel starts.
     #[serde(default)]
@@ -302,6 +325,20 @@ pub struct DisplayRecordingConfig {
     /// Time-based file rotation (§59); `None` = single file.
     #[serde(default)]
     pub file_rotation: FileRotationPolicy,
+}
+
+impl Default for DisplayRecordingConfig {
+    /// Mirrors [`RawRecordingConfig::default`]: destination/Hourly/Append, off
+    /// until asked. Raw and Display share the default folder — with rotation the
+    /// per-period filenames differ by extension (`.raw`/`.disp`), so they coexist.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            destination: default_recording_destination(),
+            overwrite_policy: OverwritePolicy::AppendIfExists,
+            file_rotation: FileRotationPolicy::Hourly,
+        }
+    }
 }
 
 /// Disk-space guard for a recording (§56.2, §168). When free space on the
