@@ -177,12 +177,12 @@ Message-model removal). Everything below this block is verified done:
       (`pipeline.rs`) and the GUI only surfaces the first snapshot view (`detail.rs`).
       A non-primary view can be marked paused but has no per-view stream state to freeze.
       Needs a decision: per-view render state, or document pause as stream-wide (one view).
-- [ ] `.disp` per-chunk rendering garbles a multi-byte character split across two
-      reads: the display recorder renders each chunk independently, so a UTF-8 code
-      point (or, for odd-length chunks, UTF-16 unit) straddling a chunk boundary
-      becomes `U+FFFD` in the `.disp` — the live view is immune (it re-renders the
-      accumulated buffer). Either carry a partial-sequence tail per recording view,
-      or document `.disp` as chunk-rendered.
+- [x] `.disp` per-chunk rendering garbled a multi-byte character split across two
+      reads, and injected a newline per read chunk — both fixed by the streaming
+      renderer (ADR-018): the `.disp` is now the exact rendered stream (no hard
+      wraps ever; soft wrap is the viewer's job). Pinned by
+      `stream_renderer_is_chunking_invariant` +
+      `disp_is_the_exact_rendered_stream_across_read_boundaries`.
 
 ## Future work — deferred (spec Appendix A)
 

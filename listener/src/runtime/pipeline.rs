@@ -34,7 +34,9 @@ use crate::config::{
 
 use crate::core::{ChannelId, ChunkTime, DisplayViewId, MatchRuleId, RecordingState, RuntimeEvent};
 use crate::diagnostics::{Diagnostic, DiagnosticLog};
-use crate::display::{AnnotationPlacement, DisplayView, RenderAnnotation, RenderedOutput};
+use crate::display::{
+    AnnotationPlacement, DisplayView, RenderAnnotation, RenderedOutput, StreamRenderer,
+};
 use crate::record::{
     start_display_recording, start_raw_recording, DisplayFileRecorder, FileRotationPolicy,
     OverwritePolicy, RawFileRecorder, Recording, RecordingStopReason, RotatingDisplayRecorder,
@@ -155,10 +157,11 @@ impl DisplayViewHandle {
     }
 }
 
-/// A Display View's optional recorder: its renderer plus the display-recording
-/// handle (§54). Recording runs regardless of pause (§58).
+/// A Display View's optional recorder: its **streaming** renderer (per-recording
+/// state so the `.disp` is the exact rendered stream, ADR-018) plus the
+/// display-recording handle (§54). Recording runs regardless of pause (§58).
 struct ViewRecorder {
-    renderer: DisplayView,
+    renderer: StreamRenderer,
     recording: Recording<RenderedOutput>,
 }
 
@@ -500,16 +503,20 @@ impl ChannelPipeline {
             render_annotations_for_chunk(&mark_annotations, chunk_offset, bytes.len());
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.as_mut() {
+                // Streaming render (ADR-018): the concatenated .disp is the exact
+                // rendered stream — read boundaries leave no trace. Possibly
+                // empty (a chunk held back as an incomplete multi-byte tail).
                 // The chunk's arrival time rides on the rendered output so a
                 // rotating display recorder picks its period file from arrival,
                 // not write time (§59) — the two differ under a backlog.
-                let rendered = rec.renderer.render_stream_annotated(
-                    channel_id,
-                    bytes,
-                    &chunk_marks,
-                    Some(data.received_at),
-                );
-                rec.recording.try_record(rendered);
+                let text = rec.renderer.render_chunk(bytes, &chunk_marks);
+                if !text.is_empty() {
+                    rec.recording.try_record(RenderedOutput {
+                        channel_id,
+                        text,
+                        timestamp: Some(data.received_at),
+                    });
+                }
             }
         }
     }
@@ -626,7 +633,9 @@ impl ChannelPipeline {
         let suffix = byte_offset
             .map(|n| format!(" offset={n}"))
             .unwrap_or_default();
-        let text = format!("\u{2039}MARK rule={rule_id}{suffix}\u{203a}");
+        // Framed with explicit newlines: the recorder appends verbatim now
+        // (ADR-018), so the marker provides its own line breaks.
+        let text = format!("\n\u{2039}MARK rule={rule_id}{suffix}\u{203a}\n");
         let channel_id = self.channel_id;
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.as_mut() {
@@ -920,7 +929,7 @@ impl ChannelPipeline {
             .first_mut()
             .and_then(|v| v.recorder.take());
         if let Some(rec) = taken {
-            rec.recording.finalize(RecordingStopReason::Disabled).await;
+            finalize_view_recorder(self.channel_id, rec, RecordingStopReason::Disabled).await;
             self.diagnostics
                 .record(Diagnostic::event("Display recording stopped"));
         }
@@ -998,7 +1007,7 @@ impl ChannelPipeline {
         }
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.take() {
-                rec.recording.finalize(RecordingStopReason::Disabled).await;
+                finalize_view_recorder(self.channel_id, rec, RecordingStopReason::Disabled).await;
             }
         }
     }
@@ -1019,8 +1028,7 @@ impl ChannelPipeline {
         }
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.take() {
-                rec.recording
-                    .finalize(RecordingStopReason::ChannelStopped)
+                finalize_view_recorder(self.channel_id, rec, RecordingStopReason::ChannelStopped)
                     .await;
             }
         }
@@ -1052,7 +1060,7 @@ impl ChannelPipeline {
     ) {
         if let Some(view) = self.display_views.first_mut() {
             view.recorder = Some(ViewRecorder {
-                renderer,
+                renderer: StreamRenderer::new(renderer),
                 recording,
             });
         }
@@ -1211,6 +1219,26 @@ impl ChannelPipeline {
     fn stream_tail(&self) -> Vec<u8> {
         self.stream_buf.iter().copied().collect()
     }
+}
+
+/// Finalize one Display recording: flush the streaming renderer's tail (a
+/// still-carried incomplete sequence and any deferred annotations — rendered
+/// lossily now that the stream has truly ended) into the recording, then
+/// finalize the file (§56, ADR-018).
+async fn finalize_view_recorder(
+    channel_id: ChannelId,
+    mut rec: ViewRecorder,
+    reason: RecordingStopReason,
+) {
+    let tail = rec.renderer.finish();
+    if !tail.is_empty() {
+        rec.recording.try_record(RenderedOutput {
+            channel_id,
+            text: tail,
+            timestamp: None,
+        });
+    }
+    rec.recording.finalize(reason).await;
 }
 
 /// Whether `free` bytes is below the disk-guard threshold (§168).
@@ -1527,6 +1555,42 @@ mod tests {
 
         let written = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(written.contains("hello"));
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn disp_is_the_exact_rendered_stream_across_read_boundaries() {
+        // ADR-018: the .disp concatenation carries no read-boundary artifacts —
+        // no injected newlines (the old line-per-chunk behavior), and a UTF-8
+        // character split across two reads decodes as itself.
+        use crate::record::{start_display_recording, DisplayFileRecorder};
+        let cid = ChannelId::new();
+        let path = temp_path("exact-disp");
+        let disp = DisplayFileRecorder::create(&path, OverwritePolicy::Refuse)
+            .await
+            .unwrap();
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        p.set_display_recorder(
+            DisplayView {
+                mode: crate::display::DisplayMode::Rendered,
+                ..DisplayView::default()
+            },
+            start_display_recording(disp, 64),
+        );
+
+        // One sentence split arbitrarily across three reads, with the é split
+        // mid-character between chunks 2 and 3.
+        let full = "temp 21°C\r\nnése\r\n";
+        let bytes = full.as_bytes();
+        p.ingest(bytes_chunk(cid, &bytes[..4]));
+        p.ingest(bytes_chunk(cid, &bytes[4..13])); // ends inside the é of "nése"
+        p.ingest(bytes_chunk(cid, &bytes[13..]));
+        p.finish().await;
+
+        // Rendered mode: CRLF collapses to \n; otherwise the text is exactly the
+        // data — line structure from the data, not from the reads.
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(written, "temp 21°C\nnése\n");
         let _ = tokio::fs::remove_file(&path).await;
     }
 

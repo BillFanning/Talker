@@ -176,9 +176,12 @@ impl RawRecorder for RawFileRecorder {
     }
 }
 
-/// Display Recording to a file: writes a view's rendered text, one rendered chunk per
-/// write (§54). Not byte-exact. Any timestamps are already spliced into `output.text`
-/// by the renderer (per-match Mark timestamps, §50.2); the recorder writes verbatim.
+/// Display Recording to a file: appends a view's rendered text exactly as
+/// produced (§54) — the pipeline's `StreamRenderer` guarantees the concatenation
+/// is the exact rendered stream, so this recorder adds **nothing** (no per-chunk
+/// newline; read boundaries leave no trace). Not byte-exact. Any inline Mark
+/// timestamps are already spliced into `output.text`; `‹MARK …›` marker lines
+/// arrive pre-framed with their own newlines.
 pub struct DisplayFileRecorder {
     file: BufWriter<File>,
     /// Advisory lock on the destination (§121, ADR-014); see `RawFileRecorder._lock`.
@@ -199,7 +202,6 @@ impl DisplayFileRecorder {
 impl DisplayRecorder for DisplayFileRecorder {
     async fn write_rendered(&mut self, output: &RenderedOutput) -> Result<(), RecordError> {
         self.file.write_all(output.text.as_bytes()).await?;
-        self.file.write_all(b"\n").await?;
         Ok(())
     }
 
@@ -365,9 +367,11 @@ mod tests {
         });
         recording.finalize(RecordingStopReason::Disabled).await;
 
+        // The recorder appends verbatim — no injected separators (ADR-018): the
+        // rendered stream's own text is the file, byte for byte.
         assert_eq!(
             tokio::fs::read_to_string(&path).await.unwrap(),
-            "first\nsecond\n"
+            "firstsecond"
         );
 
         let _ = tokio::fs::remove_file(&path).await;

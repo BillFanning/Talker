@@ -93,6 +93,73 @@ fn decode_utf16_with_offsets(bytes: &[u8], big_endian: bool) -> Vec<(char, usize
     out
 }
 
+/// How many trailing bytes of `bytes` are an **incomplete** (not invalid)
+/// multi-byte sequence under `encoding` — the carry a *streaming* renderer must
+/// hold back until the next chunk so a character split across two reads decodes
+/// as itself instead of `U+FFFD` (§119: lossy replacement is for *invalid*
+/// input, and a read boundary is not the data's fault). Always `0` for the
+/// single-byte encodings; at most 3 otherwise.
+pub(crate) fn incomplete_tail(bytes: &[u8], encoding: DisplayEncoding) -> usize {
+    match encoding {
+        DisplayEncoding::Ascii | DisplayEncoding::Latin1 => 0,
+        DisplayEncoding::Utf8 => incomplete_utf8_tail(bytes),
+        DisplayEncoding::Utf16Le => incomplete_utf16_tail(bytes, false),
+        DisplayEncoding::Utf16Be => incomplete_utf16_tail(bytes, true),
+    }
+}
+
+/// The trailing bytes of a truncated UTF-8 sequence: walk back over up to three
+/// continuation bytes to a lead byte; if the lead declares more bytes than are
+/// present, that whole tail is incomplete. Anything malformed (stray
+/// continuations, an invalid lead, or a *complete* sequence) returns 0 — the
+/// lossy decoder deals with it as data.
+fn incomplete_utf8_tail(bytes: &[u8]) -> usize {
+    let n = bytes.len();
+    let mut i = n;
+    let mut continuations = 0;
+    while i > 0 && continuations < 3 && bytes[i - 1] & 0xC0 == 0x80 {
+        i -= 1;
+        continuations += 1;
+    }
+    if i == 0 {
+        return 0; // nothing but continuation bytes — invalid, not incomplete
+    }
+    let lead = bytes[i - 1];
+    let need = match lead {
+        b if b & 0x80 == 0x00 => 1,
+        b if b & 0xE0 == 0xC0 => 2,
+        b if b & 0xF0 == 0xE0 => 3,
+        b if b & 0xF8 == 0xF0 => 4,
+        _ => return 0, // invalid lead — data, not a boundary artifact
+    };
+    let have = n - (i - 1); // lead + its continuations so far
+    if need > have {
+        have
+    } else {
+        0
+    }
+}
+
+/// The trailing bytes of a truncated UTF-16 sequence: an odd leftover byte,
+/// plus a lone **high** surrogate unit waiting for its low half.
+fn incomplete_utf16_tail(bytes: &[u8], big_endian: bool) -> usize {
+    let odd = bytes.len() % 2;
+    let even = bytes.len() - odd;
+    let mut tail = odd;
+    if even >= 2 {
+        let pair = [bytes[even - 2], bytes[even - 1]];
+        let unit = if big_endian {
+            u16::from_be_bytes(pair)
+        } else {
+            u16::from_le_bytes(pair)
+        };
+        if (0xD800..=0xDBFF).contains(&unit) {
+            tail += 2;
+        }
+    }
+    tail
+}
+
 /// Decode `bytes` into a sequence of characters under `encoding` — the character
 /// stream without byte offsets. Kept as a test convenience over
 /// [`decode_with_offsets`] (which production rendering uses so it can splice inline
@@ -161,6 +228,27 @@ mod tests {
             decode_with_offsets(&bytes, DisplayEncoding::Utf16Le),
             [('A', 0), ('😀', 2)]
         );
+    }
+
+    #[test]
+    fn incomplete_tails_hold_back_split_sequences_only() {
+        use DisplayEncoding::*;
+        // UTF-8: a lead expecting more bytes than present is held back.
+        assert_eq!(incomplete_tail("aé".as_bytes(), Utf8), 0); // complete
+        assert_eq!(incomplete_tail(&[b'a', 0xC3], Utf8), 1); // é split after lead
+        assert_eq!(incomplete_tail(&[0xE2, 0x82], Utf8), 2); // € split mid-way
+        assert_eq!(incomplete_tail(&[0xF0, 0x9F, 0x98], Utf8), 3); // 😀 3 of 4
+                                                                   // Malformed input is data for the lossy decoder, not a carry.
+        assert_eq!(incomplete_tail(&[0x80, 0x80], Utf8), 0); // stray continuations
+        assert_eq!(incomplete_tail(&[b'a', 0xFF], Utf8), 0); // invalid lead
+                                                             // Single-byte encodings never carry.
+        assert_eq!(incomplete_tail(&[0xC3], Ascii), 0);
+        assert_eq!(incomplete_tail(&[0xC3], Latin1), 0);
+        // UTF-16: odd leftover byte, and a lone high surrogate awaiting its pair.
+        assert_eq!(incomplete_tail(&[0x41, 0x00, 0x42], Utf16Le), 1);
+        assert_eq!(incomplete_tail(&[0x3D, 0xD8], Utf16Le), 2); // high surrogate
+        assert_eq!(incomplete_tail(&[0x3D, 0xD8, 0x01], Utf16Le), 3);
+        assert_eq!(incomplete_tail(&[0x41, 0x00], Utf16Le), 0); // complete 'A'
     }
 
     #[test]

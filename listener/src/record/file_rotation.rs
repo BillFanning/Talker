@@ -418,13 +418,13 @@ mod tests {
             tokio::fs::read_to_string(dir.join("AIS_2026-06-03.disp"))
                 .await
                 .unwrap(),
-            "day1\n"
+            "day1"
         );
         assert_eq!(
             tokio::fs::read_to_string(dir.join("AIS_2026-06-04.disp"))
                 .await
                 .unwrap(),
-            "day2\n"
+            "day2"
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;

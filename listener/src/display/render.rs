@@ -2,7 +2,7 @@
 //! and wrapping (spec §42–§46), and the configured [`DisplayView`] renderer.
 
 use super::encoding::decode_with_offsets;
-use super::{CharacterRendering, DisplayEncoding, DisplayMode, RenderedOutput, WrappingMode};
+use super::{CharacterRendering, DisplayEncoding, DisplayMode, WrappingMode};
 
 /// Where an inline annotation string is spliced relative to the byte it targets
 /// (§50.2 Mark timestamps). Renderer-local so the pure display layer does not depend
@@ -180,16 +180,19 @@ fn split_run(
 /// line (annotation cells count, matching the old per-cell chunking).
 /// `annotations` are spliced as extra cells before/after their target byte.
 /// Emits directly into one pre-sized `String` — no per-byte allocation.
+/// `continuation` marks a *streaming* chunk that follows earlier output, so the
+/// first cell gets a leading separator instead of starting flush.
 fn render_hex(
     bytes: &[u8],
     separator: &str,
     bytes_per_line: Option<usize>,
     annotations: &[RenderAnnotation],
+    continuation: bool,
 ) -> String {
     let per_line = bytes_per_line.filter(|&n| n > 0);
     let mut walker = AnnotationWalker::new(annotations);
     let mut out = String::with_capacity(bytes.len() * (2 + separator.len()));
-    let mut cells_on_line = 0usize;
+    let mut cells_on_line = usize::from(continuation);
     // Start a new cell: a newline once the line is full, else the separator.
     let start_cell = |out: &mut String, cells_on_line: &mut usize| {
         if *cells_on_line > 0 {
@@ -251,13 +254,15 @@ fn wrap_lines(text: &str, width: Option<usize>) -> String {
 /// dropped (so CRLF collapses to a single break), TAB expands to the next
 /// 8-column tab stop, and other control characters are not printed. v1 does not
 /// emulate cursor movement.
+/// `col` is the terminal column carried in/out so tab stops stay correct when a
+/// streaming caller renders chunk by chunk (a one-shot caller passes `&mut 0`).
 fn render_rendered(
     bytes: &[u8],
     encoding: DisplayEncoding,
     annotations: &[RenderAnnotation],
+    col: &mut usize,
 ) -> String {
     let mut out = String::new();
-    let mut col = 0usize;
     let mut walker = AnnotationWalker::new(annotations);
     // Annotation strings are inserted verbatim (they don't shift the tab column
     // accounting — a timestamp is presentation, not stream content).
@@ -269,15 +274,15 @@ fn render_rendered(
         match c {
             '\n' => {
                 out.push('\n');
-                col = 0;
+                *col = 0;
             }
             '\r' => {}
             '\t' => {
-                let spaces = 8 - (col % 8);
+                let spaces = 8 - (*col % 8);
                 for _ in 0..spaces {
                     out.push(' ');
                 }
-                col += spaces;
+                *col += spaces;
             }
             // A space is an ordinary printable character in terminal output — it
             // must pass through. (`is_special` treats 0x20 as special only so Raw
@@ -285,12 +290,12 @@ fn render_rendered(
             // apply here.) Guard it before the control-dropping arm below.
             ' ' => {
                 out.push(' ');
-                col += 1;
+                *col += 1;
             }
             c if is_special(c) => {} // other controls are not printed
             c => {
                 out.push(c);
-                col += 1;
+                *col += 1;
             }
         }
         for s in after {
@@ -370,7 +375,13 @@ impl DisplayView {
         match self.mode {
             DisplayMode::Hex => {
                 let bytes_per_line = wrap.then_some(self.hex_bytes_per_line);
-                render_hex(bytes, &self.hex_separator, bytes_per_line, annotations)
+                render_hex(
+                    bytes,
+                    &self.hex_separator,
+                    bytes_per_line,
+                    annotations,
+                    false,
+                )
             }
             DisplayMode::Raw => {
                 // One cell per byte's rendered char, with annotation strings spliced
@@ -395,7 +406,7 @@ impl DisplayView {
                 w.out
             }
             DisplayMode::Rendered => {
-                let text = render_rendered(bytes, self.encoding, annotations);
+                let text = render_rendered(bytes, self.encoding, annotations, &mut 0);
                 if wrap {
                     wrap_lines(&text, self.wrap_width)
                 } else {
@@ -404,32 +415,140 @@ impl DisplayView {
             }
         }
     }
+}
 
-    /// Render a span of stream bytes for this view (§41, §141). `received_at` is
-    /// the chunk's arrival time, carried on the output to drive time-based
-    /// Display rotation (§59).
-    pub fn render_stream(
-        &self,
-        channel_id: crate::core::ChannelId,
-        bytes: &[u8],
-        received_at: Option<crate::core::ChunkTime>,
-    ) -> RenderedOutput {
-        self.render_stream_annotated(channel_id, bytes, &[], received_at)
+/// A **streaming** renderer for Display Recording (§54): renders the received
+/// stream chunk by chunk into the *exact rendered stream* — the same text as if
+/// the whole stream were rendered at once. Chunk boundaries are reception
+/// details (ADR-010) and leave no trace in the output:
+/// - a multi-byte character split across reads decodes as itself (the
+///   incomplete tail is carried into the next chunk), never `U+FFFD`;
+/// - Rendered-mode tab stops keep their terminal column across chunks;
+/// - Hex cells get exactly one separator between them, across chunks too.
+///
+/// **No hard wraps are ever emitted** (the view's wrapping config is ignored
+/// here): line breaks come only from the data, and soft-wrapping at the display
+/// edge is the *viewer's* job — the Notepad model. Owned per active recording;
+/// state starts fresh at each recording begin and spans rotation boundaries.
+pub struct StreamRenderer {
+    view: DisplayView,
+    /// Undecoded tail of the previous chunk — an incomplete multi-byte sequence
+    /// held back until its remaining bytes arrive.
+    carry: Vec<u8>,
+    /// Annotations whose target byte is still in `carry` (or beyond), offsets
+    /// relative to `carry[0]`.
+    pending: Vec<RenderAnnotation>,
+    /// Rendered-mode terminal column, so tab stops survive chunk boundaries.
+    col: usize,
+    /// Whether any Hex cell has been emitted — drives the joining separator.
+    hex_continuation: bool,
+}
+
+impl StreamRenderer {
+    pub fn new(view: DisplayView) -> Self {
+        Self {
+            view,
+            carry: Vec::new(),
+            pending: Vec::new(),
+            col: 0,
+            hex_continuation: false,
+        }
     }
 
-    /// Render a span of stream bytes with inline `annotations` spliced in (§50.2).
-    /// `received_at` rides along as the output's rotation timestamp (§59).
-    pub fn render_stream_annotated(
-        &self,
-        channel_id: crate::core::ChannelId,
-        bytes: &[u8],
-        annotations: &[RenderAnnotation],
-        received_at: Option<crate::core::ChunkTime>,
-    ) -> RenderedOutput {
-        RenderedOutput {
-            channel_id,
-            text: self.render_text_annotated(bytes, annotations),
-            timestamp: received_at,
+    /// Render one received chunk; `annotations` offsets are relative to
+    /// `bytes[0]` (any order — sorted internally). Returns the text to append
+    /// to the recording, possibly empty (e.g. the whole chunk is an incomplete
+    /// tail). An annotation at/past the renderable end is deferred and splices
+    /// before its byte when that byte arrives (or at [`finish`](Self::finish)).
+    pub fn render_chunk(&mut self, bytes: &[u8], annotations: &[RenderAnnotation]) -> String {
+        // Re-join the carried tail so a split character decodes whole; shift the
+        // incoming annotation offsets past it and merge with the deferred ones.
+        let carry_len = self.carry.len();
+        let joined: Vec<u8>;
+        let all: &[u8] = if carry_len == 0 {
+            bytes
+        } else {
+            joined = {
+                let mut j = std::mem::take(&mut self.carry);
+                j.extend_from_slice(bytes);
+                j
+            };
+            &joined
+        };
+        let mut anns: Vec<RenderAnnotation> = std::mem::take(&mut self.pending);
+        anns.extend(annotations.iter().map(|a| RenderAnnotation {
+            offset: a.offset + carry_len,
+            placement: a.placement,
+            text: a.text.clone(),
+        }));
+        anns.sort_by_key(|a| a.offset);
+
+        // Hold back an incomplete multi-byte tail (§119: lossy replacement is
+        // for invalid data; a read boundary is not the data's fault).
+        let tail = super::encoding::incomplete_tail(all, self.view.encoding);
+        let render_len = all.len() - tail;
+        let (now, defer): (Vec<_>, Vec<_>) = anns.into_iter().partition(|a| a.offset < render_len);
+        self.pending = defer
+            .into_iter()
+            .map(|a| RenderAnnotation {
+                offset: a.offset - render_len,
+                placement: a.placement,
+                text: a.text,
+            })
+            .collect();
+        self.carry = all[render_len..].to_vec();
+        self.render_slice(&all[..render_len], &now)
+    }
+
+    /// Flush at recording finalize: render any still-carried tail (now genuinely
+    /// truncated data — the lossy decoder applies) plus deferred annotations.
+    /// Possibly empty; the caller appends it before closing the file.
+    pub fn finish(&mut self) -> String {
+        if self.carry.is_empty() && self.pending.is_empty() {
+            return String::new();
+        }
+        let carry = std::mem::take(&mut self.carry);
+        let pending = std::mem::take(&mut self.pending);
+        self.render_slice(&carry, &pending)
+    }
+
+    /// One mode dispatch shared by `render_chunk`/`finish` — the same emitters
+    /// as the one-shot renderer, threaded with this recording's state.
+    fn render_slice(&mut self, bytes: &[u8], annotations: &[RenderAnnotation]) -> String {
+        match self.view.mode {
+            DisplayMode::Hex => {
+                let text = render_hex(
+                    bytes,
+                    &self.view.hex_separator,
+                    None,
+                    annotations,
+                    self.hex_continuation,
+                );
+                self.hex_continuation = self.hex_continuation || !text.is_empty();
+                text
+            }
+            DisplayMode::Rendered => {
+                render_rendered(bytes, self.view.encoding, annotations, &mut self.col)
+            }
+            DisplayMode::Raw => {
+                let mut walker = AnnotationWalker::new(annotations);
+                let mut w = CellWriter::new(None, bytes.len());
+                for (c, offset) in decode_with_offsets(bytes, self.view.encoding) {
+                    let (before, after) = split_run(walker.run_at(offset));
+                    for s in before {
+                        w.cell_str(s);
+                    }
+                    w.cell_rendered(c, self.view.character_rendering);
+                    for s in after {
+                        w.cell_str(s);
+                    }
+                }
+                let (end_before, _) = split_run(walker.run_at(bytes.len()));
+                for s in end_before {
+                    w.cell_str(s);
+                }
+                w.out
+            }
         }
     }
 }
@@ -518,19 +637,6 @@ mod tests {
         assert_eq!(v.render_text(b"ab \tX"), "ab      X");
     }
 
-    #[test]
-    fn render_stream_carries_channel_text_and_arrival_time() {
-        use crate::core::{ChannelId, ChunkTime};
-        let cid = ChannelId::new();
-        let at = ChunkTime::now();
-        let out =
-            view(DisplayMode::Raw, CharacterRendering::Native).render_stream(cid, b"hi", Some(at));
-        assert_eq!(out.channel_id, cid);
-        assert_eq!(out.text, "hi");
-        // The arrival time rides along — it drives Display-rotation periods (§59).
-        assert_eq!(out.timestamp.map(|t| t.wall_clock), Some(at.wall_clock));
-    }
-
     fn ann(offset: usize, placement: AnnotationPlacement, text: &str) -> RenderAnnotation {
         RenderAnnotation {
             offset,
@@ -591,6 +697,102 @@ mod tests {
         let anns = [ann(1, AnnotationPlacement::Before, "[T]")];
         // Cells: 41, [T], 42, 43 → 2 per line.
         assert_eq!(v.render_text_annotated(b"ABC", &anns), "41 [T]\n42 43");
+    }
+
+    // --- StreamRenderer (ADR-018: the exact rendered stream) ---
+
+    #[test]
+    fn stream_renderer_is_chunking_invariant() {
+        // The defining invariant: rendering byte-at-a-time equals rendering the
+        // whole stream at once — read boundaries leave no trace. Exercises
+        // multi-byte UTF-8, CRLF, tabs, and controls across all three modes.
+        let data = "a\tb€é\r\nx\x07y $GPGGA,1*77\r\n".as_bytes();
+        for (mode, chars) in [
+            (DisplayMode::Rendered, CharacterRendering::Native),
+            (DisplayMode::Raw, CharacterRendering::HexEscape),
+            (DisplayMode::Raw, CharacterRendering::Token),
+            (DisplayMode::Hex, CharacterRendering::Native),
+        ] {
+            let v = view(mode, chars);
+            let whole = {
+                let mut r = StreamRenderer::new(v.clone());
+                let mut out = r.render_chunk(data, &[]);
+                out.push_str(&r.finish());
+                out
+            };
+            let byte_at_a_time = {
+                let mut r = StreamRenderer::new(v);
+                let mut out = String::new();
+                for b in data {
+                    out.push_str(&r.render_chunk(std::slice::from_ref(b), &[]));
+                }
+                out.push_str(&r.finish());
+                out
+            };
+            assert_eq!(
+                byte_at_a_time, whole,
+                "chunking changed {mode:?}/{chars:?} output"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_renderer_rejoins_a_split_utf8_character() {
+        // The old per-chunk render turned a UTF-8 character split across two
+        // reads into U+FFFD; the carry re-joins it.
+        let v = view(DisplayMode::Rendered, CharacterRendering::Native);
+        let mut r = StreamRenderer::new(v);
+        let bytes = "é".as_bytes(); // [0xC3, 0xA9]
+        let first = r.render_chunk(&bytes[..1], &[]);
+        assert!(first.is_empty(), "the lead byte is carried, not replaced");
+        let second = r.render_chunk(&bytes[1..], &[]);
+        assert_eq!(second, "é");
+        assert!(r.finish().is_empty());
+    }
+
+    #[test]
+    fn stream_renderer_finish_renders_a_truncated_tail_lossily() {
+        // A carry still held at finalize is genuinely truncated data — the
+        // lossy decoder applies (§119).
+        let v = view(DisplayMode::Rendered, CharacterRendering::Native);
+        let mut r = StreamRenderer::new(v);
+        assert!(r.render_chunk(&[b'a', 0xC3], &[]).ends_with('a'));
+        assert_eq!(r.finish(), "\u{FFFD}");
+    }
+
+    #[test]
+    fn stream_renderer_hex_separates_across_chunks_and_tabs_keep_columns() {
+        // Hex: exactly one separator between cells, including across the chunk
+        // boundary (the old code restarted flush, gluing "41 4243 44").
+        let v = view(DisplayMode::Hex, CharacterRendering::Native);
+        let mut r = StreamRenderer::new(v);
+        let mut out = r.render_chunk(b"AB", &[]);
+        out.push_str(&r.render_chunk(b"CD", &[]));
+        assert_eq!(out, "41 42 43 44");
+
+        // Rendered: the tab column carries, so a tab right after a boundary
+        // still expands to the next 8-column stop of the whole stream.
+        let v = view(DisplayMode::Rendered, CharacterRendering::Native);
+        let mut r = StreamRenderer::new(v);
+        let mut out = r.render_chunk(b"ab", &[]);
+        out.push_str(&r.render_chunk(b"\tX", &[]));
+        assert_eq!(out, "ab      X"); // col 2 → tab to 8
+    }
+
+    #[test]
+    fn stream_renderer_defers_an_annotation_for_a_carried_byte() {
+        // A Mark targeting a byte still held in the carry splices when that
+        // byte finally renders — on the correct side of it.
+        let v = view(DisplayMode::Rendered, CharacterRendering::Native);
+        let mut r = StreamRenderer::new(v);
+        // Chunk 1: "x" + the lead byte of é; the annotation targets offset 1
+        // (the é), which is carried.
+        let bytes = "xé".as_bytes();
+        let anns = [ann(1, AnnotationPlacement::Before, "[T]")];
+        let first = r.render_chunk(&bytes[..2], &anns);
+        assert_eq!(first, "x", "the annotated byte is still in the carry");
+        let second = r.render_chunk(&bytes[2..], &[]);
+        assert_eq!(second, "[T]é", "the deferred mark splices before its byte");
     }
 
     #[test]

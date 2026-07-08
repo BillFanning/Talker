@@ -15,7 +15,7 @@
 mod encoding;
 mod render;
 
-pub use render::{AnnotationPlacement, DisplayView, RenderAnnotation};
+pub use render::{AnnotationPlacement, DisplayView, RenderAnnotation, StreamRenderer};
 
 use crate::core::{ChannelId, ChunkTime};
 

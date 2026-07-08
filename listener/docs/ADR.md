@@ -614,6 +614,27 @@ The live viewer was rebasing `TriggeredMatch.byte_offset` (stream space) onto it
 - The edge case of a boundary-split match whose carry bytes straddle a pause transition maps approximately (the prior chunk's bytes may not be in the view); `checked_sub` clamps the pre-window edge. Vanishingly rare and self-limiting — the splice is dropped, never misplaced across the window.
 - Pinned by `match_view_offset_tracks_the_paused_view_not_the_raw_stream` (pipeline).
 
+## ADR-018 — The `.disp` is the exact rendered stream; no hard wraps, ever (the Notepad model)
+
+**Status:** Accepted. **Context:** spec §54 ("the recorder writes what the display shows, verbatim"), ADR-010 (chunk boundaries are reception details, never structure), §119 (lossy replacement is for *invalid* input), §59 (rotation), the carried TODO item on `.disp` garbling a multi-byte character split across reads.
+
+**Problem.** The Display recorder rendered each received chunk independently and appended `\n` per chunk, so the `.disp`'s line structure tracked **OS read boundaries**: the same byte stream produced different files over serial vs UDP (different chunking — exactly the divergence ADR-009 removed for the live view), a sentence split across two reads gained an artificial line break, a UTF-8/UTF-16 character split across reads became `U+FFFD`, and Hex/tab column state restarted at every read. The `.disp` was the only output in the system that leaked chunk boundaries.
+
+**Decision.** Per active Display recording, a **streaming renderer** (`display::StreamRenderer`) owned by the pipeline's `ViewRecorder` renders chunk by chunk into the *exact rendered stream* — the same text as rendering the whole stream at once, pinned by a chunking-invariance test (byte-at-a-time == one-shot). State per recording: the undecoded multi-byte **carry** (an incomplete tail held for the next chunk; annotations targeting carried bytes defer with it), the Rendered-mode **tab column**, and a Hex **separator-continuation** flag. The carry is flushed lossily at finalize (a truncated stream *is* invalid data at that point). State starts fresh at each recording begin and spans rotation boundaries (each period file stays contiguous; no artifact is reintroduced at rotation).
+
+**No hard wraps are ever written** — the Notepad model, chosen explicitly: the file stores unwrapped content; soft wrap is a viewer toggle. Line breaks come only from the data (Rendered/Raw-Native CR/LF) and from `‹MARK …›` marker lines, which now frame themselves with explicit newlines. Hex is a continuous separator-joined cell stream (its 16-per-line look is likewise a view-time choice). Wrapping at record time was rejected because the display edge is a view-time, mutable property: the width at write time would bake the window-resize history into the file, the recorder (runtime) cannot see the GUI (ADR-008 layering), headless recording has no display edge at all, and any baked width destroys determinism and diffability. The recorder ignores the view config's `wrapping` accordingly.
+
+**Why not the alternatives.**
+- *Keep line-per-chunk and document it.* Honest but wrong: adequate only by coincidence at low rates, and it fails precisely under load, when the `.disp` matters most.
+- *Delete just the recorder's `\n`.* Breaks Hex (chunks glue as `41 4243`), tab columns, and marker lines — the newline was load-bearing for all three; the fix is state, not deletion.
+- *Hard-wrap at a fixed configured width.* Deterministic, but still a lossy view decision baked into content; deferred unless a real consumer needs it.
+
+**Consequences.**
+- `DisplayFileRecorder` appends verbatim (no injected newline); `RotatingDisplayRecorder` still rotates per rendered item on arrival time — a rotation boundary can now fall mid-line, which is the correct trade (files stay individually contiguous; the stream is exact across them).
+- The pipeline flushes the renderer tail (`finish()`) into the recording at every finalize path (stop, stop-all, channel stop).
+- The live viewer and the `.disp` now agree byte-for-byte for Rendered/Raw content (the viewer re-renders the accumulated buffer, which was always boundary-free).
+- Pinned by: `stream_renderer_is_chunking_invariant`, `stream_renderer_rejoins_a_split_utf8_character`, `stream_renderer_hex_separates_across_chunks_and_tabs_keep_columns`, `stream_renderer_defers_an_annotation_for_a_carried_byte`, and the pipeline-level `disp_is_the_exact_rendered_stream_across_read_boundaries`.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_
