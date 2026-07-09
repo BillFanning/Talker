@@ -35,7 +35,15 @@ pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
     let level_handle = logging.level_handle();
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 740.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 740.0])
+            .with_min_inner_size([640.0, 480.0]),
+        // Don't persist/restore window geometry (listener's lesson, ADR-016):
+        // eframe restores the saved window state *after* the window is shown,
+        // which produced a double frame/title-bar flash on launch — and a bad
+        // tiny geometry could be restored too. The window always opens at the
+        // default size; zoom and the last profile are persisted separately.
+        persist_window: false,
         ..Default::default()
     };
     eframe::run_native(
@@ -74,6 +82,10 @@ fn zoom_percent(ppp: f32) -> u32 {
 }
 
 struct TalkerApp {
+    /// A clone of the egui context, handed to each runner thread as a
+    /// repaint-on-status callback (`Context` is a cheap `Arc` clone and
+    /// `request_repaint` is thread-safe) — listener's driver-wake model.
+    egui_ctx: egui::Context,
     profile: Profile,
     profile_path: Option<PathBuf>,
     dirty: bool,
@@ -154,12 +166,16 @@ impl TalkerApp {
             .and_then(|s| s.get_string("dark_mode"))
             .map(|s| s != "false")
             .unwrap_or(true);
-        install_visuals(ctx);
+        // The shared wiredata look (ADR-016): font stack, both themes'
+        // visuals, and the style tweaks come from `wiredata-ui`, so talker
+        // and listener read as one product. Talker keeps its dark/light
+        // toggle; `apply_theme` just picks which installed theme is active.
+        wiredata_ui::fonts::install_fonts(ctx);
+        wiredata_ui::style::install_visuals(ctx);
+        wiredata_ui::style::apply_style_tweaks(ctx);
         apply_theme(ctx, dark_mode);
-        install_control_pictures_fallback_font(ctx);
-        install_unicode_fallback_fonts(ctx);
-        bump_non_monospace_text_size(ctx, 0.5);
         let mut app = Self {
+            egui_ctx: ctx.clone(),
             profile: Profile::default(),
             profile_path: None,
             dirty: false,
@@ -503,11 +519,15 @@ impl TalkerApp {
 
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(32);
         let (status_tx, status_rx) = crossbeam_channel::bounded(256);
+        // Wake the UI whenever a status is queued, so sends appear the
+        // moment they happen instead of on the next poll tick.
+        let repaint_ctx = self.egui_ctx.clone();
+        let notify: runner::StatusNotify = Box::new(move || repaint_ctx.request_repaint());
         let thread = std::thread::spawn(move || {
             for pred in predecessors {
                 let _ = pred.join();
             }
-            runner::open_and_run(i, cfg, schedule, cmd_rx, status_tx);
+            runner::open_and_run(i, cfg, schedule, cmd_rx, status_tx, Some(notify));
         });
 
         if i < self.talkers.len() {
@@ -689,13 +709,11 @@ impl TalkerApp {
         }
 
         if any_running || any_draining {
-            // Keep polling while channels run or drain, but at a bounded
-            // cadence — an unconditional `request_repaint()` here redrew at
-            // maximum framerate continuously, even for a once-a-minute
-            // schedule. (Phase 4 of the GUI merge replaces this with
-            // repaint-on-status callbacks from the talker threads, like
-            // listener's driver.)
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            // Sends wake the UI instantly via the runners' notify callbacks
+            // (ADR-016); this slower heartbeat only covers what has no
+            // callback — log lines arriving over `log_rx`, the window title,
+            // and reaping drained threads.
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
 
         // Update window title when it changes.
@@ -2430,28 +2448,8 @@ fn checksum_label(algorithm: ChecksumAlgorithm) -> &'static str {
 /// Register the app's high-contrast Dark and Light visuals, one per
 /// egui theme. The caller picks which is active via
 /// [`egui::Context::set_theme`]; this only installs the palettes.
-fn install_visuals(ctx: &egui::Context) {
-    // ── Dark ──
-    let dark_fg = egui::Color32::from_gray(230);
-    let mut dark = egui::Visuals::dark();
-    dark.override_text_color = Some(dark_fg);
-    dark.widgets.noninteractive.fg_stroke.color = dark_fg;
-    dark.widgets.inactive.fg_stroke.color = dark_fg;
-    dark.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(90));
-
-    // ── Light ──
-    let light_fg = egui::Color32::from_gray(20);
-    let mut light = egui::Visuals::light();
-    light.override_text_color = Some(light_fg);
-    light.widgets.noninteractive.fg_stroke.color = light_fg;
-    light.widgets.inactive.fg_stroke.color = light_fg;
-    light.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(160));
-
-    ctx.set_visuals_of(egui::Theme::Dark, dark);
-    ctx.set_visuals_of(egui::Theme::Light, light);
-}
-
-/// Apply `dark`/light to `ctx` via [`egui::ThemePreference`].
+/// Apply `dark`/light to `ctx` via [`egui::ThemePreference`]. The visuals for
+/// both themes are installed by `wiredata_ui::style::install_visuals` (ADR-016).
 fn apply_theme(ctx: &egui::Context, dark: bool) {
     ctx.set_theme(if dark {
         egui::ThemePreference::Dark
@@ -2460,124 +2458,9 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     });
 }
 
-/// Add `delta` points to every text style in both themes *except* the
-/// Monospace family, so the display pane's output data (rendered with
-/// `RichText::monospace()`) keeps its original size while the rest of the
-/// UI (labels, buttons, headings, byte markers) is slightly larger.
-fn bump_non_monospace_text_size(ctx: &egui::Context, delta: f32) {
-    ctx.all_styles_mut(|style| {
-        for font_id in style.text_styles.values_mut() {
-            if font_id.family != egui::FontFamily::Monospace {
-                font_id.size += delta;
-            }
-        }
-    });
-}
-
-/// Register a Unicode Control Pictures fallback font.
-///
-/// The default `egui` fonts (Hack, Ubuntu-Light, NotoEmoji, emoji-icon) cover
-/// zero glyphs in U+2400–U+243F, so the display pane's `Pictures` style would
-/// otherwise render every control byte as a tofu box. We ship an ~19 KB
-/// subset of Cascadia Mono containing exactly U+2400–U+2421 and register it
-/// as a low-priority fallback for both the Monospace family (display pane)
-/// and the Proportional family (the `␊` radio label in the controls bar).
-fn install_control_pictures_fallback_font(ctx: &egui::Context) {
-    const FONT: &[u8] = include_bytes!("../../assets/fonts/CascadiaMono-ControlPictures.ttf");
-    ctx.add_font(egui::epaint::text::FontInsert::new(
-        "control_pictures",
-        egui::FontData::from_static(FONT),
-        vec![
-            egui::epaint::text::InsertFontFamily {
-                family: egui::FontFamily::Monospace,
-                priority: egui::epaint::text::FontPriority::Lowest,
-            },
-            egui::epaint::text::InsertFontFamily {
-                family: egui::FontFamily::Proportional,
-                priority: egui::epaint::text::FontPriority::Lowest,
-            },
-        ],
-    ));
-}
-
-/// Install Noto Sans as the primary proportional UI font, plus the
-/// per-script Noto files as lowest-priority fallbacks.
-///
-/// `NotoSans-Regular` (Latin / Greek / Cyrillic / Vietnamese) is
-/// registered at **Highest** priority for the `Proportional` family,
-/// so it wins over egui's default Ubuntu-Light for the whole UI —
-/// one consistent humanist sans. It's also a *lowest*-priority
-/// fallback for `Monospace`, so Hack stays the wire-bytes face but
-/// Noto fills any Latin gaps.
-///
-/// The remaining script files (Symbols2, Thai, Arabic, Hebrew,
-/// Devanagari) are lowest-priority fallbacks for both families, so
-/// non-Latin codepoints render with real glyphs instead of tofu in
-/// the message editor / preview / output pane. CJK is *not* included
-/// — the extra ~10 MB isn't worth it for the typical talker use
-/// case. See `assets/fonts/README.md` for the rationale and file list.
-fn install_unicode_fallback_fonts(ctx: &egui::Context) {
-    use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
-    use egui::FontFamily::{Monospace, Proportional};
-
-    // Primary UI face: Noto Sans wins for Proportional, fills gaps
-    // for Monospace.
-    ctx.add_font(FontInsert::new(
-        "noto_sans",
-        egui::FontData::from_static(include_bytes!("../../assets/fonts/NotoSans-Regular.ttf")),
-        vec![
-            InsertFontFamily {
-                family: Proportional,
-                priority: FontPriority::Highest,
-            },
-            InsertFontFamily {
-                family: Monospace,
-                priority: FontPriority::Lowest,
-            },
-        ],
-    ));
-
-    // Per-script fallbacks. Order doesn't matter — each only
-    // contributes glyphs in its own coverage range.
-    const FALLBACKS: &[(&str, &[u8])] = &[
-        (
-            "noto_sans_symbols2",
-            include_bytes!("../../assets/fonts/NotoSansSymbols2-Regular.ttf"),
-        ),
-        (
-            "noto_sans_thai",
-            include_bytes!("../../assets/fonts/NotoSansThai-Regular.ttf"),
-        ),
-        (
-            "noto_sans_arabic",
-            include_bytes!("../../assets/fonts/NotoSansArabic-Regular.ttf"),
-        ),
-        (
-            "noto_sans_hebrew",
-            include_bytes!("../../assets/fonts/NotoSansHebrew-Regular.ttf"),
-        ),
-        (
-            "noto_sans_devanagari",
-            include_bytes!("../../assets/fonts/NotoSansDevanagari-Regular.ttf"),
-        ),
-    ];
-    for (name, bytes) in FALLBACKS {
-        ctx.add_font(FontInsert::new(
-            name,
-            egui::FontData::from_static(bytes),
-            vec![
-                InsertFontFamily {
-                    family: Monospace,
-                    priority: FontPriority::Lowest,
-                },
-                InsertFontFamily {
-                    family: Proportional,
-                    priority: FontPriority::Lowest,
-                },
-            ],
-        ));
-    }
-}
+// (The former local font installers and text-size bump moved to `wiredata-ui`
+// — fonts::install_fonts covers the control pictures via the full Cascadia
+// face, and style::apply_style_tweaks covers the +0.5 non-monospace size.)
 
 // ── Field renderers ───────────────────────────────────────────────────────────
 

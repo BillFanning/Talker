@@ -21,6 +21,9 @@ path = "src/bin/listener-gui.rs"
 
 [dependencies]
 
+# Shared GUI chrome: fonts, palette, base style (ADR-019)
+wiredata-ui = { path = "../wiredata-ui" }
+
 # Error handling (application-level)
 anyhow = { workspace = true }
 

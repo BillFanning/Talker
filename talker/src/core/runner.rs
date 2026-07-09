@@ -73,6 +73,11 @@ pub struct TalkerHandle {
     pub thread: std::thread::JoinHandle<()>,
 }
 
+/// Called after each status is queued, so an event-driven owner (the GUI)
+/// can wake and drain instead of polling. Kept as a plain closure — core
+/// stays UI-framework-free; the GUI passes `ctx.request_repaint`.
+pub type StatusNotify = Box<dyn Fn() + Send>;
+
 /// Open `cfg`'s interface, then run the send loop.
 ///
 /// Meant to be called *on the channel's own thread* (the GUI path), so the
@@ -85,15 +90,23 @@ pub fn open_and_run(
     schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
     status_tx: Sender<TalkerStatus>,
+    notify: Option<StatusNotify>,
 ) {
     match cfg.open() {
-        Ok(interface) => run(channel, interface, schedule, cmd_rx, status_tx),
+        Ok(interface) => run(channel, interface, schedule, cmd_rx, status_tx, notify),
         Err(e) => {
             tracing::error!("failed to open channel {}: {e:#}", channel + 1);
-            let _ = status_tx.try_send(TalkerStatus::OpenFailed {
-                channel,
-                message: format!("{e:#}"),
-            });
+            if status_tx
+                .try_send(TalkerStatus::OpenFailed {
+                    channel,
+                    message: format!("{e:#}"),
+                })
+                .is_ok()
+            {
+                if let Some(n) = &notify {
+                    n();
+                }
+            }
         }
     }
 }
@@ -108,13 +121,14 @@ pub fn run(
     schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
     status_tx: Sender<TalkerStatus>,
+    notify: Option<StatusNotify>,
 ) {
     tracing::info!(
         "channel {} running ({}-message schedule)",
         channel + 1,
         schedule.len()
     );
-    run_loop(channel, interface, schedule, cmd_rx, status_tx);
+    run_loop(channel, interface, schedule, cmd_rx, status_tx, notify);
     tracing::info!("channel {} stopped", channel + 1);
 }
 
@@ -129,6 +143,7 @@ fn run_loop(
     mut schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
     status_tx: Sender<TalkerStatus>,
+    notify: Option<StatusNotify>,
 ) {
     let mut total_count = 0u64;
     // Per-message send counts, indexed by the message's position in the
@@ -151,10 +166,17 @@ fn run_loop(
                     }
                     Err(e) => {
                         tracing::warn!("channel {} interface update failed: {e:#}", channel + 1);
-                        let _ = status_tx.try_send(TalkerStatus::ConnectionError {
-                            channel,
-                            message: format!("{e:#}"),
-                        });
+                        let sent = status_tx
+                            .try_send(TalkerStatus::ConnectionError {
+                                channel,
+                                message: format!("{e:#}"),
+                            })
+                            .is_ok();
+                        if sent {
+                            if let Some(n) = &notify {
+                                n();
+                            }
+                        }
                     }
                 }
                 Flow::Continue
@@ -194,23 +216,38 @@ fn run_loop(
                     // Best-effort: a full receiver drops the update rather
                     // than backpressuring the send cadence — counts
                     // self-correct via the next delivered status.
-                    if let Err(TrySendError::Full(_)) = status_tx.try_send(status) {
-                        dropped_statuses += 1;
-                        if dropped_statuses == 1 {
-                            tracing::warn!(
-                                "channel {}: status receiver is falling behind — sends \
-                                 continue at cadence; display updates are being sampled",
-                                channel + 1
-                            );
+                    match status_tx.try_send(status) {
+                        Ok(()) => {
+                            if let Some(n) = &notify {
+                                n();
+                            }
                         }
+                        Err(TrySendError::Full(_)) => {
+                            dropped_statuses += 1;
+                            if dropped_statuses == 1 {
+                                tracing::warn!(
+                                    "channel {}: status receiver is falling behind — sends \
+                                     continue at cadence; display updates are being sampled",
+                                    channel + 1
+                                );
+                            }
+                        }
+                        Err(TrySendError::Disconnected(_)) => {}
                     }
                 }
                 Err(e) => {
                     tracing::warn!("channel {} send failed: {e:#}", channel + 1);
-                    let _ = status_tx.try_send(TalkerStatus::ConnectionError {
-                        channel,
-                        message: format!("{e:#}"),
-                    });
+                    let sent = status_tx
+                        .try_send(TalkerStatus::ConnectionError {
+                            channel,
+                            message: format!("{e:#}"),
+                        })
+                        .is_ok();
+                    if sent {
+                        if let Some(n) = &notify {
+                            n();
+                        }
+                    }
                 }
             },
             // Nothing due yet: block on the command channel until the next
@@ -274,7 +311,8 @@ mod tests {
         let schedule = Schedule::compile(messages, Instant::now()).unwrap();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
         let (status_tx, status_rx) = crossbeam_channel::bounded(256);
-        let thread = std::thread::spawn(move || run(0, interface, schedule, cmd_rx, status_tx));
+        let thread =
+            std::thread::spawn(move || run(0, interface, schedule, cmd_rx, status_tx, None));
         (
             sent,
             TalkerHandle {
@@ -393,7 +431,7 @@ mod tests {
         let schedule = Schedule::compile(&[msg("AB", 100)], Instant::now()).unwrap();
         let (_cmd_tx, cmd_rx) = crossbeam_channel::bounded::<TalkerCommand>(8);
         let (status_tx, status_rx) = crossbeam_channel::bounded(8);
-        open_and_run(3, cfg, schedule, cmd_rx, status_tx);
+        open_and_run(3, cfg, schedule, cmd_rx, status_tx, None);
         match status_rx.try_recv() {
             Ok(TalkerStatus::OpenFailed { channel, message }) => {
                 assert_eq!(channel, 3);

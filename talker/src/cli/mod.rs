@@ -217,7 +217,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         cmd_txs.push(cmd_tx);
         let status_tx = status_tx.clone();
         handles.push(std::thread::spawn(move || {
-            runner::run(i, interface, schedule, cmd_rx, status_tx);
+            // No notify callback: the CLI's main thread blocks on the status
+            // channel anyway, so there is nothing to wake.
+            runner::run(i, interface, schedule, cmd_rx, status_tx, None);
         }));
     }
     drop(status_tx); // only the runners hold senders now

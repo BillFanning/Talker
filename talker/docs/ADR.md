@@ -293,6 +293,23 @@ The version number increments only on breaking schema changes that `serde(defaul
 
 ---
 
+## ADR-016 — `wiredata-ui`: a shared GUI-chrome crate (fonts, palette, base style)
+
+**Context:** The GUI merge makes `talker` adopt `listener`'s look and feel (channel list + detail layout, listener's light theme, a dark theme for both). Before this decision each app carried its own copies of the same chrome: overlapping bundled Noto font files, two divergent visual styles, and duplicated formatting helpers. A deliberate "the two apps look identical" goal turns that duplication into guaranteed drift.
+
+**Decision:** A fourth workspace crate, **`wiredata-ui`** (internal, `publish = false`), owns the GUI **chrome** only: the bundled font stack and its fallback chains (`fonts`), the named severity/status color palette with `LIGHT` and `DARK` const instances (`palette`), the base widget visuals for both themes plus the shared non-visual style tweaks (`style`), and small pure formatting helpers (`format::human_bytes`). It depends **only on `egui`** — never on `talker`, `listener`, `eframe`, or any runtime crate. App-specific widgets, layouts, and view-models stay in each app. Listener's counterpart decision is its ADR-019.
+
+**Scope rule (what belongs here):** a piece moves into `wiredata-ui` only when it is (a) purely presentational, (b) meaningfully identical across both apps, and (c) egui-only. Anything entangled with an app's runtime, config schema, or view-model stays out. A shared *runtime* crate (`wiredata-core`) was considered during the talker review and rejected — config/timestamp/profile duplication is small and stable, and the apps' I/O shapes are opposite; the chrome is the one place where duplication would actively grow.
+
+**Consequences:**
+- The font assets moved from `listener/assets/fonts/` to `wiredata-ui/assets/fonts/` (one copy; talker's private subset — including the Cascadia control-pictures subset font — was deleted, since the full Cascadia face in the shared stack covers U+2400–U+243F).
+- Talker's local visuals/font installers were replaced by `wiredata_ui::{fonts::install_fonts, style::install_visuals, style::apply_style_tweaks}`. Talker's light theme is now listener's grey-backdrop look; talker's original dark values seeded the shared dark theme. The dark/light **toggle** remains talker-only until listener grows one.
+- Talker also adopts listener's window-startup lessons: `persist_window: false` (no post-show geometry jump) and a minimum window size.
+- Listener's `gui/{fonts,theme}.rs` and `widgets/format.rs` became thin re-exports, so its call sites are unchanged.
+- The crate has no `docs/` folder; its decisions live in the two app ADR series (this entry and listener ADR-019).
+
+---
+
 ## Open questions
 
 The following decisions are deferred until the relevant module is written. They are recorded here so they are not forgotten and so the eventual decision (in a future ADR or commit) can reference the context.

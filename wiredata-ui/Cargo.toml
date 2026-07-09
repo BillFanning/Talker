@@ -1,0 +1,12 @@
+[package]
+name        = "wiredata-ui"
+description = "Shared GUI chrome for the wiredata apps: fonts, palette, base style, formatting"
+publish     = false
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+
+[dependencies]
+egui = { workspace = true }

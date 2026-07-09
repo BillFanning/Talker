@@ -3,6 +3,7 @@ members = [
     "nmea0183",
     "talker",
     "listener",
+    "wiredata-ui",
 ]
 resolver = "2"
 

@@ -635,6 +635,17 @@ The live viewer was rebasing `TriggeredMatch.byte_offset` (stream space) onto it
 - The live viewer and the `.disp` now agree byte-for-byte for Rendered/Raw content (the viewer re-renders the accumulated buffer, which was always boundary-free).
 - Pinned by: `stream_renderer_is_chunking_invariant`, `stream_renderer_rejoins_a_split_utf8_character`, `stream_renderer_hex_separates_across_chunks_and_tabs_keep_columns`, `stream_renderer_defers_an_annotation_for_a_carried_byte`, and the pipeline-level `disp_is_the_exact_rendered_stream_across_read_boundaries`.
 
+## ADR-019 — GUI chrome moves to the shared `wiredata-ui` crate
+
+**Status:** Accepted. **Context:** the GUI merge — talker adopts listener's look and feel, and both apps will eventually offer the same light/dark themes. Counterpart of talker ADR-016, which holds the full rationale and the scope rule.
+
+**Decision.** Listener's GUI **chrome** — the bundled font stack (`gui/fonts.rs`), the named color palette (`gui/theme.rs`), the base widget visuals and style tweaks (the body of `apply_style`), and `widgets::format::human_bytes` — moved verbatim into the new internal workspace crate **`wiredata-ui`** (egui-only, `publish = false`). The listener modules remain as thin re-exports, so every call site is unchanged. Listener still pins `ThemePreference::Light`; the shared crate also installs the dark visuals (seeded from talker's dark theme) so the future listener theme toggle is a preference switch, not a styling project. The palette gained a `DARK` counterpart for the same reason — several light values (e.g. `WARNING_AMBER`, `INFO_GREY`) are unreadable on a dark backdrop.
+
+**Consequences.**
+- `listener/assets/fonts/` moved to `wiredata-ui/assets/fonts/` (README and licenses included); the font rationale doc lives there now.
+- Anything app-specific stays put: view-models, widgets with runtime knowledge, the stream-view `ColorScheme` (user-chosen content colors are not chrome).
+- A change to the shared look lands in both apps by construction — the drift risk that motivated the crate is gone.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

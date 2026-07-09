@@ -111,60 +111,15 @@ fn apply_style(ctx: &egui::Context) {
     // No custom UI scale: the OS DPI setting drives sizing. (We deliberately do not
     // call `set_pixels_per_point` / `set_zoom_factor` — overriding the scale here both
     // ignores the user's system setting and gets persisted into eframe storage, where
-    // a stale value then sticks across launches. Text size is nudged in
-    // `all_styles_mut` below instead.)
+    // a stale value then sticks across launches. Text size is nudged by the shared
+    // style tweaks instead.)
 
-    // Clean slate: a light theme with the grey backdrop the user likes and darker
-    // (heavier) text — no custom 3-D / outline / sizing overrides.
-    let mut light = egui::Visuals::light();
-    light.override_text_color = Some(egui::Color32::from_gray(20));
-    light.panel_fill = egui::Color32::from_gray(220);
-    light.window_fill = egui::Color32::from_gray(220);
-    // More visible dividers (#6): `ui.separator()` draws with the noninteractive
-    // bg_stroke, which defaults to a very faint grey — darken and thicken it.
-    light.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.5, egui::Color32::from_gray(120));
-    // Make buttons read as raised, interactive objects in every state (not flat
-    // labels). egui's light defaults give buttons almost no fill or border; give the
-    // resting (`inactive`), `hovered`, and `active` states a filled face + a visible
-    // border + a little rounding, brightening on hover and darkening on press, so a
-    // button looks clickable whether enabled or disabled. Disabled buttons use
-    // `noninteractive` (flat/dim), so the enabled↔disabled distinction is preserved.
-    let btn_border = egui::Stroke::new(1.0, egui::Color32::from_gray(150));
-    let btn_round = egui::CornerRadius::same(4);
-    light.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(236);
-    light.widgets.inactive.bg_fill = egui::Color32::from_gray(236);
-    light.widgets.inactive.bg_stroke = btn_border;
-    light.widgets.inactive.corner_radius = btn_round;
-    light.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(248);
-    light.widgets.hovered.bg_fill = egui::Color32::from_gray(248);
-    light.widgets.hovered.bg_stroke = egui::Stroke::new(1.2, egui::Color32::from_gray(110));
-    light.widgets.hovered.corner_radius = btn_round;
-    light.widgets.active.weak_bg_fill = egui::Color32::from_gray(214);
-    light.widgets.active.bg_fill = egui::Color32::from_gray(214);
-    light.widgets.active.bg_stroke = egui::Stroke::new(1.2, egui::Color32::from_gray(90));
-    light.widgets.active.corner_radius = btn_round;
-    ctx.set_visuals_of(egui::Theme::Light, light);
+    // The shared wiredata look (ADR-019): visuals for both themes come from
+    // `wiredata-ui` so talker and listener read as one product. Listener pins
+    // Light today; the dark visuals are installed ready for the theme toggle.
+    wiredata_ui::style::install_visuals(ctx);
     ctx.set_theme(egui::ThemePreference::Light);
-
-    // Match talker's text size (+0.5 to non-monospace; the stream view keeps its
-    // monospace size). Button sizing stays at the egui default.
-    ctx.all_styles_mut(|style| {
-        for font in style.text_styles.values_mut() {
-            if font.family != egui::FontFamily::Monospace {
-                font.size += 0.5;
-            }
-        }
-        // Open popups/menus instantly. egui fades areas in over `animation_time`
-        // (~83 ms), which made the color/font dropdowns feel laggy to appear; for
-        // a utility UI an instant snap reads as snappier (and stops hover/expand
-        // transitions dragging too).
-        style.animation_time = 0.0;
-        // Enlarge the collapsing-section triangles ~25% so they're easier to hit
-        // and read (#7). `icon_width` also sizes checkbox/radio glyphs, which scale
-        // up consistently.
-        style.spacing.icon_width *= 1.25;
-        style.spacing.icon_width_inner *= 1.25;
-    });
+    wiredata_ui::style::apply_style_tweaks(ctx);
 }
 
 /// The eframe application root: the runtime bridge, the folded view-model, the

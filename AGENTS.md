@@ -30,6 +30,10 @@ Each crate owns a `docs/` folder:
 | `nmea0183` | [nmea0183/docs/nmea0183_specification.md](nmea0183/docs/nmea0183_specification.md) | [nmea0183/docs/ADR.md](nmea0183/docs/ADR.md) | [nmea0183/docs/TODO.md](nmea0183/docs/TODO.md) |
 | `listener` | [listener/docs/listener_specification.md](listener/docs/listener_specification.md) | [listener/docs/ADR.md](listener/docs/ADR.md) | [listener/docs/TODO.md](listener/docs/TODO.md) |
 
+- `wiredata-ui` (the shared GUI-chrome crate) has **no** `docs/` folder: it is internal
+  and small by design. Its decisions live in the app ADR series — talker ADR-016 and
+  listener ADR-019 — and any chrome change that alters both apps' look should reference
+  them.
 - Record any non-trivial design choice as a **new ADR entry** in the owning crate's
   `ADR.md` (talker and nmea0183 share one ADR number series; listener has its own).
 - Track concrete implementation reminders in the owning crate's `TODO.md`.
@@ -101,7 +105,7 @@ toolchain.
 
 ### Workspace layout
 
-Three crates in a Cargo workspace:
+Four crates in a Cargo workspace:
 
 - **`nmea0183/`** — library crate; no dependency on `talker` or `listener`; intended for
   independent crates.io publication. Handles NMEA 0183 sentence construction, parsing,
@@ -119,6 +123,13 @@ Three crates in a Cargo workspace:
   displays/records the verbatim byte stream — no decoding, no `nmea0183` dependency.
   Single crate with modular internals (listener ADR-004 / spec §127); `lib.rs` + thin
   `main.rs`, same shape as `talker`.
+- **`wiredata-ui/`** — internal (`publish = false`) shared GUI **chrome** for the two
+  apps (talker ADR-016 / listener ADR-019): the bundled font stack + assets, the named
+  color palette (`LIGHT`/`DARK`), the base widget visuals for both themes, shared style
+  tweaks, and pure formatting helpers. Depends **only on `egui`** — never on `talker`,
+  `listener`, `eframe`, or any runtime crate. A piece belongs here only if it is purely
+  presentational, identical across both apps, and egui-only; app-specific widgets,
+  layouts, and view-models stay in the apps.
 
 ```
 talker/src/
@@ -160,6 +171,8 @@ I/O shape (see talker ADR-002 vs listener ADR-001):
 
 - `nmea0183` must not import application-level crates (`anyhow`, `eframe`, `clap`,
   `tokio`, etc.). It stays a pure, publishable library.
+- `wiredata-ui` imports only `egui`. It must never depend on `talker`, `listener`,
+  `eframe`, or runtime crates — chrome only (talker ADR-016 / listener ADR-019).
 - UI threads never perform I/O and never block.
 - `cli/` and `gui/` are thin layers; business logic lives in `core/` (or the equivalent
   internal modules).

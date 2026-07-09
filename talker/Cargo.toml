@@ -12,8 +12,9 @@ name = "talker"
 path = "src/main.rs"
 
 [dependencies]
-# Workspace crate
+# Workspace crates
 nmea0183 = { path = "../nmea0183" }
+wiredata-ui = { path = "../wiredata-ui" }   # shared GUI chrome (ADR-016)
 
 # Serial
 serialport = { workspace = true }
