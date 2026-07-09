@@ -94,15 +94,47 @@ impl Profile {
         Ok(profile)
     }
 
+    /// Check that every message in every channel would compile.
+    ///
+    /// Cheap preflight (see [`MessageConfig::validate`]): run it after load
+    /// to surface all payload errors before any interface is opened or any
+    /// thread spawned. Labels are 1-based to match the UI.
+    ///
+    /// [`MessageConfig::validate`]: crate::core::message::MessageConfig::validate
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (ci, channel) in self.channels.iter().enumerate() {
+            for (mi, message) in channel.messages.iter().enumerate() {
+                message
+                    .validate()
+                    .with_context(|| format!("channel {} message {}", ci + 1, mi + 1))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Serialize this profile to a TOML file, creating parent directories as
     /// needed.
+    ///
+    /// The write is atomic: content goes to a sibling temp file which is
+    /// renamed over the target, so a crash mid-save can never leave a
+    /// truncated profile — the previous file survives intact until the
+    /// rename replaces it whole.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating directory {:?}", parent))?;
         }
         let content = toml::to_string(self).context("serializing profile to TOML")?;
-        std::fs::write(path, content).with_context(|| format!("writing profile {:?}", path))?;
+        let mut tmp_name = path.as_os_str().to_owned();
+        tmp_name.push(".tmp");
+        let tmp = PathBuf::from(tmp_name);
+        std::fs::write(&tmp, content)
+            .with_context(|| format!("writing profile temp file {:?}", tmp))?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(anyhow::Error::new(e)
+                .context(format!("moving saved profile into place at {:?}", path)));
+        }
         Ok(())
     }
 }
@@ -157,6 +189,34 @@ mod tests {
         assert_eq!(p.version, CURRENT_VERSION);
     }
 
+    // ── validate ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_passes_a_good_profile_and_labels_a_bad_message() {
+        let iface = InterfaceConfig::TcpClient(TcpClientConfig::new(
+            "127.0.0.1:4000".parse::<SocketAddr>().unwrap(),
+        ));
+        let mut p = Profile::new("v");
+        p.channels = vec![
+            ChannelConfig::new(
+                iface.clone(),
+                vec![MessageConfig::new(PayloadConfig::raw_hex("AABB"), 100)],
+            ),
+            ChannelConfig::new(
+                iface,
+                vec![MessageConfig::new(PayloadConfig::raw_hex("XYZ"), 100)],
+            ),
+        ];
+        let err = p.validate().unwrap_err();
+        // 1-based labels pointing at the offending message.
+        assert!(
+            format!("{err:#}").contains("channel 2 message 1"),
+            "{err:#}"
+        );
+        p.channels.pop();
+        assert!(p.validate().is_ok());
+    }
+
     // ── save / load round-trip ────────────────────────────────────────────────
 
     #[test]
@@ -209,6 +269,18 @@ mod tests {
             !content.contains("name"),
             "saved TOML still contains a `name` field: {content}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_replaces_existing_file_and_leaves_no_temp() {
+        let path = temp_path("atomic");
+        std::fs::write(&path, "version = 2\n# old content\n").unwrap();
+        Profile::new("atomic").save(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("old content"));
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        assert!(!tmp.exists(), "temp file left behind: {tmp:?}");
         let _ = std::fs::remove_file(&path);
     }
 

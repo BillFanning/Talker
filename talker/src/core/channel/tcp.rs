@@ -1,10 +1,20 @@
 use std::io::Write;
 use std::net::TcpStream;
+use std::time::Duration;
 
 use anyhow::Context;
 
 use super::config::TcpClientConfig;
 use super::Interface;
+
+/// Cap on connect. Without it the OS default applies (~20s on Windows),
+/// which is far too long for an interactive tool to sit unresponsive.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cap on each blocking write. Without it, a peer that stops reading
+/// (dead device, full window) wedges the owning talker thread inside
+/// `write_all` forever — it can then never see its Stop command.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) struct TcpClientInterface {
     stream: TcpStream,
@@ -12,8 +22,15 @@ pub(super) struct TcpClientInterface {
 
 impl TcpClientInterface {
     pub(super) fn open(config: &TcpClientConfig) -> anyhow::Result<Self> {
-        let stream = TcpStream::connect(config.address)
+        let stream = TcpStream::connect_timeout(&config.address, CONNECT_TIMEOUT)
             .with_context(|| format!("connecting to {}", config.address))?;
+        stream
+            .set_write_timeout(Some(WRITE_TIMEOUT))
+            .context("setting TCP write timeout")?;
+        // Talker is a timing-oriented test tool: each scheduled message
+        // should hit the wire when it fires, not when Nagle decides to
+        // coalesce it with the next one.
+        stream.set_nodelay(true).context("setting TCP_NODELAY")?;
         Ok(Self { stream })
     }
 }
@@ -60,6 +77,15 @@ mod tests {
             .unwrap();
         let n = server_stream.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"ping");
+    }
+
+    #[test]
+    fn open_sets_nodelay_and_write_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conn = TcpClientInterface::open(&TcpClientConfig::new(addr)).unwrap();
+        assert!(conn.stream.nodelay().unwrap());
+        assert_eq!(conn.stream.write_timeout().unwrap(), Some(WRITE_TIMEOUT));
     }
 
     #[test]
