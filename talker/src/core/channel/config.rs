@@ -143,6 +143,26 @@ impl UdpConfig {
                 group,
                 port,
                 interface: None,
+                ttl: None,
+            },
+            local_port: None,
+        }
+    }
+
+    /// Multicast with an explicit outgoing `interface` and/or `ttl`
+    /// (either `None` = OS default). See [`UdpMode::Multicast`].
+    pub fn multicast_with(
+        group: Ipv4Addr,
+        port: u16,
+        interface: Option<Ipv4Addr>,
+        ttl: Option<u32>,
+    ) -> Self {
+        Self {
+            mode: UdpMode::Multicast {
+                group,
+                port,
+                interface,
+                ttl,
             },
             local_port: None,
         }
@@ -162,9 +182,15 @@ pub enum UdpMode {
     Multicast {
         group: Ipv4Addr,
         port: u16,
-        /// Outgoing interface; `None` means OS default.
+        /// Outgoing interface, by its local IPv4 address; `None` means the
+        /// OS default interface (`IP_MULTICAST_IF`).
         #[serde(default)]
         interface: Option<Ipv4Addr>,
+        /// Multicast hop limit (`IP_MULTICAST_TTL`); `None` leaves the OS
+        /// default, which is `1` — datagrams stay on the local subnet.
+        /// Raise it to route multicast across routers.
+        #[serde(default)]
+        ttl: Option<u32>,
     },
 }
 
@@ -242,6 +268,35 @@ mod tests {
     fn udp_multicast_round_trip() {
         let c = InterfaceConfig::Udp(UdpConfig::multicast("239.1.2.3".parse().unwrap(), 5000));
         round_trip(&c);
+    }
+
+    #[test]
+    fn udp_multicast_with_interface_and_ttl_round_trip() {
+        let c = InterfaceConfig::Udp(UdpConfig::multicast_with(
+            "239.1.2.3".parse().unwrap(),
+            5000,
+            Some("192.168.1.10".parse().unwrap()),
+            Some(8),
+        ));
+        round_trip(&c);
+    }
+
+    #[test]
+    fn udp_multicast_defaults_interface_and_ttl_to_none() {
+        // Old profiles predate the interface / ttl keys; #[serde(default)]
+        // means they deserialize to None, not an error.
+        let json =
+            r#"{"mode":{"type":"multicast","group":"239.1.2.3","port":5000},"local_port":null}"#;
+        let cfg: UdpConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.mode,
+            UdpMode::Multicast {
+                group: "239.1.2.3".parse().unwrap(),
+                port: 5000,
+                interface: None,
+                ttl: None,
+            }
+        );
     }
 
     #[test]

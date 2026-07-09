@@ -3292,6 +3292,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serialport",
+ "socket2 0.5.10",
  "toml",
  "tracing",
  "tracing-appender",

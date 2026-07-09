@@ -110,6 +110,11 @@ pub struct ConnDraft {
     pub udp_unicast: AddrPortPair,
     pub udp_broadcast: AddrPortPair,
     pub udp_multicast: AddrPortPair,
+    /// Multicast outgoing interface / TTL. No editor widget yet (that comes
+    /// with the GUI merge); carried through load → save so a profile that
+    /// sets them via TOML is never silently stripped on the next save.
+    pub udp_multicast_interface: Option<Ipv4Addr>,
+    pub udp_multicast_ttl: Option<u32>,
     /// Transient hold-to-repeat state for the active mode's ± port
     /// buttons. Shared because only one mode is being edited at a time.
     pub udp_port_hold: Option<PortHold>,
@@ -148,6 +153,8 @@ impl Default for ConnDraft {
                 ..Default::default()
             },
             udp_multicast: AddrPortPair::default(),
+            udp_multicast_interface: None,
+            udp_multicast_ttl: None,
             udp_port_hold: None,
             local_port: String::new(),
             tcp_addr: String::new(),
@@ -221,13 +228,20 @@ impl From<&InterfaceConfig> for ConnDraft {
                             submitted: true,
                         };
                     }
-                    UdpMode::Multicast { group, port, .. } => {
+                    UdpMode::Multicast {
+                        group,
+                        port,
+                        interface,
+                        ttl,
+                    } => {
                         draft.udp_mode = UdpModeDraft::Multicast;
                         draft.udp_multicast = AddrPortPair {
                             addr: group.to_string(),
                             port: port.to_string(),
                             submitted: true,
                         };
+                        draft.udp_multicast_interface = *interface;
+                        draft.udp_multicast_ttl = *ttl;
                     }
                 }
                 draft
@@ -294,7 +308,12 @@ impl ConnDraft {
                 let mut udp = match self.udp_mode {
                     UdpModeDraft::Unicast => UdpConfig::unicast(SocketAddr::from((addr, port))),
                     UdpModeDraft::Broadcast => UdpConfig::broadcast(SocketAddr::from((addr, port))),
-                    UdpModeDraft::Multicast => UdpConfig::multicast(addr, port),
+                    UdpModeDraft::Multicast => UdpConfig::multicast_with(
+                        addr,
+                        port,
+                        self.udp_multicast_interface,
+                        self.udp_multicast_ttl,
+                    ),
                 };
                 udp.local_port = local_port;
                 Some(InterfaceConfig::Udp(udp))
@@ -568,6 +587,17 @@ mod tests {
         conn_round_trip(InterfaceConfig::Udp(UdpConfig::multicast(
             "239.0.0.7".parse().unwrap(),
             5500,
+        )));
+    }
+
+    #[test]
+    fn udp_multicast_draft_preserves_interface_and_ttl() {
+        // No editor widget yet, but a load → save must not strip these.
+        conn_round_trip(InterfaceConfig::Udp(UdpConfig::multicast_with(
+            "239.0.0.7".parse().unwrap(),
+            5500,
+            Some("192.168.5.4".parse().unwrap()),
+            Some(16),
         )));
     }
 

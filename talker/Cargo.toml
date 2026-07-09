@@ -29,6 +29,9 @@ ctrlc = { workspace = true }
 # Threading
 crossbeam-channel = { workspace = true }
 
+# Sockets (multicast interface / TTL selection)
+socket2 = { workspace = true }
+
 # Logging
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
