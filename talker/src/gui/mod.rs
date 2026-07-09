@@ -1,6 +1,5 @@
 mod display;
 mod draft;
-mod thread;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -17,12 +16,12 @@ use crate::core::{
         NmeaChecksumMode, Segment,
     },
     profile::Profile,
+    runner::{self, TalkerCommand, TalkerHandle, TalkerStatus},
     scheduler::Schedule,
 };
 
 use display::{ChannelDisplay, ControlStyle, DisplayMode};
 use draft::{ConnDraft, ConnKind, PayloadKind, PortHold, ScheduleDraft, UdpModeDraft};
-use thread::{run_talker, TalkerCommand, TalkerHandle, TalkerStatus};
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -82,6 +81,14 @@ struct TalkerApp {
     sched_drafts: Vec<Vec<ScheduleDraft>>,
     conn_errors: Vec<Option<String>>,
     talkers: Vec<Option<TalkerHandle>>,
+    /// Per-channel threads of stopped runners that may still be draining (a
+    /// runner can take up to its interface timeouts to exit a blocking send).
+    /// Never joined on the UI thread: [`Self::poll_channels`] reaps finished
+    /// handles each frame, and a restart of a slot hands its whole bucket to
+    /// the new runner thread, which joins the predecessors before reopening
+    /// the interface (a serial port is exclusive — the old holder must drop
+    /// first).
+    draining: Vec<Vec<std::thread::JoinHandle<()>>>,
     log_rx: crossbeam_channel::Receiver<LogEvent>,
     /// Buffered log lines paired with their level. The level (not a
     /// baked colour) is stored so the log re-colours live when the
@@ -94,6 +101,11 @@ struct TalkerApp {
     /// within the channel's compiled schedule. Grows on demand when a
     /// status arrives for an index past the current vector length.
     message_sent_counts: Vec<Vec<u64>>,
+    /// Per-channel cumulative count of status updates the runner discarded
+    /// because the GUI's status queue was full (the display pane sampled).
+    /// Carried inside every `Sent` status, so it stays correct even when
+    /// updates are lost.
+    status_drops: Vec<u64>,
     displays: Vec<ChannelDisplay>,
     error_count: u64,
     last_title: String,
@@ -155,12 +167,14 @@ impl TalkerApp {
             sched_drafts: Vec::new(),
             conn_errors: Vec::new(),
             talkers: Vec::new(),
+            draining: Vec::new(),
             log_rx,
             log_lines: Vec::new(),
             log_level: LogLevel::default(),
             log_level_handle,
             sent_counts: Vec::new(),
             message_sent_counts: Vec::new(),
+            status_drops: Vec::new(),
             displays: Vec::new(),
             error_count: 0,
             last_title: String::new(),
@@ -295,11 +309,18 @@ impl TalkerApp {
                     .collect();
                 self.conn_errors = vec![None; n];
                 self.talkers = (0..n).map(|_| None).collect();
+                self.draining = (0..n).map(|_| Vec::new()).collect();
                 self.sent_counts = vec![0; n];
                 self.message_sent_counts = (0..n)
                     .map(|j| vec![0u64; p.channels.get(j).map(|c| c.messages.len()).unwrap_or(0)])
                     .collect();
+                self.status_drops = vec![0; n];
                 self.displays = (0..n).map(|_| ChannelDisplay::default()).collect();
+                // Preflight the whole profile so any payload that won't
+                // compile is surfaced now, not silently at the first Start.
+                if let Err(e) = p.validate() {
+                    tracing::warn!("profile '{}' has an invalid message: {e:#}", p.name);
+                }
                 self.profile = p;
                 self.profile_path = Some(path.to_path_buf());
                 self.dirty = false;
@@ -331,8 +352,10 @@ impl TalkerApp {
         self.sched_drafts.clear();
         self.conn_errors.clear();
         self.talkers.clear();
+        self.draining.clear();
         self.sent_counts.clear();
         self.message_sent_counts.clear();
+        self.status_drops.clear();
         self.displays.clear();
         self.error_count = 0;
         tracing::info!("new profile");
@@ -413,6 +436,8 @@ impl TalkerApp {
     // ── Talker thread lifecycle ────────────────────────────────────────────────
 
     fn start_connection(&mut self, i: usize) {
+        // Park any currently-running runner as a predecessor; the interface
+        // is opened on the new runner thread, never on the UI thread.
         self.stop_connection(i);
         self.flush_drafts_to_profile();
 
@@ -438,18 +463,6 @@ impl TalkerApp {
             return;
         };
 
-        let interface = match cfg.open() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("failed to open channel {n}: {e:#}");
-                self.error_count += 1;
-                if i < self.conn_errors.len() {
-                    self.conn_errors[i] = Some(format!("{e:#}"));
-                }
-                return;
-            }
-        };
-
         let messages = self
             .profile
             .channels
@@ -470,15 +483,32 @@ impl TalkerApp {
         if i < self.sent_counts.len() {
             self.sent_counts[i] = 0;
         }
+        if i < self.status_drops.len() {
+            self.status_drops[i] = 0;
+        }
         // Zero per-message counts, sized to the now-active schedule.
         let message_count = messages.len();
         if i < self.message_sent_counts.len() {
             self.message_sent_counts[i] = vec![0u64; message_count];
         }
 
+        // Predecessors this runner must outlive before it may (re)open the
+        // interface — a serial port is exclusive, so the previous holder has
+        // to drop first. Joined on the runner thread, never on the UI thread.
+        let predecessors = if i < self.draining.len() {
+            std::mem::take(&mut self.draining[i])
+        } else {
+            Vec::new()
+        };
+
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(32);
         let (status_tx, status_rx) = crossbeam_channel::bounded(256);
-        let thread = std::thread::spawn(move || run_talker(interface, schedule, cmd_rx, status_tx));
+        let thread = std::thread::spawn(move || {
+            for pred in predecessors {
+                let _ = pred.join();
+            }
+            runner::open_and_run(i, cfg, schedule, cmd_rx, status_tx);
+        });
 
         if i < self.talkers.len() {
             self.talkers[i] = Some(TalkerHandle {
@@ -487,16 +517,22 @@ impl TalkerApp {
                 thread,
             });
         }
-        tracing::info!("channel {n} started ({message_count}-message schedule)");
+        tracing::info!("channel {n} starting ({message_count}-message schedule)");
     }
 
+    /// Stop channel `i` without blocking the UI: send `Stop` and move the
+    /// runner thread into the draining bucket to finish on its own. The
+    /// handle is reaped by [`Self::poll_channels`] once it exits, or joined
+    /// by the next start of this slot.
     fn stop_connection(&mut self, i: usize) {
-        if i < self.talkers.len() {
-            if let Some(h) = self.talkers[i].take() {
-                let _ = h.cmd_tx.try_send(TalkerCommand::Stop);
-                let _ = h.thread.join();
-                tracing::info!("connection {i} stopped");
+        let handle = self.talkers.get_mut(i).and_then(|t| t.take());
+        if let Some(h) = handle {
+            let _ = h.cmd_tx.try_send(TalkerCommand::Stop);
+            if i < self.draining.len() {
+                self.draining[i].push(h.thread);
             }
+            // 1-based to match "Channel N" everywhere else in the UI/logs.
+            tracing::info!("channel {} stopping", i + 1);
         }
     }
 
@@ -607,10 +643,15 @@ impl TalkerApp {
                         message_index,
                         message_count,
                         total_count,
+                        dropped_statuses,
                         payload,
+                        ..
                     } => {
                         if i < self.sent_counts.len() {
                             self.sent_counts[i] = total_count;
+                        }
+                        if i < self.status_drops.len() {
+                            self.status_drops[i] = dropped_statuses;
                         }
                         if let Some(per_msg) = self.message_sent_counts.get_mut(i) {
                             if message_index >= per_msg.len() {
@@ -625,7 +666,8 @@ impl TalkerApp {
                             d.push(payload);
                         }
                     }
-                    TalkerStatus::ConnectionError { message, .. } => {
+                    TalkerStatus::ConnectionError { message, .. }
+                    | TalkerStatus::OpenFailed { message, .. } => {
                         self.error_count += 1;
                         if i < self.conn_errors.len() {
                             self.conn_errors[i] = Some(message);
@@ -637,8 +679,23 @@ impl TalkerApp {
                 self.talkers[i] = None;
             }
         }
-        if any_running {
-            ctx.request_repaint();
+
+        // Reap finished draining threads (stopped runners that have exited);
+        // keep any still winding down a blocking send.
+        let mut any_draining = false;
+        for bucket in &mut self.draining {
+            bucket.retain(|h| !h.is_finished());
+            any_draining |= !bucket.is_empty();
+        }
+
+        if any_running || any_draining {
+            // Keep polling while channels run or drain, but at a bounded
+            // cadence — an unconditional `request_repaint()` here redrew at
+            // maximum framerate continuously, even for a once-a-minute
+            // schedule. (Phase 4 of the GUI merge replaces this with
+            // repaint-on-status callbacks from the talker threads, like
+            // listener's driver.)
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         // Update window title when it changes.
@@ -1172,9 +1229,19 @@ impl TalkerApp {
             self.sched_drafts.remove(i);
             self.conn_errors.remove(i);
             self.talkers.remove(i);
+            // A still-draining runner (just parked by stop_connection) is
+            // detached by dropping its bucket; it exits on its own Stop and
+            // releases the interface. Not joined here — that would block the
+            // UI on a wedged send, the very thing draining avoids.
+            if i < self.draining.len() {
+                self.draining.remove(i);
+            }
             self.sent_counts.remove(i);
             if i < self.message_sent_counts.len() {
                 self.message_sent_counts.remove(i);
+            }
+            if i < self.status_drops.len() {
+                self.status_drops.remove(i);
             }
             self.displays.remove(i);
             if i < self.profile.channels.len() {
@@ -1187,8 +1254,10 @@ impl TalkerApp {
             self.sched_drafts.push(Vec::new());
             self.conn_errors.push(None);
             self.talkers.push(None);
+            self.draining.push(Vec::new());
             self.message_sent_counts.push(Vec::new());
             self.sent_counts.push(0);
+            self.status_drops.push(0);
             self.displays.push(ChannelDisplay::default());
             self.dirty = true;
         }

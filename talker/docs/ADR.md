@@ -52,7 +52,7 @@ An ADR captures *why* a significant decision was made, not just *what* was decid
 
 **Consequences:**
 - Each talker thread is a plain OS thread, easy to reason about and debug.
-- `crossbeam-channel` `select!` macro is used in each talker thread to wait on both the schedule timer and incoming command channels simultaneously without spinning.
+- Each talker thread waits without spinning by blocking on its command channel with a deadline: `Receiver::recv_deadline(next_fire)` when a message is scheduled (wakes exactly at the fire time, or immediately for a command), and `recv()` when the schedule is idle. A disconnected command channel ends the loop, so a dropped handle cannot leak the thread. (An earlier draft of this ADR specified the `crossbeam-channel` `select!` macro; the single-command-channel deadline receive is simpler and equivalent — there is only one channel to wait on, since the schedule timer is a computed deadline, not a channel.) The loop lives in `core::runner`, shared by the CLI and GUI (spec §2.2).
 - Each active connection has its own dedicated channel pair with the UI thread.
 - `core::channel` manages a collection of channel instances from the initial implementation; there is no single-channel shortcut to be refactored later.
 - The number of simultaneous connections is bounded by available system resources (serial ports, network sockets), not by any artificial limit in the software.

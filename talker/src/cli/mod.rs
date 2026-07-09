@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Context;
 use clap::{Args as ClapArgs, ValueEnum};
@@ -11,7 +9,8 @@ use crate::core::{
     logging::{self, FileLogConfig, Rotation},
     message::decode_utf8_lossy_latin1,
     profile::{self, Profile},
-    scheduler::{Schedule, Tick},
+    runner::{self, TalkerCommand, TalkerStatus},
+    scheduler::Schedule,
 };
 
 /// How `--echo` renders each sent message to stdout.
@@ -207,67 +206,56 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         prepared.push((i, interface, schedule));
     }
 
-    // Shared stop flag written by the Ctrl+C handler.
-    let running = Arc::new(AtomicBool::new(true));
+    // One runner thread per channel, each driven by the same core send loop
+    // as the GUI (spec §2.2). Ctrl+C broadcasts Stop over the command
+    // channels; a shared status channel feeds `--echo`.
+    let (status_tx, status_rx) = crossbeam_channel::unbounded::<TalkerStatus>();
+    let mut cmd_txs = Vec::new();
+    let mut handles = Vec::new();
+    for (i, interface, schedule) in prepared {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
+        cmd_txs.push(cmd_tx);
+        let status_tx = status_tx.clone();
+        handles.push(std::thread::spawn(move || {
+            runner::run(i, interface, schedule, cmd_rx, status_tx);
+        }));
+    }
+    drop(status_tx); // only the runners hold senders now
+
     {
-        let stop = Arc::clone(&running);
-        ctrlc::set_handler(move || stop.store(false, Ordering::SeqCst))
-            .context("installing Ctrl+C handler")?;
+        let cmd_txs = cmd_txs.clone();
+        ctrlc::set_handler(move || {
+            for tx in &cmd_txs {
+                let _ = tx.send(TalkerCommand::Stop);
+            }
+        })
+        .context("installing Ctrl+C handler")?;
     }
 
-    // One talker thread per channel — all run in parallel.
+    tracing::info!("{} channel(s) started — Ctrl+C to stop", handles.len());
+
+    // Consume statuses until every runner has dropped its sender (all
+    // stopped). `--echo` mirrors each send to stdout here on the main
+    // thread, so output lines can't interleave mid-line across channels.
     let echo = args.echo;
     let echo_format = args.echo_format;
     let tag = !args.no_tag;
-    let mut handles = Vec::new();
-    for (i, interface, schedule) in prepared {
-        let running = Arc::clone(&running);
-        handles.push(std::thread::spawn(move || {
-            run_channel(i, interface, schedule, &running, echo, echo_format, tag);
-        }));
+    for status in status_rx.iter() {
+        if let TalkerStatus::Sent {
+            channel, payload, ..
+        } = status
+        {
+            if echo {
+                echo_line(channel, &payload, echo_format, tag);
+            }
+        }
     }
-    tracing::info!("{} channel(s) started — Ctrl+C to stop", handles.len());
 
     for handle in handles {
         let _ = handle.join();
     }
     tracing::info!("stopped");
     Ok(())
-}
-
-/// Send loop for one channel: poll the schedule, send whatever is due, and
-/// wait, until `running` is cleared by the Ctrl+C handler.
-///
-/// With `echo` set, each successful send is mirrored to stdout in
-/// `format`, tagged with the channel index so multi-channel output
-/// can be filtered.
-fn run_channel(
-    index: usize,
-    mut interface: Box<dyn Interface>,
-    mut schedule: Schedule,
-    running: &AtomicBool,
-    echo: bool,
-    format: EchoFormat,
-    tag: bool,
-) {
-    while running.load(Ordering::SeqCst) {
-        match schedule.poll(Instant::now()) {
-            Tick::Send { payload, .. } => match interface.send(&payload) {
-                Ok(()) => {
-                    if echo {
-                        echo_line(index, &payload, format, tag);
-                    }
-                }
-                Err(e) => tracing::warn!("channel {index} send failed: {e:#}"),
-            },
-            // Sleep in <=50 ms slices so Ctrl+C stays responsive on long waits.
-            Tick::Wait(until) => {
-                let remaining = until.saturating_duration_since(Instant::now());
-                std::thread::sleep(remaining.min(Duration::from_millis(50)));
-            }
-            Tick::Idle => std::thread::sleep(Duration::from_millis(50)),
-        }
-    }
 }
 
 /// Print one echo line. Payload bytes pass straight through the
