@@ -70,6 +70,17 @@ impl Schedule {
         Ok(Self { messages })
     }
 
+    /// Number of messages in the schedule (active and dormant).
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Always `false` — [`Schedule::compile`] rejects an empty message list.
+    /// Provided for API completeness alongside [`Schedule::len`].
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
     /// Index of the active message with the earliest next-fire time.
     ///
     /// Ties are broken by message order (lowest index first).
@@ -87,6 +98,13 @@ impl Schedule {
     /// If a message is due, its next-fire time is advanced by its interval
     /// (from the previous fire time, so the cadence does not drift) and the
     /// payload is returned for sending. Otherwise reports how long to wait.
+    ///
+    /// **Stall policy: fire once, skip the backlog.** After a stall (a
+    /// blocked send, machine sleep), the missed fire times are *not* burst
+    /// out back-to-back: one send fires now, then the next-fire time jumps
+    /// to the first point of the message's original cadence grid that lies
+    /// in the future. Talker generates test traffic — a receiver cares about
+    /// cadence, not about conservation of message count.
     pub fn poll(&mut self, now: Instant) -> Tick {
         let Some(index) = self.earliest() else {
             return Tick::Idle;
@@ -94,6 +112,15 @@ impl Schedule {
         let msg = &mut self.messages[index];
         if msg.next_fire <= now {
             msg.next_fire += msg.interval;
+            if msg.next_fire <= now {
+                // More than one interval behind: skip the missed grid
+                // points. Integer math, not a loop — a long sleep with a
+                // short interval could mean millions of missed points.
+                // (`interval` is non-zero: `earliest` only yields active
+                // messages.)
+                let rem = now.duration_since(msg.next_fire).as_nanos() % msg.interval.as_nanos();
+                msg.next_fire = now - Duration::from_nanos(rem as u64) + msg.interval;
+            }
             Tick::Send {
                 index,
                 payload: msg.compiled.render(),
@@ -186,6 +213,36 @@ mod tests {
                                                           // polled late at t0+150: still due; next fire advances from 100, not 150
         assert!(matches!(s.poll(t0 + ms(150)), Tick::Send { .. }));
         assert_eq!(s.poll(t0 + ms(150)), Tick::Wait(t0 + ms(200)));
+    }
+
+    #[test]
+    fn stall_fires_once_then_skips_missed_ticks_staying_on_grid() {
+        let t0 = Instant::now();
+        let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
+        assert!(matches!(s.poll(t0), Tick::Send { .. })); // next fire → t0+100
+                                                          // 9½ intervals late: exactly one catch-up send fires…
+        assert!(matches!(s.poll(t0 + ms(1050)), Tick::Send { .. }));
+        // …and the next fire is the first *future* point of the original
+        // cadence grid (t0+1100) — not nine burst sends, and no drift.
+        assert_eq!(s.poll(t0 + ms(1050)), Tick::Wait(t0 + ms(1100)));
+    }
+
+    #[test]
+    fn stall_of_exactly_one_interval_does_not_skip() {
+        // One interval late is the boundary: the normal advance already
+        // lands the next fire in the future, so no skipping happens.
+        let t0 = Instant::now();
+        let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
+        assert!(matches!(s.poll(t0), Tick::Send { .. }));
+        assert!(matches!(s.poll(t0 + ms(199)), Tick::Send { .. }));
+        assert_eq!(s.poll(t0 + ms(199)), Tick::Wait(t0 + ms(200)));
+    }
+
+    #[test]
+    fn schedule_len_counts_all_messages() {
+        let s = Schedule::compile(&[msg("AB", 100), msg("CD", 0)], Instant::now()).unwrap();
+        assert_eq!(s.len(), 2);
+        assert!(!s.is_empty());
     }
 
     #[test]
