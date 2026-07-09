@@ -50,39 +50,6 @@ pub fn decode_utf8_lossy_latin1(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(test)]
-mod decode_utf8_lossy_latin1_tests {
-    use super::*;
-
-    #[test]
-    fn pure_ascii_passes_through() {
-        assert_eq!(decode_utf8_lossy_latin1(b"hello"), "hello");
-    }
-
-    #[test]
-    fn valid_utf8_decodes() {
-        assert_eq!(decode_utf8_lossy_latin1("héllo".as_bytes()), "héllo");
-    }
-
-    #[test]
-    fn lone_high_byte_falls_back_to_latin1() {
-        // 0xEE → î (U+00EE)
-        assert_eq!(decode_utf8_lossy_latin1(&[0xEE]), "\u{00EE}");
-        // 0xFF → ÿ (U+00FF)
-        assert_eq!(decode_utf8_lossy_latin1(&[0xFF]), "\u{00FF}");
-    }
-
-    #[test]
-    fn mixes_utf8_and_high_bytes() {
-        // "A" (ASCII) + 0xEE (invalid UTF-8) + "B" (ASCII)
-        assert_eq!(decode_utf8_lossy_latin1(b"A\xEEB"), "A\u{00EE}B");
-    }
-
-    #[test]
-    fn empty_input_yields_empty() {
-        assert_eq!(decode_utf8_lossy_latin1(b""), "");
-    }
-}
 pub use marker::{repair_after_edit, segments, Segment};
 pub use timestamp::TimestampConfig;
 
@@ -160,6 +127,16 @@ impl MessageConfig {
             timestamp: self.timestamp,
             checksum: self.checksum,
         })
+    }
+
+    /// Check that this message would compile, without keeping the result.
+    ///
+    /// The one shared validation surface (a `compile()` dry-run): the GUI
+    /// uses it to gate Start / drive red borders, the CLI to fail a profile
+    /// before any interface is opened. Anything that passes here cannot fail
+    /// later at `Schedule::compile` time.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.compile().map(|_| ())
     }
 }
 
@@ -295,18 +272,34 @@ impl PayloadConfig {
 }
 
 fn compile_hex(data: &str) -> anyhow::Result<Vec<u8>> {
-    let clean: String = data.chars().filter(|c| !matches!(c, ' ' | '-')).collect();
+    // Strict by design: anything but hex digits and the allowed separators
+    // (space, hyphen) is rejected — a typo in test data must surface, not be
+    // skipped. Iterating chars (not byte slices) keeps non-ASCII input a
+    // clean error rather than a slice panic.
+    let mut out = Vec::with_capacity(data.len() / 2);
+    let mut pending: Option<u8> = None;
+    for c in data.chars() {
+        if matches!(c, ' ' | '-') {
+            continue;
+        }
+        let digit = c.to_digit(16).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid hex character {c:?} in {data:?} (expected 0-9 A-F, spaces, or hyphens)"
+            )
+        })? as u8;
+        pending = match pending {
+            None => Some(digit),
+            Some(high) => {
+                out.push((high << 4) | digit);
+                None
+            }
+        };
+    }
     anyhow::ensure!(
-        clean.len().is_multiple_of(2),
-        "hex string has odd length after stripping whitespace: {data:?}"
+        pending.is_none(),
+        "hex string has odd length after stripping separators: {data:?}"
     );
-    (0..clean.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&clean[i..i + 2], 16)
-                .map_err(|_| anyhow::anyhow!("invalid hex byte {:?} in {data:?}", &clean[i..i + 2]))
-        })
-        .collect()
+    Ok(out)
 }
 
 /// Encode UTF-8 text, expanding `‹XX›` markers to raw bytes (spec §5.3).
@@ -398,8 +391,24 @@ fn compile_nmea(
     nmea_checksum: NmeaChecksumMode,
 ) -> anyhow::Result<Vec<u8>> {
     use nmea0183::{NmeaSentence, SentenceType, TalkerId};
-    let talker_id: TalkerId = talker.parse().unwrap();
-    let st: SentenceType = sentence_type.parse().unwrap();
+    // Arbitrary (non-standard) talker IDs and sentence types are a feature —
+    // unknown strings parse into the enums' `Custom` variants. But characters
+    // with structural meaning in NMEA framing would corrupt the sentence
+    // around the field data, so those are rejected with a pointed error.
+    for (what, s) in [("talker ID", talker), ("sentence type", sentence_type)] {
+        if let Some(c) = s
+            .chars()
+            .find(|c| matches!(c, '$' | '!' | ',' | '*' | '\r' | '\n'))
+        {
+            anyhow::bail!("NMEA {what} {s:?} contains {c:?}, which would corrupt sentence framing");
+        }
+    }
+    // Both `FromStr` impls have `Err = Infallible` (unknown strings become
+    // `Custom`), so these expects cannot fire.
+    let talker_id: TalkerId = talker.parse().expect("TalkerId parse is infallible");
+    let st: SentenceType = sentence_type
+        .parse()
+        .expect("SentenceType parse is infallible");
     let sentence = NmeaSentence::new(talker_id, st, fields.to_vec());
     Ok(sentence.to_wire_with(nmea_checksum.into()).into_bytes())
 }
@@ -434,6 +443,34 @@ mod tests {
     #[test]
     fn compile_raw_hex_invalid_byte_errors() {
         assert!(PayloadConfig::raw_hex("DEXZ").compile().is_err());
+    }
+
+    #[test]
+    fn compile_raw_hex_accepts_lowercase() {
+        assert_eq!(
+            PayloadConfig::raw_hex("dead beef").compile().unwrap(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+    }
+
+    #[test]
+    fn compile_raw_hex_non_ascii_errors_without_panicking() {
+        // Multi-byte characters used to make byte-indexed slicing panic
+        // mid-character; now they are a clean error.
+        for input in ["€€", "DE€D", "0\u{00E9}"] {
+            let err = PayloadConfig::raw_hex(input).compile().unwrap_err();
+            assert!(
+                format!("{err:#}").contains("invalid hex character"),
+                "input {input:?} gave: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn compile_raw_hex_rejects_sign_characters() {
+        // `from_str_radix` used to accept a leading '+' inside a pair
+        // ("+F" parsed as 0x0F); strict scanning rejects it.
+        assert!(PayloadConfig::raw_hex("+F").compile().is_err());
     }
 
     // ── UTF-8 ─────────────────────────────────────────────────────────────────
@@ -589,6 +626,35 @@ mod tests {
         assert!(wire.ends_with("\r\n"));
     }
 
+    #[test]
+    fn compile_nmea_custom_talker_and_sentence_still_compile() {
+        // Non-standard IDs are a deliberate capability (Custom variants).
+        let p = PayloadConfig::nmea("ZZ", "ABC", vec![]);
+        let wire = String::from_utf8(p.compile().unwrap()).unwrap();
+        assert!(wire.starts_with("$ZZABC"), "wire was: {wire}");
+    }
+
+    #[test]
+    fn compile_nmea_rejects_framing_characters() {
+        // Structural NMEA characters in the talker / sentence-type strings
+        // would corrupt the sentence framing — clean error, not silent send.
+        for (talker, sentence) in [
+            ("G,P", "GGA"),
+            ("GP", "GG*A"),
+            ("$GP", "GGA"),
+            ("GP", "GGA\r\n"),
+            ("G!P", "GGA"),
+        ] {
+            let err = PayloadConfig::nmea(talker, sentence, vec![])
+                .compile()
+                .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("sentence framing"),
+                "({talker:?},{sentence:?}) gave: {err:#}"
+            );
+        }
+    }
+
     // ── MessageConfig / CompiledMessage ───────────────────────────────────────
 
     #[test]
@@ -672,6 +738,37 @@ mod tests {
         let m: MessageConfig = serde_json::from_str(json).unwrap();
         assert!(m.timestamp.is_none());
         assert!(m.checksum.is_none());
+    }
+
+    // ── decode_utf8_lossy_latin1 ──────────────────────────────────────────────
+
+    #[test]
+    fn decode_pure_ascii_passes_through() {
+        assert_eq!(decode_utf8_lossy_latin1(b"hello"), "hello");
+    }
+
+    #[test]
+    fn decode_valid_utf8_decodes() {
+        assert_eq!(decode_utf8_lossy_latin1("héllo".as_bytes()), "héllo");
+    }
+
+    #[test]
+    fn decode_lone_high_byte_falls_back_to_latin1() {
+        // 0xEE → î (U+00EE)
+        assert_eq!(decode_utf8_lossy_latin1(&[0xEE]), "\u{00EE}");
+        // 0xFF → ÿ (U+00FF)
+        assert_eq!(decode_utf8_lossy_latin1(&[0xFF]), "\u{00FF}");
+    }
+
+    #[test]
+    fn decode_mixes_utf8_and_high_bytes() {
+        // "A" (ASCII) + 0xEE (invalid UTF-8) + "B" (ASCII)
+        assert_eq!(decode_utf8_lossy_latin1(b"A\xEEB"), "A\u{00EE}B");
+    }
+
+    #[test]
+    fn decode_empty_input_yields_empty() {
+        assert_eq!(decode_utf8_lossy_latin1(b""), "");
     }
 
     #[test]

@@ -42,26 +42,23 @@ pub struct ChecksumConfig {
     pub intentionally_wrong: bool,
 }
 
+// Const instances so each algorithm's 256-entry lookup table is built at
+// compile time. `Crc::new` inside `compute` rebuilt the table on every call —
+// once per send for a checksummed message.
+const CRC8_SMBUS: crc::Crc<u8> = crc::Crc::<u8>::new(&crc::CRC_8_SMBUS);
+const CRC16_KERMIT: crc::Crc<u16> = crc::Crc::<u16>::new(&crc::CRC_16_KERMIT);
+const CRC16_MODBUS: crc::Crc<u16> = crc::Crc::<u16>::new(&crc::CRC_16_MODBUS);
+const CRC32_ISO_HDLC: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+
 impl ChecksumConfig {
     /// Compute the checksum of `data`, returned as the raw bytes to append.
     pub fn compute(&self, data: &[u8]) -> Vec<u8> {
         let mut bytes = match self.algorithm {
             ChecksumAlgorithm::Xor => vec![data.iter().fold(0u8, |acc, &b| acc ^ b)],
-            ChecksumAlgorithm::Crc8 => {
-                vec![crc::Crc::<u8>::new(&crc::CRC_8_SMBUS).checksum(data)]
-            }
-            ChecksumAlgorithm::Crc16Ccitt => crc::Crc::<u16>::new(&crc::CRC_16_KERMIT)
-                .checksum(data)
-                .to_be_bytes()
-                .to_vec(),
-            ChecksumAlgorithm::Crc16Modbus => crc::Crc::<u16>::new(&crc::CRC_16_MODBUS)
-                .checksum(data)
-                .to_be_bytes()
-                .to_vec(),
-            ChecksumAlgorithm::Crc32 => crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC)
-                .checksum(data)
-                .to_be_bytes()
-                .to_vec(),
+            ChecksumAlgorithm::Crc8 => vec![CRC8_SMBUS.checksum(data)],
+            ChecksumAlgorithm::Crc16Ccitt => CRC16_KERMIT.checksum(data).to_be_bytes().to_vec(),
+            ChecksumAlgorithm::Crc16Modbus => CRC16_MODBUS.checksum(data).to_be_bytes().to_vec(),
+            ChecksumAlgorithm::Crc32 => CRC32_ISO_HDLC.checksum(data).to_be_bytes().to_vec(),
         };
         if self.intentionally_wrong {
             // Corrupt the last byte so the value always differs from the real
