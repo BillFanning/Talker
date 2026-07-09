@@ -1,7 +1,24 @@
 # Talker — Program Specification
-**Version:** 2.0
+**Version:** 2.0.1
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
+
+Revision v2.0.1 (corrections to match the implementation and its dependencies):
+
+- **§4.2 serial parameters** — parity is `None, Even, Odd` and stop bits are `1, 2`.
+  The `serialport` backend offers no Mark/Space parity and no 1.5 stop bits; the
+  earlier list over-promised the dependency (neither ever worked). Corrected, not
+  removed behavior.
+- **§4.1 UDP Multicast** — now states the full configurable set: group address,
+  port, outgoing interface, and TTL (all implemented).
+- **§8.1 scheduling** — clarified that the "priority-queue scheduler" is a
+  conceptual model, implemented as a linear next-fire scan (equivalent at the
+  message counts talker handles).
+- **§3.1 CLI** — single-channel ad-hoc invocation without a profile is marked as
+  planned; the current CLI loads a profile.
+
+No `schema_version` change: profiles are unaffected (the multicast `interface`/`ttl`
+keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 
 ---
 
@@ -149,7 +166,7 @@ CLI mode supports multiple simultaneous channels identically to GUI mode — one
 talker --profile full_bridge_sim
 ```
 
-This loads the profile, spawns a talker thread for each channel defined in it, and runs until interrupted. Single-channel ad-hoc invocation (without a profile) remains the fast path for simple cases.
+This loads the profile, spawns a talker thread for each channel defined in it, and runs until interrupted. *(Planned)* Single-channel ad-hoc invocation without a profile — a fast path for simple cases — is not yet implemented; today the CLI requires `--profile` / `--profile-path`.
 
 #### Profile Compatibility
 
@@ -198,7 +215,7 @@ Each channel has exactly one interface port. The supported interface types are:
 | RS-232 Serial | Full parameter configuration (see 4.2) |
 | UDP Unicast | Host and port configurable |
 | UDP Broadcast | Broadcast address and port configurable |
-| UDP Multicast | Group address and TTL configurable |
+| UDP Multicast | Group address, port, outgoing interface, and TTL configurable |
 | TCP Client | Connect to a remote host/port |
 
 The channel abstraction in `core::channel` is designed for easy addition of future interface types (e.g., WebSocket, raw socket) without changes to the interface layers or scheduler.
@@ -210,8 +227,8 @@ All standard RS-232 parameters are user-configurable:
 - Port (e.g., COM3, /dev/ttyUSB0)
 - Baud rate: common standard rates are selectable from a list (110, 300, 1200, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600); a free-entry field allows specifying any rate outside this range
 - Data bits (5, 6, 7, 8)
-- Parity (None, Even, Odd, Mark, Space)
-- Stop bits (1, 1.5, 2)
+- Parity (None, Even, Odd)
+- Stop bits (1, 2)
 - Hardware flow control (RTS/CTS, None)
 
 ### 4.3 Real-Time Parameter Changes
@@ -505,7 +522,7 @@ Checksum configuration is saved as part of a profile.
 
 ### 8.1 Scheduling
 
-Each channel runs a **priority-queue scheduler**. Each message within the channel has its own independent send interval and is scheduled independently of all other messages.
+Each channel runs a **priority-queue scheduler**. Each message within the channel has its own independent send interval and is scheduled independently of all other messages. ("Priority queue" describes the model; the implementation is a linear next-fire scan over the channel's messages, which is equivalent and faster at the small message counts talker handles.)
 
 **Queue model:**
 
@@ -513,6 +530,7 @@ Each channel runs a **priority-queue scheduler**. Each message within the channe
 - When a channel starts, all enabled messages (interval > 0) are inserted into the queue with next-fire-time = now (all fire immediately at t=0).
 - The scheduler picks the message with the earliest next-fire-time, waits until that time, sends the message, then re-inserts it with next-fire-time = previous-fire-time + interval.
 - When two messages are due at the same time, they fire in list order (the order in which they appear in the message list for that channel).
+- **After a stall** (a blocked send, the machine sleeping), a message that is more than one interval overdue fires **once**, then its next-fire-time jumps forward to the first grid point (`previous-fire-time + k·interval`) still in the future. Missed intervals are skipped, not burst out back-to-back: talker generates test cadence, so a receiver should see the rate resume, not a flood catching up the count.
 
 **Interval = 0 (dormant):** A message with interval = 0 is excluded from the queue and does not send. Changing a message's interval to 0 while the channel is running removes it from the queue immediately; other messages are unaffected and the channel continues running.
 
