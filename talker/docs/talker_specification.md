@@ -1,7 +1,24 @@
 # Talker — Program Specification
-**Version:** 2.0.1
+**Version:** 2.1
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
+
+Revision v2.1 (master–detail GUI, named channels, shared chrome):
+
+- **§2.2 GUI layout** — the stacked all-channels card view is replaced by a
+  **master–detail** layout: a collapsible channel list on the left (per-row status
+  glyph, name, interface summary, sent count + msgs/s, last error) and a detail pane
+  for the **selected** channel (header with editable name and actions, Connection
+  editor, Messages editor, Output display pane). `+ Add` (per interface kind) and
+  Start all / Stop all live in the list header.
+- **§2.1 / §6** — the workspace has a fourth crate, `wiredata-ui` (internal shared GUI
+  chrome — fonts, palette, base style; talker ADR-016). Channels gain an optional
+  display `name` in the profile schema — additive `#[serde(default)]`, omitted when
+  empty, so older profiles load unchanged and unnamed channels serialize as before.
+  Names are cosmetic (channels stay positional); duplicates are allowed but hinted.
+- **§3.2 GUI state** — window geometry is **not** persisted anymore (the window opens
+  at its default size; restoring geometry after the window is shown caused a visible
+  double-flash). Zoom, theme, and the last profile path still persist.
 
 Revision v2.0.1 (corrections to match the implementation and its dependencies):
 
@@ -32,11 +49,12 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 
 ### 2.1 Crate Structure
 
-`wiredata` is a Cargo workspace with three crates:
+`wiredata` is a Cargo workspace with four crates:
 
 - **`talker`** — the binary crate containing the CLI, GUI, and all application logic
 - **`nmea0183`** — a standalone library crate containing all NMEA 0183 support, with no dependency on `talker`
 - **`listener`** — the receive/decode counterpart to `talker`, with its own spec, ADR, and TODO
+- **`wiredata-ui`** — internal shared GUI chrome for the two apps (fonts, color palette, base widget style, formatting helpers); egui-only, never published (talker ADR-016 / listener ADR-019)
 
 Each crate keeps its own `docs/` folder (spec, ADR, TODO). There is no
 workspace-root docs directory.
@@ -112,19 +130,25 @@ The correct model is one application instance, one GUI, and one talker thread pe
 | **Talker thread (one per active channel)** | Runs the priority-queue scheduler for that channel; owns the interface handle; handles open/close/reopen |
 | **Logger thread** | Receives log messages via channel; writes to file and/or stdout without blocking talker threads |
 
-#### GUI Multi-Channel Panel
+#### GUI Multi-Channel Layout (master–detail)
 
-The GUI displays a list of channels. Each channel has its own:
+The GUI uses a **master–detail** layout:
 
-- Configuration panel (interface type, parameters)
-- Message list (one or more messages, each independently configured)
-- Status indicator (connected, sending, error, idle)
-- Send controls (start, stop)
-- Send count, error count
-- Error log (most recent entry always visible; click to expand a scrolling list of all entries)
-- Real-time outbound display pane (configurable view — see Section 5.5)
+- **Channel list** (left, resizable, collapsible to a thin status strip): one row per
+  channel showing a status glyph (running / fault / stopped), the channel's display
+  name (or the positional "Channel N" fallback), a one-line interface summary with
+  unfilled fields flagged, the running send count with a msgs/s estimate, and the most
+  recent error. The list header holds `+ Add` (per interface kind: Serial / UDP / TCP)
+  and Start all / Stop all.
+- **Detail pane** (centre): everything about the **selected** channel — a header with
+  the editable name, interface-kind selector, summary, drift badge, and per-channel
+  actions (start / stop / restart / remove); the Connection editor; the Messages
+  editor (one or more messages, each independently configured); and the real-time
+  outbound display pane (configurable view — see Section 5.7).
 
-Channels can be added, changed, removed, started, and stopped independently at runtime.
+Channels can be added, renamed, changed, removed, started, and stopped independently
+at runtime. Channel names are cosmetic (channels are positional); empty names fall
+back to "Channel N", and duplicate names are allowed but flagged inline.
 
 #### Communication
 
@@ -198,7 +222,7 @@ GUI state and profile data are stored separately and serve different purposes:
 - **Profiles** (channel config, message config, checksum settings) are TOML files shared between CLI and GUI. They live in the profile directory and are the primary unit of saved work.
 - **GUI state** (window size, position, which panels are open, display column toggles, name of the last active profile) is stored in a separate file using `eframe`'s built-in persistence mechanism. It is never loaded by the CLI and never conflicts with profile data.
 
-On exit, the GUI saves its state automatically. On next launch, the GUI restores window geometry and reopens the last active profile.
+On exit, the GUI saves its state automatically. On next launch, the GUI reopens the last active profile and restores zoom and theme. Window geometry is deliberately **not** persisted: eframe restores it only after the window is first shown, which produced a visible double frame/title-bar flash on every launch (and could resurrect a broken tiny geometry) — the window always opens at its default size instead.
 
 GUI state is stored in a platform-appropriate config directory (via the `dirs` crate or `eframe`'s default storage path).
 
@@ -563,6 +587,7 @@ version = 2
 name = "GPS sim"
 
 [[channels]]
+name = "GPS feed"   # optional display name (v2.1); omitted when unnamed
 type = "serial"
 port = "COM3"
 baud = 9600

@@ -94,6 +94,11 @@ pub fn lan_addr_prefix() -> Option<String> {
 }
 
 pub struct ConnDraft {
+    /// Channel display name (cosmetic; `ChannelConfig::name`). Empty means
+    /// unnamed — the GUI falls back to "Channel N". Not part of
+    /// `to_config()` (which builds only the interface); the profile writer
+    /// carries it separately.
+    pub name: String,
     pub kind: ConnKind,
     // serial
     pub serial_port: String,
@@ -132,6 +137,7 @@ pub struct ConnDraft {
 impl Default for ConnDraft {
     fn default() -> Self {
         Self {
+            name: String::new(),
             kind: ConnKind::Serial,
             serial_port: String::new(),
             baud_rate: 9600,
