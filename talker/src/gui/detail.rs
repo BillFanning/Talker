@@ -128,45 +128,15 @@ impl TalkerApp {
         iface_drift: bool,
         msg_drift: bool,
     ) {
-        // Confirm step (only relevant when the profile is dirty —
-        // removing a clean profile's channel is reversible by Load).
-        // Mirrors the per-message ✕ confirm UI: Cancel restores the
-        // ✕, red "Remove" commits.
-        if self.conn_drafts[i].pending_remove {
-            if ui
-                .small_button("Cancel")
-                .on_hover_text("Keep this channel")
-                .clicked()
-            {
-                self.conn_drafts[i].pending_remove = false;
-            }
-            let confirm = egui::Button::new(
-                egui::RichText::new("Remove")
-                    .color(egui::Color32::WHITE)
-                    .strong(),
-            )
-            .fill(egui::Color32::from_rgb(180, 60, 60));
-            if ui
-                .add(confirm)
-                .on_hover_text("Remove this channel; unsaved profile changes will be lost")
-                .clicked()
-            {
-                self.deferred.remove = Some(i);
-            }
-            ui.label(
-                egui::RichText::new("Discard channel?")
-                    .color(egui::Color32::from_rgb(220, 180, 80)),
-            );
-        } else if ui
+        // Channel removal confirms through a modal (listener's pattern) —
+        // it can't be missed, and Escape / backdrop-click cancels. The
+        // per-message ✕ keeps its lighter inline confirm.
+        if ui
             .button(egui::RichText::new("\u{00D7}").size(18.0).strong())
             .on_hover_text("Remove this channel")
             .clicked()
         {
-            if self.dirty {
-                self.conn_drafts[i].pending_remove = true;
-            } else {
-                self.deferred.remove = Some(i);
-            }
+            self.confirm_remove = Some(i);
         }
         if running {
             if ui.small_button("\u{25a0}").on_hover_text("Stop").clicked() {

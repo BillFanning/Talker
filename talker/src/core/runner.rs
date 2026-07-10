@@ -95,7 +95,11 @@ pub fn open_and_run(
     match cfg.open() {
         Ok(interface) => run(channel, interface, schedule, cmd_rx, status_tx, notify),
         Err(e) => {
-            tracing::error!("failed to open channel {}: {e:#}", channel + 1);
+            tracing::error!(
+                channel = channel + 1,
+                "failed to open channel {}: {e:#}",
+                channel + 1
+            );
             if status_tx
                 .try_send(TalkerStatus::OpenFailed {
                     channel,
@@ -124,12 +128,13 @@ pub fn run(
     notify: Option<StatusNotify>,
 ) {
     tracing::info!(
+        channel = channel + 1,
         "channel {} running ({}-message schedule)",
         channel + 1,
         schedule.len()
     );
     run_loop(channel, interface, schedule, cmd_rx, status_tx, notify);
-    tracing::info!("channel {} stopped", channel + 1);
+    tracing::info!(channel = channel + 1, "channel {} stopped", channel + 1);
 }
 
 enum Flow {
@@ -152,41 +157,47 @@ fn run_loop(
     let mut per_message_counts: Vec<u64> = vec![0; schedule.len()];
     let mut dropped_statuses = 0u64;
 
-    let handle = |cmd: TalkerCommand,
-                  interface: &mut Box<dyn Interface>,
-                  schedule: &mut Schedule|
-     -> Flow {
-        match cmd {
-            TalkerCommand::Stop => Flow::Stop,
-            TalkerCommand::UpdateInterface(cfg) => {
-                match cfg.open() {
-                    Ok(new) => {
-                        *interface = new;
-                        tracing::info!("channel {} interface updated", channel + 1);
-                    }
-                    Err(e) => {
-                        tracing::warn!("channel {} interface update failed: {e:#}", channel + 1);
-                        let sent = status_tx
-                            .try_send(TalkerStatus::ConnectionError {
-                                channel,
-                                message: format!("{e:#}"),
-                            })
-                            .is_ok();
-                        if sent {
-                            if let Some(n) = &notify {
-                                n();
+    let handle =
+        |cmd: TalkerCommand, interface: &mut Box<dyn Interface>, schedule: &mut Schedule| -> Flow {
+            match cmd {
+                TalkerCommand::Stop => Flow::Stop,
+                TalkerCommand::UpdateInterface(cfg) => {
+                    match cfg.open() {
+                        Ok(new) => {
+                            *interface = new;
+                            tracing::info!(
+                                channel = channel + 1,
+                                "channel {} interface updated",
+                                channel + 1
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                channel = channel + 1,
+                                "channel {} interface update failed: {e:#}",
+                                channel + 1
+                            );
+                            let sent = status_tx
+                                .try_send(TalkerStatus::ConnectionError {
+                                    channel,
+                                    message: format!("{e:#}"),
+                                })
+                                .is_ok();
+                            if sent {
+                                if let Some(n) = &notify {
+                                    n();
+                                }
                             }
                         }
                     }
+                    Flow::Continue
                 }
-                Flow::Continue
+                TalkerCommand::SetInterval { index, interval_ms } => {
+                    schedule.set_interval(index, interval_ms, Instant::now());
+                    Flow::Continue
+                }
             }
-            TalkerCommand::SetInterval { index, interval_ms } => {
-                schedule.set_interval(index, interval_ms, Instant::now());
-                Flow::Continue
-            }
-        }
-    };
+        };
 
     loop {
         // Drain anything already queued so back-to-back sends can't starve
@@ -226,6 +237,7 @@ fn run_loop(
                             dropped_statuses += 1;
                             if dropped_statuses == 1 {
                                 tracing::warn!(
+                                    channel = channel + 1,
                                     "channel {}: status receiver is falling behind — sends \
                                      continue at cadence; display updates are being sampled",
                                     channel + 1
@@ -236,7 +248,11 @@ fn run_loop(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("channel {} send failed: {e:#}", channel + 1);
+                    tracing::warn!(
+                        channel = channel + 1,
+                        "channel {} send failed: {e:#}",
+                        channel + 1
+                    );
                     let sent = status_tx
                         .try_send(TalkerStatus::ConnectionError {
                             channel,

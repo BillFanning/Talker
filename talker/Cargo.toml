@@ -11,6 +11,14 @@ rust-version.workspace = true
 name = "talker"
 path = "src/main.rs"
 
+# Flash-free GUI launcher: a Windows "windows" subsystem app (no console
+# allocated on double-click). The `talker` binary above stays a console app for
+# terminal CLI/headless use; this one is just the desktop GUI entry point.
+# Mirrors listener's two-binary pattern — see src/bin/talker-gui.rs.
+[[bin]]
+name = "talker-gui"
+path = "src/bin/talker-gui.rs"
+
 [dependencies]
 # Workspace crates
 nmea0183 = { path = "../nmea0183" }
@@ -56,6 +64,12 @@ rfd = { workspace = true }
 
 # Timestamps
 chrono = { workspace = true }
+
+# FreeConsole for the GUI path of the console binary (`talker --gui`), so a
+# double-click of talker.exe into the GUI doesn't keep an empty console window.
+# talker-gui.exe never allocates one in the first place (windows subsystem).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 # Integration tests live in /tests per Rust convention

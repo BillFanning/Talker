@@ -23,7 +23,7 @@ pub enum EchoFormat {
     #[default]
     Rendered,
     /// Printable ASCII as-is; every non-printable byte
-    /// (`< 0x20`, `0x7F`, `>= 0x80`) shown as `<0xXX>`. Matches the
+    /// (`< 0x20`, `0x7F`, `>= 0x80`) shown as `<XX>`. Matches the
     /// GUI's "Raw" display mode with the HexEscapes control style.
     Raw,
     /// Each byte as two uppercase hex digits, space-separated.
@@ -109,7 +109,7 @@ pub struct Args {
                      `rendered` decodes bytes as UTF-8 with Latin-1 fallback so \
                      every byte has a glyph (matches the GUI's Rendered display \
                      mode). `raw` shows printable ASCII as-is and non-printable \
-                     bytes as `<0xXX>` (matches the GUI's Raw mode + HexEscapes \
+                     bytes as `<XX>` (matches the GUI's Raw mode + HexEscapes \
                      control style). `hex` shows each byte as two uppercase hex \
                      digits, space-separated — the format `--echo` used before \
                      this flag existed. Ignored when `--echo` is absent."
@@ -285,7 +285,8 @@ fn format_payload(payload: &[u8], format: EchoFormat) -> String {
     }
 }
 
-/// Printable ASCII as-is; every other byte as `<0xXX>`. Matches the
+/// Printable ASCII as-is; every other byte as `<XX>` (listener's hex-escape
+/// format, so the two apps read identically). Matches the
 /// GUI's `DisplayMode::Raw` with the `HexEscapes` control style —
 /// chosen as the default for CLI since it doesn't depend on Unicode
 /// control-picture fonts being installed.
@@ -295,7 +296,7 @@ fn raw_string(bytes: &[u8]) -> String {
         if (0x20..=0x7E).contains(&b) {
             out.push(b as char);
         } else {
-            out.push_str(&format!("<0x{b:02X}>"));
+            out.push_str(&format!("<{b:02X}>"));
         }
     }
     out
@@ -572,9 +573,9 @@ mod tests {
     #[test]
     fn raw_string_shows_printable_and_hex_escapes() {
         assert_eq!(raw_string(b"Hello!"), "Hello!");
-        assert_eq!(raw_string(&[0x41, 0x0D, 0x0A]), "A<0x0D><0x0A>");
+        assert_eq!(raw_string(&[0x41, 0x0D, 0x0A]), "A<0D><0A>");
         // High byte (Latin-1 'î') is non-printable ASCII → hex escape.
-        assert_eq!(raw_string(&[0xEE]), "<0xEE>");
+        assert_eq!(raw_string(&[0xEE]), "<EE>");
     }
 
     #[test]
@@ -585,7 +586,7 @@ mod tests {
         // Raw: printable as-is, CR/LF as hex escapes.
         let raw = format_payload(nmea, EchoFormat::Raw);
         assert!(raw.starts_with("$GPGGA"));
-        assert!(raw.ends_with("<0x0D><0x0A>"));
+        assert!(raw.ends_with("<0D><0A>"));
         // Rendered: control bytes pass through as their Unicode codepoint.
         let rendered = format_payload(nmea, EchoFormat::Rendered);
         assert!(rendered.starts_with("$GPGGA"));

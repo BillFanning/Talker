@@ -126,12 +126,6 @@ pub struct ConnDraft {
     pub local_port: String, // optional local bind port
     // tcp
     pub tcp_addr: String,
-    /// True while the user has clicked the channel-remove (✕) button
-    /// on a dirty profile but hasn't yet confirmed. The action area
-    /// swaps to "Discard? [Cancel] [Remove]" while this is set.
-    /// Cleared on Confirm, Cancel, or anything that makes the
-    /// channel disappear. Not serialised.
-    pub pending_remove: bool,
 }
 
 impl Default for ConnDraft {
@@ -164,7 +158,6 @@ impl Default for ConnDraft {
             udp_port_hold: None,
             local_port: String::new(),
             tcp_addr: String::new(),
-            pending_remove: false,
         }
     }
 }

@@ -1284,11 +1284,7 @@ pub(super) fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay)
                         "\u{240A}",
                     );
                     ui.radio_value(&mut display.control_style, ControlStyle::Brackets, "[LF]");
-                    ui.radio_value(
-                        &mut display.control_style,
-                        ControlStyle::HexEscapes,
-                        "<0x0A>",
-                    );
+                    ui.radio_value(&mut display.control_style, ControlStyle::HexEscapes, "<0A>");
                 }
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1303,27 +1299,13 @@ pub(super) fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay)
             .stick_to_bottom(true)
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                // Render all messages as ONE Label so consecutive sends
-                // flow into each other instead of stacking on separate
-                // rows. The per-message labels we used to render each
-                // gained a row-of-padding inter-message gap that looked
-                // like a stray newline.
-                //
-                // Separator between messages:
-                //  - Hex: a single space, so byte groups stay readable
-                //    ("34 0D 0A 34 0D 0A", not "34 0D 0A34 0D 0A").
-                //  - Raw / Rendered: empty, so the wire-byte stream is
-                //    shown verbatim. Any line breaks the user sees here
-                //    come from the bytes themselves (a 0x0A in Rendered
-                //    mode, etc.) — not synthesized by the display.
-                let sep = if display.mode == DisplayMode::Hex {
-                    " "
-                } else {
-                    ""
-                };
-                let combined: String = display.lines().collect::<Vec<_>>().join(sep);
+                // One Label for the whole pane so consecutive sends flow
+                // into each other (per-message labels gained a padding gap
+                // that read as a stray newline). The text is memoized in
+                // ChannelDisplay — re-rendered only when the buffer or the
+                // view settings change, not per repaint.
                 ui.add(
-                    egui::Label::new(egui::RichText::new(combined).monospace())
+                    egui::Label::new(egui::RichText::new(display.rendered()).monospace())
                         .wrap()
                         .selectable(true),
                 );

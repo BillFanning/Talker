@@ -24,7 +24,8 @@ pub enum ControlStyle {
     Pictures,
     /// Bracketed abbreviations: `[LF]` `[CR]` `[ESC]`.
     Brackets,
-    /// Hex escape codes: `<0x0A>` `<0x0D>` `<0x1B>`.
+    /// Hex escape codes: `<0A>` `<0D>` `<1B>` — the same format listener
+    /// renders, so the two apps read identically.
     HexEscapes,
 }
 
@@ -39,6 +40,12 @@ pub struct ChannelDisplay {
     buffer: Vec<Vec<u8>>,
     pub mode: DisplayMode,
     pub control_style: ControlStyle,
+    /// Bumped on every buffer mutation; keys the render cache below.
+    generation: u64,
+    /// Memoized whole-pane render, keyed by (generation, mode, style) so the
+    /// pane re-renders only when the buffer or the view settings change —
+    /// not on every repaint.
+    cache: Option<(u64, DisplayMode, ControlStyle, String)>,
 }
 
 impl ChannelDisplay {
@@ -49,17 +56,38 @@ impl ChannelDisplay {
             let excess = self.buffer.len() - CAPACITY;
             self.buffer.drain(..excess);
         }
+        self.generation += 1;
     }
 
     pub fn clear(&mut self) {
         self.buffer.clear();
+        self.generation += 1;
     }
 
-    /// Render each buffered message to a display line in the current view.
-    pub fn lines(&self) -> impl Iterator<Item = String> + '_ {
-        let mode = self.mode;
-        let style = self.control_style;
-        self.buffer.iter().map(move |msg| render(msg, mode, style))
+    /// The whole pane's text in the current view, memoized.
+    ///
+    /// Messages are joined with a single space in Hex mode (so byte groups
+    /// stay readable: "34 0D 0A 34", not "34 0D 0A34") and concatenated
+    /// verbatim otherwise — any line breaks the user sees come from the
+    /// bytes themselves, never synthesized by the display.
+    pub fn rendered(&mut self) -> &str {
+        let key = (self.generation, self.mode, self.control_style);
+        let stale = !matches!(&self.cache, Some((g, m, s, _)) if (*g, *m, *s) == key);
+        if stale {
+            let sep = if self.mode == DisplayMode::Hex {
+                " "
+            } else {
+                ""
+            };
+            let text = self
+                .buffer
+                .iter()
+                .map(|msg| render(msg, self.mode, self.control_style))
+                .collect::<Vec<_>>()
+                .join(sep);
+            self.cache = Some((key.0, key.1, key.2, text));
+        }
+        &self.cache.as_ref().expect("cache was just filled").3
     }
 }
 
@@ -90,18 +118,18 @@ pub fn render(bytes: &[u8], mode: DisplayMode, control_style: ControlStyle) -> S
 /// (`Pictures`/`Brackets` outside 0x00–0x1F and 0x7F) fall back to a hex escape.
 fn render_control(b: u8, style: ControlStyle) -> String {
     match style {
-        ControlStyle::HexEscapes => format!("<0x{b:02X}>"),
+        ControlStyle::HexEscapes => format!("<{b:02X}>"),
         ControlStyle::Pictures => match b {
             0x00..=0x1F => char::from_u32(0x2400 + u32::from(b))
                 .map(String::from)
-                .unwrap_or_else(|| format!("<0x{b:02X}>")),
+                .unwrap_or_else(|| format!("<{b:02X}>")),
             0x7F => "\u{2421}".to_string(),
-            _ => format!("<0x{b:02X}>"),
+            _ => format!("<{b:02X}>"),
         },
         ControlStyle::Brackets => match b {
             0x00..=0x1F => format!("[{}]", C0_NAMES[b as usize]),
             0x7F => "[DEL]".to_string(),
-            _ => format!("<0x{b:02X}>"),
+            _ => format!("<{b:02X}>"),
         },
     }
 }
@@ -179,7 +207,7 @@ mod tests {
                 DisplayMode::Raw,
                 ControlStyle::HexEscapes,
             ),
-            "<0x00><0x1F><0x7F>"
+            "<00><1F><7F>"
         );
     }
 
@@ -191,7 +219,7 @@ mod tests {
             ControlStyle::Brackets,
             ControlStyle::HexEscapes,
         ] {
-            assert_eq!(render(&[0x80], DisplayMode::Raw, style), "<0x80>");
+            assert_eq!(render(&[0x80], DisplayMode::Raw, style), "<80>");
         }
     }
 
@@ -246,12 +274,10 @@ mod tests {
         for i in 0..(CAPACITY + 25) {
             d.push(vec![i as u8]);
         }
-        assert_eq!(d.lines().count(), CAPACITY);
+        let text = d.rendered().to_string();
+        assert_eq!(text.split(' ').count(), CAPACITY);
         // The oldest entries were dropped; the newest is last.
-        assert_eq!(
-            d.lines().last().unwrap(),
-            format!("{:02X}", (CAPACITY + 24) as u8)
-        );
+        assert!(text.ends_with(&format!("{:02X}", (CAPACITY + 24) as u8)));
     }
 
     #[test]
@@ -259,18 +285,22 @@ mod tests {
         let mut d = ChannelDisplay::default();
         d.push(vec![0x01]);
         d.clear();
-        assert_eq!(d.lines().count(), 0);
+        assert_eq!(d.rendered(), "");
     }
 
     #[test]
-    fn lines_use_the_current_mode() {
+    fn rendered_follows_the_current_mode_and_memoizes() {
         let mut d = ChannelDisplay {
             mode: DisplayMode::Hex,
             ..Default::default()
         };
         d.push(vec![0x41, 0x42]);
-        assert_eq!(d.lines().next().unwrap(), "41 42");
+        assert_eq!(d.rendered(), "41 42");
+        // A view change invalidates the cache…
         d.mode = DisplayMode::Raw;
-        assert_eq!(d.lines().next().unwrap(), "AB");
+        assert_eq!(d.rendered(), "AB");
+        // …and a new payload does too.
+        d.push(vec![0x43]);
+        assert_eq!(d.rendered(), "ABC");
     }
 }

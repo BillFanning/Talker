@@ -23,7 +23,32 @@ use draft::{ConnDraft, ConnKind, ScheduleDraft, UdpModeDraft};
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// Detach the inherited console when going graphical. The `talker` binary is a
+/// console-subsystem app so the headless CLI works when launched from a
+/// terminal; the cost is that a double-click into the GUI leaves a console
+/// window behind. Freeing it here removes that window. `talker-gui.exe` never
+/// allocates one in the first place. No-op off Windows.
+#[cfg(windows)]
+fn detach_console() {
+    // SAFETY: `FreeConsole` takes no arguments and is always safe to call; it
+    // simply detaches the process from its console if it has one.
+    unsafe {
+        let _ = windows_sys::Win32::System::Console::FreeConsole();
+    }
+}
+
+#[cfg(not(windows))]
+fn detach_console() {}
+
+/// Launch the graphical interface.
+///
+/// **Shared GUI-startup funnel (two-binary invariant — see
+/// `src/bin/talker-gui.rs`).** Both GUI entry points route through here: the
+/// `talker-gui` (windows-subsystem) binary and `talker.exe`'s `--gui` path.
+/// Put ALL GUI startup (console detach, logging, window options) in this
+/// function so the two binaries stay identical — never in either `main`.
 pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
+    detach_console(); // drop the double-click console before the window opens
     let (log_tx, log_rx) = crossbeam_channel::bounded::<LogEvent>(512);
     // `logging` stays in scope until `run_native` returns so the
     // file-appender worker guards aren't dropped early. The reload
@@ -72,6 +97,11 @@ const ZOOM_STEP_PPP: f32 = ZOOM_BASE_PPP * 0.10;
 /// Zoom clamp range, as `pixels_per_point` (50%..=200% of the base).
 const ZOOM_MIN_PPP: f32 = ZOOM_BASE_PPP * 0.5;
 const ZOOM_MAX_PPP: f32 = ZOOM_BASE_PPP * 2.0;
+
+/// eframe-storage key for the newline-joined recent-profiles list.
+const RECENT_PROFILES_KEY: &str = "recent_profiles";
+/// How many entries the Profile menu's Recent section keeps.
+const MAX_RECENT_PROFILES: usize = 8;
 
 /// Convert a `pixels_per_point` value to the widget's displayed
 /// percentage (relative to [`ZOOM_BASE_PPP`]), rounded to a whole number.
@@ -132,6 +162,19 @@ struct TalkerApp {
     channels_collapsed: bool,
     /// Per-channel msgs/s estimators for the channel-list rows.
     rates: Vec<RateTracker>,
+    /// Per-channel log-event tallies for the channel-list rows.
+    log_counts: Vec<LogCounts>,
+    /// Per-severity display filters for the log panel (capture level is a
+    /// separate concern — the Level ComboBox).
+    show_info: bool,
+    show_warn: bool,
+    show_error: bool,
+    /// Recently loaded/saved profile paths, most recent first (max
+    /// [`MAX_RECENT_PROFILES`]); persisted via eframe storage.
+    recent_profiles: Vec<PathBuf>,
+    /// A pending "remove this channel?" confirmation; `Some(index)` while
+    /// the modal is up.
+    confirm_remove: Option<usize>,
     /// Mutations that the channel-card render loop has requested. Drained at
     /// the END of each frame (after egui's layout passes complete) — never
     /// mid-frame — so the state changes can't cause widgets to appear,
@@ -153,6 +196,16 @@ struct DeferredActions {
     /// Add a channel of this kind (from the list header's `+ Add` menu).
     add_channel: Option<ConnKind>,
     refresh_ports: bool,
+}
+
+/// Per-channel tallies of log events attributed via the structured
+/// `channel` tracing field (see `LogEvent::channel`), shown on the
+/// channel-list rows. Reset when the channel starts, like the send counts.
+#[derive(Clone, Copy, Default)]
+struct LogCounts {
+    info: u32,
+    warn: u32,
+    error: u32,
 }
 
 /// Lightweight msgs/s estimator for a channel-list row: samples the
@@ -245,6 +298,21 @@ impl TalkerApp {
             selected: None,
             channels_collapsed: false,
             rates: Vec::new(),
+            log_counts: Vec::new(),
+            show_info: true,
+            show_warn: true,
+            show_error: true,
+            recent_profiles: storage
+                .and_then(|s| s.get_string(RECENT_PROFILES_KEY))
+                .map(|joined| {
+                    joined
+                        .lines()
+                        .filter(|l| !l.is_empty())
+                        .map(PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            confirm_remove: None,
             deferred: DeferredActions::default(),
         };
         app.refresh_serial_ports();
@@ -387,6 +455,7 @@ impl TalkerApp {
                 self.status_drops = vec![0; n];
                 self.displays = (0..n).map(|_| ChannelDisplay::default()).collect();
                 self.rates = vec![RateTracker::new(); n];
+                self.log_counts = vec![LogCounts::default(); n];
                 self.selected = if n > 0 { Some(0) } else { None };
                 // Preflight the whole profile so any payload that won't
                 // compile is surfaced now, not silently at the first Start.
@@ -395,6 +464,7 @@ impl TalkerApp {
                 }
                 self.profile = p;
                 self.profile_path = Some(path.to_path_buf());
+                self.push_recent(path);
                 self.dirty = false;
                 tracing::info!("profile '{}' loaded", self.profile.name);
             }
@@ -430,9 +500,18 @@ impl TalkerApp {
         self.status_drops.clear();
         self.displays.clear();
         self.rates.clear();
+        self.log_counts.clear();
         self.selected = None;
         self.error_count = 0;
         tracing::info!("new profile");
+    }
+
+    /// Move `path` to the front of the recent-profiles list (deduplicated,
+    /// capped at [`MAX_RECENT_PROFILES`]).
+    fn push_recent(&mut self, path: &Path) {
+        self.recent_profiles.retain(|p| p != path);
+        self.recent_profiles.insert(0, path.to_path_buf());
+        self.recent_profiles.truncate(MAX_RECENT_PROFILES);
     }
 
     fn load_profile_dialog(&mut self) {
@@ -494,6 +573,7 @@ impl TalkerApp {
         match self.profile.save(path) {
             Ok(()) => {
                 self.profile_path = Some(path.to_path_buf());
+                self.push_recent(path);
                 // Keep the in-memory display name in sync with the
                 // file root — see [`Profile::name`]. Especially
                 // matters after Save As to a new path.
@@ -533,7 +613,7 @@ impl TalkerApp {
         let n = i + 1;
 
         let Some(cfg) = self.conn_drafts.get(i).and_then(|d| d.to_config()) else {
-            tracing::warn!("channel {n} config invalid");
+            tracing::warn!(channel = n, "channel {n} config invalid");
             return;
         };
 
@@ -546,7 +626,7 @@ impl TalkerApp {
         let schedule = match Schedule::compile(&messages, Instant::now()) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("channel {n} schedule error: {e:#}");
+                tracing::error!(channel = n, "channel {n} schedule error: {e:#}");
                 return;
             }
         };
@@ -559,6 +639,9 @@ impl TalkerApp {
         }
         if i < self.status_drops.len() {
             self.status_drops[i] = 0;
+        }
+        if i < self.log_counts.len() {
+            self.log_counts[i] = LogCounts::default();
         }
         // Zero per-message counts, sized to the now-active schedule.
         let message_count = messages.len();
@@ -595,7 +678,10 @@ impl TalkerApp {
                 thread,
             });
         }
-        tracing::info!("channel {n} starting ({message_count}-message schedule)");
+        tracing::info!(
+            channel = n,
+            "channel {n} starting ({message_count}-message schedule)"
+        );
     }
 
     /// Stop channel `i` without blocking the UI: send `Stop` and move the
@@ -610,7 +696,7 @@ impl TalkerApp {
                 self.draining[i].push(h.thread);
             }
             // 1-based to match "Channel N" everywhere else in the UI/logs.
-            tracing::info!("channel {} stopping", i + 1);
+            tracing::info!(channel = i + 1, "channel {} stopping", i + 1);
         }
     }
 
@@ -699,6 +785,17 @@ impl TalkerApp {
         }
 
         for event in self.log_rx.try_iter() {
+            // Tally channel-attributed events (structured `channel` field,
+            // 1-based) for the channel-list rows.
+            if let Some(idx) = event.channel.and_then(|n| n.checked_sub(1)) {
+                if let Some(c) = self.log_counts.get_mut(idx) {
+                    match event.level {
+                        tracing::Level::ERROR => c.error += 1,
+                        tracing::Level::WARN => c.warn += 1,
+                        _ => c.info += 1,
+                    }
+                }
+            }
             let ts = event.timestamp.format("%H:%M:%S%.3f");
             let line = format!("[{ts}] [{:<5}] {}", event.level, event.message);
             self.log_lines.push((line, event.level));
@@ -801,6 +898,7 @@ impl eframe::App for TalkerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().set_pixels_per_point(self.pixels_per_point);
         self.poll_channels(ui.ctx());
+        self.handle_tab_keys(ui.ctx());
         egui::Frame::new()
             .inner_margin(4.0)
             .stroke(egui::Stroke::new(
@@ -826,6 +924,7 @@ impl eframe::App for TalkerApp {
                 }
                 egui::CentralPanel::default().show_inside(ui, |ui| self.show_detail(ui));
             });
+        self.show_remove_confirm(ui.ctx());
         // Apply user-requested mutations AFTER the layout closes — never
         // inside it — so egui's two-pass layout sees one consistent state.
         self.process_deferred();
@@ -840,6 +939,26 @@ impl eframe::App for TalkerApp {
         storage.set_string("last_profile_path", path_str);
         storage.set_string("pixels_per_point", self.pixels_per_point.to_string());
         storage.set_string("dark_mode", self.dark_mode.to_string());
+        let recents = self
+            .recent_profiles
+            .iter()
+            .filter_map(|p| p.to_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        storage.set_string(RECENT_PROFILES_KEY, recents);
+    }
+
+    /// On window close (the X button) or any app exit: orderly shutdown.
+    /// Every runner gets Stop and is then joined (bounded by the interface
+    /// send timeouts), so serial ports and sockets close cleanly before the
+    /// process dies instead of being killed mid-write.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stop_all();
+        for bucket in std::mem::take(&mut self.draining) {
+            for handle in bucket {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -870,22 +989,56 @@ impl TalkerApp {
                         egui::Color32::from_rgb(220, 180, 60),
                     );
                 }
-                if ui.button("New").clicked() {
-                    self.new_profile();
-                }
-                if ui.button("Load\u{2026}").clicked() {
-                    self.load_profile_dialog();
-                }
-                if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
-                    self.save_profile();
-                }
-                if ui
-                    .button("Save As\u{2026}")
-                    .on_hover_text("Ctrl+Shift+S — write to a new file")
-                    .clicked()
-                {
-                    self.save_profile_as();
-                }
+                ui.menu_button("Profile", |ui| {
+                    // Recent profiles at the top: one click reloads.
+                    // Most-recent-first. The header always shows (with a
+                    // placeholder when empty) so the section is visibly
+                    // present.
+                    ui.label(egui::RichText::new("Recent").weak());
+                    if self.recent_profiles.is_empty() {
+                        ui.add_enabled(false, egui::Button::new("(none yet)"));
+                    } else {
+                        let recents = self.recent_profiles.clone();
+                        for path in recents {
+                            let label = path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or_else(|| path.to_str().unwrap_or("profile"));
+                            if ui
+                                .button(label)
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                            {
+                                if self.confirm_discard() {
+                                    self.error_count = 0;
+                                    self.load_profile_from_path(&path);
+                                }
+                                ui.close();
+                            }
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("New").clicked() {
+                        self.new_profile();
+                        ui.close();
+                    }
+                    if ui.button("Load\u{2026}").clicked() {
+                        self.load_profile_dialog();
+                        ui.close();
+                    }
+                    if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
+                        self.save_profile();
+                        ui.close();
+                    }
+                    if ui
+                        .button("Save As\u{2026}")
+                        .on_hover_text("Ctrl+Shift+S — write to a new file")
+                        .clicked()
+                    {
+                        self.save_profile_as();
+                        ui.close();
+                    }
+                });
 
                 ui.separator();
                 let r_minus = ui.small_button("−");
@@ -1023,6 +1176,12 @@ impl TalkerApp {
                             tracing::error!("log level change failed: {e:#}");
                         }
                     }
+                    ui.separator();
+                    // Display filters — what's *shown*, independent of the
+                    // capture level above. Info covers DEBUG/TRACE too.
+                    ui.checkbox(&mut self.show_info, "Info");
+                    ui.checkbox(&mut self.show_warn, "Warn");
+                    ui.checkbox(&mut self.show_error, "Error");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("Clear").clicked() {
                             self.log_lines.clear();
@@ -1033,6 +1192,14 @@ impl TalkerApp {
                 let dark = ui.visuals().dark_mode;
                 ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
                     for (line, level) in &self.log_lines {
+                        let show = match *level {
+                            tracing::Level::ERROR => self.show_error,
+                            tracing::Level::WARN => self.show_warn,
+                            _ => self.show_info,
+                        };
+                        if !show {
+                            continue;
+                        }
                         ui.colored_label(
                             level_color(*level, dark),
                             egui::RichText::new(line).monospace(),
@@ -1040,6 +1207,68 @@ impl TalkerApp {
                     }
                 });
             });
+    }
+
+    /// Ctrl+Tab / Ctrl+Shift+Tab cycles the channel selection (same keys as
+    /// listener). Plain Tab is left to egui's widget-focus traversal.
+    fn handle_tab_keys(&mut self, ctx: &egui::Context) {
+        let (tab, shift, ctrl) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Tab),
+                i.modifiers.shift,
+                i.modifiers.ctrl,
+            )
+        });
+        if tab && ctrl {
+            let n = self.conn_drafts.len();
+            if n > 0 {
+                self.selected = Some(match self.selected {
+                    Some(s) if !shift => (s + 1) % n,
+                    Some(s) => (s + n - 1) % n,
+                    None => 0,
+                });
+            }
+        }
+    }
+
+    /// The "are you sure?" dialog for channel Remove. A modal so it can't be
+    /// ignored; confirming queues the removal (selection then falls to the
+    /// neighbour). Clicking the dimmed backdrop or pressing Escape cancels.
+    fn show_remove_confirm(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.confirm_remove else {
+            return;
+        };
+        let name = self.channel_name(i);
+        let mut close = false;
+        let resp = egui::Modal::new(egui::Id::new("remove_confirm")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.heading("Remove channel?");
+            ui.add_space(4.0);
+            ui.label(format!(
+                "“{name}” will be stopped and removed. Unsaved profile changes to it are lost."
+            ));
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Remove").color(egui::Color32::WHITE),
+                        )
+                        .fill(wiredata_ui::palette::LIGHT.fault_red),
+                    )
+                    .clicked()
+                {
+                    self.deferred.remove = Some(i);
+                    close = true;
+                }
+            });
+        });
+        if close || resp.should_close() {
+            self.confirm_remove = None;
+        }
     }
 
     /// Apply every mutation queued on `self.deferred` during the just-
@@ -1096,6 +1325,9 @@ impl TalkerApp {
             if i < self.rates.len() {
                 self.rates.remove(i);
             }
+            if i < self.log_counts.len() {
+                self.log_counts.remove(i);
+            }
             if i < self.profile.channels.len() {
                 self.profile.channels.remove(i);
             }
@@ -1129,6 +1361,7 @@ impl TalkerApp {
             self.status_drops.push(0);
             self.displays.push(ChannelDisplay::default());
             self.rates.push(RateTracker::new());
+            self.log_counts.push(LogCounts::default());
             // Jump straight to the new channel for editing.
             self.selected = Some(self.conn_drafts.len() - 1);
             self.dirty = true;

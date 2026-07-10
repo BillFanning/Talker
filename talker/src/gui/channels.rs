@@ -21,6 +21,10 @@ struct ChannelRow {
     sent: u64,
     /// Messages per second over the last sampling window (0 when idle).
     per_sec: f32,
+    /// Log events attributed to this channel since its last start.
+    info: u32,
+    warnings: u32,
+    errors: u32,
 }
 
 impl TalkerApp {
@@ -87,6 +91,9 @@ impl TalkerApp {
                 error: self.conn_errors.get(i).and_then(|e| e.clone()),
                 sent: self.sent_counts.get(i).copied().unwrap_or(0),
                 per_sec: self.rates.get(i).map(|r| r.per_sec).unwrap_or(0.0),
+                info: self.log_counts.get(i).map(|c| c.info).unwrap_or(0),
+                warnings: self.log_counts.get(i).map(|c| c.warn).unwrap_or(0),
+                errors: self.log_counts.get(i).map(|c| c.error).unwrap_or(0),
             })
             .collect();
 
@@ -117,6 +124,40 @@ impl TalkerApp {
                             let (glyph, color, tip) = status_glyph(row, pal);
                             ui.colored_label(color, glyph).on_hover_text(tip);
                             ui.label(wiredata_ui::fonts::bold(&row.name));
+                            // Per-channel log tallies (since the channel's
+                            // last start), right-aligned like listener's tab
+                            // counts. Only non-zero severities are shown.
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let tip = "Log events attributed to this channel \
+                                               since its last start";
+                                    if row.errors > 0 {
+                                        ui.label(
+                                            egui::RichText::new(format!("{} err", row.errors))
+                                                .color(pal.fault_red)
+                                                .size(11.0),
+                                        )
+                                        .on_hover_text(tip);
+                                    }
+                                    if row.warnings > 0 {
+                                        ui.label(
+                                            egui::RichText::new(format!("{} warn", row.warnings))
+                                                .color(pal.warning_amber)
+                                                .size(11.0),
+                                        )
+                                        .on_hover_text(tip);
+                                    }
+                                    if row.info > 0 {
+                                        ui.label(
+                                            egui::RichText::new(format!("{} info", row.info))
+                                                .color(pal.count_info_grey)
+                                                .size(11.0),
+                                        )
+                                        .on_hover_text(tip);
+                                    }
+                                },
+                            );
                         });
                         ui.weak(&row.summary);
                         if row.running {

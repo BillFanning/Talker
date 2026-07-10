@@ -9,6 +9,12 @@ pub struct LogEvent {
     pub target: String,
     pub message: String,
     pub timestamp: chrono::DateTime<chrono::Local>,
+    /// The 1-based channel number this event is about, when the emitter
+    /// attributed it via a structured `channel = n` tracing field (the
+    /// runner and the GUI lifecycle logs do). Drives the per-channel
+    /// info/warn/error counts on the channel-list rows. `None` for
+    /// app-level events.
+    pub channel: Option<usize>,
 }
 
 /// A [`Layer`] that forwards tracing events to a GUI thread via a channel.
@@ -33,32 +39,50 @@ impl GuiLogLayer {
 impl<S: Subscriber> Layer<S> for GuiLogLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
-        let mut visitor = MessageVisitor(String::new());
+        let mut visitor = EventVisitor::default();
         event.record(&mut visitor);
 
         let log_event = LogEvent {
             level: *meta.level(),
             target: meta.target().to_string(),
-            message: visitor.0,
+            message: visitor.message,
             timestamp: chrono::Local::now(),
+            channel: visitor.channel,
         };
 
         let _ = self.sender.try_send(log_event);
     }
 }
 
-struct MessageVisitor(String);
+#[derive(Default)]
+struct EventVisitor {
+    message: String,
+    /// Value of a structured `channel` field, when present (1-based).
+    channel: Option<usize>,
+}
 
-impl tracing::field::Visit for MessageVisitor {
+impl tracing::field::Visit for EventVisitor {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "message" {
-            self.0 = value.to_string();
+            self.message = value.to_string();
+        }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "channel" {
+            self.channel = usize::try_from(value).ok();
+        }
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        if field.name() == "channel" {
+            self.channel = usize::try_from(value).ok();
         }
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            self.0 = format!("{value:?}");
+            self.message = format!("{value:?}");
         }
     }
 }
@@ -81,6 +105,7 @@ mod tests {
             target: "my::module".to_string(),
             message: "hello world".to_string(),
             timestamp: chrono::Local::now(),
+            channel: None,
         };
         assert_eq!(event.level, tracing::Level::INFO);
         assert_eq!(event.target, "my::module");
@@ -94,10 +119,31 @@ mod tests {
             target: "t".to_string(),
             message: "msg".to_string(),
             timestamp: chrono::Local::now(),
+            channel: None,
         };
         let cloned = event.clone();
         assert_eq!(cloned.level, event.level);
         assert_eq!(cloned.message, event.message);
+    }
+
+    #[test]
+    fn layer_captures_the_channel_field_end_to_end() {
+        // A real tracing event dispatched through the layer: the structured
+        // `channel` field lands in LogEvent::channel, and an event without
+        // one yields None.
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let subscriber = tracing_subscriber::registry().with(GuiLogLayer::new(tx));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(channel = 3usize, "channel 3 running");
+            tracing::warn!("app-level warning");
+        });
+        let first = rx.try_recv().unwrap();
+        assert_eq!(first.channel, Some(3));
+        assert_eq!(first.message, "channel 3 running");
+        let second = rx.try_recv().unwrap();
+        assert_eq!(second.channel, None);
+        assert_eq!(second.level, tracing::Level::WARN);
     }
 
     #[test]
@@ -114,19 +160,5 @@ mod tests {
         drop(rx); // disconnect receiver
                   // Sending to a disconnected channel must not panic — try_send discards.
         drop(layer);
-    }
-
-    #[test]
-    fn message_visitor_captures_str_field() {
-        let mut v = MessageVisitor(String::new());
-        // Simulate recording a "message" str field.
-        // We can't easily construct tracing::field::Field directly, so we
-        // verify via the field name check path indirectly through record_str.
-        // Use a real tracing event dispatched through a test subscriber.
-        // This is tested end-to-end in integration tests; here we just cover
-        // the visitor struct itself.
-        assert!(v.0.is_empty());
-        v.0 = "captured".to_string();
-        assert_eq!(v.0, "captured");
     }
 }
