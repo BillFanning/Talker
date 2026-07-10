@@ -94,7 +94,7 @@ pub fn run() -> anyhow::Result<()> {
                     format!("failed to start the runtime bridge: {e}").into()
                 },
             )?;
-            Ok(Box::new(ListenerApp::new(bridge, cc.storage)))
+            Ok(Box::new(ListenerApp::new(bridge, &cc.egui_ctx, cc.storage)))
         }),
     )
     .map_err(|e| anyhow!("{e}"))
@@ -115,10 +115,9 @@ fn apply_style(ctx: &egui::Context) {
     // style tweaks instead.)
 
     // The shared wiredata look (ADR-019): visuals for both themes come from
-    // `wiredata-ui` so talker and listener read as one product. Listener pins
-    // Light today; the dark visuals are installed ready for the theme toggle.
+    // `wiredata-ui` so talker and listener read as one product. Which theme is
+    // *active* is restored from storage in `ListenerApp::new` (light default).
     wiredata_ui::style::install_visuals(ctx);
-    ctx.set_theme(egui::ThemePreference::Light);
     wiredata_ui::style::apply_style_tweaks(ctx);
 }
 
@@ -149,6 +148,11 @@ struct ListenerApp {
     channel_seq: std::collections::HashMap<AddKind, u32>,
     /// Whether the channel-list (tabs) column is collapsed to a thin strip (#1).
     channels_collapsed: bool,
+    /// `true` = dark theme, `false` = light (the default). Persisted; toggled
+    /// from the ◐ button in the channel-list header. The shared visuals for
+    /// both themes come from `wiredata-ui` (ADR-019); the palette follows via
+    /// [`theme::set_dark_active`].
+    dark_mode: bool,
     /// Per-severity filters for the diagnostics log.
     show_info: bool,
     show_warn: bool,
@@ -207,9 +211,16 @@ struct StreamRenderKey {
 
 /// eframe storage key for the persisted recent-profiles list (newline-joined paths).
 const RECENT_PROFILES_KEY: &str = "recent_profiles";
+/// eframe storage key for the dark-theme preference ("true"/"false"; same key
+/// talker uses). Light is the default.
+const DARK_MODE_KEY: &str = "dark_mode";
 
 impl ListenerApp {
-    fn new(bridge: BridgeHandle, storage: Option<&dyn eframe::Storage>) -> Self {
+    fn new(
+        bridge: BridgeHandle,
+        ctx: &egui::Context,
+        storage: Option<&dyn eframe::Storage>,
+    ) -> Self {
         // Restore the recent-profiles list from eframe storage (survives restarts).
         let recent_profiles = storage
             .and_then(|s| s.get_string(RECENT_PROFILES_KEY))
@@ -220,6 +231,18 @@ impl ListenerApp {
                     .collect()
             })
             .unwrap_or_default();
+        // Restore the theme preference (light default) and activate it —
+        // both visuals were installed by `apply_style`; this only picks.
+        let dark_mode = storage
+            .and_then(|s| s.get_string(DARK_MODE_KEY))
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        ctx.set_theme(if dark_mode {
+            egui::ThemePreference::Dark
+        } else {
+            egui::ThemePreference::Light
+        });
+        theme::set_dark_active(dark_mode);
         Self {
             bridge,
             state: AppState::default(),
@@ -231,6 +254,7 @@ impl ListenerApp {
             name_duplicate: false,
             channel_seq: std::collections::HashMap::new(),
             channels_collapsed: false,
+            dark_mode,
             show_info: true,
             show_warn: true,
             show_error: true,
@@ -443,7 +467,7 @@ impl ListenerApp {
                         egui::Button::new(
                             egui::RichText::new("Remove").color(egui::Color32::WHITE),
                         )
-                        .fill(theme::FAULT_RED),
+                        .fill(theme::fault_red()),
                     )
                     .clicked()
                 {
@@ -470,6 +494,7 @@ impl eframe::App for ListenerApp {
             .collect::<Vec<_>>()
             .join("\n");
         storage.set_string(RECENT_PROFILES_KEY, joined);
+        storage.set_string(DARK_MODE_KEY, self.dark_mode.to_string());
     }
 
     /// On window close (the X button) or any app exit, shut the driver down and wait

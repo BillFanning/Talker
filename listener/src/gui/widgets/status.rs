@@ -48,9 +48,9 @@ pub(crate) fn recording_indicator(
     // Same colors as channel status (`status_color`): the active ● is RUNNING_GREEN
     // (like a Running channel), faulted ⚠ is FAULT_RED, off ■ is IDLE_GREY.
     match recording {
-        Some(RecordingState::Enabled) => ("\u{25CF}", theme::RUNNING_GREEN, "recording"),
-        Some(RecordingState::Faulted) => ("\u{26A0}", theme::FAULT_RED, "faulted"),
-        Some(RecordingState::Disabled) | None => ("\u{25A0}", theme::IDLE_GREY, "off"),
+        Some(RecordingState::Enabled) => ("\u{25CF}", theme::running_green(), "recording"),
+        Some(RecordingState::Faulted) => ("\u{26A0}", theme::fault_red(), "faulted"),
+        Some(RecordingState::Disabled) | None => ("\u{25A0}", theme::idle_grey(), "off"),
     }
 }
 
@@ -68,9 +68,9 @@ pub(crate) fn status_label(status: ChannelStatus) -> &'static str {
 /// line is high (asserted), grey when low, with a hover tooltip.
 pub(crate) fn line_indicator(ui: &mut egui::Ui, name: &str, high: bool) {
     let color = if high {
-        theme::LINE_HIGH_GREEN
+        theme::line_high_green()
     } else {
-        theme::LINE_LOW_GREY
+        theme::line_low_grey()
     };
     ui.colored_label(color, name)
         .on_hover_text(if high { "high" } else { "low" });
@@ -81,7 +81,7 @@ pub(crate) fn line_indicator(ui: &mut egui::Ui, name: &str, high: bool) {
 /// response so the caller can send the matching Set command.
 pub(crate) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Response {
     let color = if high {
-        theme::LINE_HIGH_GREEN
+        theme::line_high_green()
     } else {
         ui.visuals().weak_text_color()
     };
@@ -99,10 +99,10 @@ pub(crate) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Re
 /// All values live in [`super::super::theme`].
 pub(crate) fn status_color(status: ChannelStatus) -> egui::Color32 {
     match status {
-        ChannelStatus::Running => theme::RUNNING_GREEN,
-        ChannelStatus::Stopped => theme::IDLE_GREY,
-        ChannelStatus::Faulted => theme::FAULT_RED,
-        ChannelStatus::Reconnecting => theme::RECONNECTING_AMBER,
+        ChannelStatus::Running => theme::running_green(),
+        ChannelStatus::Stopped => theme::idle_grey(),
+        ChannelStatus::Faulted => theme::fault_red(),
+        ChannelStatus::Reconnecting => theme::reconnecting_amber(),
     }
 }
 

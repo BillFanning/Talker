@@ -38,6 +38,24 @@ impl ListenerApp {
                 self.channels_collapsed = true;
             }
             ui.heading("Channels");
+            // Theme toggle — same glyphs and storage key as talker, so the
+            // two apps read and behave identically. Both themes' visuals are
+            // pre-installed (ADR-019); this flips the preference and the
+            // palette mirror.
+            let (glyph, tip) = if self.dark_mode {
+                ("\u{25D1}", "Switch to light theme") // ◑
+            } else {
+                ("\u{25D0}", "Switch to dark theme") // ◐
+            };
+            if ui.small_button(glyph).on_hover_text(tip).clicked() {
+                self.dark_mode = !self.dark_mode;
+                ui.ctx().set_theme(if self.dark_mode {
+                    egui::ThemePreference::Dark
+                } else {
+                    egui::ThemePreference::Light
+                });
+                theme::set_dark_active(self.dark_mode);
+            }
             ui.menu_button("+ Add", |ui| {
                 if ui.button("UDP").clicked() {
                     self.add_channel(AddKind::Udp);
@@ -151,7 +169,7 @@ impl ListenerApp {
                     let mut frame = egui::Frame::group(ui.style())
                         .inner_margin(8.0)
                         .corner_radius(egui::CornerRadius::same(6))
-                        .stroke(egui::Stroke::new(1.5, theme::BOX_STROKE));
+                        .stroke(egui::Stroke::new(1.5, theme::box_stroke()));
                     if selected {
                         frame.fill = visuals.selection.bg_fill;
                         frame.stroke = egui::Stroke::new(1.5, visuals.selection.stroke.color);
@@ -198,15 +216,15 @@ impl ListenerApp {
                             ui.label(
                                 egui::RichText::new(format!("{} info", row.info))
                                     .weak()
-                                    .color(theme::COUNT_INFO_GREY),
+                                    .color(theme::count_info_grey()),
                             );
                             ui.label(
                                 egui::RichText::new(format!("{} warn", row.warnings))
-                                    .color(theme::WARNING_AMBER),
+                                    .color(theme::warning_amber()),
                             );
                             ui.label(
                                 egui::RichText::new(format!("{} err", row.errors))
-                                    .color(theme::FAULT_RED),
+                                    .color(theme::fault_red()),
                             );
                         });
                         // Line 5: the last error (e.g. a recording fault), so a fault on
@@ -216,7 +234,7 @@ impl ListenerApp {
                                 egui::Label::new(
                                     egui::RichText::new(format!("⚠ {err}"))
                                         .small()
-                                        .color(theme::FAULT_RED),
+                                        .color(theme::fault_red()),
                                 )
                                 .wrap(),
                             );

@@ -91,7 +91,7 @@ impl ListenerApp {
             });
         });
         if let Some(err) = &last_error {
-            ui.colored_label(theme::FAULT_RED, format!("⚠ {err}"));
+            ui.colored_label(theme::fault_red(), format!("⚠ {err}"));
             // The port/bind recourse only applies to a *start* fault (channel Faulted) —
             // not a recording fault, which leaves the channel Running and whose error
             // already names its own recourse (check the destination / on-exists).
@@ -214,13 +214,13 @@ impl ListenerApp {
         let (headline_level, headline, headline_color) = match entries.last() {
             Some(d) => {
                 let (level, color) = match d.severity {
-                    DiagnosticSeverity::Event => ("INFO", theme::EVENT_GREY),
-                    DiagnosticSeverity::Warning => ("WARN", theme::WARNING_AMBER),
-                    DiagnosticSeverity::Error => ("ERROR", theme::FAULT_RED),
+                    DiagnosticSeverity::Event => ("INFO", theme::event_grey()),
+                    DiagnosticSeverity::Warning => ("WARN", theme::warning_amber()),
+                    DiagnosticSeverity::Error => ("ERROR", theme::fault_red()),
                 };
                 (level, d.message.clone(), color)
             }
-            None => ("", "no diagnostics yet".to_string(), theme::IDLE_GREY),
+            None => ("", "no diagnostics yet".to_string(), theme::idle_grey()),
         };
         let dv = DiagView {
             headline_level,
@@ -281,13 +281,13 @@ impl ListenerApp {
                         for d in dv.entries.iter().rev() {
                             let (enabled, color, level) = match d.severity {
                                 DiagnosticSeverity::Event => {
-                                    (self.show_info, theme::INFO_GREY, "INFO ")
+                                    (self.show_info, theme::info_grey(), "INFO ")
                                 }
                                 DiagnosticSeverity::Warning => {
-                                    (self.show_warn, theme::WARNING_AMBER, "WARN ")
+                                    (self.show_warn, theme::warning_amber(), "WARN ")
                                 }
                                 DiagnosticSeverity::Error => {
-                                    (self.show_error, theme::FAULT_RED, "ERROR")
+                                    (self.show_error, theme::fault_red(), "ERROR")
                                 }
                             };
                             if !enabled {
@@ -380,7 +380,7 @@ impl ListenerApp {
             if self.name_duplicate {
                 ui.label(
                     egui::RichText::new("⚠ name already in use — names must be unique")
-                        .color(theme::WARNING_AMBER),
+                        .color(theme::warning_amber()),
                 );
             }
         });
@@ -409,7 +409,7 @@ impl ListenerApp {
                 ))
                 .weak();
                 ui.label(if q.peak * 2 >= q.capacity.max(1) {
-                    text.color(theme::WARNING_AMBER)
+                    text.color(theme::warning_amber())
                 } else {
                     text
                 });
