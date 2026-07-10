@@ -242,7 +242,7 @@ impl DataTransportRunner for OpenSerialTransport {
         let notices = self.notices;
         let control = self.control;
         let reader = SerialReader { port: self.port };
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("serial-rx".to_string())
             .spawn(move || {
                 let outcome = run_blocking_receive_loop(
@@ -256,8 +256,19 @@ impl DataTransportRunner for OpenSerialTransport {
                 );
                 // Report the outcome to the async side (never blocks a worker).
                 let _ = done_tx.send(outcome);
-            })
-            .expect("failed to spawn serial receive thread");
+            });
+        if let Err(e) = spawned {
+            // Thread spawn can fail on resource exhaustion — plausible on a
+            // weeks-long logging host, and never worth a panic (§: no panics
+            // in production paths). Report it as a faulted transport: the
+            // moved `done_tx` was dropped with the failed closure, so make a
+            // fresh pre-completed handle carrying the fault.
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(TransportOutcome::Faulted(format!(
+                "failed to spawn the serial receive thread: {e}"
+            )));
+            return TransportJoinHandle::Thread(rx);
+        }
         TransportJoinHandle::Thread(done_rx)
     }
 }

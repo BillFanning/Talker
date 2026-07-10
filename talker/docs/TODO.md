@@ -18,6 +18,15 @@ Cross off items as they are completed. Add new ones inline as they come up.
   a GUI setting), which also enables a portable "profiles next to the .exe" layout
   without making it the default. Sample profiles ship in `talker/profiles/`.
 
+## Docs
+
+- [ ] **Spec §8.1 wording tighten (next spec pass, no bump alone).** The v2.1
+  intro says the priority queue is the conceptual model (the implementation is a
+  linear next-fire scan), but the first "Queue model" bullet still reads "maintains
+  a priority queue sorted by next-fire-time" — tighten to "tracks each message's
+  next-fire-time (conceptually a priority queue)". Fold into whichever spec revision
+  lands next; not worth a version bump alone. (External review, 2026-07-10.)
+
 ## When writing the project README
 
 - [ ] Document the system packages required on Linux for `eframe` (`libxcb`, `libxkbcommon`, etc.) per ADR-003 consequences.

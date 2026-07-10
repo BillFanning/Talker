@@ -209,7 +209,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // One runner thread per channel, each driven by the same core send loop
     // as the GUI (spec §2.2). Ctrl+C broadcasts Stop over the command
     // channels; a shared status channel feeds `--echo`.
-    let (status_tx, status_rx) = crossbeam_channel::unbounded::<TalkerStatus>();
+    //
+    // Bounded, like the GUI's: if `--echo` output backs up (stdout piped
+    // into a slow consumer), the runners drop status updates and count them
+    // (`dropped_statuses`) instead of buffering without limit — send cadence
+    // is never sacrificed to echo, and memory stays flat on a long soak.
+    // Without `--echo` the main thread drains and discards immediately, so
+    // the bound is never felt.
+    let (status_tx, status_rx) = crossbeam_channel::bounded::<TalkerStatus>(1024);
     let mut cmd_txs = Vec::new();
     let mut handles = Vec::new();
     for (i, interface, schedule) in prepared {

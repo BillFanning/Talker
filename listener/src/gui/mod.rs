@@ -21,7 +21,7 @@ use anyhow::anyhow;
 
 use crate::config::ChannelConfig;
 use crate::core::ChannelId;
-use crate::display::{CharacterRendering, DisplayMode};
+use crate::display::{CharacterRendering, DisplayMode, StreamRenderer};
 
 use bridge::{BridgeHandle, UiCommand};
 use fonts::install_fonts;
@@ -88,13 +88,22 @@ pub fn run() -> anyhow::Result<()> {
             apply_style(&cc.egui_ctx);
             // The driver wakes the UI by requesting a repaint when it pushes an
             // update, so a streaming source refreshes without busy-polling.
-            let ctx = cc.egui_ctx.clone();
-            let bridge = bridge::spawn(move || ctx.request_repaint()).map_err(
+            // Coalesced (wiredata-ui): any number of pushes between frames —
+            // a poll pass emits stats/snapshot/delta per channel — cost one
+            // winit wake instead of one each.
+            let repaint = wiredata_ui::repaint::RepaintCoalescer::for_ctx(cc.egui_ctx.clone());
+            let notify = std::sync::Arc::clone(&repaint);
+            let bridge = bridge::spawn(move || notify.notify()).map_err(
                 |e| -> Box<dyn std::error::Error + Send + Sync> {
                     format!("failed to start the runtime bridge: {e}").into()
                 },
             )?;
-            Ok(Box::new(ListenerApp::new(bridge, &cc.egui_ctx, cc.storage)))
+            Ok(Box::new(ListenerApp::new(
+                bridge,
+                repaint,
+                &cc.egui_ctx,
+                cc.storage,
+            )))
         }),
     )
     .map_err(|e| anyhow!("{e}"))
@@ -125,6 +134,9 @@ fn apply_style(ctx: &egui::Context) {
 /// selected channel, and the add-channel form's draft state.
 struct ListenerApp {
     bridge: BridgeHandle,
+    /// The driver's repaint coalescer (shared with the bridge callback);
+    /// re-armed at the top of each frame, before the update drain.
+    repaint: std::sync::Arc<wiredata_ui::repaint::RepaintCoalescer>,
     state: AppState,
     selected: Option<ChannelId>,
     /// Last selection sent to the driver, so we only send `Select` on change. The
@@ -178,35 +190,46 @@ struct ListenerApp {
 /// How many recent profiles to keep in the Profile menu.
 pub(super) const MAX_RECENT_PROFILES: usize = 8;
 
-/// Cached, line-split render of a channel's accumulated stream bytes, reused
-/// across frames until one of its inputs changes (see [`StreamRenderKey`]). The
-/// key's `channel` also guards against showing one channel's rows after the
-/// selection moves to another.
+/// Incrementally maintained, line-split render of a channel's accumulated
+/// stream bytes for the live viewer.
+///
+/// The earlier cache re-rendered the **whole** retained window (up to the
+/// ~1 MB cap) and re-split every row each time the stream cursor advanced —
+/// O(buffer) per accepted delta at up to the 5 Hz poll rate, a milder
+/// recurrence of the symptom ADR-011 removed. Now only the **new** bytes are
+/// rendered, through a persistent [`StreamRenderer`] (ADR-018 — the same
+/// carry/tab-column/hex-continuation state the `.disp` recorder uses, so the
+/// incremental output equals a one-shot render; chunking-invariance is pinned
+/// by the renderer's own tests), and appended as rows. Front rows are trimmed
+/// in per-append batches as the byte window evicts.
+///
+/// A full rebuild happens only when a **setting** changes (channel selection,
+/// view mode, ctrl-chars, wrap width), when a Mark appears for (or is pruned
+/// from) an already-rendered offset, or when the stream resets/evicts past
+/// the rendered point. `wrap_cols` is the wrap width in monospace columns:
+/// rows are pre-wrapped so each is exactly one visual line (uniform height),
+/// which lets the viewer both soft-wrap *and* virtualize with `show_rows`.
 struct StreamRenderCache {
-    key: StreamRenderKey,
-    rows: Vec<String>,
-}
-
-/// The cheap signature that decides whether [`StreamRenderCache`] is still valid.
-/// The stream `cursor` advances as deltas are folded and `len` captures front
-/// eviction, so together they capture "the bytes changed" without hashing the
-/// buffer; `channel` guards a selection change and the render settings a view
-/// change.
-#[derive(Clone, Copy, PartialEq)]
-struct StreamRenderKey {
     channel: ChannelId,
-    cursor: u64,
-    len: usize,
     mode: DisplayMode,
     chars: CharacterRendering,
-    /// Wrap width in monospace columns. The cache rows are pre-wrapped to this so each
-    /// row is exactly one visual line (uniform height) — that lets the viewer both
-    /// soft-wrap *and* virtualize with `show_rows`. Re-split when the width changes.
     wrap_cols: usize,
-    /// A cheap signature of the inline Mark timestamps (§50.2) currently spliced into
-    /// the view, so the cache re-renders when the marks change even if the bytes
-    /// don't. A hash, not the marks themselves, to keep the key `Copy`.
-    marks_sig: u64,
+    /// Signature of the marks already spliced into rendered rows (offset <
+    /// `rendered_cursor`). A change — a late mark for an already-rendered
+    /// byte, or front-pruning of the mark list — forces a rebuild; marks for
+    /// not-yet-rendered bytes ride the incremental path.
+    history_marks_sig: u64,
+    /// Absolute stream offset rendered so far (== the view's `stream_cursor`
+    /// at the last refresh).
+    rendered_cursor: u64,
+    /// The persistent incremental renderer (ADR-018 state).
+    renderer: StreamRenderer,
+    rows: Vec<String>,
+    /// Per-append trim accounting: (`end_offset`, rows owned). When the byte
+    /// window's start passes a batch's end offset, its rows are dropped from
+    /// the front. Ownership is kept exact across the open-row seam (an append
+    /// pops the previous open row, so the previous batch is debited one).
+    row_batches: std::collections::VecDeque<(u64, usize)>,
 }
 
 /// eframe storage key for the persisted recent-profiles list (newline-joined paths).
@@ -218,6 +241,7 @@ const DARK_MODE_KEY: &str = "dark_mode";
 impl ListenerApp {
     fn new(
         bridge: BridgeHandle,
+        repaint: std::sync::Arc<wiredata_ui::repaint::RepaintCoalescer>,
         ctx: &egui::Context,
         storage: Option<&dyn eframe::Storage>,
     ) -> Self {
@@ -245,6 +269,7 @@ impl ListenerApp {
         theme::set_dark_active(dark_mode);
         Self {
             bridge,
+            repaint,
             state: AppState::default(),
             selected: None,
             last_selected_sent: None,
@@ -295,9 +320,13 @@ impl ListenerApp {
     }
 
     /// Send a command to the driver. Non-blocking: a full command channel drops the
-    /// command rather than stalling the UI thread (AGENTS §5).
+    /// command rather than stalling the UI thread (AGENTS §5). A drop is logged —
+    /// it means the driver is saturated or gone, and the user's click did nothing;
+    /// silence here cost a debugging session once (Stop all, before batching).
     pub(super) fn send(&self, command: UiCommand) {
-        let _ = self.bridge.commands.try_send(command);
+        if let Err(e) = self.bridge.commands.try_send(command) {
+            tracing::warn!("UI command dropped ({e}) — the driver is busy or stopped; retry");
+        }
     }
 
     /// Add a fresh channel of `kind` (from the "Add" menu by the list heading). It is
@@ -507,6 +536,9 @@ impl eframe::App for ListenerApp {
 
     // This workspace's eframe surfaces a `Ui` directly (App::ui), like talker's GUI.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Re-arm the coalescer BEFORE draining, so a push arriving mid-drain
+        // either lands in this frame's batch or triggers a fresh wake.
+        self.repaint.frame_started();
         self.drain_updates();
         self.handle_tab_keys(ui.ctx());
         if self.channels_collapsed {

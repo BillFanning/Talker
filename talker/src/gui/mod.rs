@@ -110,10 +110,11 @@ fn zoom_percent(ppp: f32) -> u32 {
 }
 
 struct TalkerApp {
-    /// A clone of the egui context, handed to each runner thread as a
-    /// repaint-on-status callback (`Context` is a cheap `Arc` clone and
-    /// `request_repaint` is thread-safe) — listener's driver-wake model.
-    egui_ctx: egui::Context,
+    /// Repaint-on-status coalescer shared with every runner thread: a status
+    /// wakes the UI instantly, but N statuses between frames cost **one**
+    /// winit wake (see `wiredata_ui::repaint`). Re-armed at the top of each
+    /// frame, before the status drain.
+    repaint: std::sync::Arc<wiredata_ui::repaint::RepaintCoalescer>,
     profile: Profile,
     profile_path: Option<PathBuf>,
     dirty: bool,
@@ -272,7 +273,7 @@ impl TalkerApp {
         wiredata_ui::style::apply_style_tweaks(ctx);
         apply_theme(ctx, dark_mode);
         let mut app = Self {
-            egui_ctx: ctx.clone(),
+            repaint: wiredata_ui::repaint::RepaintCoalescer::for_ctx(ctx.clone()),
             profile: Profile::default(),
             profile_path: None,
             dirty: false,
@@ -661,9 +662,10 @@ impl TalkerApp {
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(32);
         let (status_tx, status_rx) = crossbeam_channel::bounded(256);
         // Wake the UI whenever a status is queued, so sends appear the
-        // moment they happen instead of on the next poll tick.
-        let repaint_ctx = self.egui_ctx.clone();
-        let notify: runner::StatusNotify = Box::new(move || repaint_ctx.request_repaint());
+        // moment they happen instead of on the next poll tick. Coalesced:
+        // any number of statuses between frames cost one wake.
+        let repaint = std::sync::Arc::clone(&self.repaint);
+        let notify: runner::StatusNotify = Box::new(move || repaint.notify());
         let thread = std::thread::spawn(move || {
             for pred in predecessors {
                 let _ = pred.join();
@@ -897,6 +899,10 @@ impl TalkerApp {
 impl eframe::App for TalkerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().set_pixels_per_point(self.pixels_per_point);
+        // Re-arm the repaint coalescer BEFORE draining statuses, so a status
+        // arriving mid-drain either lands in this frame's batch or triggers a
+        // fresh wake — never lost.
+        self.repaint.frame_started();
         self.poll_channels(ui.ctx());
         self.handle_tab_keys(ui.ctx());
         egui::Frame::new()
@@ -1190,22 +1196,39 @@ impl TalkerApp {
                 });
                 ui.separator();
                 let dark = ui.visuals().dark_mode;
-                ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                    for (line, level) in &self.log_lines {
-                        let show = match *level {
-                            tracing::Level::ERROR => self.show_error,
-                            tracing::Level::WARN => self.show_warn,
-                            _ => self.show_info,
-                        };
-                        if !show {
-                            continue;
+                // Filter first, then virtualize: `show_rows` lays out only the
+                // visible rows instead of all (up to 2,000) lines every
+                // repaint. Rows must be uniform height for virtualization, so
+                // long lines truncate (hover shows the full text) rather than
+                // wrap.
+                let visible: Vec<(&str, tracing::Level)> = self
+                    .log_lines
+                    .iter()
+                    .filter(|(_, level)| match *level {
+                        tracing::Level::ERROR => self.show_error,
+                        tracing::Level::WARN => self.show_warn,
+                        _ => self.show_info,
+                    })
+                    .map(|(line, level)| (line.as_str(), *level))
+                    .collect();
+                let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show_rows(ui, row_h, visible.len(), |ui, range| {
+                        for &(line, level) in &visible[range] {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(line)
+                                        .monospace()
+                                        .color(level_color(level, dark)),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(line);
                         }
-                        ui.colored_label(
-                            level_color(*level, dark),
-                            egui::RichText::new(line).monospace(),
-                        );
-                    }
-                });
+                    });
             });
     }
 

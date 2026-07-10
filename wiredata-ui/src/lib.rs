@@ -10,4 +10,5 @@
 pub mod fonts;
 pub mod format;
 pub mod palette;
+pub mod repaint;
 pub mod style;

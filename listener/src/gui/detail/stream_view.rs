@@ -7,7 +7,7 @@
 use crate::core::ChannelId;
 use crate::display::{
     AnnotationPlacement, CharacterRendering, DisplayEncoding, DisplayMode, DisplayView,
-    RenderAnnotation, WrappingMode,
+    RenderAnnotation, StreamRenderer, WrappingMode,
 };
 
 use super::super::bridge::UiCommand;
@@ -168,7 +168,7 @@ impl ListenerApp {
                 let rows: &[String] = self
                     .stream_cache
                     .as_ref()
-                    .filter(|c| c.key.channel == id)
+                    .filter(|c| c.channel == id)
                     .map(|c| c.rows.as_slice())
                     .unwrap_or(&[]);
                 // The viewer fills its full height whether or not data is flowing — the
@@ -393,65 +393,233 @@ impl ListenerApp {
         });
     }
 
-    /// Refresh the memoized stream-view rows for `id` if the accumulated bytes or
-    /// the render settings changed. Keyed on the view's stream cursor (advances as
-    /// deltas are folded) plus the view mode/character rendering, so we re-render
-    /// the scrollback only when something actually changed — not every frame.
+    /// Refresh the incrementally maintained stream-view rows for `id` (see
+    /// [`super::super::StreamRenderCache`]): render only the bytes new since
+    /// the last refresh, rebuilding from scratch only on a settings / marks /
+    /// reset change. No-ops entirely when nothing changed.
     fn refresh_stream_rows(&mut self, id: ChannelId, renderer: &DisplayView, wrap_cols: usize) {
         let Some(view) = self.state.channel_mut(id) else {
             self.stream_cache = None;
             return;
         };
-        // The cache key hashes the pinned marks directly (no allocation) — the
-        // annotation list itself is only built below, on a cache miss.
-        let marks_sig = marks_signature(&view.marks);
-        let key = super::super::StreamRenderKey {
-            channel: id,
-            cursor: view.stream_cursor,
-            len: view.stream_bytes.len(),
-            mode: view.view_prefs.mode,
-            chars: view.view_prefs.chars,
-            wrap_cols,
-            marks_sig,
-        };
-        if self.stream_cache.as_ref().is_some_and(|c| c.key == key) {
-            return; // still valid — reuse the cached rows
-        }
-        // Inline Mark timestamps (§50.2): rebase each pinned mark's **view-space**
-        // offset onto the accumulated window (front byte = cursor − buffered len)
-        // and splice its text before/after the annotated byte — exactly as the
-        // Display Recording does. The source is the channel's persistent
-        // `marks` (folded from snapshot firings, lifetime tied to the bytes),
-        // NOT the snapshot's bounded rolling `matches` window — deriving from
-        // that made timestamps vanish from a paused view as firings churned.
-        // `marks` is offset-sorted, so the annotations come out sorted, which the
-        // renderer's forward-only walker requires.
-        let window_start = view.stream_cursor - view.stream_bytes.len() as u64;
-        let annotations: Vec<RenderAnnotation> = view
-            .marks
-            .iter()
-            .filter_map(|m| {
-                let within = m.offset.checked_sub(window_start)? as usize;
-                (within <= view.stream_bytes.len()).then(|| RenderAnnotation {
-                    offset: within,
-                    placement: if m.before {
-                        AnnotationPlacement::Before
-                    } else {
-                        AnnotationPlacement::After
-                    },
-                    text: m.text.clone(),
-                })
-            })
-            .collect();
-        let text = renderer.render_text_annotated(view.stream_contiguous(), &annotations);
-        let rows = split_stream_rows(&text, wrap_cols);
-        self.stream_cache = Some(super::super::StreamRenderCache { key, rows });
+        // Make the window contiguous *first*, then take an immutable slice via
+        // `as_slices` — `stream_contiguous()`'s returned slice would hold the
+        // mutable borrow and conflict with reading `view.marks` alongside it.
+        view.stream_bytes.make_contiguous();
+        let (window, rest) = view.stream_bytes.as_slices();
+        debug_assert!(rest.is_empty(), "make_contiguous left a split deque");
+        refresh_rows(
+            &mut self.stream_cache,
+            StreamRefresh {
+                channel: id,
+                window,
+                cursor: view.stream_cursor,
+                marks: &view.marks,
+                view: renderer,
+                wrap_cols,
+            },
+        );
     }
 }
 
-/// A cheap order-sensitive hash of the pinned marks, so the row cache invalidates
-/// when the inline Mark timestamps change even though the raw bytes didn't —
-/// computed straight off the mark list, with no per-frame allocation.
+/// Inputs for one refresh of the incremental row cache.
+struct StreamRefresh<'a> {
+    channel: ChannelId,
+    /// The accumulated byte window, contiguous. Its first byte sits at absolute
+    /// stream offset `cursor - window.len()`.
+    window: &'a [u8],
+    /// Absolute stream offset one past the window's last byte.
+    cursor: u64,
+    /// The channel's pinned inline-Mark timestamps (§50.2), **offset-sorted**
+    /// (view space) — the renderer's forward-only walker requires sorted input.
+    marks: &'a [crate::gui::state::StreamMark],
+    view: &'a DisplayView,
+    wrap_cols: usize,
+}
+
+/// Cap on trim-accounting batches: beyond this the two oldest merge, so a
+/// slow-trickle channel (many small deltas, no eviction yet) can't grow the
+/// bookkeeping without bound. Coarser batches only make front-trimming
+/// slightly lazier, never wrong.
+const MAX_ROW_BATCHES: usize = 512;
+
+/// Refresh `cache` from `p`: incremental append when only new bytes arrived,
+/// full rebuild when a setting / the mark history / the stream base changed.
+fn refresh_rows(cache: &mut Option<super::super::StreamRenderCache>, p: StreamRefresh) {
+    let window_start = p.cursor - p.window.len() as u64;
+    let needs_rebuild = match cache.as_ref() {
+        None => true,
+        Some(c) => {
+            c.channel != p.channel
+                || c.mode != p.view.mode
+                || c.chars != p.view.character_rendering
+                || c.wrap_cols != p.wrap_cols
+                // The stream restarted / reset behind us…
+                || p.cursor < c.rendered_cursor
+                // …or eviction ran past the rendered point (a gap we can't append over).
+                || window_start > c.rendered_cursor
+                // A mark appeared for (or was pruned from) an already-rendered offset.
+                || marks_signature_below(p.marks, c.rendered_cursor) != c.history_marks_sig
+        }
+    };
+    if needs_rebuild {
+        *cache = Some(rebuild_rows(&p, window_start));
+        return;
+    }
+    let c = cache.as_mut().expect("checked Some above");
+    if p.cursor == c.rendered_cursor {
+        return; // nothing new — the common per-frame case
+    }
+    // Append path: render only the suffix past the rendered cursor, through the
+    // persistent renderer (so carry / tab column / hex separators continue
+    // exactly as a one-shot render would — ADR-018 chunking invariance).
+    let from = (c.rendered_cursor - window_start) as usize;
+    let delta = &p.window[from..];
+    let annotations = delta_annotations(p.marks, c.rendered_cursor, delta.len());
+    let text = c.renderer.render_chunk(delta, &annotations);
+    c.append_text(&text, p.cursor);
+    c.rendered_cursor = p.cursor;
+    c.history_marks_sig = marks_signature_below(p.marks, p.cursor);
+    c.trim_evicted(window_start);
+}
+
+/// Build the cache fresh: render the whole current window in one chunk (the
+/// renderer keeps its state, so subsequent appends continue seamlessly).
+fn rebuild_rows(p: &StreamRefresh, window_start: u64) -> super::super::StreamRenderCache {
+    // Rebase each pinned mark's view-space offset onto the window and splice
+    // its text before/after the annotated byte — exactly as the Display
+    // Recording does. The source is the channel's persistent `marks` (folded
+    // from snapshot firings, lifetime tied to the bytes), NOT the snapshot's
+    // bounded rolling `matches` window — deriving from that made timestamps
+    // vanish from a paused view as firings churned.
+    let annotations: Vec<RenderAnnotation> = p
+        .marks
+        .iter()
+        .filter_map(|m| {
+            let within = m.offset.checked_sub(window_start)? as usize;
+            (within <= p.window.len()).then(|| RenderAnnotation {
+                offset: within,
+                placement: if m.before {
+                    AnnotationPlacement::Before
+                } else {
+                    AnnotationPlacement::After
+                },
+                text: m.text.clone(),
+            })
+        })
+        .collect();
+    let mut renderer = StreamRenderer::new(p.view.clone());
+    let text = renderer.render_chunk(p.window, &annotations);
+    let rows = split_stream_rows(&text, p.wrap_cols);
+    let row_count = rows.len();
+    super::super::StreamRenderCache {
+        channel: p.channel,
+        mode: p.view.mode,
+        chars: p.view.character_rendering,
+        wrap_cols: p.wrap_cols,
+        history_marks_sig: marks_signature_below(p.marks, p.cursor),
+        rendered_cursor: p.cursor,
+        renderer,
+        rows,
+        row_batches: std::collections::VecDeque::from([(p.cursor, row_count)]),
+    }
+}
+
+/// The marks that fall inside a delta starting at absolute `delta_start`,
+/// rebased to chunk-relative offsets for [`StreamRenderer::render_chunk`]. A
+/// mark exactly at the delta's end is left for the next delta (where it lands
+/// at relative offset 0) — the renderer would otherwise splice an `After`
+/// mark ahead of its not-yet-arrived byte.
+fn delta_annotations(
+    marks: &[crate::gui::state::StreamMark],
+    delta_start: u64,
+    delta_len: usize,
+) -> Vec<RenderAnnotation> {
+    marks
+        .iter()
+        .filter_map(|m| {
+            let within = m.offset.checked_sub(delta_start)? as usize;
+            (within < delta_len).then(|| RenderAnnotation {
+                offset: within,
+                placement: if m.before {
+                    AnnotationPlacement::Before
+                } else {
+                    AnnotationPlacement::After
+                },
+                text: m.text.clone(),
+            })
+        })
+        .collect()
+}
+
+impl super::super::StreamRenderCache {
+    /// Append newly rendered `text`, re-splitting only the open last row (the
+    /// text after the stream's last `\n`, or its last partial wrap chunk) plus
+    /// the new text — O(delta + one row), never O(buffer).
+    ///
+    /// `split_stream_rows` guarantees the invariant this leans on: the last
+    /// row is always the open line's most recent wrap chunk (an empty row
+    /// when the text ends in `\n`), and wrap-chunk boundaries fall at fixed
+    /// multiples of the column count — so popping the open row and
+    /// re-splitting `open + new` yields exactly what a one-shot split of the
+    /// whole text would.
+    fn append_text(&mut self, text: &str, end_offset: u64) {
+        let seed = match self.rows.pop() {
+            Some(open) => {
+                // The open row was owned by the previous batch — debit it so
+                // batch ownership keeps summing to rows.len().
+                if let Some((_, owned)) = self.row_batches.back_mut() {
+                    *owned = owned.saturating_sub(1);
+                }
+                open
+            }
+            None => String::new(),
+        };
+        let mut combined = seed;
+        combined.push_str(text);
+        let before = self.rows.len();
+        self.rows
+            .extend(split_stream_rows(&combined, self.wrap_cols));
+        self.row_batches
+            .push_back((end_offset, self.rows.len() - before));
+        // Bound the bookkeeping: merge the two oldest batches (older rows,
+        // newer end offset) once the queue is full.
+        while self.row_batches.len() > MAX_ROW_BATCHES {
+            let (_, n1) = self.row_batches.pop_front().expect("len checked");
+            let (e2, n2) = self.row_batches.pop_front().expect("len > 1");
+            self.row_batches.push_front((e2, n1 + n2));
+        }
+    }
+
+    /// Drop front rows whose bytes have been evicted from the window: whole
+    /// batches only, so the cost is O(evicted rows) amortized. A batch's seam
+    /// row can contain a few bytes of its successor; trimming it with the
+    /// batch discards those a hair early — invisible in a bottom-anchored
+    /// view (the window's own front eviction already cuts mid-line).
+    fn trim_evicted(&mut self, window_start: u64) {
+        while let Some(&(end, n)) = self.row_batches.front() {
+            if window_start >= end && self.row_batches.len() > 1 {
+                self.rows.drain(..n.min(self.rows.len()));
+                self.row_batches.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// A cheap order-sensitive hash of the pinned marks **below** an absolute
+/// offset — the already-rendered history. The rows cache invalidates (full
+/// rebuild) when this changes even though the raw bytes didn't: a late mark
+/// arriving for an already-rendered byte, or front-pruning of the mark list.
+/// Marks are offset-sorted, so the prefix is found by partition point; no
+/// per-frame allocation.
+fn marks_signature_below(marks: &[crate::gui::state::StreamMark], below: u64) -> u64 {
+    let end = marks.partition_point(|m| m.offset < below);
+    marks_signature(&marks[..end])
+}
+
+/// A cheap order-sensitive hash of a mark list.
 fn marks_signature(marks: &[crate::gui::state::StreamMark]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -503,4 +671,286 @@ fn split_stream_rows(text: &str, wrap_cols: usize) -> Vec<String> {
         }
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::MatchRuleId;
+    use crate::gui::state::StreamMark;
+
+    fn view(mode: DisplayMode) -> DisplayView {
+        DisplayView {
+            mode,
+            encoding: DisplayEncoding::Utf8,
+            character_rendering: CharacterRendering::Native,
+            wrapping: WrappingMode::NoWrap,
+            wrap_width: None,
+            hex_separator: " ".to_string(),
+            hex_bytes_per_line: 16,
+        }
+    }
+
+    fn mark(offset: u64, before: bool, text: &str) -> StreamMark {
+        StreamMark {
+            offset,
+            rule_id: MatchRuleId::new(),
+            before,
+            text: text.to_string(),
+        }
+    }
+
+    /// Feed `data` to a fresh cache in `chunk`-sized deltas (no eviction) and
+    /// return the resulting rows.
+    fn incremental_rows(
+        data: &[u8],
+        chunk: usize,
+        marks: &[StreamMark],
+        v: &DisplayView,
+        cols: usize,
+    ) -> Vec<String> {
+        let id = ChannelId::new();
+        let mut cache = None;
+        let mut fed = 0usize;
+        while fed < data.len() {
+            let end = (fed + chunk).min(data.len());
+            refresh_rows(
+                &mut cache,
+                StreamRefresh {
+                    channel: id,
+                    window: &data[..end],
+                    cursor: end as u64,
+                    marks,
+                    view: v,
+                    wrap_cols: cols,
+                },
+            );
+            fed = end;
+        }
+        cache.expect("fed at least one delta").rows
+    }
+
+    /// Reference: the same input rendered in one shot through a fresh
+    /// renderer (identical carry semantics), then split.
+    fn batch_rows(data: &[u8], marks: &[StreamMark], v: &DisplayView, cols: usize) -> Vec<String> {
+        let annotations = delta_annotations(marks, 0, data.len());
+        let mut r = StreamRenderer::new(v.clone());
+        split_stream_rows(&r.render_chunk(data, &annotations), cols)
+    }
+
+    #[test]
+    fn incremental_rows_equal_one_shot_rows() {
+        // The defining invariant of the incremental cache: feeding the stream
+        // delta-by-delta produces exactly the rows of a one-shot render+split.
+        // Exercises newlines, blank lines, wrap-length lines, multi-byte
+        // UTF-8 split across deltas, and all three modes, at several chunk
+        // sizes (1 = every boundary possible).
+        let data = "alpha\n\nbravo-charlie delta echo\nfoxtrot golf hotel\r\nindia".as_bytes();
+        for mode in [DisplayMode::Rendered, DisplayMode::Raw, DisplayMode::Hex] {
+            let v = view(mode);
+            for cols in [8usize, 10, 80] {
+                let want = batch_rows(data, &[], &v, cols);
+                for chunk in [1usize, 3, 7, 64] {
+                    let got = incremental_rows(data, chunk, &[], &v, cols);
+                    assert_eq!(got, want, "mode {mode:?} cols {cols} chunk {chunk}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_character_across_deltas_never_shows_a_replacement() {
+        // A UTF-8 character split across two deltas is held in the renderer
+        // carry, not rendered as U+FFFD-then-fixed.
+        let data = "ab \u{e9} cd".as_bytes();
+        let v = view(DisplayMode::Rendered);
+        let got = incremental_rows(data, 1, &[], &v, 80);
+        assert_eq!(got, vec!["ab \u{e9} cd".to_string()]);
+    }
+
+    #[test]
+    fn hex_separators_continue_across_deltas() {
+        let v = view(DisplayMode::Hex);
+        let got = incremental_rows(b"ABCD", 2, &[], &v, 80);
+        assert_eq!(got, vec!["41 42 43 44".to_string()]);
+    }
+
+    #[test]
+    fn marks_for_new_bytes_ride_the_incremental_path() {
+        // A mark whose byte arrives in the second delta splices without a
+        // rebuild (same rows as one-shot).
+        let data = b"hello world";
+        let marks = vec![mark(6, true, "[T]")];
+        let v = view(DisplayMode::Rendered);
+        let got = incremental_rows(data, 4, &marks, &v, 80);
+        assert_eq!(got, vec!["hello [T]world".to_string()]);
+    }
+
+    #[test]
+    fn late_mark_for_rendered_bytes_forces_a_rebuild() {
+        let id = ChannelId::new();
+        let v = view(DisplayMode::Rendered);
+        let mut cache = None;
+        let data = b"hello world";
+        refresh_rows(
+            &mut cache,
+            StreamRefresh {
+                channel: id,
+                window: data,
+                cursor: data.len() as u64,
+                marks: &[],
+                view: &v,
+                wrap_cols: 80,
+            },
+        );
+        assert_eq!(
+            cache.as_ref().unwrap().rows,
+            vec!["hello world".to_string()]
+        );
+        // The mark targets offset 0 - long since rendered. The history
+        // signature changes, so the cache rebuilds with the splice.
+        let marks = vec![mark(0, true, "[LATE]")];
+        refresh_rows(
+            &mut cache,
+            StreamRefresh {
+                channel: id,
+                window: data,
+                cursor: data.len() as u64,
+                marks: &marks,
+                view: &v,
+                wrap_cols: 80,
+            },
+        );
+        assert_eq!(
+            cache.as_ref().unwrap().rows,
+            vec!["[LATE]hello world".to_string()]
+        );
+    }
+
+    #[test]
+    fn eviction_trims_front_rows_and_keeps_the_tail_exact() {
+        // Simulate the state's byte cap: after each delta the window keeps
+        // only the last `cap` bytes. Front rows must be trimmed (bounded
+        // memory) and the tail rows must match a one-shot render's tail.
+        let id = ChannelId::new();
+        let v = view(DisplayMode::Rendered);
+        let mut cache = None;
+        let cap = 32usize;
+        let mut all: Vec<u8> = Vec::new();
+        for i in 0..40 {
+            all.extend_from_slice(format!("line {i:02}\n").as_bytes());
+            let start = all.len().saturating_sub(cap);
+            refresh_rows(
+                &mut cache,
+                StreamRefresh {
+                    channel: id,
+                    window: &all[start..],
+                    cursor: all.len() as u64,
+                    marks: &[],
+                    view: &v,
+                    wrap_cols: 80,
+                },
+            );
+        }
+        let c = cache.unwrap();
+        // Bounded: the window holds 4 lines (32 / 8 bytes each); trimming is
+        // per-batch (a hair lazy), so allow a small constant slack - the
+        // point is it is not ~40 rows.
+        assert!(
+            c.rows.len() <= 8,
+            "front rows not trimmed: {} rows",
+            c.rows.len()
+        );
+        // The tail is exact: the last rows equal the one-shot render's tail.
+        let want = batch_rows(&all, &[], &v, 80);
+        let tail = 3;
+        assert_eq!(
+            &c.rows[c.rows.len() - tail..],
+            &want[want.len() - tail..],
+            "tail rows diverged from one-shot render"
+        );
+    }
+
+    #[test]
+    fn cursor_regression_rebuilds() {
+        // A restart resets the stream offset to 0 - the cache must rebuild,
+        // not append backwards.
+        let id = ChannelId::new();
+        let v = view(DisplayMode::Rendered);
+        let mut cache = None;
+        refresh_rows(
+            &mut cache,
+            StreamRefresh {
+                channel: id,
+                window: b"old data",
+                cursor: 8,
+                marks: &[],
+                view: &v,
+                wrap_cols: 80,
+            },
+        );
+        refresh_rows(
+            &mut cache,
+            StreamRefresh {
+                channel: id,
+                window: b"new",
+                cursor: 3,
+                marks: &[],
+                view: &v,
+                wrap_cols: 80,
+            },
+        );
+        assert_eq!(cache.unwrap().rows, vec!["new".to_string()]);
+    }
+
+    #[test]
+    fn wrap_change_rebuilds_with_new_columns() {
+        let id = ChannelId::new();
+        let v = view(DisplayMode::Rendered);
+        let mut cache = None;
+        let data = b"abcdefghijklmnop"; // 16 chars, no newline
+        for cols in [8usize, 16] {
+            refresh_rows(
+                &mut cache,
+                StreamRefresh {
+                    channel: id,
+                    window: data,
+                    cursor: data.len() as u64,
+                    marks: &[],
+                    view: &v,
+                    wrap_cols: cols,
+                },
+            );
+        }
+        assert_eq!(cache.unwrap().rows, vec!["abcdefghijklmnop".to_string()]);
+    }
+
+    #[test]
+    fn batch_bookkeeping_stays_bounded() {
+        // Thousands of tiny deltas with no eviction: the trim-accounting
+        // queue merges instead of growing without bound.
+        let id = ChannelId::new();
+        let v = view(DisplayMode::Rendered);
+        let mut cache = None;
+        let mut all = Vec::new();
+        for i in 0..(MAX_ROW_BATCHES * 3) {
+            all.push(if i % 10 == 9 { b'\n' } else { b'x' });
+            refresh_rows(
+                &mut cache,
+                StreamRefresh {
+                    channel: id,
+                    window: &all,
+                    cursor: all.len() as u64,
+                    marks: &[],
+                    view: &v,
+                    wrap_cols: 80,
+                },
+            );
+        }
+        let c = cache.unwrap();
+        assert!(c.row_batches.len() <= MAX_ROW_BATCHES);
+        // Ownership accounting must still cover every row exactly.
+        let owned: usize = c.row_batches.iter().map(|&(_, n)| n).sum();
+        assert_eq!(owned, c.rows.len());
+    }
 }
