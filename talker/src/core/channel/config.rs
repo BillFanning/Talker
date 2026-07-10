@@ -12,6 +12,13 @@ use crate::core::message::MessageConfig;
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelConfig {
+    /// Display name shown in the GUI channel list. Cosmetic only — channels
+    /// are identified by position, so the name carries no uniqueness
+    /// requirement. Empty means "unnamed"; the GUI falls back to
+    /// "Channel N". Additive `#[serde(default)]` field: older profiles
+    /// load with an empty name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     pub interface: InterfaceConfig,
     #[serde(default)]
     pub messages: Vec<MessageConfig>,
@@ -20,6 +27,20 @@ pub struct ChannelConfig {
 impl ChannelConfig {
     pub fn new(interface: InterfaceConfig, messages: Vec<MessageConfig>) -> Self {
         Self {
+            name: String::new(),
+            interface,
+            messages,
+        }
+    }
+
+    /// [`ChannelConfig::new`] with a display name.
+    pub fn named(
+        name: impl Into<String>,
+        interface: InterfaceConfig,
+        messages: Vec<MessageConfig>,
+    ) -> Self {
+        Self {
+            name: name.into(),
             interface,
             messages,
         }
@@ -321,6 +342,19 @@ mod tests {
         let json = r#"{"interface":{"type":"tcp_client","address":"10.0.0.1:1"}}"#;
         let c: ChannelConfig = serde_json::from_str(json).unwrap();
         assert!(c.messages.is_empty());
+        // Older profiles predate the name key — defaults to unnamed.
+        assert!(c.name.is_empty());
+    }
+
+    #[test]
+    fn channel_config_name_round_trips_and_empty_is_omitted() {
+        let iface = InterfaceConfig::TcpClient(TcpClientConfig::new("10.0.0.1:1".parse().unwrap()));
+        let named = ChannelConfig::named("GPS feed", iface.clone(), vec![]);
+        round_trip(&named);
+        // Unnamed channels serialize without a name key at all, keeping
+        // old-style profiles byte-identical.
+        let json = serde_json::to_string(&ChannelConfig::new(iface, vec![])).unwrap();
+        assert!(!json.contains("\"name\""), "{json}");
     }
 
     #[test]
