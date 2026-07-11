@@ -479,18 +479,28 @@ mod tests {
     #[test]
     fn sends_on_schedule_and_reports_self_describing_counts() {
         let (sent, handle) = spawn_runner(&[msg("AB", 10)], false);
-        // Let a few fires happen, then stop.
-        std::thread::sleep(Duration::from_millis(60));
+        // Wait (bounded) for a few fires rather than assuming a wall-clock
+        // window: under the stall policy (skip the backlog, stay on grid) a
+        // stalled CI VM can legitimately fire only once in a fixed 60 ms —
+        // that's the policy working, not a defect (flaked on macOS CI).
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sent.lock().unwrap().len() < 3 {
+            assert!(
+                Instant::now() < deadline,
+                "expected ≥3 sends within 2 s, got {}",
+                sent.lock().unwrap().len()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
-        let statuses: Vec<TalkerStatus> = handle.status_rx.try_iter().collect();
+        // Collect statuses only after the runner has fully stopped — a send
+        // can land between an early drain and the Stop being processed, which
+        // would desync `last_total` from the payload count below.
+        let status_rx = handle.status_rx.clone();
         join_within(handle, Duration::from_secs(2));
+        let statuses: Vec<TalkerStatus> = status_rx.try_iter().collect();
 
         let payloads = sent.lock().unwrap();
-        assert!(
-            payloads.len() >= 3,
-            "expected ≥3 sends, got {}",
-            payloads.len()
-        );
         assert!(payloads.iter().all(|p| p == &vec![0xAB]));
 
         // Statuses carry identity and monotonically increasing counts.
