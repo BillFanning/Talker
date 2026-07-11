@@ -14,6 +14,64 @@ use crate::core::message::{
 use super::display::{ChannelDisplay, ControlStyle, DisplayMode};
 use super::draft::{ConnDraft, ConnKind, PayloadKind, PortHold, ScheduleDraft, UdpModeDraft};
 
+/// The shared wiredata palette matching the active theme (ADR-016).
+pub(super) fn theme_palette(ui: &egui::Ui) -> &'static wiredata_ui::palette::Palette {
+    if ui.visuals().dark_mode {
+        &wiredata_ui::palette::DARK
+    } else {
+        &wiredata_ui::palette::LIGHT
+    }
+}
+
+/// Lifecycle presentation shared by the detail header and the channel-list
+/// rows: listener's glyph set and palette colors mapped onto talker's channel
+/// states, plus a status word. Talker has no Faulted lifecycle state — a
+/// channel with an error is either still running (sending with errors) or
+/// stopped (its open failed / it exited) — so the ⚠ marks "has an error" in
+/// both cases and the word carries the run state.
+pub(super) fn lifecycle_indicator(
+    running: bool,
+    has_error: bool,
+    pal: &wiredata_ui::palette::Palette,
+) -> (&'static str, egui::Color32, &'static str) {
+    use wiredata_ui::glyphs;
+    match (running, has_error) {
+        (true, false) => (glyphs::RUNNING, pal.running_green, "running"),
+        (true, true) => (glyphs::FAULT, pal.fault_red, "running"),
+        (false, true) => (glyphs::FAULT, pal.fault_red, "faulted"),
+        (false, false) => (glyphs::STOPPED, pal.idle_grey, "stopped"),
+    }
+}
+
+/// The Start-side lifecycle button's label and enabled state — listener's
+/// `start_button` decision mapped onto talker's states, so the two detail
+/// panes carry drift and recovery the same way. Pure, unit-tested; the
+/// detail pane renders the result and defers the click:
+/// - not running, no error → "Start Channel", enabled iff the draft is valid
+/// - not running, error → "Retry Channel" (the open/run failed), iff valid
+/// - running + pending edits (interface or messages) → "Apply & Restart",
+///   enabled — one coordinated stop + apply + start
+/// - running, no edits → "Start Channel", **disabled** (nothing to do)
+pub(super) fn start_button(
+    running: bool,
+    has_error: bool,
+    drift: bool,
+    can_start: bool,
+) -> (&'static str, bool) {
+    match (running, drift) {
+        (true, true) => ("Apply & Restart", true),
+        (true, false) => ("Start Channel", false),
+        (false, _) => (
+            if has_error {
+                "Retry Channel"
+            } else {
+                "Start Channel"
+            },
+            can_start,
+        ),
+    }
+}
+
 // ── Interface summary / start blockers ────────────────────────────────────────
 
 /// Render [`interface_summary`] in a channel header, splitting on `?`
@@ -1595,5 +1653,67 @@ mod tests {
         for s in ["192.168.1.5.6", "192.168.1.300", "1..2.3.4"] {
             assert!(invalid_ipv4(s), "{s:?} can never be a valid Ipv4Addr");
         }
+    }
+
+    #[test]
+    fn lifecycle_indicator_maps_states_to_the_shared_glyph_set() {
+        use wiredata_ui::glyphs;
+        use wiredata_ui::palette::LIGHT;
+        let (g, c, w) = lifecycle_indicator(true, false, &LIGHT);
+        assert_eq!((g, w), (glyphs::RUNNING, "running"));
+        assert_eq!(c, LIGHT.running_green);
+        // Running with a live error: the ⚠ carries the alarm, the word stays
+        // honest about the run state; the detail header prints the error below.
+        let (g, c, w) = lifecycle_indicator(true, true, &LIGHT);
+        assert_eq!((g, w), (glyphs::FAULT, "running"));
+        assert_eq!(c, LIGHT.fault_red);
+        let (g, _, w) = lifecycle_indicator(false, true, &LIGHT);
+        assert_eq!((g, w), (glyphs::FAULT, "faulted"));
+        let (g, c, w) = lifecycle_indicator(false, false, &LIGHT);
+        assert_eq!((g, w), (glyphs::STOPPED, "stopped"));
+        assert_eq!(c, LIGHT.idle_grey);
+    }
+
+    #[test]
+    fn start_button_matches_listener_decision_table() {
+        // Stopped, valid → plain Start, enabled.
+        assert_eq!(
+            start_button(false, false, false, true),
+            ("Start Channel", true)
+        );
+        // Stopped, invalid draft → Start, disabled (blockers on hover).
+        assert_eq!(
+            start_button(false, false, false, false),
+            ("Start Channel", false)
+        );
+        // Stopped with an error from the last run/open → Retry.
+        assert_eq!(
+            start_button(false, true, false, true),
+            ("Retry Channel", true)
+        );
+        assert_eq!(
+            start_button(false, true, false, false),
+            ("Retry Channel", false)
+        );
+        // Drift on a stopped channel is irrelevant — Start applies drafts anyway.
+        assert_eq!(
+            start_button(false, false, true, true),
+            ("Start Channel", true)
+        );
+        // Running with pending edits → the coordinated restart.
+        assert_eq!(
+            start_button(true, false, true, false),
+            ("Apply & Restart", true)
+        );
+        // Running with errors and edits still restarts (that's the recovery).
+        assert_eq!(
+            start_button(true, true, true, false),
+            ("Apply & Restart", true)
+        );
+        // Running, nothing to apply → disabled Start.
+        assert_eq!(
+            start_button(true, false, false, false),
+            ("Start Channel", false)
+        );
     }
 }

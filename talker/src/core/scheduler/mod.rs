@@ -43,6 +43,10 @@ pub enum Tick {
 #[derive(Debug)]
 pub struct Schedule {
     messages: Vec<ScheduledMessage>,
+    /// Cumulative count of cadence grid points that were skipped (will never
+    /// fire) under the stall policy — see [`Schedule::poll`]. A growing value
+    /// means the send loop couldn't keep to the configured intervals.
+    missed_sends: u64,
 }
 
 impl Schedule {
@@ -67,7 +71,10 @@ impl Schedule {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Self { messages })
+        Ok(Self {
+            messages,
+            missed_sends: 0,
+        })
     }
 
     /// Number of messages in the schedule (active and dormant).
@@ -112,22 +119,48 @@ impl Schedule {
         let msg = &mut self.messages[index];
         if msg.next_fire <= now {
             msg.next_fire += msg.interval;
+            let mut skipped = 0u64;
             if msg.next_fire <= now {
                 // More than one interval behind: skip the missed grid
                 // points. Integer math, not a loop — a long sleep with a
                 // short interval could mean millions of missed points.
                 // (`interval` is non-zero: `earliest` only yields active
                 // messages.)
-                let rem = now.duration_since(msg.next_fire).as_nanos() % msg.interval.as_nanos();
+                let late = now.duration_since(msg.next_fire).as_nanos();
+                let interval = msg.interval.as_nanos();
+                // Grid points in (old next_fire, now] that will never fire:
+                // the one at `next_fire` plus one per full interval of
+                // additional lateness.
+                skipped = (late / interval + 1) as u64;
+                let rem = late % interval;
                 msg.next_fire = now - Duration::from_nanos(rem as u64) + msg.interval;
             }
-            Tick::Send {
-                index,
-                payload: msg.compiled.render(),
-            }
+            let payload = msg.compiled.render();
+            self.missed_sends = self.missed_sends.saturating_add(skipped);
+            Tick::Send { index, payload }
         } else {
             Tick::Wait(msg.next_fire)
         }
+    }
+
+    /// Cumulative count of sends skipped under the stall policy (grid points
+    /// that will never fire). Monotonic for the life of the schedule; a
+    /// nonzero, growing value at high message rates means the interface's
+    /// send call blocks longer than the configured interval.
+    pub fn missed_sends(&self) -> u64 {
+        self.missed_sends
+    }
+
+    /// The shortest **active** interval, or `None` when every message is
+    /// dormant. Drives the runner's high-resolution-timer decision
+    /// (`core::timing`, ADR-017): re-checked each loop pass, so
+    /// [`Schedule::set_interval`] changes take effect immediately.
+    pub fn min_active_interval(&self) -> Option<Duration> {
+        self.messages
+            .iter()
+            .filter(|m| m.is_active())
+            .map(|m| m.interval)
+            .min()
     }
 
     /// Change message `index`'s send interval, effective immediately.
@@ -225,6 +258,8 @@ mod tests {
         // …and the next fire is the first *future* point of the original
         // cadence grid (t0+1100) — not nine burst sends, and no drift.
         assert_eq!(s.poll(t0 + ms(1050)), Tick::Wait(t0 + ms(1100)));
+        // The nine skipped grid points (t0+200 … t0+1000) are counted.
+        assert_eq!(s.missed_sends(), 9);
     }
 
     #[test]
@@ -236,6 +271,33 @@ mod tests {
         assert!(matches!(s.poll(t0), Tick::Send { .. }));
         assert!(matches!(s.poll(t0 + ms(199)), Tick::Send { .. }));
         assert_eq!(s.poll(t0 + ms(199)), Tick::Wait(t0 + ms(200)));
+        assert_eq!(s.missed_sends(), 0);
+    }
+
+    #[test]
+    fn on_time_sends_never_count_as_missed() {
+        let t0 = Instant::now();
+        let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
+        assert!(matches!(s.poll(t0), Tick::Send { .. }));
+        assert!(matches!(s.poll(t0 + ms(100)), Tick::Send { .. }));
+        assert!(matches!(s.poll(t0 + ms(200)), Tick::Send { .. }));
+        assert_eq!(s.missed_sends(), 0);
+    }
+
+    #[test]
+    fn missed_sends_accumulate_across_stalls() {
+        let t0 = Instant::now();
+        let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
+        assert!(matches!(s.poll(t0), Tick::Send { .. })); // next fire → t0+100
+                                                          // Two intervals late: the t0+200 point is skipped (fires at 250 as
+                                                          // the late t0+100 point; next fire lands on t0+300).
+        assert!(matches!(s.poll(t0 + ms(250)), Tick::Send { .. }));
+        assert_eq!(s.missed_sends(), 1);
+        assert!(matches!(s.poll(t0 + ms(300)), Tick::Send { .. })); // on grid
+                                                                    // A second stall adds to the same counter: the send at 550 is the
+                                                                    // late t0+400 point, so only t0+500 is skipped.
+        assert!(matches!(s.poll(t0 + ms(550)), Tick::Send { .. }));
+        assert_eq!(s.missed_sends(), 2);
     }
 
     #[test]
@@ -243,6 +305,27 @@ mod tests {
         let s = Schedule::compile(&[msg("AB", 100), msg("CD", 0)], Instant::now()).unwrap();
         assert_eq!(s.len(), 2);
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn min_active_interval_ignores_dormant_messages() {
+        let t0 = Instant::now();
+        let s = Schedule::compile(&[msg("AB", 100), msg("CD", 10), msg("EF", 0)], t0).unwrap();
+        assert_eq!(s.min_active_interval(), Some(ms(10)));
+        // All dormant → no interval at all.
+        let s = Schedule::compile(&[msg("AB", 0)], t0).unwrap();
+        assert_eq!(s.min_active_interval(), None);
+    }
+
+    #[test]
+    fn min_active_interval_follows_set_interval() {
+        let t0 = Instant::now();
+        let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
+        assert_eq!(s.min_active_interval(), Some(ms(100)));
+        s.set_interval(0, 5, t0);
+        assert_eq!(s.min_active_interval(), Some(ms(5)));
+        s.set_interval(0, 0, t0); // dormant
+        assert_eq!(s.min_active_interval(), None);
     }
 
     #[test]

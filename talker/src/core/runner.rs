@@ -16,6 +16,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use crate::core::{
     channel::{Interface, InterfaceConfig},
     scheduler::{Schedule, Tick},
+    timing,
 };
 
 /// A command sent from the owning thread (UI or CLI) to a channel's runner.
@@ -47,11 +48,17 @@ pub enum TalkerStatus {
         message_count: u64,
         /// Running send count across all messages in this channel.
         total_count: u64,
+        /// Cumulative wire bytes sent across all messages in this channel.
+        total_bytes: u64,
         /// Cumulative count of status updates this channel discarded because
         /// the receiver was full. Riding in every `Sent`, the reader
         /// self-corrects even when some updates (including ones carrying
         /// this field) were themselves dropped.
         dropped_statuses: u64,
+        /// Cumulative count of sends skipped under the scheduler's stall
+        /// policy (`Schedule::missed_sends`) — the channel couldn't keep to
+        /// its configured cadence. Like the counts, rides in every `Sent`.
+        missed_sends: u64,
         /// Exact bytes put on the wire.
         payload: Vec<u8>,
     },
@@ -151,6 +158,7 @@ fn run_loop(
     notify: Option<StatusNotify>,
 ) {
     let mut total_count = 0u64;
+    let mut total_bytes = 0u64;
     // Per-message send counts, indexed by the message's position in the
     // compiled schedule. The resize is defensive; the schedule's size is
     // fixed at compile time.
@@ -199,7 +207,20 @@ fn run_loop(
             }
         };
 
+    // Hold the OS high-resolution timer exactly while the schedule needs it
+    // (an interval below the threshold makes 15.625 ms deadline wakes skip
+    // grid points — ADR-017). Re-evaluated every pass, so a SetInterval can
+    // raise or release it mid-run; dropped with the runner either way.
+    let mut timer_guard: Option<timing::HighResolutionGuard> = None;
+
     loop {
+        let fast = schedule
+            .min_active_interval()
+            .is_some_and(|i| i < timing::HIGH_RATE_THRESHOLD);
+        if fast != timer_guard.is_some() {
+            timer_guard = fast.then(timing::high_resolution);
+        }
+
         // Drain anything already queued so back-to-back sends can't starve
         // command handling.
         for cmd in cmd_rx.try_iter() {
@@ -212,6 +233,7 @@ fn run_loop(
             Tick::Send { index, payload } => match interface.send(&payload) {
                 Ok(()) => {
                     total_count += 1;
+                    total_bytes += payload.len() as u64;
                     if index >= per_message_counts.len() {
                         per_message_counts.resize(index + 1, 0);
                     }
@@ -221,7 +243,9 @@ fn run_loop(
                         message_index: index,
                         message_count: per_message_counts[index],
                         total_count,
+                        total_bytes,
                         dropped_statuses,
+                        missed_sends: schedule.missed_sends(),
                         payload,
                     };
                     // Best-effort: a full receiver drops the update rather
@@ -378,6 +402,7 @@ mod tests {
                     channel,
                     message_index,
                     total_count,
+                    total_bytes,
                     dropped_statuses,
                     ..
                 } => {
@@ -385,6 +410,9 @@ mod tests {
                     assert_eq!(*message_index, 0);
                     assert!(*total_count > last_total);
                     last_total = *total_count;
+                    // Every payload is the single byte 0xAB, so the byte
+                    // total tracks the send count exactly.
+                    assert_eq!(*total_bytes, *total_count);
                     assert_eq!(*dropped_statuses, 0);
                 }
                 _ => panic!("unexpected non-Sent status"),

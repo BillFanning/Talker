@@ -114,7 +114,9 @@ impl ListenerApp {
         // Configure is edit-only: there's no Apply button here. Edits commit via the
         // Start / Apply & Restart button at the top, which applies the pending draft.
         if let Some((_, config)) = &mut self.edit_draft {
-            egui::CollapsingHeader::new(bold("Configure channel"))
+            // "Configure connection" — the shared section title in both apps
+            // (talker's Connection editor uses the same words).
+            egui::CollapsingHeader::new(bold("Configure connection"))
                 // A STABLE id (not per-channel) so switching channels doesn't create a
                 // "new" header each time — that re-triggered a focus/animation highlight
                 // that flashed a rectangle around the label on every channel switch. The

@@ -49,6 +49,10 @@ fn detach_console() {}
 /// function so the two binaries stay identical — never in either `main`.
 pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
     detach_console(); // drop the double-click console before the window opens
+
+    // Windows 11 would otherwise ignore the high-rate timer request while
+    // the window is minimized — the usual state of a long soak (ADR-017).
+    crate::core::timing::keep_timer_resolution_when_minimized();
     let (log_tx, log_rx) = crossbeam_channel::bounded::<LogEvent>(512);
     // `logging` stays in scope until `run_native` returns so the
     // file-appender worker guards aren't dropped early. The reload
@@ -98,6 +102,11 @@ const ZOOM_STEP_PPP: f32 = ZOOM_BASE_PPP * 0.10;
 const ZOOM_MIN_PPP: f32 = ZOOM_BASE_PPP * 0.5;
 const ZOOM_MAX_PPP: f32 = ZOOM_BASE_PPP * 2.0;
 
+/// Capacity of each runner→UI status queue. Bounded so a stalled UI samples
+/// display updates (drop-and-count) instead of buffering without limit; the
+/// occupancy and peak are shown in the detail header's performance readouts.
+const STATUS_QUEUE_CAP: usize = 256;
+
 /// eframe-storage key for the newline-joined recent-profiles list.
 const RECENT_PROFILES_KEY: &str = "recent_profiles";
 /// How many entries the Profile menu's Recent section keeps.
@@ -138,6 +147,8 @@ struct TalkerApp {
     log_level: LogLevel,
     log_level_handle: LogLevelHandle,
     sent_counts: Vec<u64>,
+    /// Per-channel cumulative wire bytes sent (from `Sent::total_bytes`).
+    sent_bytes: Vec<u64>,
     /// Per-message send counts. Outer index: channel. Inner index: message
     /// within the channel's compiled schedule. Grows on demand when a
     /// status arrives for an index past the current vector length.
@@ -147,6 +158,14 @@ struct TalkerApp {
     /// Carried inside every `Sent` status, so it stays correct even when
     /// updates are lost.
     status_drops: Vec<u64>,
+    /// Per-channel cumulative sends skipped by the scheduler's stall policy
+    /// (`Sent::missed_sends`) — the cadence health readout.
+    missed_sends: Vec<u64>,
+    /// Per-channel status-queue occupancy, sampled each frame just before
+    /// the drain, and its high-water mark since the channel started. Peak
+    /// near [`STATUS_QUEUE_CAP`] means display updates are about to drop.
+    status_queue_len: Vec<usize>,
+    status_queue_peak: Vec<usize>,
     displays: Vec<ChannelDisplay>,
     error_count: u64,
     last_title: String,
@@ -209,13 +228,16 @@ struct LogCounts {
     error: u32,
 }
 
-/// Lightweight msgs/s estimator for a channel-list row: samples the
-/// cumulative sent count over a ~1 s window and reports the delta rate.
+/// Lightweight throughput estimator for a channel: samples the cumulative
+/// sent count and byte total over a ~1 s window and reports the delta rates
+/// (msgs/s for the channel-list row, both for the detail header).
 #[derive(Clone, Copy)]
 struct RateTracker {
     last_sample: Instant,
     last_total: u64,
+    last_bytes: u64,
     per_sec: f32,
+    bytes_per_sec: f32,
 }
 
 impl RateTracker {
@@ -223,21 +245,27 @@ impl RateTracker {
         Self {
             last_sample: Instant::now(),
             last_total: 0,
+            last_bytes: 0,
             per_sec: 0.0,
+            bytes_per_sec: 0.0,
         }
     }
 
-    fn sample(&mut self, now: Instant, total: u64, running: bool) {
+    fn sample(&mut self, now: Instant, total: u64, bytes: u64, running: bool) {
         if !running {
             self.per_sec = 0.0;
+            self.bytes_per_sec = 0.0;
             self.last_total = total;
+            self.last_bytes = bytes;
             self.last_sample = now;
             return;
         }
         let dt = now.duration_since(self.last_sample).as_secs_f32();
         if dt >= 1.0 {
             self.per_sec = total.saturating_sub(self.last_total) as f32 / dt;
+            self.bytes_per_sec = bytes.saturating_sub(self.last_bytes) as f32 / dt;
             self.last_total = total;
+            self.last_bytes = bytes;
             self.last_sample = now;
         }
     }
@@ -287,8 +315,12 @@ impl TalkerApp {
             log_level: LogLevel::default(),
             log_level_handle,
             sent_counts: Vec::new(),
+            sent_bytes: Vec::new(),
             message_sent_counts: Vec::new(),
             status_drops: Vec::new(),
+            missed_sends: Vec::new(),
+            status_queue_len: Vec::new(),
+            status_queue_peak: Vec::new(),
             displays: Vec::new(),
             error_count: 0,
             last_title: String::new(),
@@ -346,10 +378,6 @@ impl TalkerApp {
         }
 
         app
-    }
-
-    fn is_any_running(&self) -> bool {
-        self.talkers.iter().any(|t| t.is_some())
     }
 
     fn is_connection_running(&self, i: usize) -> bool {
@@ -450,10 +478,14 @@ impl TalkerApp {
                 self.talkers = (0..n).map(|_| None).collect();
                 self.draining = (0..n).map(|_| Vec::new()).collect();
                 self.sent_counts = vec![0; n];
+                self.sent_bytes = vec![0; n];
                 self.message_sent_counts = (0..n)
                     .map(|j| vec![0u64; p.channels.get(j).map(|c| c.messages.len()).unwrap_or(0)])
                     .collect();
                 self.status_drops = vec![0; n];
+                self.missed_sends = vec![0; n];
+                self.status_queue_len = vec![0; n];
+                self.status_queue_peak = vec![0; n];
                 self.displays = (0..n).map(|_| ChannelDisplay::default()).collect();
                 self.rates = vec![RateTracker::new(); n];
                 self.log_counts = vec![LogCounts::default(); n];
@@ -497,8 +529,12 @@ impl TalkerApp {
         self.talkers.clear();
         self.draining.clear();
         self.sent_counts.clear();
+        self.sent_bytes.clear();
         self.message_sent_counts.clear();
         self.status_drops.clear();
+        self.missed_sends.clear();
+        self.status_queue_len.clear();
+        self.status_queue_peak.clear();
         self.displays.clear();
         self.rates.clear();
         self.log_counts.clear();
@@ -638,8 +674,20 @@ impl TalkerApp {
         if i < self.sent_counts.len() {
             self.sent_counts[i] = 0;
         }
+        if i < self.sent_bytes.len() {
+            self.sent_bytes[i] = 0;
+        }
         if i < self.status_drops.len() {
             self.status_drops[i] = 0;
+        }
+        if i < self.missed_sends.len() {
+            self.missed_sends[i] = 0;
+        }
+        if i < self.status_queue_len.len() {
+            self.status_queue_len[i] = 0;
+        }
+        if i < self.status_queue_peak.len() {
+            self.status_queue_peak[i] = 0;
         }
         if i < self.log_counts.len() {
             self.log_counts[i] = LogCounts::default();
@@ -660,7 +708,7 @@ impl TalkerApp {
         };
 
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(32);
-        let (status_tx, status_rx) = crossbeam_channel::bounded(256);
+        let (status_tx, status_rx) = crossbeam_channel::bounded(STATUS_QUEUE_CAP);
         // Wake the UI whenever a status is queued, so sends appear the
         // moment they happen instead of on the next poll tick. Coalesced:
         // any number of statuses between frames cost one wake.
@@ -811,6 +859,16 @@ impl TalkerApp {
         for i in 0..self.talkers.len() {
             let (statuses, finished) = match &self.talkers[i] {
                 Some(h) => {
+                    // Occupancy is sampled *before* the drain (it's 0 after),
+                    // so the readout shows how far the queue filled between
+                    // frames; the peak is the high-water mark since start.
+                    let qlen = h.status_rx.len();
+                    if i < self.status_queue_len.len() {
+                        self.status_queue_len[i] = qlen;
+                    }
+                    if i < self.status_queue_peak.len() {
+                        self.status_queue_peak[i] = self.status_queue_peak[i].max(qlen);
+                    }
                     let s: Vec<TalkerStatus> = h.status_rx.try_iter().collect();
                     let f = h.thread.is_finished();
                     (s, f)
@@ -824,15 +882,23 @@ impl TalkerApp {
                         message_index,
                         message_count,
                         total_count,
+                        total_bytes,
                         dropped_statuses,
+                        missed_sends,
                         payload,
                         ..
                     } => {
                         if i < self.sent_counts.len() {
                             self.sent_counts[i] = total_count;
                         }
+                        if i < self.sent_bytes.len() {
+                            self.sent_bytes[i] = total_bytes;
+                        }
                         if i < self.status_drops.len() {
                             self.status_drops[i] = dropped_statuses;
+                        }
+                        if i < self.missed_sends.len() {
+                            self.missed_sends[i] = missed_sends;
                         }
                         if let Some(per_msg) = self.message_sent_counts.get_mut(i) {
                             if message_index >= per_msg.len() {
@@ -865,8 +931,9 @@ impl TalkerApp {
         let now = Instant::now();
         for i in 0..self.rates.len() {
             let total = self.sent_counts.get(i).copied().unwrap_or(0);
+            let bytes = self.sent_bytes.get(i).copied().unwrap_or(0);
             let running = self.talkers.get(i).is_some_and(|t| t.is_some());
-            self.rates[i].sample(now, total, running);
+            self.rates[i].sample(now, total, bytes, running);
         }
 
         // Reap finished draining threads (stopped runners that have exited);
@@ -975,78 +1042,10 @@ impl TalkerApp {
         egui::Panel::top("top_bar").show_inside(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label("Profile:");
-                let r =
-                    ui.add(egui::TextEdit::singleline(&mut self.profile.name).desired_width(160.0));
-                if r.changed() {
-                    self.dirty = true;
-                }
-                // Dirty marker: a small amber `*` painted at the
-                // upper-left corner of the field. Uses the painter
-                // (not a label) so it doesn't push surrounding
-                // widgets around when it appears/disappears.
-                if self.dirty {
-                    let pos = r.rect.left_top() + egui::vec2(3.0, 1.0);
-                    ui.painter().text(
-                        pos,
-                        egui::Align2::LEFT_TOP,
-                        "*",
-                        egui::FontId::proportional(14.0),
-                        egui::Color32::from_rgb(220, 180, 60),
-                    );
-                }
-                ui.menu_button("Profile", |ui| {
-                    // Recent profiles at the top: one click reloads.
-                    // Most-recent-first. The header always shows (with a
-                    // placeholder when empty) so the section is visibly
-                    // present.
-                    ui.label(egui::RichText::new("Recent").weak());
-                    if self.recent_profiles.is_empty() {
-                        ui.add_enabled(false, egui::Button::new("(none yet)"));
-                    } else {
-                        let recents = self.recent_profiles.clone();
-                        for path in recents {
-                            let label = path
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or_else(|| path.to_str().unwrap_or("profile"));
-                            if ui
-                                .button(label)
-                                .on_hover_text(path.display().to_string())
-                                .clicked()
-                            {
-                                if self.confirm_discard() {
-                                    self.error_count = 0;
-                                    self.load_profile_from_path(&path);
-                                }
-                                ui.close();
-                            }
-                        }
-                    }
-                    ui.separator();
-                    if ui.button("New").clicked() {
-                        self.new_profile();
-                        ui.close();
-                    }
-                    if ui.button("Load\u{2026}").clicked() {
-                        self.load_profile_dialog();
-                        ui.close();
-                    }
-                    if ui.button("Save").on_hover_text("Ctrl+S").clicked() {
-                        self.save_profile();
-                        ui.close();
-                    }
-                    if ui
-                        .button("Save As\u{2026}")
-                        .on_hover_text("Ctrl+Shift+S — write to a new file")
-                        .clicked()
-                    {
-                        self.save_profile_as();
-                        ui.close();
-                    }
-                });
-
-                ui.separator();
+                // Profile UI (menu + name/dirty status) lives in the channel-
+                // list header next to "+ Add", as in listener — see
+                // `show_profile_menu` in `channels.rs`. The top bar keeps the
+                // app-wide controls: zoom and theme.
                 let r_minus = ui.small_button("−");
                 ui.label(format!("{}%", zoom_percent(self.pixels_per_point)));
                 let r_plus = ui.small_button("+");
@@ -1338,11 +1337,23 @@ impl TalkerApp {
                 self.draining.remove(i);
             }
             self.sent_counts.remove(i);
+            if i < self.sent_bytes.len() {
+                self.sent_bytes.remove(i);
+            }
             if i < self.message_sent_counts.len() {
                 self.message_sent_counts.remove(i);
             }
             if i < self.status_drops.len() {
                 self.status_drops.remove(i);
+            }
+            if i < self.missed_sends.len() {
+                self.missed_sends.remove(i);
+            }
+            if i < self.status_queue_len.len() {
+                self.status_queue_len.remove(i);
+            }
+            if i < self.status_queue_peak.len() {
+                self.status_queue_peak.remove(i);
             }
             self.displays.remove(i);
             if i < self.rates.len() {
@@ -1381,7 +1392,11 @@ impl TalkerApp {
             self.draining.push(Vec::new());
             self.message_sent_counts.push(Vec::new());
             self.sent_counts.push(0);
+            self.sent_bytes.push(0);
             self.status_drops.push(0);
+            self.missed_sends.push(0);
+            self.status_queue_len.push(0);
+            self.status_queue_peak.push(0);
             self.displays.push(ChannelDisplay::default());
             self.rates.push(RateTracker::new());
             self.log_counts.push(LogCounts::default());

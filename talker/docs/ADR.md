@@ -310,6 +310,21 @@ The version number increments only on breaking schema changes that `serde(defaul
 
 ---
 
+## ADR-017 — High-resolution OS timer scope for high-rate schedules
+
+**Context:** The runner waits for its next fire with a deadline-bounded blocking receive (`recv_deadline`, ADR-002). On Windows a parked thread with a timeout wakes on the system scheduler tick — **15.625 ms** by default — so a 10 ms interval (100 Hz) can never be honored: every wake lands more than one interval late, the stall policy (spec §8.1) skips the backlog to stay on grid, and ~36% of sends are skipped with ~15.6 ms observed spacing. 10 Hz absorbs the same jitter invisibly, which is why the problem only appears at high rates.
+
+**Options:** (a) request 1 ms resolution process-wide for the whole app lifetime — simple but pays an idle power cost and is against Microsoft guidance; (b) hybrid wait (sleep short, spin the last ~2 ms) — precise to sub-ms but burns a core per fast channel; (c) request 1 ms resolution **only while a schedule actually needs it**.
+
+**Decision:** (c), in `core::timing`. A refcounted RAII guard (`high_resolution()` / `HighResolutionGuard`) wraps `timeBeginPeriod(1)`/`timeEndPeriod(1)`: the first holder raises the request, the last drop releases it, and the count and OS call share one lock so concurrent acquire/release can't reorder the pair. Each runner re-evaluates `Schedule::min_active_interval() < HIGH_RATE_THRESHOLD` (32 ms = two default ticks) every loop pass, so `SetInterval` acquires/releases mid-run. Both entry points (GUI funnel, CLI run) additionally opt out of Windows 11's minimized-window timer throttling via `SetProcessInformation(ProcessPowerThrottling, IGNORE_TIMER_RESOLUTION)` — otherwise a minimized long soak silently falls back to 15.6 ms wakes. Everything is a no-op off Windows.
+
+**Consequences:**
+- 100 Hz sends hit cadence (wake jitter ~1–2 ms ≪ 10 ms interval); the practical ceiling moves to roughly 500 Hz–1 kHz, beyond which option (b) would be needed.
+- No elevation required; per-process since Windows 10 2004, so other processes are unaffected. The kernel releases the request on process death (any kind), so a leaked guard cannot outlive talker — the RAII release is about dropping the power cost early, not correctness.
+- The GUI's "Missed sends" readout is the acceptance signal: it should stay 0 at 100 Hz on an otherwise healthy interface.
+
+---
+
 ## Open questions
 
 The following decisions are deferred until the relevant module is written. They are recorded here so they are not forgotten and so the eventual decision (in a future ADR or commit) can reference the context.

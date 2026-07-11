@@ -68,6 +68,10 @@ pub fn run() -> anyhow::Result<()> {
     crate::diagnostics::init_logging(); // §114; non-fatal if already installed (§117)
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            // Title carries the version, like talker's. The `run_native` app
+            // name below stays the bare "Listener" — eframe keys its storage
+            // location on it, so changing it would orphan persisted settings.
+            .with_title(format!("Listener v{}", env!("CARGO_PKG_VERSION")))
             .with_inner_size(DEFAULT_WINDOW_SIZE)
             .with_min_inner_size(MIN_WINDOW_SIZE),
         // Don't persist/restore window geometry. eframe restores the saved window state

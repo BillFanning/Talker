@@ -170,6 +170,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         return list_profiles();
     }
 
+    // Windows 11 would otherwise ignore the high-rate timer request while
+    // the console window is minimized/occluded (ADR-017).
+    crate::core::timing::keep_timer_resolution_when_minimized();
+
     let (mut profile, path) = load_profile(&args)?;
     // Mirror the GUI: the file root is the profile's identity, so
     // overlay `profile.name` from the path's stem. The TOML's `name`

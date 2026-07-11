@@ -8,12 +8,15 @@ use egui::{Align, Layout};
 use crate::core::message::NmeaChecksumMode;
 use crate::core::runner::TalkerCommand;
 
+use wiredata_ui::{fonts::bold, format::human_bytes, glyphs};
+
 use super::draft::{ConnKind, PayloadKind, ScheduleDraft};
 use super::widgets::{
-    checksum_label, code_page_label, hex_valid, invalid_parse, marker_aware_text_edit,
-    plain_text_edit_with_cursor, preview_ascii, preview_text, red_bordered, show_display_pane,
-    show_insert_byte_button, show_insert_unit_button, show_interface_summary, show_serial_fields,
-    show_tcp_fields, show_udp_fields, start_blockers, UppercaseHex,
+    checksum_label, code_page_label, hex_valid, invalid_parse, lifecycle_indicator,
+    marker_aware_text_edit, plain_text_edit_with_cursor, preview_ascii, preview_text, red_bordered,
+    show_display_pane, show_insert_byte_button, show_insert_unit_button, show_interface_summary,
+    show_serial_fields, show_tcp_fields, show_udp_fields, start_blockers, start_button,
+    theme_palette, UppercaseHex,
 };
 use super::TalkerApp;
 
@@ -34,9 +37,7 @@ impl TalkerApp {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.push_id(i, |ui| {
                 let running = self.is_connection_running(i);
-                ui.horizontal(|ui| {
-                    self.show_channel_header(ui, i, running);
-                });
+                self.show_channel_header(ui, i, running);
                 ui.separator();
                 self.show_channel_body(ui, i, running);
                 ui.separator();
@@ -45,158 +46,205 @@ impl TalkerApp {
         });
     }
 
+    /// The detail header, laid out like listener's channel block so the two
+    /// apps read as one product: name row (status glyph · name · label ·
+    /// kind), a `status · interface` row, sent totals + throughput, the
+    /// performance readouts for high-rate health, and the lifecycle button
+    /// pair. Channel removal lives on the channel-list rows (the ✕ overlay),
+    /// as in listener.
     fn show_channel_header(&mut self, ui: &mut egui::Ui, i: usize, running: bool) {
-        let error = self.conn_errors.get(i).and_then(|e| e.as_deref());
-        let (dot_color, dot_tip): (egui::Color32, &str) = if !running {
-            (egui::Color32::GRAY, "not running")
-        } else if let Some(msg) = error {
-            (egui::Color32::RED, msg)
-        } else {
-            (egui::Color32::from_rgb(80, 200, 80), "ok")
-        };
-        ui.colored_label(dot_color, "\u{2022}")
-            .on_hover_text(dot_tip);
+        let pal = theme_palette(ui);
+        // Owned copy: the error is rendered at the bottom of the header,
+        // after several `&mut self` widget closures.
+        let error: Option<String> = self.conn_errors.get(i).and_then(|e| e.clone());
+        let (glyph, glyph_color, status_word) = lifecycle_indicator(running, error.is_some(), pal);
+        let (iface_drift, msg_drift) = self.detect_drift(i);
 
-        // Editable display name (cosmetic — channels are positional).
-        // The hint shows the positional fallback the list uses when the
-        // name is empty.
-        let hint = format!("Channel {}", i + 1);
-        let name_r = ui.add(
-            egui::TextEdit::singleline(&mut self.conn_drafts[i].name)
-                .id_salt("channel_name")
-                .desired_width(140.0)
-                .hint_text(hint),
-        );
-        if name_r.changed() {
-            self.dirty = true;
-        }
-        // Duplicate names are allowed (nothing is keyed by them) but
-        // worth a nudge — two identical rows in the list are confusing.
-        let name = &self.conn_drafts[i].name;
-        let duplicate = !name.is_empty()
-            && self
-                .conn_drafts
-                .iter()
-                .enumerate()
-                .any(|(j, d)| j != i && d.name == *name);
-        ui.push_id("dup_name_hint", |ui| {
-            if duplicate {
-                ui.label(
-                    egui::RichText::new("duplicate name")
-                        .color(egui::Color32::from_rgb(220, 180, 80))
-                        .size(11.0),
-                )
-                .on_hover_text("Another channel has the same name — allowed, but confusing.");
+        // Name row: status glyph (listener's symbol set/colors, painted into
+        // a fixed cell so status changes never shift the row) + editable
+        // name + label + interface kind.
+        ui.horizontal(|ui| {
+            glyphs::paint_glyph(ui, glyph, glyphs::glyph_size(glyph), glyph_color);
+            // Editable display name (cosmetic — channels are positional).
+            // The hint shows the positional fallback the list uses when the
+            // name is empty.
+            let hint = format!("Channel {}", i + 1);
+            let name_r = ui.add(
+                egui::TextEdit::singleline(&mut self.conn_drafts[i].name)
+                    .id_salt("channel_name")
+                    .desired_width(140.0)
+                    .hint_text(hint),
+            );
+            if name_r.changed() {
+                self.dirty = true;
+            }
+            ui.label(bold("Name"))
+                .on_hover_text("This channel's display name, shown in the channel list.");
+            // Duplicate names are allowed (nothing is keyed by them) but
+            // worth a nudge — two identical rows in the list are confusing.
+            let name = &self.conn_drafts[i].name;
+            let duplicate = !name.is_empty()
+                && self
+                    .conn_drafts
+                    .iter()
+                    .enumerate()
+                    .any(|(j, d)| j != i && d.name == *name);
+            ui.push_id("dup_name_hint", |ui| {
+                if duplicate {
+                    ui.label(
+                        egui::RichText::new("duplicate name")
+                            .color(pal.warning_amber)
+                            .size(11.0),
+                    )
+                    .on_hover_text("Another channel has the same name — allowed, but confusing.");
+                }
+            });
+
+            ui.separator();
+            let before_kind = self.conn_drafts[i].kind;
+            ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Serial, "Serial");
+            ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Udp, "UDP");
+            ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Tcp, "TCP");
+            if self.conn_drafts[i].kind != before_kind {
+                self.deferred.apply.push(i);
             }
         });
 
-        ui.separator();
-        let before_kind = self.conn_drafts[i].kind;
-        ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Serial, "Serial");
-        ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Udp, "UDP");
-        ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Tcp, "TCP");
-        if self.conn_drafts[i].kind != before_kind {
-            self.deferred.apply.push(i);
-        }
-        ui.separator();
-        // Stable id sources on every conditional widget that follows, so
-        // the appearing / disappearing pending indicator can't shift the
-        // sibling auto-ids between egui's two layout passes.
-        ui.push_id("iface_summary", |ui| {
-            show_interface_summary(ui, &self.conn_drafts[i]);
-        });
-        let (iface_drift, msg_drift) = self.detect_drift(i);
-        ui.push_id("pending_indicator", |ui| {
-            show_unapplied_badge(ui, running, iface_drift, msg_drift);
-        });
-        ui.push_id("channel_actions", |ui| {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                self.show_channel_actions(ui, i, running, iface_drift, msg_drift);
+        // Status · interface row (listener's `running · details` line).
+        // A stable id source on the summary, whose red `?` pills come and go
+        // between egui's two layout passes.
+        ui.horizontal(|ui| {
+            ui.label(status_word);
+            ui.label("·");
+            ui.push_id("iface_summary", |ui| {
+                show_interface_summary(ui, &self.conn_drafts[i]);
             });
         });
+
+        // Sent totals + rolling throughput (listener's byte-based liveness
+        // line, plus talker's message-count view of the same traffic).
+        let msgs = self.sent_counts.get(i).copied().unwrap_or(0);
+        let bytes = self.sent_bytes.get(i).copied().unwrap_or(0);
+        let (mps, bps) = self
+            .rates
+            .get(i)
+            .map(|r| (r.per_sec, r.bytes_per_sec))
+            .unwrap_or((0.0, 0.0));
+        ui.label(format!(
+            "Sent: {} · {msgs} msgs    Throughput: {:.1} kB/s · {:.1} msg/s",
+            human_bytes(bytes),
+            bps / 1000.0,
+            mps
+        ));
+
+        // Performance under load (listener's queue-readout pattern): one
+        // weak line per signal, amber once its pressure threshold trips.
+        // Always rendered so the header doesn't jump when a value appears.
+        let perf_line = |ui: &mut egui::Ui, text: String, hot: bool, tip: &str| {
+            let rt = egui::RichText::new(text).weak();
+            ui.label(if hot { rt.color(pal.warning_amber) } else { rt })
+                .on_hover_text(tip);
+        };
+        let qlen = self.status_queue_len.get(i).copied().unwrap_or(0);
+        let qpeak = self.status_queue_peak.get(i).copied().unwrap_or(0);
+        perf_line(
+            ui,
+            format!(
+                "Status queue: {qlen}/{} (peak {qpeak})",
+                super::STATUS_QUEUE_CAP
+            ),
+            qpeak * 2 >= super::STATUS_QUEUE_CAP,
+            "The runner→UI status queue: each send queues one display update; \
+             the UI drains it every frame. A peak near capacity means updates \
+             are about to be sampled — sends themselves are never delayed.",
+        );
+        let drops = self.status_drops.get(i).copied().unwrap_or(0);
+        perf_line(
+            ui,
+            format!("Display updates dropped: {drops}"),
+            drops > 0,
+            "Status updates the runner discarded because the queue above was \
+             full. Counts stay exact (each update carries the running totals); \
+             only the Output pane sampled.",
+        );
+        let missed = self.missed_sends.get(i).copied().unwrap_or(0);
+        perf_line(
+            ui,
+            format!("Missed sends: {missed}"),
+            missed > 0,
+            "Sends skipped to stay on cadence after a stall — an interface \
+             send blocking longer than the message interval, or machine sleep. \
+             The scheduler fires once, then jumps to the next future point of \
+             the cadence grid; a growing value means this channel can't keep \
+             the configured rate.",
+        );
+
+        if let Some(err) = &error {
+            ui.colored_label(pal.fault_red, format!("\u{26A0} {err}"));
+        }
+
+        ui.add_space(12.0); // a blank line between the readouts and the buttons
+        self.show_lifecycle_buttons(ui, i, running, iface_drift || msg_drift, error.is_some());
     }
 
-    /// Right-side action button cluster: × remove, then either ■ Stop (+ ↻
-    /// Restart when drift exists) when running or ▶ Start when not. Called
-    /// from inside a `right_to_left` layout, so the first widget rendered
-    /// here appears rightmost.
-    fn show_channel_actions(
+    /// The lifecycle button pair (listener's control row): [Start Channel /
+    /// Apply & Restart / Retry Channel] [Stop Channel], both always present
+    /// at the shared control size; the Start side's label/enabled state is
+    /// the pure [`start_button`] decision. Start, Retry, and Apply & Restart
+    /// are all the same deferred action — `start_connection` stops any
+    /// current runner, applies the drafts (interface + messages), and starts.
+    fn show_lifecycle_buttons(
         &mut self,
         ui: &mut egui::Ui,
         i: usize,
         running: bool,
-        iface_drift: bool,
-        msg_drift: bool,
+        drift: bool,
+        has_error: bool,
     ) {
-        // Channel removal confirms through a modal (listener's pattern) —
-        // it can't be missed, and Escape / backdrop-click cancels. The
-        // per-message ✕ keeps its lighter inline confirm.
-        if ui
-            .button(egui::RichText::new("\u{00D7}").size(18.0).strong())
-            .on_hover_text("Remove this channel")
-            .clicked()
-        {
-            self.confirm_remove = Some(i);
-        }
-        if running {
-            if ui.small_button("\u{25a0}").on_hover_text("Stop").clicked() {
-                self.deferred.stop = Some(i);
-            }
-            // ↻ Restart, shown only when there's drift to apply.
-            // start_connection internally calls stop_connection first, so
-            // deferring `start` here gives us a clean stop+apply+start.
-            if iface_drift || msg_drift {
-                let restart = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new("\u{21BA}")
-                            .color(egui::Color32::from_rgb(220, 180, 60))
-                            .strong()
-                            .size(16.0),
-                    )
-                    .small(),
-                );
-                if restart
-                    .on_hover_text(
-                        "Restart channel — stops the current send loop, applies \
-                         the current draft (interface + messages), and starts again.",
-                    )
-                    .clicked()
-                {
-                    self.deferred.start = Some(i);
-                }
-            }
-        } else {
-            let can = self.can_start_connection(i);
-            // Compute the disabled-hover tip *before* the widget is added,
-            // so we can chain `on_disabled_hover_text` directly on the
-            // Response — egui only displays the tooltip when the call is
-            // part of the same Response chain as the widget add.
-            let tip = if !can {
-                let t = start_blockers(&self.conn_drafts[i], &self.sched_drafts[i]).join("\n");
-                if t.is_empty() {
+        // Matches listener's CONTROL_BUTTON_SIZE so the two detail panes
+        // read identically; text wider than the min grows the button.
+        const SIZE: egui::Vec2 = egui::vec2(96.0, 32.0);
+        let can_start = self.can_start_connection(i);
+        let (label, enabled) = start_button(running, has_error, drift, can_start);
+        ui.horizontal(|ui| {
+            let mut btn = ui.add_enabled(enabled, egui::Button::new(label).min_size(SIZE));
+            if !running && !enabled {
+                // The disabled hover must chain off the same Response as the
+                // add, or egui won't show it.
+                let tip = start_blockers(&self.conn_drafts[i], &self.sched_drafts[i]).join("\n");
+                btn = btn.on_disabled_hover_text(if tip.is_empty() {
                     "Add a valid message first".to_string()
                 } else {
-                    t
-                }
-            } else {
-                String::new()
-            };
-            let mut btn = ui.add_enabled(can, egui::Button::new("\u{25b6}").small());
-            if !can {
-                btn = btn.on_disabled_hover_text(tip);
+                    tip
+                });
+            }
+            if label == "Apply & Restart" {
+                btn = btn.on_hover_text(
+                    "Stops the current send loop, applies the edited interface \
+                     and messages, and starts again. Interface-only edits can \
+                     also be applied live by pressing Enter in the edited field.",
+                );
             }
             if btn.clicked() {
                 self.deferred.start = Some(i);
             }
-        }
+            if ui
+                .add_enabled(running, egui::Button::new("Stop Channel").min_size(SIZE))
+                .clicked()
+            {
+                self.deferred.stop = Some(i);
+            }
+        });
     }
 
     fn show_channel_body(&mut self, ui: &mut egui::Ui, i: usize, running: bool) {
-        // Connection stays a plain collapsing section — it does NOT
-        // auto-collapse on run (you often want the interface params
-        // visible while a channel is live). Default open; the user's
-        // expand/collapse choice persists via the stable id_salt.
-        let (changed, refresh) = egui::CollapsingHeader::new("Connection")
+        // "Configure connection" — the shared section title in both apps
+        // (listener's Configure section uses the same words). Stays a plain
+        // collapsing section — it does NOT auto-collapse on run (you often
+        // want the interface params visible while a channel is live).
+        // Default open; the user's expand/collapse choice persists via the
+        // stable id_salt.
+        let (changed, refresh) = egui::CollapsingHeader::new("Configure connection")
             .id_salt(("conn_section", i))
             .default_open(true)
             .show(ui, |ui| {
@@ -239,14 +287,12 @@ impl TalkerApp {
             .get(i)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
-        let status_drops = self.status_drops.get(i).copied().unwrap_or(0);
         let interval_changes = show_schedule_section(
             ui,
             &mut self.sched_drafts[i],
             &mut self.dirty,
             per_message_counts,
             running,
-            status_drops,
         );
         for (msg_index, interval_ms) in interval_changes {
             if let Some(Some(handle)) = self.talkers.get(i) {
@@ -267,39 +313,26 @@ fn show_schedule_section(
     dirty: &mut bool,
     per_message_counts: &[u64],
     channel_running: bool,
-    status_drops: u64,
 ) -> Vec<(usize, u64)> {
     let mut to_remove: Option<usize> = None;
     let mut add_one = false;
     // Message indices whose interval was committed this frame, with the new value.
     let mut interval_changes: Vec<(usize, u64)> = Vec::new();
 
-    // `id_salt` keeps the persistent open/closed state stable even
-    // though the title text changes every frame as `total_sent`
-    // ticks. Without it CollapsingHeader derives its id from the
-    // label, so a user expand would be forgotten on the next send.
+    // Sent totals and drop counts live in the detail header now; this
+    // header is just the section title. `id_salt` keeps the persistent
+    // open/closed state stable when the message count changes the label.
     // (The old stacked-card layout auto-collapsed this section on
     // Start; in the detail pane there's room, so the section just
     // honours whatever the user last chose.)
-    let total_sent: u64 = per_message_counts.iter().sum();
     let n = entries.len();
     let header = if n == 0 {
-        "Messages — (none)".to_string()
-    } else if channel_running {
-        let drops = if status_drops > 0 {
-            // The runner sampled display updates because the GUI's status
-            // queue was full — counts stay correct (they ride in each
-            // status), but the Output pane missed some payloads.
-            format!(" ({status_drops} display updates dropped)")
-        } else {
-            String::new()
-        };
+        "Configure messages — (none)".to_string()
+    } else {
         format!(
-            "Messages — {n} message{}, Sent: {total_sent}{drops}",
+            "Configure messages — {n} message{}",
             if n == 1 { "" } else { "s" }
         )
-    } else {
-        format!("Messages — {n} message{}", if n == 1 { "" } else { "s" })
     };
     egui::CollapsingHeader::new(header)
         .id_salt("messages_section")
@@ -927,51 +960,4 @@ fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             ui.checkbox(&mut entry.checksum_wrong, "Intentionally wrong");
         }
     });
-}
-
-/// Amber pill in the detail header when the user has edited fields
-/// that haven't reached the running talker thread yet. Hides itself when
-/// there's no drift (or when the channel isn't running and the user is
-/// just composing — they'll apply by pressing Start anyway).
-///
-/// - **Interface drift** can be applied live (press Enter in the edited
-///   field; the talker thread reopens the interface).
-/// - **Message drift** currently needs a stop+start — the schedule is
-///   compiled at channel open and can't be hot-swapped today.
-fn show_unapplied_badge(ui: &mut egui::Ui, running: bool, iface_drift: bool, msg_drift: bool) {
-    if !running || !(iface_drift || msg_drift) {
-        return;
-    }
-    let (label, tip) = match (iface_drift, msg_drift) {
-        (true, true) => (
-            "RESTART NEEDED",
-            "Both interface parameters and the message list have been edited.\n\
-             Press Stop then Start to apply both — message changes can't be \
-             applied without a restart.",
-        ),
-        (false, true) => (
-            "RESTART NEEDED",
-            "Message edits (payload, interval rules, timestamp/checksum toggles, \
-             added/removed messages) only take effect when the channel restarts. \
-             Press Stop then Start.",
-        ),
-        (true, false) => (
-            "APPLY NEEDED",
-            "Interface parameters have been edited but not yet applied to the \
-             running channel. Press Enter in the edited field — or stop and \
-             start the channel — to apply them.",
-        ),
-        (false, false) => unreachable!(),
-    };
-    let bg = egui::Color32::from_rgb(220, 180, 60);
-    let fg = egui::Color32::BLACK;
-    egui::Frame::default()
-        .fill(bg)
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(label).color(fg).strong().size(12.0));
-        })
-        .response
-        .on_hover_text(tip);
 }

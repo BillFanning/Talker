@@ -47,10 +47,11 @@ pub(crate) fn recording_indicator(
     use crate::core::RecordingState;
     // Same colors as channel status (`status_color`): the active ● is RUNNING_GREEN
     // (like a Running channel), faulted ⚠ is FAULT_RED, off ■ is IDLE_GREY.
+    use wiredata_ui::glyphs;
     match recording {
-        Some(RecordingState::Enabled) => ("\u{25CF}", theme::running_green(), "recording"),
-        Some(RecordingState::Faulted) => ("\u{26A0}", theme::fault_red(), "faulted"),
-        Some(RecordingState::Disabled) | None => ("\u{25A0}", theme::idle_grey(), "off"),
+        Some(RecordingState::Enabled) => (glyphs::RUNNING, theme::running_green(), "recording"),
+        Some(RecordingState::Faulted) => (glyphs::FAULT, theme::fault_red(), "faulted"),
+        Some(RecordingState::Disabled) | None => (glyphs::STOPPED, theme::idle_grey(), "off"),
     }
 }
 
@@ -106,26 +107,9 @@ pub(crate) fn status_color(status: ChannelStatus) -> egui::Color32 {
     }
 }
 
-/// The base size multiplier for status indicator glyphs (relative to body size). The
-/// square (`■`) is the reference at this size; the dot and triangle are enlarged by
-/// [`glyph_scale`] to match the square's apparent size.
-pub(crate) const STATUS_GLYPH_SCALE: f32 = 1.5;
-
-/// Per-glyph optical correction: `●`/`■`/`⚠` have different bounding boxes, so at one
-/// font size they look different sizes. The square is the reference (1.0); the dot and
-/// triangle are enlarged so all three read the same size. Multiply into
-/// [`STATUS_GLYPH_SCALE`].
-fn glyph_scale(glyph: &str) -> f32 {
-    match glyph {
-        "\u{25A0}" => 1.0,  // ■ square — the reference
-        "\u{25CF}" => 1.34, // ● dot — enlarge up to the square
-        "\u{26A0}" => 1.30, // ⚠ triangle — enlarge up to the square
-        _ => 1.0,
-    }
-}
-
-/// The shared status symbol set + its size, used for BOTH channel-lifecycle and raw-
-/// recording state so the two read consistently:
+/// The shared status symbol set + its size (now `wiredata_ui::glyphs` — talker
+/// uses the same set), used for BOTH channel-lifecycle and raw-recording state
+/// so the two read consistently:
 /// - Stopped / recording-off → `■`
 /// - Running / recording-on → `●`
 /// - Faulted (channel or recording) → `⚠`
@@ -135,34 +119,18 @@ fn glyph_scale(glyph: &str) -> f32 {
 /// every call site renders the same symbol at the same apparent size. Pair with
 /// [`status_color`] (channel) or the recording color from [`recording_indicator`].
 pub(crate) fn status_glyph(status: ChannelStatus) -> (&'static str, f32) {
+    use wiredata_ui::glyphs;
     let glyph = match status {
-        ChannelStatus::Stopped => "\u{25A0}", // ■ square
-        ChannelStatus::Faulted => "\u{26A0}", // ⚠ triangle
-        ChannelStatus::Running | ChannelStatus::Reconnecting => "\u{25CF}", // ● dot
+        ChannelStatus::Stopped => glyphs::STOPPED,
+        ChannelStatus::Faulted => glyphs::FAULT,
+        ChannelStatus::Running | ChannelStatus::Reconnecting => glyphs::RUNNING,
     };
-    (glyph, STATUS_GLYPH_SCALE * glyph_scale(glyph))
+    (glyph, glyphs::glyph_size(glyph))
 }
 
 /// The size for a recording-indicator glyph, matching [`status_glyph`]'s optical
 /// sizing for the same symbol.
-pub(crate) fn recording_glyph_size(glyph: &str) -> f32 {
-    STATUS_GLYPH_SCALE * glyph_scale(glyph)
-}
+pub(crate) use wiredata_ui::glyphs::glyph_size as recording_glyph_size;
 
-/// Paint a status/recording `glyph` into a **fixed-size, non-interactive cell**,
-/// centered. Painting (rather than adding a sized label) keeps the glyph from driving
-/// the row height — a taller glyph otherwise shifts the line beside it. `allocate_space`
-/// reserves only layout space with no widget id, so there's no stray hover/focus
-/// rectangle. `scale` is the body-relative glyph size (from [`status_glyph`] /
-/// [`recording_glyph_size`]); the cell is sized to the largest glyph.
-pub(crate) fn paint_glyph(ui: &mut egui::Ui, glyph: &str, scale: f32, color: egui::Color32) {
-    let base = egui::TextStyle::Body.resolve(ui.style()).size;
-    let (_id, rect) = ui.allocate_space(egui::vec2(base * 1.5, base));
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        glyph,
-        egui::FontId::proportional(base * scale),
-        color,
-    );
-}
+/// The fixed-cell, non-interactive glyph painter — see `wiredata_ui::glyphs`.
+pub(crate) use wiredata_ui::glyphs::paint_glyph;

@@ -9,6 +9,7 @@
 
 pub mod fonts;
 pub mod format;
+pub mod glyphs;
 pub mod palette;
 pub mod repaint;
 pub mod style;

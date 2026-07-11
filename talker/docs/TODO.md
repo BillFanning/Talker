@@ -26,11 +26,65 @@ Cross off items as they are completed. Add new ones inline as they come up.
   a priority queue sorted by next-fire-time" — tighten to "tracks each message's
   next-fire-time (conceptually a priority queue)". Fold into whichever spec revision
   lands next; not worth a version bump alone. (External review, 2026-07-10.)
+- [ ] **Spec §3.2 detail-header readouts (next spec pass, no bump alone).** The
+  detail header now mirrors listener's channel block (GUI-merge harmonization,
+  2026-07-10): status glyph + name row, `status · interface` row, sent totals +
+  throughput (byte- and message-based), and performance readouts (`Status queue`
+  occupancy/peak vs `gui::STATUS_QUEUE_CAP`, `Display updates dropped` from
+  `TalkerStatus::Sent::dropped_statuses`, `Missed sends` from
+  `Schedule::missed_sends`). Also from the same harmonization pass: the
+  lifecycle buttons are listener's labeled pair (`start_button` decision), the
+  Profile menu moved to the channel-list header (the top-bar name field is
+  gone; renaming = Save As…), channel removal is the list rows' ✕ overlay, and
+  the detail sections are titled "Configure connection" / "Configure messages"
+  (listener's Configure section was renamed to "Configure connection" to
+  match). Fold the layout and the two new `Sent` fields (`total_bytes`,
+  `missed_sends`) into the next spec revision.
+
+## macOS target (planned, 2026-07-10)
+
+- [ ] **App Nap opt-out in `core::timing` (ADR-017 counterpart).** macOS timers
+  are sub-ms (no `timeBeginPeriod` analog needed), but App Nap throttles the
+  timers of hidden/occluded apps — the macOS analog of the Windows 11 timer
+  throttling we opt out of. Implement `raise()`/`lower()` for
+  `cfg(target_os = "macos")`: hold an `NSProcessInfo`
+  `beginActivityWithOptions(NSActivityLatencyCritical |
+  NSActivityUserInitiated, reason)` token while the high-resolution guard is
+  held, end it on release. Needs `objc2`/`objc2-foundation` as a
+  `cfg(target_os = "macos")` dependency. The refcount plumbing
+  (`ResolutionCounter`) is platform-neutral and already in place.
+- [ ] **Platform pass.** Verify `serialport` enumeration on macOS (ports are
+  `/dev/cu.*`; prefer `cu` over `tty` devices), eframe/winit windowing, and
+  that all `windows-sys` usage stays `cfg(windows)`-gated. Fonts are bundled,
+  so no font work expected.
 
 ## When writing the project README
 
 - [ ] Document the system packages required on Linux for `eframe` (`libxcb`, `libxkbcommon`, etc.) per ADR-003 consequences.
 - [ ] Document MSRV and the `rustup update stable` requirement per ADR-008.
+- [ ] **High-rate timing section (user doc)** — from the 2026-07-10 timing
+  discussion; ADR-017 has the design rationale, this is the user-facing telling:
+  - Windows wakes sleeps on a 15.625 ms tick; talker auto-requests 1 ms
+    resolution while any schedule has an interval < 32 ms (`core::timing`,
+    no elevation needed, released when the last fast channel stops, cleaned
+    up by the OS even on a kill).
+  - What **Missed sends** means: one missed send = one message transmission
+    skipped under the stall policy ("fire once, skip the backlog, stay on
+    grid" — cadence over count); `should-have-fired = sent + missed`;
+    per-channel total across all messages in the schedule.
+  - **Status queue / Display updates dropped** vs **Missed sends**: the first
+    two affect only what the Output pane shows (drop-and-count, sends never
+    delayed); missed sends means the wire cadence itself broke.
+  - Practical rate ceilings: ~100 Hz clean out of the box (post-ADR-017);
+    ~500 Hz–1 kHz is wake-quantization territory (hybrid spin-wait was
+    considered and deliberately not built — one pegged core per fast channel,
+    worse when oversubscribed; revisit only on a real ≥1 kHz UDP need).
+  - Serial line-rate math: `payload_bytes × 10 / baud` must fit the interval
+    (a 40-byte sentence at 115200 baud ≈ 3.5 ms → 1 kHz is physically
+    impossible regardless of timers).
+  - Minimized windows: talker opts out of Windows 11 timer throttling at
+    startup, so minimized long soaks keep cadence; macOS will need the App
+    Nap equivalent (see "macOS target" above).
 
 ## Future work — out of scope for spec v2.0
 
