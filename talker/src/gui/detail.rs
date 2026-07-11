@@ -295,11 +295,19 @@ impl TalkerApp {
             running,
         );
         for (msg_index, interval_ms) in interval_changes {
-            if let Some(Some(handle)) = self.talkers.get(i) {
-                let _ = handle.cmd_tx.try_send(TalkerCommand::SetInterval {
-                    index: msg_index,
-                    interval_ms,
-                });
+            let failed = match self.talkers.get(i) {
+                Some(Some(handle)) => handle
+                    .cmd_tx
+                    .try_send(TalkerCommand::SetInterval {
+                        index: msg_index,
+                        interval_ms,
+                    })
+                    .err()
+                    .map(|e| matches!(e, crossbeam_channel::TrySendError::Full(_))),
+                _ => None,
+            };
+            if let Some(queue_full) = failed {
+                self.command_not_delivered(i, "the interval change", queue_full);
             }
         }
     }

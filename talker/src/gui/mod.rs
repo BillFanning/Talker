@@ -741,12 +741,37 @@ impl TalkerApp {
     fn stop_connection(&mut self, i: usize) {
         let handle = self.talkers.get_mut(i).and_then(|t| t.take());
         if let Some(h) = handle {
-            let _ = h.cmd_tx.try_send(TalkerCommand::Stop);
+            if let Err(e) = h.cmd_tx.try_send(TalkerCommand::Stop) {
+                // Disconnected = the runner already exited, so the stop is
+                // moot; only a full queue (runner wedged in a blocking send)
+                // is a real failure the user must see.
+                if matches!(e, crossbeam_channel::TrySendError::Full(_)) {
+                    self.command_not_delivered(i, "Stop", true);
+                }
+            }
             if i < self.draining.len() {
                 self.draining[i].push(h.thread);
             }
             // 1-based to match "Channel N" everywhere else in the UI/logs.
             tracing::info!(channel = i + 1, "channel {} stopping", i + 1);
+        }
+    }
+
+    /// Surface a command that could not be delivered to channel `i`'s runner.
+    /// A silently dropped Stop/Apply/interval change makes the on-screen state
+    /// diverge from the runner's — to the user it looks like a no-op bug, so
+    /// it goes in the channel's error banner, not just the log.
+    pub(crate) fn command_not_delivered(&mut self, i: usize, what: &str, queue_full: bool) {
+        let why = if queue_full {
+            "the runner's command queue is full (it may be wedged in a blocking send)"
+        } else {
+            "the runner has already exited"
+        };
+        let msg = format!("{what} was not delivered: {why}");
+        tracing::warn!(channel = i + 1, "channel {}: {msg}", i + 1);
+        self.error_count += 1;
+        if i < self.conn_errors.len() {
+            self.conn_errors[i] = Some(msg);
         }
     }
 
@@ -801,8 +826,16 @@ impl TalkerApp {
                 Vec::new(),
             ));
         }
-        if let Some(Some(h)) = self.talkers.get(i) {
-            let _ = h.cmd_tx.try_send(TalkerCommand::UpdateInterface(cfg));
+        let failed = match self.talkers.get(i) {
+            Some(Some(h)) => h
+                .cmd_tx
+                .try_send(TalkerCommand::UpdateInterface(cfg))
+                .err()
+                .map(|e| matches!(e, crossbeam_channel::TrySendError::Full(_))),
+            _ => None,
+        };
+        if let Some(queue_full) = failed {
+            self.command_not_delivered(i, "the interface update", queue_full);
         }
         self.dirty = true;
     }
@@ -918,6 +951,15 @@ impl TalkerApp {
                         self.error_count += 1;
                         if i < self.conn_errors.len() {
                             self.conn_errors[i] = Some(message);
+                        }
+                    }
+                    TalkerStatus::SendRecovered { .. } => {
+                        // Close the failing episode visibly right away rather
+                        // than waiting for the next Sent. The episode's cost
+                        // (failed/suppressed counts) reaches the log pane via
+                        // the runner's own tracing.
+                        if i < self.conn_errors.len() {
+                            self.conn_errors[i] = None;
                         }
                     }
                 }

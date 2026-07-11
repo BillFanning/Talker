@@ -189,7 +189,15 @@ struct ListenerApp {
     /// Recently saved/loaded profile paths, most-recent-first (capped). Listed at the
     /// top of the Profile menu for one-click reload. Session-scoped for now.
     recent_profiles: Vec<std::path::PathBuf>,
+    /// A UI command the bridge could not accept (§99 non-blocking send): the
+    /// user's click did nothing, which must be *visible*, not just a tracing
+    /// warning — a silently dropped "Stop all" cost a debugging session once.
+    /// Shown as a top banner; auto-expires, or dismiss by button.
+    command_drop: Option<(String, std::time::Instant)>,
 }
+
+/// How long the dropped-command banner stays up if not dismissed.
+const COMMAND_DROP_NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// How many recent profiles to keep in the Profile menu.
 pub(super) const MAX_RECENT_PROFILES: usize = 8;
@@ -291,6 +299,7 @@ impl ListenerApp {
             stream_cache: None,
             current_profile_path: None,
             recent_profiles,
+            command_drop: None,
         }
     }
 
@@ -324,12 +333,48 @@ impl ListenerApp {
     }
 
     /// Send a command to the driver. Non-blocking: a full command channel drops the
-    /// command rather than stalling the UI thread (AGENTS §5). A drop is logged —
-    /// it means the driver is saturated or gone, and the user's click did nothing;
-    /// silence here cost a debugging session once (Stop all, before batching).
-    pub(super) fn send(&self, command: UiCommand) {
+    /// command rather than stalling the UI thread (AGENTS §5). A drop is surfaced in
+    /// the [`Self::command_drop`] banner *and* logged — it means the driver is
+    /// saturated or gone, and the user's click did nothing; silence here cost a
+    /// debugging session once (Stop all, before batching).
+    pub(super) fn send(&mut self, command: UiCommand) {
         if let Err(e) = self.bridge.commands.try_send(command) {
             tracing::warn!("UI command dropped ({e}) — the driver is busy or stopped; retry");
+            self.command_drop = Some((
+                "a command was not delivered (the runtime is busy or stopped) — \
+                 the last click did nothing; retry it"
+                    .to_owned(),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+
+    /// The dropped-command banner (see [`Self::send`]): a top strip in the
+    /// warning color, dismissable, auto-expiring after
+    /// [`COMMAND_DROP_NOTICE_TTL`]. Drawn before the panels so it pushes the
+    /// whole workspace down — impossible to miss, gone when stale.
+    fn show_command_drop_banner(&mut self, ui: &mut egui::Ui) {
+        let Some((message, at)) = &self.command_drop else {
+            return;
+        };
+        if at.elapsed() > COMMAND_DROP_NOTICE_TTL {
+            self.command_drop = None;
+            return;
+        }
+        let message = message.clone();
+        let dismissed = egui::Panel::top("command_drop_notice")
+            .resizable(false)
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let warn = ui.visuals().warn_fg_color;
+                    ui.colored_label(warn, format!("\u{26A0} {message}"));
+                    ui.button("Dismiss").clicked()
+                })
+                .inner
+            })
+            .inner;
+        if dismissed {
+            self.command_drop = None;
         }
     }
 
@@ -545,6 +590,7 @@ impl eframe::App for ListenerApp {
         self.repaint.frame_started();
         self.drain_updates();
         self.handle_tab_keys(ui.ctx());
+        self.show_command_drop_banner(ui);
         if self.channels_collapsed {
             // Collapsed: a thin strip — an expand button plus mini tabs (a status dot
             // per channel, click to select, name on hover) (#1).
