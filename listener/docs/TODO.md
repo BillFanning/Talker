@@ -155,7 +155,9 @@ Message-model removal). Everything below this block is verified done:
 ## Carried over (still valid under v2)
 
 - [ ] Disk-guard GUI exposure (§56.2)
-- [ ] **TCP connection channels are currently unobservable** (bigger than the
+- [ ] **TCP connection channels are currently unobservable** — PARKED by user
+      decision 2026-07-11 (stays deferred until a real TCP-inspection need
+      shows up; UC1 today is serial/UDP). Design when promoted: (bigger than the
       recording gap below): each accepted connection runs a full pipeline, but the
       supervisor drops its `PipelineRequest` sender (`runtime/tcp.rs`), so there is
       no per-connection snapshot, stream delta, display, or match evaluation — the

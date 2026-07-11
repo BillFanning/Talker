@@ -38,27 +38,37 @@ pub enum TalkerCommand {
 /// the CLI funnels all channels into a single channel; the GUI keeps one
 /// receiver per channel and ignores the field.
 pub enum TalkerStatus {
-    /// A message was sent. Carries both per-channel and per-message counts
-    /// plus the wire bytes (for the display pane).
-    Sent {
+    /// Periodic counters (ADR-018 lane 1): cumulative totals, **no payload**.
+    /// Emitted at most once per [`ObserverPolicy::counter_interval`] on the
+    /// send path, plus once when the runner stops (so totals are exact at
+    /// rest). Every field is cumulative, so the reader self-corrects even
+    /// when some updates were dropped by a full queue.
+    Counters {
         channel: usize,
-        /// Which message in the channel's schedule fired.
-        message_index: usize,
-        /// Running send count for this *specific message*.
-        message_count: u64,
         /// Running send count across all messages in this channel.
         total_count: u64,
         /// Cumulative wire bytes sent across all messages in this channel.
         total_bytes: u64,
+        /// Per-message running send counts, indexed by the message's
+        /// position in the compiled schedule.
+        per_message_counts: Vec<u64>,
         /// Cumulative count of status updates this channel discarded because
-        /// the receiver was full. Riding in every `Sent`, the reader
-        /// self-corrects even when some updates (including ones carrying
-        /// this field) were themselves dropped.
+        /// the receiver was full.
         dropped_statuses: u64,
         /// Cumulative count of sends skipped under the scheduler's stall
         /// policy (`Schedule::missed_sends`) — the channel couldn't keep to
-        /// its configured cadence. Like the counts, rides in every `Sent`.
+        /// its configured cadence.
         missed_sends: u64,
+    },
+    /// A sampled send (ADR-018 lane 2): the exact wire bytes of one send,
+    /// for the Output pane. Newest-per-interval — the first send after
+    /// [`ObserverPolicy::sample_interval`] elapses carries its payload — so
+    /// the pane shows a live, bounded sample rather than every message.
+    /// `ObserverPolicy::every_send` (CLI `--echo`) makes this every send.
+    SendSample {
+        channel: usize,
+        /// Which message in the channel's schedule fired.
+        message_index: usize,
         /// Exact bytes put on the wire.
         payload: Vec<u8>,
     },
@@ -92,6 +102,47 @@ const RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 /// this interval. Recovery stays automatic — no manual Retry state (pinned by
 /// `send_failure_reports_connection_error_and_keeps_running`).
 const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// How a runner reports to its observer (ADR-018): the named policy the owner
+/// passes to [`run`]/[`open_and_run`]. Counters and payload samples are
+/// **rate-limited lanes**; errors ([`TalkerStatus::ConnectionError`] /
+/// [`TalkerStatus::SendRecovered`] / [`TalkerStatus::OpenFailed`]) are always
+/// immediate and never rate-limited.
+#[derive(Clone, Copy, Debug)]
+pub struct ObserverPolicy {
+    /// Minimum spacing between [`TalkerStatus::Counters`] emissions. A final
+    /// one is always emitted when the runner stops.
+    pub counter_interval: Duration,
+    /// Minimum spacing between payload-bearing [`TalkerStatus::SendSample`]s.
+    /// `Duration::ZERO` = every send carries its payload (CLI `--echo`).
+    pub sample_interval: Duration,
+}
+
+impl ObserverPolicy {
+    /// The GUI default: ~5 Hz counters, ~10 Hz payload samples — display cost
+    /// stays constant regardless of send rate (ADR-018).
+    pub fn sampled() -> Self {
+        Self {
+            counter_interval: Duration::from_millis(200),
+            sample_interval: Duration::from_millis(100),
+        }
+    }
+
+    /// Every send emits its payload (CLI `--echo` — the one consumer that
+    /// genuinely wants every wire message). Counters stay periodic.
+    pub fn every_send() -> Self {
+        Self {
+            sample_interval: Duration::ZERO,
+            ..Self::sampled()
+        }
+    }
+}
+
+impl Default for ObserverPolicy {
+    fn default() -> Self {
+        Self::sampled()
+    }
+}
 
 /// One failing episode: from the first failed send (reported) to the first
 /// successful one (reported with these counts). See [`RETRY_BACKOFF_INITIAL`].
@@ -129,9 +180,12 @@ pub fn open_and_run(
     cmd_rx: Receiver<TalkerCommand>,
     status_tx: Sender<TalkerStatus>,
     notify: Option<StatusNotify>,
+    policy: ObserverPolicy,
 ) {
     match cfg.open() {
-        Ok(interface) => run(channel, interface, schedule, cmd_rx, status_tx, notify),
+        Ok(interface) => run(
+            channel, interface, schedule, cmd_rx, status_tx, notify, policy,
+        ),
         Err(e) => {
             tracing::error!(
                 channel = channel + 1,
@@ -164,6 +218,7 @@ pub fn run(
     cmd_rx: Receiver<TalkerCommand>,
     status_tx: Sender<TalkerStatus>,
     notify: Option<StatusNotify>,
+    policy: ObserverPolicy,
 ) {
     tracing::info!(
         channel = channel + 1,
@@ -171,7 +226,9 @@ pub fn run(
         channel + 1,
         schedule.len()
     );
-    run_loop(channel, interface, schedule, cmd_rx, status_tx, notify);
+    run_loop(
+        channel, interface, schedule, cmd_rx, status_tx, notify, policy,
+    );
     tracing::info!(channel = channel + 1, "channel {} stopped", channel + 1);
 }
 
@@ -187,9 +244,14 @@ fn run_loop(
     cmd_rx: Receiver<TalkerCommand>,
     status_tx: Sender<TalkerStatus>,
     notify: Option<StatusNotify>,
+    policy: ObserverPolicy,
 ) {
     let mut total_count = 0u64;
     let mut total_bytes = 0u64;
+    // Lane rate limits (ADR-018): `None` = nothing emitted yet, so the first
+    // send always produces both a sample and counters (instant first paint).
+    let mut last_sample: Option<Instant> = None;
+    let mut last_counters: Option<Instant> = None;
     // Per-message send counts, indexed by the message's position in the
     // compiled schedule. The resize is defensive; the schedule's size is
     // fixed at compile time.
@@ -258,7 +320,7 @@ fn run_loop(
     // see [`RETRY_BACKOFF_INITIAL`]). `None` while sends are succeeding.
     let mut episode: Option<FailureEpisode> = None;
 
-    loop {
+    'run: loop {
         let fast = schedule
             .min_active_interval()
             .is_some_and(|i| i < timing::HIGH_RATE_THRESHOLD);
@@ -270,7 +332,7 @@ fn run_loop(
         // command handling.
         for cmd in cmd_rx.try_iter() {
             if let Flow::Stop = handle(cmd, &mut interface, &mut schedule, &mut episode) {
-                return;
+                break 'run;
             }
         }
 
@@ -314,37 +376,44 @@ fn run_loop(
                             per_message_counts.resize(index + 1, 0);
                         }
                         per_message_counts[index] += 1;
-                        let status = TalkerStatus::Sent {
-                            channel,
-                            message_index: index,
-                            message_count: per_message_counts[index],
-                            total_count,
-                            total_bytes,
-                            dropped_statuses,
-                            missed_sends: schedule.missed_sends(),
-                            payload,
-                        };
-                        // Best-effort: a full receiver drops the update rather
-                        // than backpressuring the send cadence — counts
-                        // self-correct via the next delivered status.
-                        match status_tx.try_send(status) {
-                            Ok(()) => {
-                                if let Some(n) = &notify {
-                                    n();
-                                }
-                            }
-                            Err(TrySendError::Full(_)) => {
-                                dropped_statuses += 1;
-                                if dropped_statuses == 1 {
-                                    tracing::warn!(
-                                        channel = channel + 1,
-                                        "channel {}: status receiver is falling behind — sends \
-                                     continue at cadence; display updates are being sampled",
-                                        channel + 1
-                                    );
-                                }
-                            }
-                            Err(TrySendError::Disconnected(_)) => {}
+                        // Rate-limited observer lanes (ADR-018): a payload
+                        // sample and/or a counters update, each at most once
+                        // per its policy interval. Best-effort sends — a full
+                        // receiver drops the update rather than backpressuring
+                        // the send cadence; cumulative counters self-correct
+                        // via the next delivered update.
+                        let now = Instant::now();
+                        if last_sample.is_none_or(|t| now - t >= policy.sample_interval) {
+                            last_sample = Some(now);
+                            emit_status(
+                                &status_tx,
+                                &notify,
+                                channel,
+                                &mut dropped_statuses,
+                                TalkerStatus::SendSample {
+                                    channel,
+                                    message_index: index,
+                                    payload,
+                                },
+                            );
+                        }
+                        if last_counters.is_none_or(|t| now - t >= policy.counter_interval) {
+                            last_counters = Some(now);
+                            let drops_so_far = dropped_statuses;
+                            emit_status(
+                                &status_tx,
+                                &notify,
+                                channel,
+                                &mut dropped_statuses,
+                                TalkerStatus::Counters {
+                                    channel,
+                                    total_count,
+                                    total_bytes,
+                                    per_message_counts: per_message_counts.clone(),
+                                    dropped_statuses: drops_so_far,
+                                    missed_sends: schedule.missed_sends(),
+                                },
+                            );
                         }
                     }
                     Err(e) => match episode.as_mut() {
@@ -395,23 +464,73 @@ fn run_loop(
             Tick::Wait(until) => match cmd_rx.recv_deadline(until) {
                 Ok(cmd) => {
                     if let Flow::Stop = handle(cmd, &mut interface, &mut schedule, &mut episode) {
-                        return;
+                        break 'run;
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+                Err(RecvTimeoutError::Disconnected) => break 'run,
             },
             // No active messages: nothing can happen until a command arrives,
             // so block indefinitely — zero wakeups.
             Tick::Idle => match cmd_rx.recv() {
                 Ok(cmd) => {
                     if let Flow::Stop = handle(cmd, &mut interface, &mut schedule, &mut episode) {
-                        return;
+                        break 'run;
                     }
                 }
-                Err(_) => return,
+                Err(_) => break 'run,
             },
         }
+    }
+
+    // Final counters (ADR-018): the rate-limited lane can be up to one
+    // interval stale when the runner stops — emit once more so the observer's
+    // totals are exact at rest. Best-effort like every status.
+    let drops_so_far = dropped_statuses;
+    emit_status(
+        &status_tx,
+        &notify,
+        channel,
+        &mut dropped_statuses,
+        TalkerStatus::Counters {
+            channel,
+            total_count,
+            total_bytes,
+            per_message_counts,
+            dropped_statuses: drops_so_far,
+            missed_sends: schedule.missed_sends(),
+        },
+    );
+}
+
+/// Queue one status update, best-effort (never blocks the send cadence): a
+/// full receiver counts a drop (`dropped_statuses` — cumulative fields in the
+/// next delivered `Counters` self-correct), a disconnected one is ignored.
+fn emit_status(
+    status_tx: &Sender<TalkerStatus>,
+    notify: &Option<StatusNotify>,
+    channel: usize,
+    dropped_statuses: &mut u64,
+    status: TalkerStatus,
+) {
+    match status_tx.try_send(status) {
+        Ok(()) => {
+            if let Some(n) = notify {
+                n();
+            }
+        }
+        Err(TrySendError::Full(_)) => {
+            *dropped_statuses += 1;
+            if *dropped_statuses == 1 {
+                tracing::warn!(
+                    channel = channel + 1,
+                    "channel {}: status receiver is falling behind — sends continue at \
+                     cadence; observer updates are being dropped and counted",
+                    channel + 1
+                );
+            }
+        }
+        Err(TrySendError::Disconnected(_)) => {}
     }
 }
 
@@ -442,6 +561,16 @@ mod tests {
         messages: &[MessageConfig],
         fail: bool,
     ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle) {
+        // Tests default to the every-send policy so per-send behaviour stays
+        // directly observable; the sampled lanes have their own test.
+        spawn_runner_with(messages, fail, ObserverPolicy::every_send())
+    }
+
+    fn spawn_runner_with(
+        messages: &[MessageConfig],
+        fail: bool,
+        policy: ObserverPolicy,
+    ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let interface = Box::new(MockInterface {
             sent: Arc::clone(&sent),
@@ -450,8 +579,9 @@ mod tests {
         let schedule = Schedule::compile(messages, Instant::now()).unwrap();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
         let (status_tx, status_rx) = crossbeam_channel::bounded(256);
-        let thread =
-            std::thread::spawn(move || run(0, interface, schedule, cmd_rx, status_tx, None));
+        let thread = std::thread::spawn(move || {
+            run(0, interface, schedule, cmd_rx, status_tx, None, policy)
+        });
         (
             sent,
             TalkerHandle {
@@ -503,31 +633,79 @@ mod tests {
         let payloads = sent.lock().unwrap();
         assert!(payloads.iter().all(|p| p == &vec![0xAB]));
 
-        // Statuses carry identity and monotonically increasing counts.
-        let mut last_total = 0;
+        // Lanes carry identity; counters are monotonic and exact at rest
+        // (the final Counters emitted at stop — ADR-018).
+        let mut samples = 0usize;
+        let mut last_total = 0u64;
         for s in &statuses {
             match s {
-                TalkerStatus::Sent {
+                TalkerStatus::SendSample {
                     channel,
                     message_index,
+                    payload,
+                } => {
+                    assert_eq!(*channel, 0);
+                    assert_eq!(*message_index, 0);
+                    assert_eq!(payload, &vec![0xAB]);
+                    samples += 1;
+                }
+                TalkerStatus::Counters {
+                    channel,
                     total_count,
                     total_bytes,
+                    per_message_counts,
                     dropped_statuses,
                     ..
                 } => {
                     assert_eq!(*channel, 0);
-                    assert_eq!(*message_index, 0);
-                    assert!(*total_count > last_total);
+                    assert!(*total_count >= last_total, "counters must be monotonic");
                     last_total = *total_count;
                     // Every payload is the single byte 0xAB, so the byte
                     // total tracks the send count exactly.
                     assert_eq!(*total_bytes, *total_count);
+                    assert_eq!(per_message_counts.iter().sum::<u64>(), *total_count);
                     assert_eq!(*dropped_statuses, 0);
                 }
-                _ => panic!("unexpected non-Sent status"),
+                _ => panic!("unexpected status variant"),
             }
         }
+        // every-send policy: one sample per send; the final Counters makes
+        // the totals exact.
+        assert_eq!(samples, payloads.len());
         assert_eq!(last_total as usize, payloads.len());
+    }
+
+    #[test]
+    fn sampled_policy_bounds_payload_traffic() {
+        // A huge sample interval: only the *first* send carries its payload,
+        // however many sends happen; a zero counter interval keeps totals
+        // exact per send. Pins the ADR-018 claim that display cost is
+        // decoupled from send rate.
+        let policy = ObserverPolicy {
+            counter_interval: Duration::ZERO,
+            sample_interval: Duration::from_secs(3600),
+        };
+        let (sent, handle) = spawn_runner_with(&[msg("AB", 5)], false, policy);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sent.lock().unwrap().len() < 3 {
+            assert!(Instant::now() < deadline, "expected ≥3 sends within 2 s");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        let status_rx = handle.status_rx.clone();
+        join_within(handle, Duration::from_secs(2));
+
+        let mut samples = 0usize;
+        let mut last_total = 0u64;
+        for s in status_rx.try_iter() {
+            match s {
+                TalkerStatus::SendSample { .. } => samples += 1,
+                TalkerStatus::Counters { total_count, .. } => last_total = total_count,
+                _ => panic!("unexpected status variant"),
+            }
+        }
+        assert_eq!(samples, 1, "one payload sample regardless of send count");
+        assert_eq!(last_total as usize, sent.lock().unwrap().len());
     }
 
     #[test]
@@ -627,8 +805,17 @@ mod tests {
         let schedule = Schedule::compile(&[msg("AB", 5)], Instant::now()).unwrap();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
         let (status_tx, status_rx) = crossbeam_channel::bounded(256);
-        let thread =
-            std::thread::spawn(move || run(0, interface, schedule, cmd_rx, status_tx, None));
+        let thread = std::thread::spawn(move || {
+            run(
+                0,
+                interface,
+                schedule,
+                cmd_rx,
+                status_tx,
+                None,
+                ObserverPolicy::every_send(),
+            )
+        });
         let handle = TalkerHandle {
             cmd_tx,
             status_rx,
@@ -680,7 +867,15 @@ mod tests {
         let schedule = Schedule::compile(&[msg("AB", 100)], Instant::now()).unwrap();
         let (_cmd_tx, cmd_rx) = crossbeam_channel::bounded::<TalkerCommand>(8);
         let (status_tx, status_rx) = crossbeam_channel::bounded(8);
-        open_and_run(3, cfg, schedule, cmd_rx, status_tx, None);
+        open_and_run(
+            3,
+            cfg,
+            schedule,
+            cmd_rx,
+            status_tx,
+            None,
+            ObserverPolicy::every_send(),
+        );
         match status_rx.try_recv() {
             Ok(TalkerStatus::OpenFailed { channel, message }) => {
                 assert_eq!(channel, 3);

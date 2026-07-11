@@ -221,6 +221,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // Without `--echo` the main thread drains and discards immediately, so
     // the bound is never felt.
     let (status_tx, status_rx) = crossbeam_channel::bounded::<TalkerStatus>(1024);
+    // `--echo` is the one consumer that wants every wire payload (ADR-018);
+    // without it, sampled lanes keep the status traffic constant at any rate.
+    let policy = if args.echo {
+        runner::ObserverPolicy::every_send()
+    } else {
+        runner::ObserverPolicy::sampled()
+    };
     let mut cmd_txs = Vec::new();
     let mut handles = Vec::new();
     for (i, interface, schedule) in prepared {
@@ -230,7 +237,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         handles.push(std::thread::spawn(move || {
             // No notify callback: the CLI's main thread blocks on the status
             // channel anyway, so there is nothing to wake.
-            runner::run(i, interface, schedule, cmd_rx, status_tx, None);
+            runner::run(i, interface, schedule, cmd_rx, status_tx, None, policy);
         }));
     }
     drop(status_tx); // only the runners hold senders now
@@ -254,7 +261,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let echo_format = args.echo_format;
     let tag = !args.no_tag;
     for status in status_rx.iter() {
-        if let TalkerStatus::Sent {
+        if let TalkerStatus::SendSample {
             channel, payload, ..
         } = status
         {

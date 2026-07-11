@@ -52,12 +52,14 @@ Cross off items as they are completed. Add new ones inline as they come up.
   interface update pulls the next retry forward. Pinned by
   `repeated_send_failures_report_one_connection_error` +
   `recovery_reports_send_recovered_with_episode_counts`.
-- [ ] **Telemetry split — see proposed ADR-018 (needs acceptance).** Every send
-  emits a payload-bearing `TalkerStatus::Sent`; the GUI front-drains a 200-item
-  Vec and rebuilds the full output string per repaint (`gui/display.rs`, the
-  `widgets.rs` selectable label). Split into periodic counters, sampled display
-  batches, and immediate edge-triggered errors; per-send payload delivery only
-  for CLI `--echo`.
+- [x] **Telemetry split (ADR-018, accepted + implemented 2026-07-11).**
+  `TalkerStatus::Sent` replaced by the three lanes: `Counters` (≤5 Hz +
+  final-at-stop, cumulative, self-correcting), `SendSample` (payload-bearing,
+  ≤10 Hz newest-per-interval), immediate errors. The owner picks the policy
+  via `ObserverPolicy` (`sampled()` for the GUI, `every_send()` for CLI
+  `--echo`). Pinned by `sampled_policy_bounds_payload_traffic` + the reworked
+  `sends_on_schedule_and_reports_self_describing_counts`. Spec "status"
+  wording: fold into the next spec pass (no bump alone).
 - [ ] **Observer-path allocations** (behind the workspace benchmark harness
   below): compiled static messages should send without a fresh wire `Vec` per
   send (`render_into`/reusable buffer, `core::message::compile`); cache
@@ -70,11 +72,13 @@ Cross off items as they are completed. Add new ones inline as they come up.
   `command_not_delivered` (gui/mod.rs), distinguishing queue-full (runner
   wedged) from runner-exited (a moot Stop stays silent). Listener's sibling
   landed in the same commit (listener TODO).
-- [ ] **TalkerSupervisor — see proposed ADR-019 (needs acceptance).** Channel
-  lifecycle, thread collection, draining, counters, and observer policy live in
+- [ ] **TalkerSupervisor (ADR-019, ACCEPTED 2026-07-11 — implementation
+  pending, sequenced after ADR-018 which is now in).** Channel lifecycle,
+  thread collection, draining, counters, and observer policy live in
   `gui/mod.rs` (~1.5 k lines), contradicting the spec's core-owns-the-channel-
-  collection boundary; a `core` supervisor should own the runners and expose
-  one API to CLI and GUI — also the path to CLI parity.
+  collection boundary; a `core` supervisor owns the runners and exposes one
+  API to CLI and GUI — also the path to CLI parity. Needs its own focused
+  session; settle ADR-019's open points at implementation time.
 - [ ] **Palette bypasses.** Several status/warning/log/destructive colors are
   hardcoded in the talker GUI (e.g. `gui/detail.rs` destructive red,
   `gui/mod.rs` log-severity colors) instead of coming from

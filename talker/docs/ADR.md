@@ -325,36 +325,58 @@ The version number increments only on breaking schema changes that `serde(defaul
 
 ---
 
-## ADR-018 — Talker telemetry split (PROPOSED — skeleton, not yet accepted)
+## ADR-018 — Talker telemetry split: counters, sampled payloads, edge-triggered errors
 
-**Status:** Proposed (external review, 2026-07-11). Skeleton only — accept, amend, or
-reject before implementing; the TODO "Telemetry split" item tracks it.
+**Status:** Accepted 2026-07-11 (proposed by the 2026-07-11 external review).
 
-**Context:** Every send emits a payload-bearing `TalkerStatus::Sent` over the
+**Context:** Every send emitted a payload-bearing `TalkerStatus::Sent` over the
 per-channel status channel; the GUI maintains a front-drained 200-item display Vec and
-rebuilds the complete output string per repaint. Correctness is protected (bounded
+rebuilds the complete output string per repaint. Correctness was protected (bounded
 queue, drop-and-count, `dropped_statuses` self-correction — sends are never delayed),
 but the per-send CPU/allocation cost scales with rate and becomes load-bearing in the
-500 Hz–1 kHz territory ADR-017 opened.
+500 Hz–1 kHz territory ADR-017 opened: at 1 kHz the runner allocated and shipped a
+thousand payload Vecs a second that the GUI mostly discarded.
 
-**Proposal:** Split the status protocol into three lanes with different cadences:
-(1) **periodic counters** — total/per-message counts, bytes, missed sends, on a timer
-(~5 Hz), not per send; (2) **sampled display batches** — a bounded sample of recent
-payloads for the Output pane, coalesced; (3) **immediate edge-triggered errors** —
-first failure/recovery transitions, never rate-limited away. Full per-send payload
-delivery remains only for CLI `--echo`, which explicitly asks for it.
+**Decision:** The status protocol has three lanes with different cadences, and the
+owner picks the payload policy via a named `ObserverPolicy` passed to the runner:
 
-**Open points to settle at acceptance:** exact counter cadence; sampling policy for
-the display lane (newest-N vs. reservoir); whether `Sent` survives as a variant or
-splits into three; migration for the GUI's self-correcting counter logic; benchmark
-evidence (workspace harness — TODO) sizing the win before the protocol churn.
+1. **Periodic counters** — `TalkerStatus::Counters` (total/per-message counts, bytes,
+   missed sends, dropped statuses; **no payload**), emitted at most once per
+   `counter_interval` (default 200 ms ≈ 5 Hz), checked on the send path. A final
+   `Counters` is emitted when the runner stops, so totals are exact at rest.
+2. **Sampled display payloads** — `TalkerStatus::SendSample` (payload-bearing),
+   newest-per-interval: the first send after `sample_interval` elapses carries its
+   payload (default 100 ms ≈ 10 Hz). The Output pane shows a live, bounded sample
+   instead of every wire message.
+3. **Immediate errors** — `ConnectionError` / `SendRecovered` / `OpenFailed`
+   (edge-triggered per ADR-017's sibling backoff work) are never rate-limited.
+
+`Sent` is **removed**, replaced by lanes 1+2. CLI `--echo` passes
+`ObserverPolicy::every()` (every send emits a `SendSample`) — the one consumer that
+genuinely wants every payload keeps it, explicitly.
+
+**Consequences:**
+- Per-send cost at any rate is a counter bump; allocations for observers happen at
+  the sample cadence, not the send cadence. The 200-item display Vec fills at ≤10
+  items/s regardless of send rate.
+- The self-correcting counter scheme survives: totals ride in every `Counters`, so a
+  dropped status is corrected by the next one; drop-and-count is unchanged.
+- Status-queue pressure drops by construction (≤ ~15 statuses/s/channel steady-state
+  vs. one per send), making `dropped_statuses` a true anomaly signal.
+- The GUI's per-send "Output" completeness is gone by design at high rates — the pane
+  is a sample, labeled as such; the wire remains exact (that's what recording and the
+  CLI `--echo` are for).
+- The scheduler/spec "status" wording needs a spec-pass update (see TODO, no bump
+  alone).
 
 ---
 
-## ADR-019 — Core `TalkerSupervisor` owning the channel collection (PROPOSED — skeleton, not yet accepted)
+## ADR-019 — Core `TalkerSupervisor` owning the channel collection
 
-**Status:** Proposed (external review, 2026-07-11). Skeleton only — accept, amend, or
-reject before implementing; the TODO "TalkerSupervisor" item tracks it.
+**Status:** Accepted 2026-07-11 (proposed by the 2026-07-11 external review).
+Implementation deliberately **sequenced after ADR-018** — the telemetry lanes change
+the same status plumbing the supervisor will own, and moving them once is cheaper.
+The open points below are settled at implementation time, not re-litigated.
 
 **Context:** The spec places channel collection and management in `core`
 (`core::channel` manages a collection from day one), but in practice channel

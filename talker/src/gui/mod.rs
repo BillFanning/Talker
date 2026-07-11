@@ -718,7 +718,17 @@ impl TalkerApp {
             for pred in predecessors {
                 let _ = pred.join();
             }
-            runner::open_and_run(i, cfg, schedule, cmd_rx, status_tx, Some(notify));
+            runner::open_and_run(
+                i,
+                cfg,
+                schedule,
+                cmd_rx,
+                status_tx,
+                Some(notify),
+                // Sampled lanes (ADR-018): the GUI's display cost stays
+                // constant regardless of the channel's send rate.
+                runner::ObserverPolicy::sampled(),
+            );
         });
 
         if i < self.talkers.len() {
@@ -911,14 +921,14 @@ impl TalkerApp {
             any_running = true;
             for status in statuses {
                 match status {
-                    TalkerStatus::Sent {
-                        message_index,
-                        message_count,
+                    // Lane 1 (ADR-018): periodic cumulative counters — every
+                    // readout except the Output pane feeds from here.
+                    TalkerStatus::Counters {
                         total_count,
                         total_bytes,
+                        per_message_counts,
                         dropped_statuses,
                         missed_sends,
-                        payload,
                         ..
                     } => {
                         if i < self.sent_counts.len() {
@@ -934,11 +944,14 @@ impl TalkerApp {
                             self.missed_sends[i] = missed_sends;
                         }
                         if let Some(per_msg) = self.message_sent_counts.get_mut(i) {
-                            if message_index >= per_msg.len() {
-                                per_msg.resize(message_index + 1, 0);
-                            }
-                            per_msg[message_index] = message_count;
+                            *per_msg = per_message_counts;
                         }
+                    }
+                    // Lane 2: a sampled send for the Output pane. Also live
+                    // proof of a working interface, so it clears the error
+                    // banner (a failing episode suppresses sends, so no
+                    // samples arrive while the banner should stay up).
+                    TalkerStatus::SendSample { payload, .. } => {
                         if i < self.conn_errors.len() {
                             self.conn_errors[i] = None;
                         }
