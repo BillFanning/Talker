@@ -197,10 +197,11 @@ Message-model removal). Everything below this block is verified done:
       forever. Pinned by
       `write_fault_is_visible_on_the_handle_without_further_enqueues` +
       `flush_failure_faults_the_recording`.
-- [ ] **Command acks.** A dropped/failed user command is only a tracing warning
-      (GUI bridge send failure, `gui/mod.rs`) — Start/Stop/Apply/Record should
-      produce an acknowledged result or a visible, persistent error in the GUI.
-      Talker has the sibling item (talker TODO).
+- [x] **Command acks** — DONE (`6d4da3b`). A dropped `UiCommand` now raises the
+      dismissable top banner (`show_command_drop_banner`, auto-expires after
+      `COMMAND_DROP_NOTICE_TTL`) in addition to the tracing warning — the
+      user sees that the last click did nothing. Talker's sibling landed in
+      the same commit (talker TODO).
 - [ ] **Match-scanning cost** (behind the workspace benchmark harness — talker
       TODO): `MatchRuleSet::evaluate_stream` scans each rule naively
       (`windows()`), allocates a boundary-carry buffer per chunk, clones actions

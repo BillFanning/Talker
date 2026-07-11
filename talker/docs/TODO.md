@@ -43,14 +43,15 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 ## Robustness & performance (external review, 2026-07-11)
 
-- [ ] **Send-failure storms: edge-trigger + backoff.** A failing send logs and
-  emits `ConnectionError` at the full schedule rate — at 100 Hz a dead
-  TCP/serial target produces 100 errors/s, burning CPU and burying the first
-  failure. Keep the keeps-running contract
-  (`send_failure_reports_connection_error_and_keeps_running`) — auto-recovery
-  is deliberate; do **not** add a hard Faulted-requires-Retry state — but
-  report edge-triggered (first failure + recovery, with a suppressed count)
-  and bound the retry rate with backoff while failing.
+- [x] **Send-failure storms: edge-trigger + backoff** — DONE (`6d4da3b`). A
+  send failure opens a `FailureEpisode` (runner.rs): first failure reported
+  (`ConnectionError`), further due fires suppressed under the bounded-backoff
+  policy (`RETRY_BACKOFF_INITIAL` 250 ms doubling to `RETRY_BACKOFF_MAX` 5 s),
+  first success closes it with `SendRecovered { failures, suppressed }`.
+  Keeps-running contract retained (no manual Retry state); a successful
+  interface update pulls the next retry forward. Pinned by
+  `repeated_send_failures_report_one_connection_error` +
+  `recovery_reports_send_recovered_with_episode_counts`.
 - [ ] **Telemetry split — see proposed ADR-018 (needs acceptance).** Every send
   emits a payload-bearing `TalkerStatus::Sent`; the GUI front-drains a 200-item
   Vec and rebuilds the full output string per repaint (`gui/display.rs`, the
@@ -64,10 +65,11 @@ Cross off items as they are completed. Add new ones inline as they come up.
   replace the GUI output Vec with an incremental row ring + `show_rows`
   (listener's rendering lessons). Adopt a scheduler heap only if benchmarks
   show message-count scans matter.
-- [ ] **Command acks.** Failed `Stop`/interface-update/`SetInterval` sends to a
-  runner are silently ignored (`gui/mod.rs`) — commands should produce an
-  acknowledged result or a visible error, especially Start/Stop/Apply.
-  Listener has the sibling item (listener TODO).
+- [x] **Command acks** — DONE (`6d4da3b`). Failed `Stop`/interface-update/
+  `SetInterval` sends surface in the channel's error banner via
+  `command_not_delivered` (gui/mod.rs), distinguishing queue-full (runner
+  wedged) from runner-exited (a moot Stop stays silent). Listener's sibling
+  landed in the same commit (listener TODO).
 - [ ] **TalkerSupervisor — see proposed ADR-019 (needs acceptance).** Channel
   lifecycle, thread collection, draining, counters, and observer policy live in
   `gui/mod.rs` (~1.5 k lines), contradicting the spec's core-owns-the-channel-
