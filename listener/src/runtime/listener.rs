@@ -57,6 +57,8 @@ fn view_count(config: &ChannelConfig) -> usize {
 fn retained_snapshot(
     id: ChannelId,
     diagnostics: &[crate::diagnostics::Diagnostic],
+    activity: ChannelActivity,
+    boundary_saves: u64,
 ) -> ChannelSnapshot {
     ChannelSnapshot {
         channel_id: id,
@@ -64,13 +66,13 @@ fn retained_snapshot(
         diagnostics: DiagnosticsSnapshot::from_diagnostics(diagnostics.iter().cloned()),
         raw_recording: None,
         display_recording: None,
-        activity: ChannelActivity {
-            last_data_at: None,
-            bytes_per_sec: 0.0,
-            total_bytes: 0,
-        },
+        // The last run's liveness facts, exact at rest (`finish_stop` zeroed
+        // the rate). Without this a stopped channel's byte total read 0 on
+        // the next poll — precisely when the user cross-checks it against
+        // the sender's total.
+        activity,
         matches: Vec::new(),
-        match_boundary_saves: 0,
+        match_boundary_saves: boundary_saves,
         stream_end_offset: 0,
         ingest_queue: crate::runtime::QueueDepth::default(),
         raw_recording_queue: None,
@@ -140,6 +142,14 @@ struct ManagedChannel {
     /// the log of a stopped/faulted Channel) and replayed into the next run's pipeline by
     /// [`prior_diagnostics`](Listener::prior_diagnostics). Bounded on use.
     retained_diagnostics: Vec<crate::diagnostics::Diagnostic>,
+    /// The last run's liveness facts, retained across Stop like the
+    /// diagnostics — a stopped channel keeps reading its exact byte total at
+    /// rest (the natural moment to cross-check against the sender). Replaced
+    /// by each run's final snapshot with the rate zeroed; the *next start*
+    /// is what resets the readout (talker semantics).
+    retained_activity: ChannelActivity,
+    /// The last run's boundary-save total, retained like the activity.
+    retained_boundary_saves: u64,
 }
 
 impl ManagedChannel {
@@ -225,6 +235,12 @@ impl Listener {
                 serial_control: None,
                 reconnect_state: None,
                 retained_diagnostics: Vec::new(),
+                retained_activity: ChannelActivity {
+                    last_data_at: None,
+                    bytes_per_sec: 0.0,
+                    total_bytes: 0,
+                },
+                retained_boundary_saves: 0,
             },
         );
         id
@@ -299,12 +315,20 @@ impl Listener {
         match channel.handle.as_ref() {
             Some(ChannelHandle::Data(tasks)) => tasks.snapshot().await,
             Some(ChannelHandle::TcpListener(_)) => None,
-            // Not running (Stopped/Faulted): there's no live pipeline, so serve a minimal
-            // snapshot carrying the retained diagnostics (the last run's log, the stop
-            // notes, and any start fault) — so the GUI shows the diagnostics of a
-            // stopped/faulted channel. Other fields are defaults (no live liveness).
-            None if !channel.retained_diagnostics.is_empty() => {
-                Some(retained_snapshot(id, &channel.retained_diagnostics))
+            // Not running (Stopped/Faulted): there's no live pipeline, so serve a
+            // minimal snapshot carrying the retained history — the last run's
+            // diagnostics (its log, the stop notes, any start fault) AND its final
+            // liveness facts, so a stopped channel's byte total reads exact at rest
+            // instead of zeroing on the first post-stop poll.
+            None if !channel.retained_diagnostics.is_empty()
+                || channel.retained_activity.total_bytes > 0 =>
+            {
+                Some(retained_snapshot(
+                    id,
+                    &channel.retained_diagnostics,
+                    channel.retained_activity,
+                    channel.retained_boundary_saves,
+                ))
             }
             None => None,
         }
@@ -641,7 +665,15 @@ impl Listener {
             // stopped channel's log and the next start carries it forward. The pipeline's
             // log already includes the prior run's retained entries (seeded at start), so
             // this *replaces* rather than appends — no growth across many cycles.
+            // The final liveness facts are retained alongside, with the rolling rate
+            // zeroed — at rest the throughput is 0 by definition, but the byte total is
+            // the number the user cross-checks against the sender.
             if let Some(snap) = final_snapshot {
+                channel.retained_activity = ChannelActivity {
+                    bytes_per_sec: 0.0,
+                    ..snap.activity
+                };
+                channel.retained_boundary_saves = snap.match_boundary_saves;
                 channel.retained_diagnostics = snap.diagnostics.into_sorted_vec();
             }
         }
@@ -1849,6 +1881,59 @@ mod tests {
 
         listener.stop(id).await.unwrap();
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// The at-rest cross-check that surfaced the retained-totals gap: after
+    /// Stop, the channel's snapshot must still read the run's exact byte
+    /// total (rate zeroed) — previously the stopped-channel snapshot served
+    /// default (zero) liveness and the GUI's next poll wiped the readout,
+    /// exactly when the user compares it against the sender's total.
+    #[tokio::test]
+    async fn stopped_channel_retains_exact_totals_at_rest() {
+        let port = {
+            std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        let mut listener = Listener::with_default_capacities();
+        let mut config = udp_channel();
+        if let InterfaceConfig::Udp(udp) = &mut config.interface {
+            udp.bind_address = "127.0.0.1".to_string();
+            udp.port = port;
+        }
+        let id = listener.add_channel(config);
+        listener.start(id).await.unwrap();
+
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let payload = b"$GPGGA,retained-totals*00\r\n";
+        for _ in 0..5 {
+            sender.send_to(payload, ("127.0.0.1", port)).unwrap();
+        }
+        let expected = (5 * payload.len()) as u64;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(stats) = listener.channel_stats(id).await {
+                if stats.activity.total_bytes == expected {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "datagrams did not arrive"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        listener.stop(id).await.unwrap();
+        // No live pipeline: cheap stats are gone…
+        assert!(listener.channel_stats(id).await.is_none());
+        // …but the snapshot serves the retained final liveness — exact total,
+        // zero rate — alongside the retained diagnostics.
+        let snap = listener.snapshot(id).await.expect("retained snapshot");
+        assert_eq!(snap.activity.total_bytes, expected, "exact total at rest");
+        assert_eq!(snap.activity.bytes_per_sec, 0.0, "no rate at rest");
     }
 
     #[tokio::test]

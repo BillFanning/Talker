@@ -188,6 +188,17 @@ Message-model removal). Everything below this block is verified done:
 
 ## Robustness & performance (external review, 2026-07-11)
 
+- [x] **Stopped channels keep their exact byte totals at rest** (live-testing
+      find, 2026-07-11). `finish_stop` now retains the final snapshot's
+      liveness (`retained_activity`, rate zeroed; + `retained_boundary_saves`)
+      alongside the diagnostics, and the stopped-channel `retained_snapshot`
+      serves them — previously it served zeroed defaults, so the GUI's next
+      poll wiped the byte total exactly when the user cross-checks it against
+      the sender. GUI side: totals now also reset on *Start* (talker
+      semantics), not on Stop. Pinned by
+      `stopped_channel_retains_exact_totals_at_rest` +
+      `totals_survive_stop_and_reset_on_start`.
+
 - [x] **Recorder faults are now visible on a quiet stream** (§56.1). The recorder
       task publishes its terminal error into a shared fault cell before exiting
       (`Recording::fault_error`); `Recording::state()` reads it eagerly, and

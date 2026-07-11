@@ -425,6 +425,12 @@ impl AppState {
                     view.stream_bytes.clear();
                     view.marks.clear();
                     view.stream_cursor = 0;
+                    // Totals belong to a run (talker semantics): they survive
+                    // Stop so an at-rest cross-check against the sender works,
+                    // and zero the moment a new run begins — instantly, not on
+                    // the first poll of the fresh pipeline.
+                    view.bytes_total = 0;
+                    view.bytes_per_sec = 0.0;
                 }
             }
             RuntimeEvent::ChannelStopped(id) => {
@@ -649,6 +655,29 @@ mod tests {
             "no recording indicator on a faulted channel"
         );
         assert_eq!(view.bytes_total, 4096, "byte liveness is kept");
+    }
+
+    #[test]
+    fn totals_survive_stop_and_reset_on_start() {
+        // Talker semantics: totals belong to a run — kept across Stop (so an
+        // at-rest cross-check against the sender works), zeroed the moment a
+        // new run begins.
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+        state.apply(UiUpdate::Snapshot(
+            id,
+            Box::new(snapshot_with(id, 22278, 42.0, 0)),
+        ));
+
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelStopped(id)));
+        let view = state.channel(id).unwrap();
+        assert_eq!(view.bytes_total, 22278, "totals survive Stop");
+
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(id)));
+        let view = state.channel(id).unwrap();
+        assert_eq!(view.bytes_total, 0, "a fresh run zeroes the totals");
+        assert_eq!(view.bytes_per_sec, 0.0);
     }
 
     fn delta(base: u64, bytes: &[u8], end: u64) -> crate::runtime::StreamDelta {
