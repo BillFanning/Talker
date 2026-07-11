@@ -1,7 +1,10 @@
 [package]
 name        = "nmea0183"
 description = "NMEA 0183 sentence construction, parsing, and checksum support — reusable library"
-version.workspace     = true
+# Versioned independently of the workspace: this crate is published to
+# crates.io on its own cadence, so a workspace bump must not imply an
+# nmea0183 release (and the semver promises that come with one).
+version               = "0.1.0"
 edition.workspace     = true
 authors.workspace     = true
 license.workspace     = true
