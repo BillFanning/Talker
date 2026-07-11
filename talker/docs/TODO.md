@@ -30,7 +30,7 @@ Cross off items as they are completed. Add new ones inline as they come up.
   detail header now mirrors listener's channel block (GUI-merge harmonization,
   2026-07-10): status glyph + name row, `status · interface` row, sent totals +
   throughput (byte- and message-based), and performance readouts (`Status queue`
-  occupancy/peak vs `gui::STATUS_QUEUE_CAP`, `Display updates dropped` from
+  occupancy/peak vs `core::supervisor::STATUS_QUEUE_CAP`, `Display updates dropped` from
   `TalkerStatus::Sent::dropped_statuses`, `Missed sends` from
   `Schedule::missed_sends`). Also from the same harmonization pass: the
   lifecycle buttons are listener's labeled pair (`start_button` decision), the
@@ -72,13 +72,14 @@ Cross off items as they are completed. Add new ones inline as they come up.
   `command_not_delivered` (gui/mod.rs), distinguishing queue-full (runner
   wedged) from runner-exited (a moot Stop stays silent). Listener's sibling
   landed in the same commit (listener TODO).
-- [ ] **TalkerSupervisor (ADR-019, ACCEPTED 2026-07-11 — implementation
-  pending, sequenced after ADR-018 which is now in).** Channel lifecycle,
-  thread collection, draining, counters, and observer policy live in
-  `gui/mod.rs` (~1.5 k lines), contradicting the spec's core-owns-the-channel-
-  collection boundary; a `core` supervisor owns the runners and exposes one
-  API to CLI and GUI — also the path to CLI parity. Needs its own focused
-  session; settle ADR-019's open points at implementation time.
+- [x] **TalkerSupervisor (ADR-019) — DONE 2026-07-11.**
+  `core::supervisor::TalkerSupervisor` owns the channel slots (runner threads,
+  channel pairs, draining, `ChannelTelemetry`); the GUI holds view-state only
+  and reads `telemetry(i)`. Settlements + two behaviour improvements (exact
+  totals at rest via kept draining receivers; orphan reaping) recorded in the
+  ADR-019 entry. CLI adoption rides with the future ad-hoc CLI work (the
+  parity item below) — the one-shot headless run keeps its blocking `--echo`
+  funnel by design. Pinned by the `core::supervisor` unit tests.
 - [ ] **Palette bypasses.** Several status/warning/log/destructive colors are
   hardcoded in the talker GUI (e.g. `gui/detail.rs` destructive red,
   `gui/mod.rs` log-severity colors) instead of coming from

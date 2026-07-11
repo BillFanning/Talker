@@ -6,7 +6,6 @@
 use egui::{Align, Layout};
 
 use crate::core::message::NmeaChecksumMode;
-use crate::core::runner::TalkerCommand;
 
 use wiredata_ui::{fonts::bold, format::human_bytes, glyphs};
 
@@ -54,9 +53,10 @@ impl TalkerApp {
     /// as in listener.
     fn show_channel_header(&mut self, ui: &mut egui::Ui, i: usize, running: bool) {
         let pal = theme_palette(ui);
-        // Owned copy: the error is rendered at the bottom of the header,
-        // after several `&mut self` widget closures.
-        let error: Option<String> = self.conn_errors.get(i).and_then(|e| e.clone());
+        // Owned snapshot of the channel's telemetry (ADR-019): the readouts
+        // are rendered across several `&mut self` widget closures.
+        let telemetry = self.sup.telemetry(i);
+        let error: Option<String> = telemetry.last_error.clone();
         let (glyph, glyph_color, status_word) = lifecycle_indicator(running, error.is_some(), pal);
         let (iface_drift, msg_drift) = self.detect_drift(i);
 
@@ -123,8 +123,8 @@ impl TalkerApp {
 
         // Sent totals + rolling throughput (listener's byte-based liveness
         // line, plus talker's message-count view of the same traffic).
-        let msgs = self.sent_counts.get(i).copied().unwrap_or(0);
-        let bytes = self.sent_bytes.get(i).copied().unwrap_or(0);
+        let msgs = telemetry.total_count;
+        let bytes = telemetry.total_bytes;
         let (mps, bps) = self
             .rates
             .get(i)
@@ -145,8 +145,8 @@ impl TalkerApp {
             ui.label(if hot { rt.color(pal.warning_amber) } else { rt })
                 .on_hover_text(tip);
         };
-        let qlen = self.status_queue_len.get(i).copied().unwrap_or(0);
-        let qpeak = self.status_queue_peak.get(i).copied().unwrap_or(0);
+        let qlen = telemetry.queue_len;
+        let qpeak = telemetry.queue_peak;
         perf_line(
             ui,
             format!(
@@ -158,7 +158,7 @@ impl TalkerApp {
              the UI drains it every frame. A peak near capacity means updates \
              are about to be sampled — sends themselves are never delayed.",
         );
-        let drops = self.status_drops.get(i).copied().unwrap_or(0);
+        let drops = telemetry.dropped_statuses;
         perf_line(
             ui,
             format!("Display updates dropped: {drops}"),
@@ -167,7 +167,7 @@ impl TalkerApp {
              full. Counts stay exact (each update carries the running totals); \
              only the Output pane sampled.",
         );
-        let missed = self.missed_sends.get(i).copied().unwrap_or(0);
+        let missed = telemetry.missed_sends;
         perf_line(
             ui,
             format!("Missed sends: {missed}"),
@@ -282,32 +282,18 @@ impl TalkerApp {
         }
 
         ui.separator();
-        let per_message_counts: &[u64] = self
-            .message_sent_counts
-            .get(i)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
+        let per_message_counts = self.sup.telemetry(i).per_message_counts;
         let interval_changes = show_schedule_section(
             ui,
             &mut self.sched_drafts[i],
             &mut self.dirty,
-            per_message_counts,
+            &per_message_counts,
             running,
         );
         for (msg_index, interval_ms) in interval_changes {
-            let failed = match self.talkers.get(i) {
-                Some(Some(handle)) => handle
-                    .cmd_tx
-                    .try_send(TalkerCommand::SetInterval {
-                        index: msg_index,
-                        interval_ms,
-                    })
-                    .err()
-                    .map(|e| matches!(e, crossbeam_channel::TrySendError::Full(_))),
-                _ => None,
-            };
-            if let Some(queue_full) = failed {
-                self.command_not_delivered(i, "the interval change", queue_full);
+            if self.sup.is_running(i) {
+                // Undeliverable changes surface in the channel telemetry.
+                let _ = self.sup.set_interval(i, msg_index, interval_ms);
             }
         }
     }

@@ -384,17 +384,41 @@ lifecycle, runner-thread collection, draining, cumulative counters, and observer
 policy live in `gui/mod.rs` (~1.5 k lines) — the GUI is not the thin layer §127/AGENTS
 call for, and the CLI cannot reach that logic (part of why CLI parity lags).
 
-**Proposal:** A `core::supervisor::TalkerSupervisor` owns the runner threads and their
-crossbeam channel pairs, exposing one API (spawn/stop/apply/set-interval/drain +
-status aggregation) consumed by both `cli/` and `gui/`. The GUI keeps only
-view-state (selection, editors, scroll positions) and rendering; the CLI gains the
-same lifecycle surface, closing the parity gap.
+**Decision (implemented 2026-07-11):** `core::supervisor::TalkerSupervisor` owns
+index-stable channel slots — runner threads, command/status channel pairs, draining
+buckets, and per-channel `ChannelTelemetry` (counts, queue occupancy, errors, the
+error banner). The open points settled as:
 
-**Open points to settle at acceptance:** API shape (blocking methods vs. command
-enum); who owns the status-drain cadence (supervisor thread vs. caller poll); whether
-the ADR-018 telemetry lanes land before, after, or together with this refactor
-(they touch the same status plumbing — sequencing matters); test strategy for the
-extracted lifecycle (the current GUI-embedded logic is untested at the unit level).
+- **API shape: blocking methods, no command enum.** `start`/`stop`/
+  `update_interface`/`set_interval` are direct calls returning a `CommandOutcome`
+  (`Delivered`/`QueueFull`/`NotRunning`); undeliverable commands are recorded in the
+  telemetry, so the caller can fire-and-forget. No supervisor thread, matching
+  ADR-002 — everything runs on the caller's thread and never blocks (`join_all` is
+  the one deliberate exception, exit-path only).
+- **Drain cadence: caller-owned poll.** `poll()` non-blockingly folds every runner's
+  status lanes (ADR-018) into the telemetry and returns the payload samples; the GUI
+  calls it each frame, woken by the notify callback it installs via `set_notify`.
+- **Sequencing:** landed after ADR-018 as planned; the lanes moved once.
+- **Tests:** the extracted lifecycle is unit-tested in core against mock interfaces
+  (start/poll/stop reap + exact totals at rest, command-failure surfacing, restart
+  reset + predecessor joins, slot removal), which the GUI-embedded version never was.
+- **CLI adoption is deferred to the ad-hoc CLI work.** The current CLI is a one-shot
+  headless run whose blocking status funnel is the right shape for `--echo`
+  (lowest-latency payload delivery); wrapping it in a poll loop would only add
+  latency. The supervisor is the base for the *future* interactive CLI lifecycle
+  (the parity item in TODO.md); today both layers consume the same runner API.
+
+**Consequences:**
+- The GUI holds pure view-state (drafts, displays, rates, selection, log tallies)
+  and reads `telemetry(i)` when rendering; ~10 parallel per-channel `Vec`s deleted.
+- Two behaviour improvements fell out: a stopped runner's status receiver is kept
+  until its thread exits, so ADR-018's final `Counters` lands and totals read exact
+  at rest (previously the tail was dropped with the receiver); removed channels'
+  runners land in an orphan bucket and are reaped, not silently detached.
+- The status-bar "Errors" tally is now per-run (each channel's count resets when it
+  starts, like the send counts and log tallies) instead of per-app-lifetime.
+- `STATUS_QUEUE_CAP` moved to `core::supervisor` (re-exported to the GUI for the
+  detail-header readout).
 
 ---
 

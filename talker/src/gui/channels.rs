@@ -98,16 +98,19 @@ impl TalkerApp {
         // Snapshot the rows, then render — the click handler mutates
         // `selected` (via deferred), which must not alias the borrow.
         let rows: Vec<ChannelRow> = (0..self.conn_drafts.len())
-            .map(|i| ChannelRow {
-                name: self.channel_name(i),
-                summary: interface_summary(&self.conn_drafts[i]),
-                running: self.is_connection_running(i),
-                error: self.conn_errors.get(i).and_then(|e| e.clone()),
-                sent: self.sent_counts.get(i).copied().unwrap_or(0),
-                per_sec: self.rates.get(i).map(|r| r.per_sec).unwrap_or(0.0),
-                info: self.log_counts.get(i).map(|c| c.info).unwrap_or(0),
-                warnings: self.log_counts.get(i).map(|c| c.warn).unwrap_or(0),
-                errors: self.log_counts.get(i).map(|c| c.error).unwrap_or(0),
+            .map(|i| {
+                let telemetry = self.sup.telemetry(i);
+                ChannelRow {
+                    name: self.channel_name(i),
+                    summary: interface_summary(&self.conn_drafts[i]),
+                    running: self.is_connection_running(i),
+                    error: telemetry.last_error,
+                    sent: telemetry.total_count,
+                    per_sec: self.rates.get(i).map(|r| r.per_sec).unwrap_or(0.0),
+                    info: self.log_counts.get(i).map(|c| c.info).unwrap_or(0),
+                    warnings: self.log_counts.get(i).map(|c| c.warn).unwrap_or(0),
+                    errors: self.log_counts.get(i).map(|c| c.error).unwrap_or(0),
+                }
             })
             .collect();
 
@@ -146,7 +149,6 @@ impl TalkerApp {
                         .clicked()
                     {
                         if self.confirm_discard() {
-                            self.error_count = 0;
                             self.load_profile_from_path(&path);
                         }
                         ui.close();
@@ -316,7 +318,7 @@ impl TalkerApp {
         let base = egui::TextStyle::Body.resolve(ui.style()).size;
         for i in 0..self.conn_drafts.len() {
             let running = self.is_connection_running(i);
-            let error = self.conn_errors.get(i).is_some_and(|e| e.is_some());
+            let error = self.sup.telemetry(i).last_error.is_some();
             let (glyph, color, _) = lifecycle_indicator(running, error, pal);
             let selected = self.selected == Some(i);
             let text = egui::RichText::new(glyph)
