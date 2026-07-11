@@ -169,10 +169,10 @@ impl ListenerApp {
                     let mut frame = egui::Frame::group(ui.style())
                         .inner_margin(8.0)
                         .corner_radius(egui::CornerRadius::same(6))
-                        .stroke(egui::Stroke::new(1.5, theme::box_stroke()));
+                        .stroke(egui::Stroke::new(1.5_f32, theme::box_stroke()));
                     if selected {
                         frame.fill = visuals.selection.bg_fill;
-                        frame.stroke = egui::Stroke::new(1.5, visuals.selection.stroke.color);
+                        frame.stroke = egui::Stroke::new(1.5_f32, visuals.selection.stroke.color);
                     }
                     let inner = frame.show(ui, |ui| {
                         ui.set_width(ui.available_width());

@@ -185,10 +185,10 @@ impl TalkerApp {
         let mut frame = egui::Frame::group(ui.style())
             .inner_margin(8.0)
             .corner_radius(egui::CornerRadius::same(6))
-            .stroke(egui::Stroke::new(1.5, pal.box_stroke));
+            .stroke(egui::Stroke::new(1.5_f32, pal.box_stroke));
         if selected {
             frame.fill = ui.visuals().selection.bg_fill;
-            frame.stroke = egui::Stroke::new(1.5, ui.visuals().selection.stroke.color);
+            frame.stroke = egui::Stroke::new(1.5_f32, ui.visuals().selection.stroke.color);
         }
         let (box_resp, remove_clicked) = ui
             .push_id(i, |ui| {

@@ -1017,7 +1017,7 @@ impl eframe::App for TalkerApp {
         egui::Frame::new()
             .inner_margin(4.0)
             .stroke(egui::Stroke::new(
-                1.5,
+                1.5_f32,
                 egui::Color32::from_rgb(110, 120, 145),
             ))
             .show(ui, |ui| {

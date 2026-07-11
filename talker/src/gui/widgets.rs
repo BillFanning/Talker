@@ -1415,7 +1415,7 @@ where
         ui.painter().rect_stroke(
             resp.rect,
             egui::CornerRadius::same(2),
-            egui::Stroke::new(2.0, RED),
+            egui::Stroke::new(2.0_f32, RED),
             egui::StrokeKind::Outside,
         );
         resp.on_hover_text(msg)
