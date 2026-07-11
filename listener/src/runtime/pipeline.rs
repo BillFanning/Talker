@@ -196,6 +196,9 @@ pub struct ChannelPipeline {
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
     /// Whether the raw recorder's fault has already been reported.
     recording_fault_reported: bool,
+    /// Whether a display recorder's fault has already been reported —
+    /// `recording_fault_reported`'s Display sibling (§54 parity).
+    display_fault_reported: bool,
     /// A `begin_recording` that failed to even open the file leaves no recorder, so the
     /// recording state would otherwise read back as "off". This sticky flag makes it
     /// read `Faulted` instead (so the GUI shows ⚠, not ■). Cleared on a successful
@@ -302,6 +305,7 @@ impl ChannelPipeline {
             ),
             raw_recorder: None,
             recording_fault_reported: false,
+            display_fault_reported: false,
             begin_faulted: false,
             display_begin_faulted: false,
             display_recording_settings: None,
@@ -419,25 +423,10 @@ impl ChannelPipeline {
 
         // 1. Raw recorder tap (§53). Non-blocking: a full recorder queue faults
         // the recording rather than stalling reception (§56.1). `try_record`
-        // updates the handle's state internally.
-        let mut recording_just_faulted = false;
+        // no-ops once faulted; faults are reported (once) by the
+        // `check_recording_faults` call at the end of this method.
         if let Some(recorder) = self.raw_recorder.as_mut() {
-            if recorder.state() == RecordingState::Enabled {
-                recorder.try_record(Arc::clone(&data));
-                if recorder.state() == RecordingState::Faulted && !self.recording_fault_reported {
-                    self.recording_fault_reported = true;
-                    recording_just_faulted = true;
-                }
-            }
-        }
-        if recording_just_faulted {
-            self.diagnostics.record(Diagnostic::error(format!(
-                "raw recording faulted on channel {}",
-                self.channel_id
-            )));
-            if let Some(events) = &self.events {
-                let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
-            }
+            recorder.try_record(Arc::clone(&data));
         }
 
         // 2. Stream scrollback (§87): keep the most recent bytes exactly as
@@ -516,6 +505,63 @@ impl ChannelPipeline {
                         text,
                         timestamp: Some(data.received_at),
                     });
+                }
+            }
+        }
+
+        // 5. Surface any recorder fault (raw or display) exactly once (§56.1).
+        self.check_recording_faults();
+    }
+
+    /// Report any recorder fault once: an error diagnostic carrying the
+    /// recorder's terminal error, plus a `RecordingFaulted` event (§56.1, §137).
+    ///
+    /// Called after every ingest *and* from `run_channel`'s periodic tick — the
+    /// recorder task dies asynchronously (write/flush failure), so on a stream
+    /// that then goes quiet there is no later enqueue to trip on; without the
+    /// periodic check the UI would show a dead recording as Enabled forever.
+    pub fn check_recording_faults(&mut self) {
+        if !self.recording_fault_reported
+            && self
+                .raw_recorder
+                .as_ref()
+                .is_some_and(|r| r.state() == RecordingState::Faulted)
+        {
+            self.recording_fault_reported = true;
+            let why = self
+                .raw_recorder
+                .as_ref()
+                .and_then(|r| r.fault_error())
+                .unwrap_or("recorder task ended unexpectedly")
+                .to_owned();
+            self.diagnostics.record(Diagnostic::error(format!(
+                "raw recording faulted on channel {}: {why}",
+                self.channel_id
+            )));
+            if let Some(events) = &self.events {
+                let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+            }
+        }
+        let display_fault = self.display_views.iter().find_map(|v| {
+            v.recorder
+                .as_ref()
+                .filter(|r| r.recording.state() == RecordingState::Faulted)
+                .map(|r| {
+                    r.recording
+                        .fault_error()
+                        .unwrap_or("recorder task ended unexpectedly")
+                        .to_owned()
+                })
+        });
+        if let Some(why) = display_fault {
+            if !self.display_fault_reported {
+                self.display_fault_reported = true;
+                self.diagnostics.record(Diagnostic::error(format!(
+                    "display recording faulted on channel {}: {why}",
+                    self.channel_id
+                )));
+                if let Some(events) = &self.events {
+                    let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
                 }
             }
         }
@@ -896,6 +942,7 @@ impl ChannelPipeline {
         match created {
             Ok(rec) => {
                 self.set_display_recorder(settings.renderer.clone(), rec);
+                self.display_fault_reported = false;
                 self.display_begin_faulted = false;
                 self.diagnostics.record(Diagnostic::event(format!(
                     "Display recording started → {}",
@@ -1319,6 +1366,9 @@ pub async fn run_channel(
             _ = idle_check.tick() => {
                 pipeline.evaluate_idle_rules(Instant::now());
                 pipeline.apply_pending_records().await;
+                // Recorder tasks fault asynchronously; on a quiet stream this
+                // tick is the only place the fault gets reported (§56.1).
+                pipeline.check_recording_faults();
             }
             maybe = ingest.recv() => match maybe {
                 Some(data) => {

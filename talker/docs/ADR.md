@@ -325,6 +325,57 @@ The version number increments only on breaking schema changes that `serde(defaul
 
 ---
 
+## ADR-018 — Talker telemetry split (PROPOSED — skeleton, not yet accepted)
+
+**Status:** Proposed (external review, 2026-07-11). Skeleton only — accept, amend, or
+reject before implementing; the TODO "Telemetry split" item tracks it.
+
+**Context:** Every send emits a payload-bearing `TalkerStatus::Sent` over the
+per-channel status channel; the GUI maintains a front-drained 200-item display Vec and
+rebuilds the complete output string per repaint. Correctness is protected (bounded
+queue, drop-and-count, `dropped_statuses` self-correction — sends are never delayed),
+but the per-send CPU/allocation cost scales with rate and becomes load-bearing in the
+500 Hz–1 kHz territory ADR-017 opened.
+
+**Proposal:** Split the status protocol into three lanes with different cadences:
+(1) **periodic counters** — total/per-message counts, bytes, missed sends, on a timer
+(~5 Hz), not per send; (2) **sampled display batches** — a bounded sample of recent
+payloads for the Output pane, coalesced; (3) **immediate edge-triggered errors** —
+first failure/recovery transitions, never rate-limited away. Full per-send payload
+delivery remains only for CLI `--echo`, which explicitly asks for it.
+
+**Open points to settle at acceptance:** exact counter cadence; sampling policy for
+the display lane (newest-N vs. reservoir); whether `Sent` survives as a variant or
+splits into three; migration for the GUI's self-correcting counter logic; benchmark
+evidence (workspace harness — TODO) sizing the win before the protocol churn.
+
+---
+
+## ADR-019 — Core `TalkerSupervisor` owning the channel collection (PROPOSED — skeleton, not yet accepted)
+
+**Status:** Proposed (external review, 2026-07-11). Skeleton only — accept, amend, or
+reject before implementing; the TODO "TalkerSupervisor" item tracks it.
+
+**Context:** The spec places channel collection and management in `core`
+(`core::channel` manages a collection from day one), but in practice channel
+lifecycle, runner-thread collection, draining, cumulative counters, and observer
+policy live in `gui/mod.rs` (~1.5 k lines) — the GUI is not the thin layer §127/AGENTS
+call for, and the CLI cannot reach that logic (part of why CLI parity lags).
+
+**Proposal:** A `core::supervisor::TalkerSupervisor` owns the runner threads and their
+crossbeam channel pairs, exposing one API (spawn/stop/apply/set-interval/drain +
+status aggregation) consumed by both `cli/` and `gui/`. The GUI keeps only
+view-state (selection, editors, scroll positions) and rendering; the CLI gains the
+same lifecycle surface, closing the parity gap.
+
+**Open points to settle at acceptance:** API shape (blocking methods vs. command
+enum); who owns the status-drain cadence (supervisor thread vs. caller poll); whether
+the ADR-018 telemetry lanes land before, after, or together with this refactor
+(they touch the same status plumbing — sequencing matters); test strategy for the
+extracted lifecycle (the current GUI-embedded logic is untested at the unit level).
+
+---
+
 ## Open questions
 
 The following decisions are deferred until the relevant module is written. They are recorded here so they are not forgotten and so the eventual decision (in a future ADR or commit) can reference the context.

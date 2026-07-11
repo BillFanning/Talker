@@ -23,9 +23,12 @@ pub struct CountBounded<T> {
 }
 
 impl<T> CountBounded<T> {
+    /// `limit` is clamped to `1..=DEFAULT_BACKSTOP` — the backstop is a hard
+    /// cap, not just the unset-limit default, so a hand-edited profile with an
+    /// absurd limit cannot make retention effectively unbounded (§80, §124).
     pub fn new(limit: usize) -> Self {
         Self {
-            limit: limit.max(1),
+            limit: limit.clamp(1, DEFAULT_BACKSTOP),
             items: VecDeque::new(),
         }
     }
@@ -57,6 +60,14 @@ impl<T> CountBounded<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limit_is_clamped_to_the_backstop() {
+        let store: CountBounded<u8> = CountBounded::new(usize::MAX);
+        assert_eq!(store.limit, DEFAULT_BACKSTOP);
+        let floor: CountBounded<u8> = CountBounded::new(0);
+        assert_eq!(floor.limit, 1);
+    }
 
     #[test]
     fn count_bounded_log_evicts_oldest() {

@@ -19,8 +19,9 @@ pub fn light_visuals() -> egui::Visuals {
     light.window_fill = egui::Color32::from_gray(220);
     // More visible dividers: `ui.separator()` draws with the noninteractive
     // bg_stroke, which defaults to a very faint grey — darken and thicken it.
-    light.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.5, egui::Color32::from_gray(120));
-    let btn_border = egui::Stroke::new(1.0, egui::Color32::from_gray(150));
+    light.widgets.noninteractive.bg_stroke =
+        egui::Stroke::new(1.5_f32, egui::Color32::from_gray(120));
+    let btn_border = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(150));
     let btn_round = egui::CornerRadius::same(4);
     light.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(236);
     light.widgets.inactive.bg_fill = egui::Color32::from_gray(236);
@@ -28,11 +29,11 @@ pub fn light_visuals() -> egui::Visuals {
     light.widgets.inactive.corner_radius = btn_round;
     light.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(248);
     light.widgets.hovered.bg_fill = egui::Color32::from_gray(248);
-    light.widgets.hovered.bg_stroke = egui::Stroke::new(1.2, egui::Color32::from_gray(110));
+    light.widgets.hovered.bg_stroke = egui::Stroke::new(1.2_f32, egui::Color32::from_gray(110));
     light.widgets.hovered.corner_radius = btn_round;
     light.widgets.active.weak_bg_fill = egui::Color32::from_gray(214);
     light.widgets.active.bg_fill = egui::Color32::from_gray(214);
-    light.widgets.active.bg_stroke = egui::Stroke::new(1.2, egui::Color32::from_gray(90));
+    light.widgets.active.bg_stroke = egui::Stroke::new(1.2_f32, egui::Color32::from_gray(90));
     light.widgets.active.corner_radius = btn_round;
     light
 }
@@ -45,8 +46,9 @@ pub fn dark_visuals() -> egui::Visuals {
     dark.override_text_color = Some(fg);
     dark.widgets.noninteractive.fg_stroke.color = fg;
     dark.widgets.inactive.fg_stroke.color = fg;
-    dark.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.5, egui::Color32::from_gray(100));
-    let btn_border = egui::Stroke::new(1.0, egui::Color32::from_gray(105));
+    dark.widgets.noninteractive.bg_stroke =
+        egui::Stroke::new(1.5_f32, egui::Color32::from_gray(100));
+    let btn_border = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(105));
     let btn_round = egui::CornerRadius::same(4);
     dark.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(52);
     dark.widgets.inactive.bg_fill = egui::Color32::from_gray(52);
@@ -54,18 +56,18 @@ pub fn dark_visuals() -> egui::Visuals {
     dark.widgets.inactive.corner_radius = btn_round;
     dark.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(64);
     dark.widgets.hovered.bg_fill = egui::Color32::from_gray(64);
-    dark.widgets.hovered.bg_stroke = egui::Stroke::new(1.2, egui::Color32::from_gray(140));
+    dark.widgets.hovered.bg_stroke = egui::Stroke::new(1.2_f32, egui::Color32::from_gray(140));
     dark.widgets.hovered.corner_radius = btn_round;
     dark.widgets.active.weak_bg_fill = egui::Color32::from_gray(40);
     dark.widgets.active.bg_fill = egui::Color32::from_gray(40);
-    dark.widgets.active.bg_stroke = egui::Stroke::new(1.2, egui::Color32::from_gray(160));
+    dark.widgets.active.bg_stroke = egui::Stroke::new(1.2_f32, egui::Color32::from_gray(160));
     dark.widgets.active.corner_radius = btn_round;
     dark
 }
 
 /// Install both themes' visuals. The caller picks the active theme with
-/// `ctx.set_theme(egui::ThemePreference::...)` — listener pins Light today;
-/// talker toggles.
+/// `ctx.set_theme(egui::ThemePreference::...)` — both apps ship a Light/Dark
+/// toggle.
 pub fn install_visuals(ctx: &egui::Context) {
     ctx.set_visuals_of(egui::Theme::Light, light_visuals());
     ctx.set_visuals_of(egui::Theme::Dark, dark_visuals());

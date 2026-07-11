@@ -279,12 +279,18 @@ impl MonitoredChannel {
 
     /// Graceful stop (§110): stop reception; the transport's sender drops, the
     /// pipeline drains the accepted backlog and returns, and the monitor ends.
-    pub(crate) async fn stop(self) -> ChannelPipeline {
+    /// `None` if the pipeline task panicked — its final state (diagnostics,
+    /// snapshot) is unrecoverable, but the stop itself still completes rather
+    /// than propagating the panic into the orchestrator.
+    pub(crate) async fn stop(self) -> Option<ChannelPipeline> {
         self.transport_cancel.cancel();
-        let pipeline = self
-            .pipeline_task
-            .await
-            .expect("pipeline task should not panic");
+        let pipeline = match self.pipeline_task.await {
+            Ok(pipeline) => Some(pipeline),
+            Err(join_err) => {
+                tracing::error!("channel pipeline task failed during stop: {join_err}");
+                None
+            }
+        };
         let _ = self.monitor.await;
         pipeline
     }
@@ -430,8 +436,9 @@ impl RunningChannel {
         &mut self.events
     }
 
-    /// Graceful stop (§110).
-    pub async fn stop(self) -> ChannelPipeline {
+    /// Graceful stop (§110). `None` if the pipeline task panicked (its final
+    /// state is unrecoverable, but the stop still completes).
+    pub async fn stop(self) -> Option<ChannelPipeline> {
         self.tasks.stop().await
     }
 
@@ -579,7 +586,8 @@ mod tests {
         .expect("datagrams did not arrive");
         let pipeline = tokio::time::timeout(Duration::from_secs(5), running.stop())
             .await
-            .expect("graceful stop hung");
+            .expect("graceful stop hung")
+            .expect("pipeline task panicked");
         // All five datagrams' bytes were received before finalizing.
         assert_eq!(pipeline.snapshot().activity.total_bytes, 5);
     }

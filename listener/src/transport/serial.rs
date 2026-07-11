@@ -169,9 +169,17 @@ impl SerialTransport {
     /// Open the port (§8.2). A bounded blocking op, run on `spawn_blocking`
     /// (§97.1). Fallible so the runtime can take Starting → Faulted (§9, §71).
     pub async fn open(self) -> serialport::Result<OpenSerialTransport> {
-        tokio::task::spawn_blocking(move || self.open_blocking())
-            .await
-            .expect("serial open task should not panic")
+        match tokio::task::spawn_blocking(move || self.open_blocking()).await {
+            Ok(result) => result,
+            // A panicked open task (e.g. a driver-provoked panic inside the
+            // serial crate) becomes an open error like any other, so the
+            // runtime takes Starting → Faulted instead of poisoning the app —
+            // production paths never panic.
+            Err(join_err) => Err(serialport::Error::new(
+                serialport::ErrorKind::Unknown,
+                format!("serial open task failed: {join_err}"),
+            )),
+        }
     }
 
     fn open_blocking(self) -> serialport::Result<OpenSerialTransport> {

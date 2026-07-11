@@ -18,7 +18,7 @@
 pub mod file;
 pub mod file_rotation;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -158,6 +158,7 @@ async fn run_recorder<I, W>(
     mut writer: W,
     mut items: mpsc::Receiver<I>,
     mut terminate: oneshot::Receiver<RecordingStopReason>,
+    fault: Arc<OnceLock<String>>,
 ) where
     I: Send + 'static,
     W: RecorderWriter<I> + 'static,
@@ -186,7 +187,11 @@ async fn run_recorder<I, W>(
             maybe = items.recv() => match maybe {
                 Some(item) => {
                     if let Err(err) = writer.write(&item).await {
-                        // Write fault: truncate here, do not drain (§56.1).
+                        // Write fault: truncate here, do not drain (§56.1). Publish
+                        // the fault before exiting so the producer handle reads
+                        // Faulted even if the stream then goes quiet and no later
+                        // enqueue trips over the closed queue.
+                        let _ = fault.set(err.to_string());
                         let _ = writer.finalize(RecordingStopReason::Faulted(err)).await;
                         return;
                     }
@@ -199,6 +204,10 @@ async fn run_recorder<I, W>(
             _ = flush_tick.tick() => {
                 if let Err(err) = writer.flush().await {
                     // A failed flush is a write fault: truncate here (§56.1).
+                    // Published like a write fault: a flush failure needs no
+                    // traffic at all, so the eager fault cell is the only way a
+                    // quiet stream's handle ever learns of it.
+                    let _ = fault.set(err.to_string());
                     let _ = writer.finalize(RecordingStopReason::Faulted(err)).await;
                     return;
                 }
@@ -214,6 +223,12 @@ pub struct Recording<I> {
     terminate: Option<oneshot::Sender<RecordingStopReason>>,
     state: RecordingState,
     task: JoinHandle<()>,
+    /// Terminal fault message, published by the recorder task (write/flush
+    /// failure) or locally (queue overflow). Once set, [`state`](Self::state)
+    /// reads `Faulted` immediately — without this, the handle only learned of a
+    /// task-side fault when a *later* enqueue hit the closed queue, and a stream
+    /// that goes quiet after a disk fault never enqueues again (§56.1).
+    fault: Arc<OnceLock<String>>,
     /// High-water mark of the queue depth seen at enqueue time (§99) — for stress
     /// testing. A 5 Hz stats poll would miss a transient backlog; this peak does not.
     peak_depth: usize,
@@ -221,7 +236,15 @@ pub struct Recording<I> {
 
 impl<I: Send + 'static> Recording<I> {
     pub fn state(&self) -> RecordingState {
+        if self.fault.get().is_some() {
+            return RecordingState::Faulted;
+        }
         self.state
+    }
+
+    /// Why the recording faulted (the rendered terminal error), if it has.
+    pub fn fault_error(&self) -> Option<&str> {
+        self.fault.get().map(String::as_str)
     }
 
     /// Current/peak/capacity of the recorder queue as a `(current, peak, capacity)`
@@ -234,8 +257,9 @@ impl<I: Send + 'static> Recording<I> {
     }
 
     /// Offer one item to the recorder. Non-blocking (§56.1): a full queue faults
-    /// the recording; a closed queue (task already faulted on a write error)
-    /// transitions the handle to `Faulted` lazily.
+    /// the recording. (A closed queue means the task already faulted and
+    /// published its error — [`state`](Self::state) reads it eagerly, so the
+    /// local transition here is just belt-and-braces.)
     pub fn try_record(&mut self, item: I) {
         if self.state != RecordingState::Enabled {
             return;
@@ -256,6 +280,7 @@ impl<I: Send + 'static> Recording<I> {
 
     fn fault(&mut self, err: RecordError) {
         self.state = RecordingState::Faulted;
+        let _ = self.fault.set(err.to_string());
         if let Some(terminate) = self.terminate.take() {
             let _ = terminate.send(RecordingStopReason::Faulted(err));
         }
@@ -298,12 +323,14 @@ where
 {
     let (items_tx, items_rx) = mpsc::channel(capacity.max(1));
     let (term_tx, term_rx) = oneshot::channel();
-    let task = tokio::spawn(run_recorder(writer, items_rx, term_rx));
+    let fault = Arc::new(OnceLock::new());
+    let task = tokio::spawn(run_recorder(writer, items_rx, term_rx, Arc::clone(&fault)));
     Recording {
         items: items_tx,
         terminate: Some(term_tx),
         state: RecordingState::Enabled,
         task,
+        fault,
         peak_depth: 0,
     }
 }
@@ -342,13 +369,90 @@ mod tests {
     async fn write_error_faults_and_ends_the_recorder_task() {
         let (tx, rx) = mpsc::channel(4);
         let (_term_tx, term_rx) = oneshot::channel();
-        let task = tokio::spawn(run_recorder(FailingRecorder, rx, term_rx));
+        let fault = Arc::new(OnceLock::new());
+        let task = tokio::spawn(run_recorder(FailingRecorder, rx, term_rx, fault));
 
         tx.send(chunk(b"data")).await.unwrap();
         // The write fails, so the task finalizes and ends on its own.
         task.await.unwrap();
         // The receiver is gone: further sends fail (the channel is closed).
         assert!(tx.send(chunk(b"more")).await.is_err());
+    }
+
+    /// A recorder whose write fails with a disk-style I/O error — for the
+    /// quiet-stream fault-visibility tests.
+    struct DiskFailRecorder;
+
+    #[async_trait::async_trait]
+    impl RawRecorder for DiskFailRecorder {
+        async fn write_chunk(&mut self, _chunk: &ReceivedData) -> Result<(), RecordError> {
+            Err(RecordError::Io(std::io::Error::other("disk full")))
+        }
+        async fn flush(&mut self) -> Result<(), RecordError> {
+            Ok(())
+        }
+        async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+            Ok(())
+        }
+    }
+
+    /// The core §56.1 visibility guarantee: after a write fault, the *handle*
+    /// reads `Faulted` with **no further enqueues** — a stream that goes quiet
+    /// right after the disk fails must not show Enabled forever.
+    #[tokio::test]
+    async fn write_fault_is_visible_on_the_handle_without_further_enqueues() {
+        let mut recording = start_raw_recording(DiskFailRecorder, 8);
+        recording.try_record(chunk(b"data")); // accepted; the write itself fails
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while recording.state() != RecordingState::Faulted {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "handle never observed the write fault"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let why = recording.fault_error().expect("fault carries its error");
+        assert!(why.contains("disk full"), "unexpected fault message: {why}");
+    }
+
+    /// A recorder whose writes succeed but whose periodic flush fails — the
+    /// fault path that needs no traffic at all.
+    struct FlushFailRecorder;
+
+    #[async_trait::async_trait]
+    impl RawRecorder for FlushFailRecorder {
+        async fn write_chunk(&mut self, _chunk: &ReceivedData) -> Result<(), RecordError> {
+            Ok(())
+        }
+        async fn flush(&mut self) -> Result<(), RecordError> {
+            Err(RecordError::Io(std::io::Error::other("flush: device gone")))
+        }
+        async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+            Ok(())
+        }
+    }
+
+    /// A periodic-flush failure faults the recording and the handle sees it —
+    /// paused tokio time drives the [`FLUSH_INTERVAL`] tick without real waits.
+    #[tokio::test(start_paused = true)]
+    async fn flush_failure_faults_the_recording() {
+        let recording = start_raw_recording(FlushFailRecorder, 8);
+        // No traffic at all: only the flush timer can fault this recording.
+        let mut waited = std::time::Duration::ZERO;
+        while recording.state() != RecordingState::Faulted {
+            assert!(
+                waited < FLUSH_INTERVAL * 10,
+                "handle never observed the flush fault"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            waited += std::time::Duration::from_millis(100);
+        }
+        let why = recording.fault_error().expect("fault carries its error");
+        assert!(
+            why.contains("device gone"),
+            "unexpected fault message: {why}"
+        );
     }
 
     /// A recorder that counts the chunks it accepts — for the handle's

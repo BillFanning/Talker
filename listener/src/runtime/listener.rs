@@ -1230,8 +1230,9 @@ fn display_renderer(config: &ChannelConfig) -> DisplayView {
 async fn drain_handle(handle: Option<ChannelHandle>) -> Option<ChannelSnapshot> {
     match handle {
         Some(ChannelHandle::Data(tasks)) => {
-            let pipeline = tasks.stop().await;
-            Some(pipeline.snapshot())
+            // `None` if the pipeline task panicked — no final snapshot then,
+            // which callers already tolerate (same as a TCP listener).
+            tasks.stop().await.map(|pipeline| pipeline.snapshot())
         }
         Some(ChannelHandle::TcpListener(listener)) => {
             listener.stop().await;

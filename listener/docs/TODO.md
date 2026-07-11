@@ -184,6 +184,44 @@ Message-model removal). Everything below this block is verified done:
       `stream_renderer_is_chunking_invariant` +
       `disp_is_the_exact_rendered_stream_across_read_boundaries`.
 
+## Robustness & performance (external review, 2026-07-11)
+
+- [x] **Recorder faults are now visible on a quiet stream** (§56.1). The recorder
+      task publishes its terminal error into a shared fault cell before exiting
+      (`Recording::fault_error`); `Recording::state()` reads it eagerly, and
+      `ChannelPipeline::check_recording_faults` — run after each ingest *and* on
+      `run_channel`'s 250 ms tick — reports it once (error diagnostic carrying
+      the cause + `RecordingFaulted`), for Raw and Display recordings alike.
+      Previously the handle learned of a write/flush fault only on the *next*
+      enqueue, so a stream that went quiet after a disk failure showed Enabled
+      forever. Pinned by
+      `write_fault_is_visible_on_the_handle_without_further_enqueues` +
+      `flush_failure_faults_the_recording`.
+- [ ] **Command acks.** A dropped/failed user command is only a tracing warning
+      (GUI bridge send failure, `gui/mod.rs`) — Start/Stop/Apply/Record should
+      produce an acknowledged result or a visible, persistent error in the GUI.
+      Talker has the sibling item (talker TODO).
+- [ ] **Match-scanning cost** (behind the workspace benchmark harness — talker
+      TODO): `MatchRuleSet::evaluate_stream` scans each rule naively
+      (`windows()`), allocates a boundary-carry buffer per chunk, clones actions
+      per occurrence, and `note_activity` loops all rules on every chunk to
+      re-arm idle ones. Compile the byte patterns into one overlapping
+      Aho–Corasick automaton and track idle rules in their own list. Rule counts
+      are small today — measure first.
+- [ ] **Selected-channel diagnostics are cloned and sorted per poll** (behind
+      benchmarks): retained diagnostics are cloned in `ChannelPipeline::snapshot`,
+      cloned again crossing the GUI bridge (`gui/bridge.rs`), then sorted every
+      poll tick (`gui/state.rs`). Add per-diagnostic sequence numbers and send
+      deltas, or consume the snapshot vectors without re-cloning.
+- [ ] **One round-trip for the on-screen channel** (behind benchmarks): the GUI
+      issues `Snapshot` and `StreamDelta` as separate `PipelineRequest`s each
+      poll; combine them into one request per tick.
+- [ ] **Doc-drift batch (fold into the next spec/doc pass, no bump alone):**
+      removed on-screen Highlight still appears in requirements prose (ADR-015
+      dropped it); stale scrollback-size claims vs. the current default; ADR
+      text still says the app lacks a dark theme (dark mode landed, Phase 7,
+      `66cb1f1`).
+
 ## Future work — deferred (spec Appendix A)
 
 - Protocol decoders / field extraction (any return would be a new ADR)

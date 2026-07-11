@@ -41,6 +41,58 @@ Cross off items as they are completed. Add new ones inline as they come up.
   match). Fold the layout and the two new `Sent` fields (`total_bytes`,
   `missed_sends`) into the next spec revision.
 
+## Robustness & performance (external review, 2026-07-11)
+
+- [ ] **Send-failure storms: edge-trigger + backoff.** A failing send logs and
+  emits `ConnectionError` at the full schedule rate — at 100 Hz a dead
+  TCP/serial target produces 100 errors/s, burning CPU and burying the first
+  failure. Keep the keeps-running contract
+  (`send_failure_reports_connection_error_and_keeps_running`) — auto-recovery
+  is deliberate; do **not** add a hard Faulted-requires-Retry state — but
+  report edge-triggered (first failure + recovery, with a suppressed count)
+  and bound the retry rate with backoff while failing.
+- [ ] **Telemetry split — see proposed ADR-018 (needs acceptance).** Every send
+  emits a payload-bearing `TalkerStatus::Sent`; the GUI front-drains a 200-item
+  Vec and rebuilds the full output string per repaint (`gui/display.rs`, the
+  `widgets.rs` selectable label). Split into periodic counters, sampled display
+  batches, and immediate edge-triggered errors; per-send payload delivery only
+  for CLI `--echo`.
+- [ ] **Observer-path allocations** (behind the workspace benchmark harness
+  below): compiled static messages should send without a fresh wire `Vec` per
+  send (`render_into`/reusable buffer, `core::message::compile`); cache
+  `Schedule::min_active_interval` instead of rescanning each runner loop pass;
+  replace the GUI output Vec with an incremental row ring + `show_rows`
+  (listener's rendering lessons). Adopt a scheduler heap only if benchmarks
+  show message-count scans matter.
+- [ ] **Command acks.** Failed `Stop`/interface-update/`SetInterval` sends to a
+  runner are silently ignored (`gui/mod.rs`) — commands should produce an
+  acknowledged result or a visible error, especially Start/Stop/Apply.
+  Listener has the sibling item (listener TODO).
+- [ ] **TalkerSupervisor — see proposed ADR-019 (needs acceptance).** Channel
+  lifecycle, thread collection, draining, counters, and observer policy live in
+  `gui/mod.rs` (~1.5 k lines), contradicting the spec's core-owns-the-channel-
+  collection boundary; a `core` supervisor should own the runners and expose
+  one API to CLI and GUI — also the path to CLI parity.
+- [ ] **Palette bypasses.** Several status/warning/log/destructive colors are
+  hardcoded in the talker GUI (e.g. `gui/detail.rs` destructive red,
+  `gui/mod.rs` log-severity colors) instead of coming from
+  `wiredata_ui::palette`. Move the semantic colors into shared palette helpers
+  (chrome rule, talker ADR-016 / listener ADR-019) — the next useful GUI
+  convergence step.
+
+## Workspace items (external review, 2026-07-11)
+
+- [ ] **Benchmark + soak harness — prerequisite for every "(behind benchmarks)"
+  item here and in the listener TODO.** There is currently no benchmark
+  harness. Cover: multi-channel talker sends at 100–1,000 Hz, failed-send
+  storms, listener 64-byte-chunk ingest throughput, match-rule scaling, full
+  scrollback eviction, slow-disk recording.
+- [ ] **`wiredata-display` extraction — only together with talker adopting the
+  incremental renderer** (row-ring item above): the protocol-neutral
+  Raw/Rendered/Hex stream machinery could move to an egui-free shared crate so
+  talker reuses listener's incremental rendering. Standalone extraction is
+  speculative crate surface — don't do it first.
+
 ## macOS target (planned, 2026-07-10)
 
 - [ ] **App Nap opt-out in `core::timing` (ADR-017 counterpart).** macOS timers
