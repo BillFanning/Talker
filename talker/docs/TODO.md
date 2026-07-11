@@ -84,11 +84,19 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 ## Workspace items (external review, 2026-07-11)
 
-- [ ] **Benchmark + soak harness — prerequisite for every "(behind benchmarks)"
-  item here and in the listener TODO.** There is currently no benchmark
-  harness. Cover: multi-channel talker sends at 100–1,000 Hz, failed-send
-  storms, listener 64-byte-chunk ingest throughput, match-rule scaling, full
-  scrollback eviction, slow-disk recording.
+- [x] **Criterion benchmark harness** — landed: `talker/benches/scheduler.rs`
+  (poll idle-scan at 8/64/512 messages, due-send incl. the per-send payload
+  clone at 64 B/1 KiB, `min_active_interval`) and `listener/benches/pipeline.rs`
+  (64-byte ingest floor, steady-state at the scrollback cap, BytePattern rule
+  scaling at 1/8/32). `cargo bench -p talker` / `-p listener`; smoke-tested via
+  `cargo bench -- --test`; clippy covers them via `--all-targets`. These are
+  the baselines gating every "(behind benchmarks)" item here and in the
+  listener TODO — measure before optimizing.
+- [ ] **Soak tests (the harness's second half).** Long-running scenarios
+  criterion can't express: multi-channel talker sends at 100–1,000 Hz over
+  real sockets, failed-send storms (now bounded by the backoff policy),
+  slow-disk recording with rotation. Likely long-running integration binaries
+  invoked manually / nightly, not in the per-push CI gate.
 - [ ] **`wiredata-display` extraction — only together with talker adopting the
   incremental renderer** (row-ring item above): the protocol-neutral
   Raw/Rendered/Hex stream machinery could move to an egui-free shared crate so

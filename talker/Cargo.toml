@@ -80,5 +80,11 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
+criterion = { workspace = true }
 # Integration tests live in /tests per Rust convention
 serde_json = "1"
+
+# Criterion provides its own main; `harness = false` keeps libtest out of the way.
+[[bench]]
+name = "scheduler"
+harness = false

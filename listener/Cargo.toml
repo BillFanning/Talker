@@ -79,7 +79,13 @@ tracing-subscriber = { workspace = true }
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
+criterion = { workspace = true }
 # Integration tests (listener/tests/) drive the runtime over loopback sockets.
 # `test-util` adds the paused-clock (`start_paused` + `advance`) used to test
 # timer-driven behavior (the periodic recorder flush) without real waits.
 tokio = { workspace = true, features = ["test-util"] }
+
+# Criterion provides its own main; `harness = false` keeps libtest out of the way.
+[[bench]]
+name = "pipeline"
+harness = false
