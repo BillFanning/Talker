@@ -2,6 +2,8 @@ use crossbeam_channel::Sender;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::{layer::Context, Layer};
 
+use crate::core::channel::ChannelId;
+
 /// A log event forwarded to the GUI status pane.
 #[derive(Debug, Clone)]
 pub struct LogEvent {
@@ -9,12 +11,13 @@ pub struct LogEvent {
     pub target: String,
     pub message: String,
     pub timestamp: chrono::DateTime<chrono::Local>,
-    /// The 1-based channel number this event is about, when the emitter
-    /// attributed it via a structured `channel = n` tracing field (the
-    /// runner and the GUI lifecycle logs do). Drives the per-channel
-    /// info/warn/error counts on the channel-list rows. `None` for
-    /// app-level events.
-    pub channel: Option<usize>,
+    /// The **stable id** of the channel this event is about (ADR-020), when
+    /// the emitter attributed it via a structured `channel = <id>` tracing
+    /// field (the runner, the supervisor, and the GUI lifecycle logs do).
+    /// Drives the per-channel info/warn/error counts on the channel-list
+    /// rows — keyed by id, so a runner below a removed channel keeps
+    /// counting into its own row. `None` for app-level events.
+    pub channel: Option<ChannelId>,
 }
 
 /// A [`Layer`] that forwards tracing events to a GUI thread via a channel.
@@ -57,8 +60,9 @@ impl<S: Subscriber> Layer<S> for GuiLogLayer {
 #[derive(Default)]
 struct EventVisitor {
     message: String,
-    /// Value of a structured `channel` field, when present (1-based).
-    channel: Option<usize>,
+    /// Value of a structured `channel` field, when present (a stable
+    /// [`ChannelId`], carried as its raw u64 — ADR-020).
+    channel: Option<ChannelId>,
 }
 
 impl tracing::field::Visit for EventVisitor {
@@ -70,13 +74,13 @@ impl tracing::field::Visit for EventVisitor {
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
         if field.name() == "channel" {
-            self.channel = usize::try_from(value).ok();
+            self.channel = Some(ChannelId::from_raw(value));
         }
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
         if field.name() == "channel" {
-            self.channel = usize::try_from(value).ok();
+            self.channel = u64::try_from(value).ok().map(ChannelId::from_raw);
         }
     }
 
@@ -129,17 +133,18 @@ mod tests {
     #[test]
     fn layer_captures_the_channel_field_end_to_end() {
         // A real tracing event dispatched through the layer: the structured
-        // `channel` field lands in LogEvent::channel, and an event without
-        // one yields None.
+        // `channel` field (a stable id's raw value, ADR-020) lands in
+        // LogEvent::channel, and an event without one yields None.
         use tracing_subscriber::layer::SubscriberExt as _;
         let (tx, rx) = crossbeam_channel::bounded(8);
         let subscriber = tracing_subscriber::registry().with(GuiLogLayer::new(tx));
+        let id = ChannelId::mint();
         tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(channel = 3usize, "channel 3 running");
+            tracing::info!(channel = id.as_u64(), "channel 3 running");
             tracing::warn!("app-level warning");
         });
         let first = rx.try_recv().unwrap();
-        assert_eq!(first.channel, Some(3));
+        assert_eq!(first.channel, Some(id));
         assert_eq!(first.message, "channel 3 running");
         let second = rx.try_recv().unwrap();
         assert_eq!(second.channel, None);

@@ -5,7 +5,7 @@ use anyhow::Context;
 use clap::{Args as ClapArgs, ValueEnum};
 
 use crate::core::{
-    channel::Interface,
+    channel::{ChannelId, Interface},
     logging::{self, FileLogConfig, Rotation},
     message::decode_utf8_lossy_latin1,
     profile::{self, Profile},
@@ -198,8 +198,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     anyhow::ensure!(!profile.channels.is_empty(), "profile has no channels");
 
     // Open every channel's interface and compile its schedule up front, so a
-    // failure aborts cleanly before any talker thread is spawned.
-    let mut prepared: Vec<(usize, Box<dyn Interface>, Schedule)> = Vec::new();
+    // failure aborts cleanly before any talker thread is spawned. Each channel
+    // gets its stable id here (ADR-020); the CLI never removes channels, but
+    // the statuses carry ids now, so the echo funnel maps id → position.
+    let mut prepared: Vec<(runner::RunnerIdentity, Box<dyn Interface>, Schedule)> = Vec::new();
     for (i, channel) in profile.channels.into_iter().enumerate() {
         let interface = channel
             .interface
@@ -207,7 +209,16 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .with_context(|| format!("opening channel {i}"))?;
         let schedule = Schedule::compile(&channel.messages, Instant::now())
             .with_context(|| format!("compiling channel {i} schedule"))?;
-        prepared.push((i, interface, schedule));
+        let label = if channel.name.is_empty() {
+            (i + 1).to_string()
+        } else {
+            format!("'{}'", channel.name)
+        };
+        let who = runner::RunnerIdentity {
+            id: ChannelId::mint(),
+            label,
+        };
+        prepared.push((who, interface, schedule));
     }
 
     // One runner thread per channel, each driven by the same core send loop
@@ -230,14 +241,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     };
     let mut cmd_txs = Vec::new();
     let mut handles = Vec::new();
-    for (i, interface, schedule) in prepared {
+    // Echo tags stay positional ("ch0:", as before): map each stable id back
+    // to the channel's position in the profile.
+    let mut echo_index: std::collections::HashMap<ChannelId, usize> =
+        std::collections::HashMap::new();
+    for (i, (who, interface, schedule)) in prepared.into_iter().enumerate() {
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
         cmd_txs.push(cmd_tx);
+        echo_index.insert(who.id, i);
         let status_tx = status_tx.clone();
         handles.push(std::thread::spawn(move || {
             // No notify callback: the CLI's main thread blocks on the status
             // channel anyway, so there is nothing to wake.
-            runner::run(i, interface, schedule, cmd_rx, status_tx, None, policy);
+            runner::run(who, interface, schedule, cmd_rx, status_tx, None, policy);
         }));
     }
     drop(status_tx); // only the runners hold senders now
@@ -266,7 +282,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         } = status
         {
             if echo {
-                echo_line(channel, &payload, echo_format, tag);
+                if let Some(&index) = echo_index.get(&channel) {
+                    echo_line(index, &payload, echo_format, tag);
+                }
             }
         }
     }

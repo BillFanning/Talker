@@ -4,6 +4,7 @@ mod display;
 mod draft;
 mod widgets;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -11,7 +12,7 @@ use anyhow::Context as _;
 use egui::{Align, Layout, ScrollArea};
 
 use crate::core::{
-    channel::ChannelConfig,
+    channel::{ChannelConfig, ChannelId},
     logging::{LogEvent, LogLevel, LogLevelHandle, LoggingConfig},
     profile::Profile,
     runner,
@@ -205,8 +206,10 @@ struct TalkerApp {
     channels_collapsed: bool,
     /// Per-channel msgs/s estimators for the channel-list rows.
     rates: Vec<RateTracker>,
-    /// Per-channel log-event tallies for the channel-list rows.
-    log_counts: Vec<LogCounts>,
+    /// Per-channel log-event tallies for the channel-list rows, keyed by the
+    /// slot's stable [`ChannelId`] (ADR-020) — a positional Vec misrouted a
+    /// running runner's events after a channel above it was removed.
+    log_counts: HashMap<ChannelId, LogCounts>,
     /// Per-severity display filters for the log panel (capture level is a
     /// separate concern — the Level ComboBox).
     show_info: bool,
@@ -352,7 +355,7 @@ impl TalkerApp {
             selected: None,
             channels_collapsed: false,
             rates: Vec::new(),
-            log_counts: Vec::new(),
+            log_counts: HashMap::new(),
             show_info: true,
             show_warn: true,
             show_error: true,
@@ -501,7 +504,9 @@ impl TalkerApp {
                 self.sup.resize_slots(n);
                 self.displays = (0..n).map(|_| ChannelDisplay::default()).collect();
                 self.rates = vec![RateTracker::new(); n];
-                self.log_counts = vec![LogCounts::default(); n];
+                // Fresh slots minted fresh ids, so old entries are unreachable
+                // — clear rather than leak them.
+                self.log_counts.clear();
                 self.selected = if n > 0 { Some(0) } else { None };
                 // Preflight the whole profile so any payload that won't
                 // compile is surfaced now, not silently at the first Start.
@@ -651,11 +656,14 @@ impl TalkerApp {
             }
         }
 
-        // 1-based for log strings — matches the UI label "Channel N".
-        let n = i + 1;
+        // Log text names the channel by its start-time label; the structured
+        // field carries the slot's stable id (ADR-020) so the tally lands on
+        // this row whatever happens above it later.
+        let label = self.channel_label(i);
+        let cid = self.sup.channel_id(i).map_or(0, |id| id.as_u64());
 
         let Some(cfg) = self.conn_drafts.get(i).and_then(|d| d.to_config()) else {
-            tracing::warn!(channel = n, "channel {n} config invalid");
+            tracing::warn!(channel = cid, "channel {label} config invalid");
             return;
         };
 
@@ -670,26 +678,26 @@ impl TalkerApp {
                 .collect::<Option<Vec<_>>>()
         }) else {
             tracing::warn!(
-                channel = n,
-                "channel {n} has an invalid message (bad interval?) — fix or remove it"
+                channel = cid,
+                "channel {label} has an invalid message (bad interval?) — fix or remove it"
             );
             return;
         };
         let schedule = match Schedule::compile(&messages, Instant::now()) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!(channel = n, "channel {n} schedule error: {e:#}");
+                tracing::error!(channel = cid, "channel {label} schedule error: {e:#}");
                 return;
             }
         };
 
         // Lifecycle, telemetry reset, predecessor joining, and the runner
         // spawn all live in the supervisor (ADR-019); the GUI resets only
-        // its own view-state.
-        if i < self.log_counts.len() {
-            self.log_counts[i] = LogCounts::default();
+        // its own view-state (log tallies reset per run, like send counts).
+        if let Some(id) = self.sup.channel_id(i) {
+            self.log_counts.remove(&id);
         }
-        self.sup.start(i, cfg, schedule);
+        self.sup.start(i, label, cfg, schedule);
     }
 
     /// Stop channel `i` without blocking the UI (the supervisor parks the
@@ -798,15 +806,16 @@ impl TalkerApp {
         }
 
         for event in self.log_rx.try_iter() {
-            // Tally channel-attributed events (structured `channel` field,
-            // 1-based) for the channel-list rows.
-            if let Some(idx) = event.channel.and_then(|n| n.checked_sub(1)) {
-                if let Some(c) = self.log_counts.get_mut(idx) {
-                    match event.level {
-                        tracing::Level::ERROR => c.error += 1,
-                        tracing::Level::WARN => c.warn += 1,
-                        _ => c.info += 1,
-                    }
+            // Tally channel-attributed events (structured `channel` field — a
+            // stable ChannelId, ADR-020) for the channel-list rows. Keyed by
+            // id, so a runner below a removed channel keeps counting into its
+            // own row instead of the one that slid into its old position.
+            if let Some(id) = event.channel {
+                let c = self.log_counts.entry(id).or_default();
+                match event.level {
+                    tracing::Level::ERROR => c.error += 1,
+                    tracing::Level::WARN => c.warn += 1,
+                    _ => c.info += 1,
                 }
             }
             let ts = event.timestamp.format("%H:%M:%S%.3f");
@@ -822,7 +831,7 @@ impl TalkerApp {
         // the GUI gets back only the display samples) and route the sampled
         // payloads into the Output panes.
         for sample in self.sup.poll() {
-            if let Some(d) = self.displays.get_mut(sample.channel) {
+            if let Some(d) = self.displays.get_mut(sample.slot) {
                 d.push(sample.payload);
             }
         }
@@ -1217,6 +1226,11 @@ impl TalkerApp {
             self.stop_connection(i);
         }
         if let Some(i) = d.remove {
+            // Drop the removed channel's tally by its id — the other rows'
+            // tallies stay keyed to their own ids, untouched by the shift.
+            if let Some(id) = self.sup.channel_id(i) {
+                self.log_counts.remove(&id);
+            }
             // The supervisor stops the runner and parks it in its orphan
             // bucket (reaped by poll — never joined on the UI thread).
             self.sup.remove_slot(i);
@@ -1225,9 +1239,6 @@ impl TalkerApp {
             self.displays.remove(i);
             if i < self.rates.len() {
                 self.rates.remove(i);
-            }
-            if i < self.log_counts.len() {
-                self.log_counts.remove(i);
             }
             if i < self.profile.channels.len() {
                 self.profile.channels.remove(i);
@@ -1257,7 +1268,7 @@ impl TalkerApp {
             self.sup.push_slot();
             self.displays.push(ChannelDisplay::default());
             self.rates.push(RateTracker::new());
-            self.log_counts.push(LogCounts::default());
+            // log_counts: entries appear on demand, keyed by the new slot's id.
             // Jump straight to the new channel for editing.
             self.selected = Some(self.conn_drafts.len() - 1);
             self.dirty = true;

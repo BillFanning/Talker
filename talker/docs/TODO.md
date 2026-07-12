@@ -116,18 +116,24 @@ Cross off items as they are completed. Add new ones inline as they come up.
   exit; the owner drains stopped runners until thread exit). Error statuses
   (`ConnectionError`/`SendRecovered`) now route through `emit_status`, so a
   dropped one is at least counted in `dropped_statuses`.
-- [ ] **Error-class separation for `last_error`** — a `SendSample` clears the
-  banner even when the error was a control-plane failure (an undelivered
-  interval change vanishes on the next healthy sample). Split interface
-  errors (cleared by live samples) from command errors (cleared only by a
-  later successful command or start). (Tranche 2.)
-- [ ] **Sample lane starves later messages** — first-send-after-interval plus
-  the scheduler's low-index tie-break means an aligned multi-message schedule
-  shows message 0 forever in the Output pane. Rotate the sample across
-  message indices. (Tranche 2.)
-- [ ] **Stable ChannelIds** — slots shift on removal but running runners keep
-  their captured channel number, misrouting log-count attribution; listener-
-  style stable IDs are the fix. Own session + ADR note. (Tranche 3.)
+- [x] **Error-class separation for `last_error`** — `ChannelTelemetry` splits
+  `last_error` (interface class; cleared by a live `SendSample`/
+  `SendRecovered`) from `command_error` (control-plane class; cleared only by
+  a later delivered command or start), and the UI banner prefers the
+  command error (`banner_error()`). Pinned by
+  `samples_clear_interface_errors_but_not_command_errors`.
+- [x] **Sample lane rotates across messages** — the lane skips a repeat of the
+  last sampled index while due (never longer than one full cycle), so an
+  aligned multi-message schedule no longer shows message 0 forever. Pinned by
+  `sample_lane_rotates_across_messages`.
+- [x] **Stable ChannelIds (ADR-020)** — `core::channel::ChannelId` minted per
+  slot; runners start with a `RunnerIdentity { id, label }` and stamp the id
+  into every `TalkerStatus` and structured `channel` tracing field; GUI log
+  tallies are keyed by id (`HashMap<ChannelId, LogCounts>`) and mapped to
+  rows via `TalkerSupervisor::channel_id(i)`. Positional routing remains
+  only where position is the meaning (`PayloadSample::slot`, CLI echo tag).
+  Pinned by `channel_ids_are_stable_across_slot_removal` + the id assertions
+  in the runner status tests.
 - [ ] **Bench the timestamp/checksum render path** — the `render_into` kill
   verdict above covered static RawHex only; a timestamped+checksummed send
   allocates several temporaries per send (`render_at`, timestamp format,

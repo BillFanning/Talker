@@ -37,6 +37,17 @@ impl TalkerApp {
         }
     }
 
+    /// The label frozen into a run's log text at start (ADR-020): the custom
+    /// name in quotes ("channel 'GPS' running"), else the 1-based position at
+    /// start time ("channel 3 running" — same as the pre-ADR-020 lines).
+    /// Attribution never rides this text; it rides the slot's stable id.
+    pub(super) fn channel_label(&self, i: usize) -> String {
+        match self.conn_drafts.get(i) {
+            Some(d) if !d.name.is_empty() => format!("'{}'", d.name),
+            _ => (i + 1).to_string(),
+        }
+    }
+
     pub(super) fn show_channel_list(&mut self, ui: &mut egui::Ui) {
         let pal = theme_palette(ui);
 
@@ -100,6 +111,13 @@ impl TalkerApp {
         let rows: Vec<ChannelRow> = (0..self.conn_drafts.len())
             .map(|i| {
                 let telemetry = self.sup.telemetry(i);
+                // Row → tally via the slot's stable id (ADR-020): the id
+                // travels with the slot, so this stays right after removals.
+                let counts = self
+                    .sup
+                    .channel_id(i)
+                    .and_then(|id| self.log_counts.get(&id).copied())
+                    .unwrap_or_default();
                 ChannelRow {
                     name: self.channel_name(i),
                     summary: interface_summary(&self.conn_drafts[i]),
@@ -107,9 +125,9 @@ impl TalkerApp {
                     error: telemetry.banner_error().map(str::to_owned),
                     sent: telemetry.total_count,
                     per_sec: self.rates.get(i).map(|r| r.per_sec).unwrap_or(0.0),
-                    info: self.log_counts.get(i).map(|c| c.info).unwrap_or(0),
-                    warnings: self.log_counts.get(i).map(|c| c.warn).unwrap_or(0),
-                    errors: self.log_counts.get(i).map(|c| c.error).unwrap_or(0),
+                    info: counts.info,
+                    warnings: counts.warn,
+                    errors: counts.error,
                 }
             })
             .collect();

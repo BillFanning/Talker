@@ -14,10 +14,21 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
 use crate::core::{
-    channel::{Interface, InterfaceConfig},
+    channel::{ChannelId, Interface, InterfaceConfig},
     scheduler::{Schedule, Tick},
     timing,
 };
+
+/// Who a runner is, fixed at start (ADR-020): the stable [`ChannelId`] every
+/// status and structured log field carries (attribution that survives slot
+/// shifts), and the human label used in log *text* ("channel 3 …",
+/// "channel 'GPS' …"). The label is frozen for the run — a rename shows up
+/// on the next start; the id is what routing trusts.
+#[derive(Clone, Debug)]
+pub struct RunnerIdentity {
+    pub id: ChannelId,
+    pub label: String,
+}
 
 /// A command sent from the owning thread (UI or CLI) to a channel's runner.
 pub enum TalkerCommand {
@@ -33,10 +44,11 @@ pub enum TalkerCommand {
 
 /// A status update from a channel's runner.
 ///
-/// Every variant names its `channel` (0-based index), so statuses stay
-/// self-describing even when several channels share one status receiver —
-/// the CLI funnels all channels into a single channel; the GUI keeps one
-/// receiver per channel and ignores the field.
+/// Every variant names its channel by stable [`ChannelId`] (ADR-020), so
+/// statuses stay self-describing even when several channels share one status
+/// receiver — the CLI funnels all channels into a single channel; the
+/// supervisor keeps one receiver per slot and routes by slot. A slot index
+/// would go stale the moment a channel above is removed; the id never does.
 pub enum TalkerStatus {
     /// Periodic counters (ADR-018 lane 1): cumulative totals, **no payload**.
     /// Emitted at most once per [`ObserverPolicy::counter_interval`] on the
@@ -44,7 +56,7 @@ pub enum TalkerStatus {
     /// rest). Every field is cumulative, so the reader self-corrects even
     /// when some updates were dropped by a full queue.
     Counters {
-        channel: usize,
+        channel: ChannelId,
         /// Running send count across all messages in this channel.
         total_count: u64,
         /// Cumulative wire bytes sent across all messages in this channel.
@@ -66,7 +78,7 @@ pub enum TalkerStatus {
     /// the pane shows a live, bounded sample rather than every message.
     /// `ObserverPolicy::every_send` (CLI `--echo`) makes this every send.
     SendSample {
-        channel: usize,
+        channel: ChannelId,
         /// Which message in the channel's schedule fired.
         message_index: usize,
         /// Exact bytes put on the wire.
@@ -76,19 +88,19 @@ pub enum TalkerStatus {
     /// the *first* failure of a failing episode is reported; repeats are
     /// counted, not re-reported, and [`SendRecovered`](Self::SendRecovered)
     /// closes the episode with the totals.
-    ConnectionError { channel: usize, message: String },
+    ConnectionError { channel: ChannelId, message: String },
     /// Sending resumed after a failing episode. Carries the episode's cost so
     /// the observer can state what was lost: `failures` sends were attempted
     /// and failed (the first was reported as `ConnectionError`), `suppressed`
     /// due fires were skipped by the bounded-backoff retry policy without
     /// being attempted at all.
     SendRecovered {
-        channel: usize,
+        channel: ChannelId,
         failures: u64,
         suppressed: u64,
     },
     /// Opening the interface failed; the runner exits after sending this.
-    OpenFailed { channel: usize, message: String },
+    OpenFailed { channel: ChannelId, message: String },
 }
 
 /// First retry delay after a send failure (the **bounded-backoff** retry
@@ -174,7 +186,7 @@ pub type StatusNotify = Box<dyn Fn() + Send>;
 /// on the UI thread. A failed open is reported as
 /// [`TalkerStatus::OpenFailed`] and the call returns.
 pub fn open_and_run(
-    channel: usize,
+    who: RunnerIdentity,
     cfg: InterfaceConfig,
     schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
@@ -183,18 +195,16 @@ pub fn open_and_run(
     policy: ObserverPolicy,
 ) {
     match cfg.open() {
-        Ok(interface) => run(
-            channel, interface, schedule, cmd_rx, status_tx, notify, policy,
-        ),
+        Ok(interface) => run(who, interface, schedule, cmd_rx, status_tx, notify, policy),
         Err(e) => {
             tracing::error!(
-                channel = channel + 1,
+                channel = who.id.as_u64(),
                 "failed to open channel {}: {e:#}",
-                channel + 1
+                who.label
             );
             if status_tx
                 .try_send(TalkerStatus::OpenFailed {
-                    channel,
+                    channel: who.id,
                     message: format!("{e:#}"),
                 })
                 .is_ok()
@@ -210,9 +220,10 @@ pub fn open_and_run(
 /// Run one channel's send loop until [`TalkerCommand::Stop`] arrives or the
 /// command channel disconnects (the owning handle was dropped).
 ///
-/// Log lines use the 1-based "channel N" form to match the UI labels.
+/// Log text names the channel by `who.label`; the structured `channel` field
+/// carries the stable id (ADR-020).
 pub fn run(
-    channel: usize,
+    who: RunnerIdentity,
     interface: Box<dyn Interface>,
     schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
@@ -221,15 +232,13 @@ pub fn run(
     policy: ObserverPolicy,
 ) {
     tracing::info!(
-        channel = channel + 1,
+        channel = who.id.as_u64(),
         "channel {} running ({}-message schedule)",
-        channel + 1,
+        who.label,
         schedule.len()
     );
-    run_loop(
-        channel, interface, schedule, cmd_rx, status_tx, notify, policy,
-    );
-    tracing::info!(channel = channel + 1, "channel {} stopped", channel + 1);
+    run_loop(&who, interface, schedule, cmd_rx, status_tx, notify, policy);
+    tracing::info!(channel = who.id.as_u64(), "channel {} stopped", who.label);
 }
 
 enum Flow {
@@ -238,7 +247,7 @@ enum Flow {
 }
 
 fn run_loop(
-    channel: usize,
+    who: &RunnerIdentity,
     mut interface: Box<dyn Interface>,
     mut schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
@@ -285,24 +294,24 @@ fn run_loop(
                             ep.next_attempt = Instant::now();
                         }
                         tracing::info!(
-                            channel = channel + 1,
+                            channel = who.id.as_u64(),
                             "channel {} interface updated",
-                            channel + 1
+                            who.label
                         );
                     }
                     Err(e) => {
                         tracing::warn!(
-                            channel = channel + 1,
+                            channel = who.id.as_u64(),
                             "channel {} interface update failed: {e:#}",
-                            channel + 1
+                            who.label
                         );
                         emit_status(
                             &status_tx,
                             &notify,
-                            channel,
+                            who,
                             dropped_statuses,
                             TalkerStatus::ConnectionError {
-                                channel,
+                                channel: who.id,
                                 message: format!("{e:#}"),
                             },
                         );
@@ -364,19 +373,19 @@ fn run_loop(
                     Ok(()) => {
                         if let Some(ep) = episode.take() {
                             tracing::info!(
-                            channel = channel + 1,
+                            channel = who.id.as_u64(),
                             "channel {} sending recovered after {} failed and {} suppressed sends",
-                            channel + 1,
+                            who.label,
                             ep.failures,
                             ep.suppressed
                         );
                             emit_status(
                                 &status_tx,
                                 &notify,
-                                channel,
+                                who,
                                 &mut dropped_statuses,
                                 TalkerStatus::SendRecovered {
-                                    channel,
+                                    channel: who.id,
                                     failures: ep.failures,
                                     suppressed: ep.suppressed,
                                 },
@@ -405,10 +414,10 @@ fn run_loop(
                                 emit_status(
                                     &status_tx,
                                     &notify,
-                                    channel,
+                                    who,
                                     &mut dropped_statuses,
                                     TalkerStatus::SendSample {
-                                        channel,
+                                        channel: who.id,
                                         message_index: index,
                                         payload,
                                     },
@@ -423,10 +432,10 @@ fn run_loop(
                             emit_status(
                                 &status_tx,
                                 &notify,
-                                channel,
+                                who,
                                 &mut dropped_statuses,
                                 TalkerStatus::Counters {
-                                    channel,
+                                    channel: who.id,
                                     total_count,
                                     total_bytes,
                                     per_message_counts: per_message_counts.clone(),
@@ -441,9 +450,9 @@ fn run_loop(
                         // reported (warn + `ConnectionError`); it opens the episode.
                         None => {
                             tracing::warn!(
-                                channel = channel + 1,
+                                channel = who.id.as_u64(),
                                 "channel {} send failed (retrying with backoff): {e:#}",
-                                channel + 1
+                                who.label
                             );
                             episode = Some(FailureEpisode {
                                 failures: 1,
@@ -454,10 +463,10 @@ fn run_loop(
                             emit_status(
                                 &status_tx,
                                 &notify,
-                                channel,
+                                who,
                                 &mut dropped_statuses,
                                 TalkerStatus::ConnectionError {
-                                    channel,
+                                    channel: who.id,
                                     message: format!("{e:#}"),
                                 },
                             );
@@ -468,9 +477,9 @@ fn run_loop(
                             ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
                             ep.next_attempt = Instant::now() + ep.backoff;
                             tracing::debug!(
-                                channel = channel + 1,
+                                channel = who.id.as_u64(),
                                 "channel {} send still failing ({} failures so far): {e:#}",
-                                channel + 1,
+                                who.label,
                                 ep.failures
                             );
                         }
@@ -524,7 +533,7 @@ fn run_loop(
     // the CLI's funnel loop), and a dropped receiver returns an error
     // immediately — so this cannot hang.
     let _ = status_tx.send(TalkerStatus::Counters {
-        channel,
+        channel: who.id,
         total_count,
         total_bytes,
         per_message_counts,
@@ -542,7 +551,7 @@ fn run_loop(
 fn emit_status(
     status_tx: &Sender<TalkerStatus>,
     notify: &Option<StatusNotify>,
-    channel: usize,
+    who: &RunnerIdentity,
     dropped_statuses: &mut u64,
     status: TalkerStatus,
 ) {
@@ -556,10 +565,10 @@ fn emit_status(
             *dropped_statuses += 1;
             if *dropped_statuses == 1 {
                 tracing::warn!(
-                    channel = channel + 1,
+                    channel = who.id.as_u64(),
                     "channel {}: status receiver is falling behind — sends continue at \
                      cadence; observer updates are being dropped and counted",
-                    channel + 1
+                    who.label
                 );
             }
         }
@@ -593,7 +602,7 @@ mod tests {
     fn spawn_runner(
         messages: &[MessageConfig],
         fail: bool,
-    ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle) {
+    ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle, ChannelId) {
         // Tests default to the every-send policy so per-send behaviour stays
         // directly observable; the sampled lanes have their own test.
         spawn_runner_with(messages, fail, ObserverPolicy::every_send())
@@ -603,7 +612,7 @@ mod tests {
         messages: &[MessageConfig],
         fail: bool,
         policy: ObserverPolicy,
-    ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle) {
+    ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle, ChannelId) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let interface = Box::new(MockInterface {
             sent: Arc::clone(&sent),
@@ -612,8 +621,13 @@ mod tests {
         let schedule = Schedule::compile(messages, Instant::now()).unwrap();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
         let (status_tx, status_rx) = crossbeam_channel::bounded(256);
+        let who = RunnerIdentity {
+            id: ChannelId::mint(),
+            label: "test".into(),
+        };
+        let id = who.id;
         let thread = std::thread::spawn(move || {
-            run(0, interface, schedule, cmd_rx, status_tx, None, policy)
+            run(who, interface, schedule, cmd_rx, status_tx, None, policy)
         });
         (
             sent,
@@ -622,6 +636,7 @@ mod tests {
                 status_rx,
                 thread,
             },
+            id,
         )
     }
 
@@ -641,7 +656,7 @@ mod tests {
 
     #[test]
     fn sends_on_schedule_and_reports_self_describing_counts() {
-        let (sent, handle) = spawn_runner(&[msg("AB", 10)], false);
+        let (sent, handle, id) = spawn_runner(&[msg("AB", 10)], false);
         // Wait (bounded) for a few fires rather than assuming a wall-clock
         // window: under the stall policy (skip the backlog, stay on grid) a
         // stalled CI VM can legitimately fire only once in a fixed 60 ms —
@@ -677,7 +692,7 @@ mod tests {
                     message_index,
                     payload,
                 } => {
-                    assert_eq!(*channel, 0);
+                    assert_eq!(*channel, id, "samples carry the stable id");
                     assert_eq!(*message_index, 0);
                     assert_eq!(payload, &vec![0xAB]);
                     samples += 1;
@@ -690,7 +705,7 @@ mod tests {
                     dropped_statuses,
                     ..
                 } => {
-                    assert_eq!(*channel, 0);
+                    assert_eq!(*channel, id, "counters carry the stable id");
                     assert!(*total_count >= last_total, "counters must be monotonic");
                     last_total = *total_count;
                     // Every payload is the single byte 0xAB, so the byte
@@ -717,7 +732,7 @@ mod tests {
             counter_interval: Duration::from_secs(3600),
             sample_interval: Duration::from_millis(5),
         };
-        let (sent, handle) = spawn_runner_with(&[msg("AB", 5), msg("CD", 5)], false, policy);
+        let (sent, handle, _id) = spawn_runner_with(&[msg("AB", 5), msg("CD", 5)], false, policy);
         let deadline = Instant::now() + Duration::from_secs(2);
         while sent.lock().unwrap().len() < 40 {
             assert!(Instant::now() < deadline, "expected sends within 2 s");
@@ -753,7 +768,7 @@ mod tests {
             counter_interval: Duration::ZERO,
             sample_interval: Duration::from_secs(3600),
         };
-        let (sent, handle) = spawn_runner_with(&[msg("AB", 5)], false, policy);
+        let (sent, handle, _id) = spawn_runner_with(&[msg("AB", 5)], false, policy);
         let deadline = Instant::now() + Duration::from_secs(2);
         while sent.lock().unwrap().len() < 3 {
             assert!(Instant::now() < deadline, "expected ≥3 sends within 2 s");
@@ -779,7 +794,7 @@ mod tests {
     #[test]
     fn stop_is_prompt_even_when_idle() {
         // All-dormant schedule → the runner blocks on the command channel.
-        let (_, handle) = spawn_runner(&[msg("AB", 0)], false);
+        let (_, handle, _id) = spawn_runner(&[msg("AB", 0)], false);
         std::thread::sleep(Duration::from_millis(20));
         handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
         join_within(handle, Duration::from_secs(1));
@@ -787,7 +802,7 @@ mod tests {
 
     #[test]
     fn dropped_command_handle_stops_the_runner() {
-        let (_, handle) = spawn_runner(&[msg("AB", 0)], false);
+        let (_, handle, _id) = spawn_runner(&[msg("AB", 0)], false);
         let TalkerHandle {
             cmd_tx,
             status_rx: _status_rx,
@@ -804,12 +819,12 @@ mod tests {
 
     #[test]
     fn send_failure_reports_connection_error_and_keeps_running() {
-        let (_, handle) = spawn_runner(&[msg("AB", 10)], true);
+        let (_, handle, id) = spawn_runner(&[msg("AB", 10)], true);
         std::thread::sleep(Duration::from_millis(40));
         let mut saw_error = false;
         for s in handle.status_rx.try_iter() {
             if let TalkerStatus::ConnectionError { channel, message } = s {
-                assert_eq!(channel, 0);
+                assert_eq!(channel, id, "errors carry the stable id");
                 assert!(message.contains("mock send failure"));
                 saw_error = true;
             }
@@ -829,7 +844,7 @@ mod tests {
         // edge trigger this would be ~20 ConnectionErrors in 100 ms; with it,
         // exactly one (the retry backoff starts at 250 ms, so no second
         // attempt happens inside the window).
-        let (_, handle) = spawn_runner(&[msg("AB", 5)], true);
+        let (_, handle, _id) = spawn_runner(&[msg("AB", 5)], true);
         std::thread::sleep(Duration::from_millis(100));
         let errors = handle
             .status_rx
@@ -873,9 +888,13 @@ mod tests {
         let schedule = Schedule::compile(&[msg("AB", 5)], Instant::now()).unwrap();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
         let (status_tx, status_rx) = crossbeam_channel::bounded(256);
+        let who = RunnerIdentity {
+            id: ChannelId::mint(),
+            label: "test".into(),
+        };
         let thread = std::thread::spawn(move || {
             run(
-                0,
+                who,
                 interface,
                 schedule,
                 cmd_rx,
@@ -935,8 +954,13 @@ mod tests {
         let schedule = Schedule::compile(&[msg("AB", 100)], Instant::now()).unwrap();
         let (_cmd_tx, cmd_rx) = crossbeam_channel::bounded::<TalkerCommand>(8);
         let (status_tx, status_rx) = crossbeam_channel::bounded(8);
+        let who = RunnerIdentity {
+            id: ChannelId::mint(),
+            label: "3".into(),
+        };
+        let id = who.id;
         open_and_run(
-            3,
+            who,
             cfg,
             schedule,
             cmd_rx,
@@ -946,7 +970,7 @@ mod tests {
         );
         match status_rx.try_recv() {
             Ok(TalkerStatus::OpenFailed { channel, message }) => {
-                assert_eq!(channel, 3);
+                assert_eq!(channel, id, "OpenFailed carries the stable id");
                 assert!(message.contains("127.0.0.1:1"), "message was: {message}");
             }
             other => panic!("expected OpenFailed, got {:?}", other.is_ok()),

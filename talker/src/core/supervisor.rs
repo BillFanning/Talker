@@ -23,8 +23,10 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, TrySendError};
 
-use crate::core::channel::InterfaceConfig;
-use crate::core::runner::{self, ObserverPolicy, TalkerCommand, TalkerHandle, TalkerStatus};
+use crate::core::channel::{ChannelId, InterfaceConfig};
+use crate::core::runner::{
+    self, ObserverPolicy, RunnerIdentity, TalkerCommand, TalkerHandle, TalkerStatus,
+};
 use crate::core::scheduler::Schedule;
 
 /// Bound on each runner's status queue. Occupancy near this cap means
@@ -81,7 +83,11 @@ impl ChannelTelemetry {
 /// One sampled send returned by [`TalkerSupervisor::poll`] — the exact wire
 /// bytes, for a display pane. Cadence is the runner's [`ObserverPolicy`].
 pub struct PayloadSample {
-    pub channel: usize,
+    /// The **current** slot index the sample drained from — the right key for
+    /// positional display routing (the supervisor's receivers travel with
+    /// their slots, so this is correct even after removals; the status's
+    /// embedded stable id serves consumers outside the slot structure).
+    pub slot: usize,
     pub payload: Vec<u8>,
 }
 
@@ -104,11 +110,35 @@ struct DrainingRunner {
     status_rx: Receiver<TalkerStatus>,
 }
 
-#[derive(Default)]
 struct Slot {
+    /// Stable identity, minted when the slot is created (ADR-020). Slots
+    /// shift positionally on removal; the id travels with the slot, and
+    /// everything the slot's runners ever emitted is attributed to it.
+    id: ChannelId,
+    /// Human label frozen at the last start ("3", "'GPS'") — used in the
+    /// supervisor's own log text so it matches the runner's. `None` before
+    /// the first start (falls back to the id's `#N` form).
+    label: Option<String>,
     handle: Option<TalkerHandle>,
     draining: Vec<DrainingRunner>,
     telemetry: ChannelTelemetry,
+}
+
+impl Slot {
+    fn new() -> Self {
+        Self {
+            id: ChannelId::mint(),
+            label: None,
+            handle: None,
+            draining: Vec::new(),
+            telemetry: ChannelTelemetry::default(),
+        }
+    }
+
+    /// The label for log text: the start-time label, else the id ("#N").
+    fn display_label(&self) -> String {
+        self.label.clone().unwrap_or_else(|| self.id.to_string())
+    }
 }
 
 /// The channel collection (spec §2.2): index-stable slots, one per configured
@@ -148,9 +178,15 @@ impl TalkerSupervisor {
         self.slots.is_empty()
     }
 
-    /// Append one empty slot (a newly added channel).
+    /// Append one empty slot (a newly added channel), minting its stable id.
     pub fn push_slot(&mut self) {
-        self.slots.push(Slot::default());
+        self.slots.push(Slot::new());
+    }
+
+    /// Slot `i`'s stable [`ChannelId`] (ADR-020) — the key log-count and
+    /// status attribution use; `None` for an out-of-range index.
+    pub fn channel_id(&self, i: usize) -> Option<ChannelId> {
+        self.slots.get(i).map(|s| s.id)
     }
 
     /// Remove slot `i`, shifting the ones above it down (mirrors the channel
@@ -201,15 +237,25 @@ impl TalkerSupervisor {
     }
 
     /// Start (or restart) channel `i` with an interface config and a compiled
-    /// schedule. Telemetry resets; the previous runner (if any) is stopped
-    /// and handed to the new thread as a predecessor to join before the
-    /// interface reopens.
-    pub fn start(&mut self, i: usize, cfg: InterfaceConfig, schedule: Schedule) {
+    /// schedule. `label` is the human name for log text (frozen for the run —
+    /// ADR-020; attribution itself rides the slot's stable id). Telemetry
+    /// resets; the previous runner (if any) is stopped and handed to the new
+    /// thread as a predecessor to join before the interface reopens.
+    pub fn start(
+        &mut self,
+        i: usize,
+        label: impl Into<String>,
+        cfg: InterfaceConfig,
+        schedule: Schedule,
+    ) {
         let message_count = schedule.len();
         self.begin_start(i, message_count);
         let Some(slot) = self.slots.get_mut(i) else {
             return;
         };
+        let label = label.into();
+        slot.label = Some(label.clone());
+        let who = RunnerIdentity { id: slot.id, label };
         let predecessors: Vec<_> = std::mem::take(&mut slot.draining)
             .into_iter()
             .map(|d| d.thread)
@@ -221,22 +267,22 @@ impl TalkerSupervisor {
             f
         });
         let policy = self.policy;
+        tracing::info!(
+            channel = who.id.as_u64(),
+            "channel {} starting ({message_count}-message schedule)",
+            who.label
+        );
         let thread = std::thread::spawn(move || {
             for pred in predecessors {
                 let _ = pred.join();
             }
-            runner::open_and_run(i, cfg, schedule, cmd_rx, status_tx, notify, policy);
+            runner::open_and_run(who, cfg, schedule, cmd_rx, status_tx, notify, policy);
         });
         self.slots[i].handle = Some(TalkerHandle {
             cmd_tx,
             status_rx,
             thread,
         });
-        tracing::info!(
-            channel = i + 1,
-            "channel {} starting ({message_count}-message schedule)",
-            i + 1
-        );
     }
 
     /// Shared start prologue: stop any current runner and zero the telemetry
@@ -275,7 +321,13 @@ impl TalkerSupervisor {
         if outcome == CommandOutcome::QueueFull {
             self.record_command_failure(i, "Stop", CommandOutcome::QueueFull);
         }
-        tracing::info!(channel = i + 1, "channel {} stopping", i + 1);
+        if let Some(slot) = self.slots.get(i) {
+            tracing::info!(
+                channel = slot.id.as_u64(),
+                "channel {} stopping",
+                slot.display_label()
+            );
+        }
         outcome
     }
 
@@ -336,7 +388,13 @@ impl TalkerSupervisor {
             _ => "the runner has already exited",
         };
         let msg = format!("{what} was not delivered: {why}");
-        tracing::warn!(channel = i + 1, "channel {}: {msg}", i + 1);
+        if let Some(slot) = self.slots.get(i) {
+            tracing::warn!(
+                channel = slot.id.as_u64(),
+                "channel {}: {msg}",
+                slot.display_label()
+            );
+        }
         if let Some(slot) = self.slots.get_mut(i) {
             slot.telemetry.errors_total += 1;
             // Control-plane class: a healthy payload sample must not clear
@@ -415,9 +473,10 @@ impl TalkerSupervisor {
 }
 
 /// Fold one receiver's pending statuses into `telemetry`, collecting payload
-/// samples. Shared by the live and draining paths.
+/// samples tagged with the slot the receiver currently occupies. Shared by
+/// the live and draining paths.
 fn drain_statuses(
-    channel: usize,
+    slot: usize,
     status_rx: &Receiver<TalkerStatus>,
     telemetry: &mut ChannelTelemetry,
     samples: &mut Vec<PayloadSample>,
@@ -443,7 +502,7 @@ fn drain_statuses(
                 // a failing episode sends are suppressed, so no samples
                 // arrive and the banner correctly persists.
                 telemetry.last_error = None;
-                samples.push(PayloadSample { channel, payload });
+                samples.push(PayloadSample { slot, payload });
             }
             TalkerStatus::ConnectionError { message, .. }
             | TalkerStatus::OpenFailed { message, .. } => {
@@ -476,6 +535,10 @@ mod tests {
     ) {
         sup.begin_start(i, schedule.len());
         let slot = sup.slots.get_mut(i).expect("slot exists");
+        let who = RunnerIdentity {
+            id: slot.id,
+            label: format!("{}", i + 1),
+        };
         let predecessors: Vec<_> = std::mem::take(&mut slot.draining)
             .into_iter()
             .map(|d| d.thread)
@@ -487,7 +550,7 @@ mod tests {
             for pred in predecessors {
                 let _ = pred.join();
             }
-            runner::run(i, interface, schedule, cmd_rx, status_tx, None, policy);
+            runner::run(who, interface, schedule, cmd_rx, status_tx, None, policy);
         });
         sup.slots[i].handle = Some(TalkerHandle {
             cmd_tx,
@@ -558,7 +621,7 @@ mod tests {
         assert_eq!(telemetry.total_count, wire, "totals exact at rest");
         // every_send policy: one sample per send reached the display lane.
         assert_eq!(samples.len() as u64, wire);
-        assert!(samples.iter().all(|s| s.channel == 0));
+        assert!(samples.iter().all(|s| s.slot == 0));
     }
 
     #[test]
@@ -593,7 +656,7 @@ mod tests {
         };
         let (tx, rx) = crossbeam_channel::bounded(4);
         tx.send(TalkerStatus::SendSample {
-            channel: 0,
+            channel: ChannelId::mint(),
             message_index: 0,
             payload: vec![0xAB],
         })
@@ -642,6 +705,32 @@ mod tests {
         poll_until(&mut sup, &mut samples, |s| s.telemetry(0).total_count >= 2);
         sup.stop_all();
         poll_until(&mut sup, &mut samples, |s| !s.any_draining());
+    }
+
+    #[test]
+    fn channel_ids_are_stable_across_slot_removal() {
+        // The whole point of ADR-020: positions shift, identity doesn't. A
+        // running runner keeps stamping the id its slot was minted with, so
+        // log-count attribution keyed by id can never land on the wrong row.
+        let mut sup = TalkerSupervisor::new(ObserverPolicy::sampled());
+        sup.push_slot();
+        sup.push_slot();
+        let first = sup.channel_id(0).unwrap();
+        let second = sup.channel_id(1).unwrap();
+        assert_ne!(first, second);
+
+        sup.remove_slot(0);
+        assert_eq!(
+            sup.channel_id(0),
+            Some(second),
+            "the surviving slot keeps its id after shifting down"
+        );
+
+        // A fresh slot mints a fresh id — removed ids are never reused.
+        sup.push_slot();
+        let third = sup.channel_id(1).unwrap();
+        assert_ne!(third, first);
+        assert_ne!(third, second);
     }
 
     #[test]

@@ -420,6 +420,51 @@ error banner). The open points settled as:
 - `STATUS_QUEUE_CAP` moved to `core::supervisor` (re-exported to the GUI for the
   detail-header readout).
 
+## ADR-020 — Stable channel identity (`ChannelId`)
+
+**Status:** Accepted 2026-07-12 (external review round 2, "positional identity").
+
+**Context:** Channels were identified everywhere by **slot index**: the runner
+thread captured its index at spawn and stamped it into every `TalkerStatus` and
+every structured `channel = n` tracing field; the GUI tallied per-channel log
+counts in a positional `Vec` keyed by that field. Slots shift down when a channel
+above is removed — but a running runner keeps its captured number, so after a
+removal its log events (and its stale text, "channel 3 …") were attributed to
+whichever row slid into its old position. The listener solved the same problem
+with runtime-minted stable ids from day one; talker inherited the positional
+scheme from its single-channel-era plumbing.
+
+**Decision:** Identity and position are separated:
+
+- **`core::channel::ChannelId`** — a process-unique, monotonic id (`u64`,
+  1-based), minted by `TalkerSupervisor::push_slot` when the slot is created and
+  carried by the slot for its whole life. Runtime-only: never persisted (profiles
+  identify channels by position and name), never reused.
+- **`RunnerIdentity { id, label }`** is what a runner is started with (ADR-019's
+  `start` gained a `label` argument): the id goes into every `TalkerStatus`
+  variant and every structured `channel` tracing field; the **label** — the
+  custom channel name in quotes, else the 1-based position at start time — is
+  used only in log *text*, frozen for the run (a rename shows on the next start).
+  Attribution never rides the text; it rides the id.
+- **The GUI keys its log tallies by id** (`HashMap<ChannelId, LogCounts>`) and
+  maps row → id at render via `TalkerSupervisor::channel_id(i)`; removal drops
+  exactly the removed channel's tally.
+- **Positional indices remain for "which row right now":** supervisor slot
+  methods, display-pane routing (`PayloadSample::slot` — the receivers travel
+  with their slots, so the *current* index at drain time is correct), and the
+  CLI's `--echo` tag (`ch0:` unchanged, via an id→position map).
+
+**Consequences:**
+- Log counts and error/status attribution can no longer land on the wrong row
+  after a removal; a runner below a removed channel keeps counting into its own
+  row. Pinned by `channel_ids_are_stable_across_slot_removal` and the id
+  assertions in the runner status tests.
+- Log text is unchanged in the common case ("channel 3 running") and better for
+  named channels ("channel 'GPS' running"); supervisor lines before a first
+  start fall back to the id form ("channel #4").
+- `TalkerStatus` stays self-describing under the CLI's shared funnel with an
+  identity that survives any future removal/reorder feature there.
+
 ---
 
 ## Open questions

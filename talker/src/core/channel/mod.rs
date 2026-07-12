@@ -8,6 +8,49 @@ pub use config::{
     TcpClientConfig, UdpConfig, UdpMode,
 };
 
+/// Stable identity of one configured channel, minted when the channel is
+/// created and unchanged for its whole life (ADR-020).
+///
+/// Channel *slots* are positional — they shift down when a channel above is
+/// removed — but a running runner thread keeps stamping the identity it was
+/// started with. When that stamp was the slot index, every status and log
+/// line from a runner below a removed channel was attributed to the wrong
+/// row. Everything that attributes across time (the structured `channel`
+/// tracing field, `TalkerStatus`) therefore carries this id; positional
+/// indices remain only for "which row right now" (rendering, command
+/// routing through the supervisor's slots).
+///
+/// Runtime-only: never persisted (profiles identify channels by position and
+/// name), never reused within a process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ChannelId(u64);
+
+impl ChannelId {
+    /// Mint the next process-unique id (1-based, monotonic).
+    pub fn mint() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// The raw id value — what the structured `channel` tracing field carries.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// Rebuild an id from a raw `channel` tracing-field value (the log layer's
+    /// inverse of [`as_u64`](Self::as_u64)).
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+impl std::fmt::Display for ChannelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#{}", self.0)
+    }
+}
+
 /// A live interface that can send raw bytes.
 ///
 /// An interface is owned by a single talker thread; `Send` is required so it
