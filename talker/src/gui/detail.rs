@@ -154,9 +154,11 @@ impl TalkerApp {
                 super::STATUS_QUEUE_CAP
             ),
             qpeak * 2 >= super::STATUS_QUEUE_CAP,
-            "The runner→UI status queue: each send queues one display update; \
-             the UI drains it every frame. A peak near capacity means updates \
-             are about to be sampled — sends themselves are never delayed.",
+            "The runner→UI observer queue carries rate-limited counters, payload \
+             samples, and immediate send errors; the UI drains it every frame. \
+             A peak near capacity means observer updates are about to be dropped \
+             and counted — sends themselves are never delayed. Reliable command \
+             results use a separate queue.",
         );
         let drops = telemetry.dropped_statuses;
         perf_line(
@@ -164,8 +166,8 @@ impl TalkerApp {
             format!("Display updates dropped: {drops}"),
             drops > 0,
             "Status updates the runner discarded because the queue above was \
-             full. Counts stay exact (each update carries the running totals); \
-             only the Output pane sampled.",
+             full. Counts stay exact (each counter update is cumulative); only \
+             the Output pane is sampled.",
         );
         let missed = telemetry.missed_sends;
         perf_line(

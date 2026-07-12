@@ -1,7 +1,7 @@
 //! Channel supervision shared by the CLI and the GUI (ADR-019).
 //!
-//! [`TalkerSupervisor`] owns the runner threads, their command/status channel
-//! pairs, the draining buckets, and the per-channel observer telemetry that
+//! [`TalkerSupervisor`] owns the runner threads, their command/control/status
+//! channels, the draining buckets, and the per-channel observer telemetry that
 //! used to live in the GUI module — restoring the spec §2.2 boundary (channel
 //! collection and management are business logic, so they live in core; `cli`
 //! and `gui` are thin layers over this one API).
@@ -19,13 +19,15 @@
 //! kept** until its thread exits, so the final `Counters` emitted at stop
 //! (ADR-018) still lands and totals read exact at rest.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, TrySendError};
 
 use crate::core::channel::{ChannelId, InterfaceConfig};
 use crate::core::runner::{
-    self, ObserverPolicy, RunnerIdentity, TalkerCommand, TalkerHandle, TalkerStatus,
+    self, CommandExecution, CommandId, CommandTarget, ObserverPolicy, RunnerControlStatus,
+    RunnerIdentity, TalkerCommand, TalkerHandle, TalkerStatus,
 };
 use crate::core::scheduler::Schedule;
 
@@ -37,6 +39,17 @@ pub const STATUS_QUEUE_CAP: usize = 256;
 /// Bound on each runner's command queue. Commands are tiny and rare; a full
 /// queue means the runner is wedged in a blocking send.
 const CMD_QUEUE_CAP: usize = 32;
+
+/// One reliable result for the start-time open plus every command that can be
+/// queued at once. Keeping this separate from sampled telemetry prevents observer
+/// pressure from erasing control truth.
+const CONTROL_QUEUE_CAP: usize = CMD_QUEUE_CAP + 1;
+
+#[derive(Clone, Debug)]
+struct CommandFailure {
+    id: CommandId,
+    message: String,
+}
 
 /// Per-channel observer state, updated by [`TalkerSupervisor::poll`] from the
 /// runner's ADR-018 status lanes. Everything cumulative comes straight from
@@ -67,8 +80,12 @@ pub struct ChannelTelemetry {
     /// The latest **control-plane** error (an undeliverable Stop/interface-
     /// update/interval command). A healthy sample must NOT clear this — the
     /// wire working says nothing about a command that never arrived. Cleared
-    /// only by a later delivered command, or on start.
+    /// only by a later successfully executed command for the same target, or
+    /// on start.
     pub command_error: Option<String>,
+    /// Latest failure per independently recoverable control target. The public
+    /// `command_error` above is the newest entry, retained as the GUI-facing cache.
+    command_failures: BTreeMap<CommandTarget, CommandFailure>,
 }
 
 impl ChannelTelemetry {
@@ -77,6 +94,38 @@ impl ChannelTelemetry {
     /// wins over an interface error.
     pub fn banner_error(&self) -> Option<&str> {
         self.command_error.as_deref().or(self.last_error.as_deref())
+    }
+
+    fn record_command_failure(&mut self, id: CommandId, target: CommandTarget, message: String) {
+        self.errors_total += 1;
+        let replace = self
+            .command_failures
+            .get(&target)
+            .is_none_or(|current| id >= current.id);
+        if replace {
+            self.command_failures
+                .insert(target, CommandFailure { id, message });
+        }
+        self.refresh_command_error();
+    }
+
+    fn resolve_command(&mut self, id: CommandId, target: CommandTarget) {
+        if self
+            .command_failures
+            .get(&target)
+            .is_some_and(|failure| failure.id <= id)
+        {
+            self.command_failures.remove(&target);
+            self.refresh_command_error();
+        }
+    }
+
+    fn refresh_command_error(&mut self) {
+        self.command_error = self
+            .command_failures
+            .values()
+            .max_by_key(|failure| failure.id)
+            .map(|failure| failure.message.clone());
     }
 }
 
@@ -91,22 +140,68 @@ pub struct PayloadSample {
     pub payload: Vec<u8>,
 }
 
-/// How a command delivery went. `NotRunning` covers both "no runner in this
+/// How a command enqueue attempt went. `NotRunning` covers both "no runner in this
 /// slot" and "the runner already exited" — for a Stop that is moot, for
 /// anything else it is surfaced in the telemetry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandOutcome {
-    Delivered,
+    Enqueued,
     /// The command queue is full — the runner may be wedged in a blocking
     /// send. Recorded in the channel's telemetry.
     QueueFull,
     NotRunning,
 }
 
+/// The immediate result of submitting a live mutation. `Enqueued` means only that
+/// the runner owns the command; [`CommandCompletion`] reports what execution did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandSubmission {
+    pub id: CommandId,
+    pub outcome: CommandOutcome,
+}
+
+/// The effect retained by the supervisor until the runner confirms execution.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommandEffect {
+    Interface(InterfaceConfig),
+    MessageInterval { index: usize, interval_ms: u64 },
+}
+
+impl CommandEffect {
+    fn target(&self) -> CommandTarget {
+        match self {
+            Self::Interface(_) => CommandTarget::Interface,
+            Self::MessageInterval { index, .. } => CommandTarget::MessageInterval(*index),
+        }
+    }
+}
+
+/// Reliable completion surfaced to presentation layers after supervisor state has
+/// been reconciled. Failed commands never mutate the applied runtime baseline.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommandCompletion {
+    Applied {
+        channel: ChannelId,
+        id: CommandId,
+        effect: CommandEffect,
+    },
+    Failed {
+        channel: ChannelId,
+        id: CommandId,
+        target: CommandTarget,
+        message: String,
+    },
+}
+
+struct PendingCommand {
+    effect: CommandEffect,
+}
+
 /// A stopped runner still winding down: its thread, plus its status receiver
 /// so the final `Counters` (ADR-018) is still drained into the telemetry.
 struct DrainingRunner {
     thread: std::thread::JoinHandle<()>,
+    control_rx: Receiver<RunnerControlStatus>,
     status_rx: Receiver<TalkerStatus>,
 }
 
@@ -122,6 +217,9 @@ struct Slot {
     handle: Option<TalkerHandle>,
     draining: Vec<DrainingRunner>,
     telemetry: ChannelTelemetry,
+    /// Interface the live runner confirmed it opened. Never inferred from drafts.
+    applied_interface: Option<InterfaceConfig>,
+    pending_commands: BTreeMap<CommandId, PendingCommand>,
 }
 
 impl Slot {
@@ -132,6 +230,8 @@ impl Slot {
             handle: None,
             draining: Vec::new(),
             telemetry: ChannelTelemetry::default(),
+            applied_interface: None,
+            pending_commands: BTreeMap::new(),
         }
     }
 
@@ -146,12 +246,13 @@ impl Slot {
 pub struct TalkerSupervisor {
     slots: Vec<Slot>,
     policy: ObserverPolicy,
-    /// Cloned into every runner thread's status-notify callback (the GUI
-    /// passes its repaint coalescer; the CLI passes nothing).
+    /// Cloned into every runner thread's observer/control notify callback
+    /// (the GUI passes its repaint coalescer; the CLI passes nothing).
     notify: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Threads of removed slots, still winding down. Reaped by `poll` — the
     /// old GUI flow silently detached these.
     orphans: Vec<DrainingRunner>,
+    command_completions: Vec<CommandCompletion>,
 }
 
 impl TalkerSupervisor {
@@ -161,6 +262,7 @@ impl TalkerSupervisor {
             policy,
             notify: None,
             orphans: Vec::new(),
+            command_completions: Vec::new(),
         }
     }
 
@@ -187,6 +289,21 @@ impl TalkerSupervisor {
     /// status attribution use; `None` for an out-of-range index.
     pub fn channel_id(&self, i: usize) -> Option<ChannelId> {
         self.slots.get(i).map(|s| s.id)
+    }
+
+    /// Current slot of a stable channel id.
+    pub fn slot_index(&self, id: ChannelId) -> Option<usize> {
+        self.slots.iter().position(|slot| slot.id == id)
+    }
+
+    /// Interface the current runner has positively confirmed open.
+    pub fn applied_interface(&self, i: usize) -> Option<&InterfaceConfig> {
+        self.slots.get(i)?.applied_interface.as_ref()
+    }
+
+    /// Drain reliable command completions accumulated by [`poll`](Self::poll).
+    pub fn take_command_completions(&mut self) -> Vec<CommandCompletion> {
+        std::mem::take(&mut self.command_completions)
     }
 
     /// Remove slot `i`, shifting the ones above it down (mirrors the channel
@@ -261,6 +378,7 @@ impl TalkerSupervisor {
             .map(|d| d.thread)
             .collect();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(CMD_QUEUE_CAP);
+        let (control_tx, control_rx) = crossbeam_channel::bounded(CONTROL_QUEUE_CAP);
         let (status_tx, status_rx) = crossbeam_channel::bounded(STATUS_QUEUE_CAP);
         let notify: Option<runner::StatusNotify> = self.notify.clone().map(|n| {
             let f: runner::StatusNotify = Box::new(move || n());
@@ -276,10 +394,16 @@ impl TalkerSupervisor {
             for pred in predecessors {
                 let _ = pred.join();
             }
-            runner::open_and_run(who, cfg, schedule, cmd_rx, status_tx, notify, policy);
+            let observer = runner::RunnerObserver::new(status_tx, policy).with_control(control_tx);
+            let observer = match notify {
+                Some(notify) => observer.with_notify(notify),
+                None => observer,
+            };
+            runner::open_and_run(who, cfg, schedule, cmd_rx, observer);
         });
         self.slots[i].handle = Some(TalkerHandle {
             cmd_tx,
+            control_rx,
             status_rx,
             thread,
         });
@@ -294,6 +418,8 @@ impl TalkerSupervisor {
                 per_message_counts: vec![0; message_count],
                 ..ChannelTelemetry::default()
             };
+            slot.applied_interface = None;
+            slot.pending_commands.clear();
         }
     }
 
@@ -309,17 +435,25 @@ impl TalkerSupervisor {
             return CommandOutcome::NotRunning;
         };
         let outcome = match handle.cmd_tx.try_send(TalkerCommand::Stop) {
-            Ok(()) => CommandOutcome::Delivered,
+            Ok(()) => CommandOutcome::Enqueued,
             Err(TrySendError::Full(_)) => CommandOutcome::QueueFull,
             Err(TrySendError::Disconnected(_)) => CommandOutcome::NotRunning,
         };
         // Keep the receiver: the final Counters (ADR-018) still lands.
         slot.draining.push(DrainingRunner {
             thread: handle.thread,
+            control_rx: handle.control_rx,
             status_rx: handle.status_rx,
         });
+        slot.pending_commands.clear();
         if outcome == CommandOutcome::QueueFull {
-            self.record_command_failure(i, "Stop", CommandOutcome::QueueFull);
+            self.record_enqueue_failure(
+                i,
+                CommandId::mint(),
+                CommandTarget::Stop,
+                "Stop",
+                CommandOutcome::QueueFull,
+            );
         }
         if let Some(slot) = self.slots.get(i) {
             tracing::info!(
@@ -338,56 +472,79 @@ impl TalkerSupervisor {
     }
 
     /// Reopen channel `i`'s interface with a new configuration, live.
-    pub fn update_interface(&mut self, i: usize, cfg: InterfaceConfig) -> CommandOutcome {
+    pub fn update_interface(&mut self, i: usize, cfg: InterfaceConfig) -> CommandSubmission {
+        let id = CommandId::mint();
         self.send_command(
             i,
-            TalkerCommand::UpdateInterface(cfg),
+            id,
+            CommandEffect::Interface(cfg.clone()),
+            TalkerCommand::UpdateInterface { id, config: cfg },
             "the interface update",
         )
     }
 
     /// Change message `index`'s send interval on channel `i`, live.
-    pub fn set_interval(&mut self, i: usize, index: usize, interval_ms: u64) -> CommandOutcome {
+    pub fn set_interval(&mut self, i: usize, index: usize, interval_ms: u64) -> CommandSubmission {
+        let id = CommandId::mint();
         self.send_command(
             i,
-            TalkerCommand::SetInterval { index, interval_ms },
+            id,
+            CommandEffect::MessageInterval { index, interval_ms },
+            TalkerCommand::SetInterval {
+                id,
+                index,
+                interval_ms,
+            },
             "the interval change",
         )
     }
 
-    fn send_command(&mut self, i: usize, cmd: TalkerCommand, what: &str) -> CommandOutcome {
+    fn send_command(
+        &mut self,
+        i: usize,
+        id: CommandId,
+        effect: CommandEffect,
+        cmd: TalkerCommand,
+        what: &str,
+    ) -> CommandSubmission {
+        let target = effect.target();
         let outcome = match self.slots.get(i).and_then(|s| s.handle.as_ref()) {
             Some(h) => match h.cmd_tx.try_send(cmd) {
-                Ok(()) => CommandOutcome::Delivered,
+                Ok(()) => CommandOutcome::Enqueued,
                 Err(TrySendError::Full(_)) => CommandOutcome::QueueFull,
                 Err(TrySendError::Disconnected(_)) => CommandOutcome::NotRunning,
             },
             None => CommandOutcome::NotRunning,
         };
         match outcome {
-            CommandOutcome::Delivered => {
-                // A delivered command supersedes a pending control-plane
-                // failure — the divergence the banner warned about is over.
+            CommandOutcome::Enqueued => {
                 if let Some(slot) = self.slots.get_mut(i) {
-                    slot.telemetry.command_error = None;
+                    slot.pending_commands.insert(id, PendingCommand { effect });
                 }
             }
-            _ => self.record_command_failure(i, what, outcome),
+            _ => self.record_enqueue_failure(i, id, target, what, outcome),
         }
-        outcome
+        CommandSubmission { id, outcome }
     }
 
-    /// An undeliverable command makes the on-screen state diverge from the
+    /// A command that could not be enqueued makes the on-screen state diverge from the
     /// runner's — to the user it looks like a no-op bug, so it lands in the
     /// channel's error telemetry, not just the log.
-    fn record_command_failure(&mut self, i: usize, what: &str, outcome: CommandOutcome) {
+    fn record_enqueue_failure(
+        &mut self,
+        i: usize,
+        id: CommandId,
+        target: CommandTarget,
+        what: &str,
+        outcome: CommandOutcome,
+    ) {
         let why = match outcome {
             CommandOutcome::QueueFull => {
                 "the runner's command queue is full (it may be wedged in a blocking send)"
             }
             _ => "the runner has already exited",
         };
-        let msg = format!("{what} was not delivered: {why}");
+        let msg = format!("{what} was not enqueued: {why}");
         if let Some(slot) = self.slots.get(i) {
             tracing::warn!(
                 channel = slot.id.as_u64(),
@@ -396,10 +553,7 @@ impl TalkerSupervisor {
             );
         }
         if let Some(slot) = self.slots.get_mut(i) {
-            slot.telemetry.errors_total += 1;
-            // Control-plane class: a healthy payload sample must not clear
-            // this (the wire working says nothing about the lost command).
-            slot.telemetry.command_error = Some(msg);
+            slot.telemetry.record_command_failure(id, target, msg);
         }
     }
 
@@ -418,19 +572,23 @@ impl TalkerSupervisor {
             if let Some(h) = slot.handle.take() {
                 let TalkerHandle {
                     cmd_tx,
+                    control_rx,
                     status_rx,
                     thread,
                 } = h;
                 drop(cmd_tx);
+                for _ in control_rx.try_iter() {}
                 for _ in status_rx.try_iter() {}
                 let _ = thread.join();
             }
             for d in slot.draining.drain(..) {
+                for _ in d.control_rx.try_iter() {}
                 for _ in d.status_rx.try_iter() {}
                 let _ = d.thread.join();
             }
         }
         for d in self.orphans.drain(..) {
+            for _ in d.control_rx.try_iter() {}
             for _ in d.status_rx.try_iter() {}
             let _ = d.thread.join();
         }
@@ -441,6 +599,7 @@ impl TalkerSupervisor {
     /// samples for the display pane. Non-blocking; call at the UI cadence.
     pub fn poll(&mut self) -> Vec<PayloadSample> {
         let mut samples = Vec::new();
+        let mut command_completions = Vec::new();
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if let Some(h) = &slot.handle {
                 // Sample occupancy *before* draining so the peak reflects the
@@ -451,6 +610,14 @@ impl TalkerSupervisor {
                 let qlen = h.status_rx.len();
                 slot.telemetry.queue_len = qlen;
                 slot.telemetry.queue_peak = slot.telemetry.queue_peak.max(qlen);
+                drain_control_statuses(
+                    &h.control_rx,
+                    slot.id,
+                    &mut slot.applied_interface,
+                    &mut slot.pending_commands,
+                    &mut slot.telemetry,
+                    &mut command_completions,
+                );
                 drain_statuses(i, &h.status_rx, &mut slot.telemetry, &mut samples);
                 if finished {
                     slot.handle = None; // runner exited on its own (open failed / disconnect)
@@ -463,12 +630,93 @@ impl TalkerSupervisor {
             // entry is dropped.
             slot.draining.retain_mut(|d| {
                 let finished = d.thread.is_finished();
+                // Results from a stopped predecessor no longer describe a live
+                // interface. Drain only to keep its reliable lane unblocked.
+                for _ in d.control_rx.try_iter() {}
                 drain_statuses(i, &d.status_rx, &mut slot.telemetry, &mut samples);
                 !finished
             });
         }
-        self.orphans.retain(|d| !d.thread.is_finished());
+        self.orphans.retain_mut(|d| {
+            for _ in d.control_rx.try_iter() {}
+            !d.thread.is_finished()
+        });
+        self.command_completions.extend(command_completions);
         samples
+    }
+}
+
+fn drain_control_statuses(
+    control_rx: &Receiver<RunnerControlStatus>,
+    slot_id: ChannelId,
+    applied_interface: &mut Option<InterfaceConfig>,
+    pending_commands: &mut BTreeMap<CommandId, PendingCommand>,
+    telemetry: &mut ChannelTelemetry,
+    completions: &mut Vec<CommandCompletion>,
+) {
+    for status in control_rx.try_iter() {
+        match status {
+            RunnerControlStatus::InterfaceOpened { channel, config } => {
+                if channel == slot_id {
+                    *applied_interface = Some(config);
+                }
+            }
+            RunnerControlStatus::CommandCompleted {
+                channel,
+                id,
+                target,
+                execution,
+            } => {
+                if channel != slot_id {
+                    continue;
+                }
+                let Some(pending) = pending_commands.remove(&id) else {
+                    tracing::warn!(
+                        channel = channel.as_u64(),
+                        "runner completed unknown command id {id:?}"
+                    );
+                    continue;
+                };
+                if pending.effect.target() != target {
+                    tracing::warn!(
+                        channel = channel.as_u64(),
+                        "runner command id {id:?} completed for the wrong target"
+                    );
+                    continue;
+                }
+                match execution {
+                    CommandExecution::Applied => {
+                        telemetry.resolve_command(id, target);
+                        if let CommandEffect::Interface(config) = &pending.effect {
+                            *applied_interface = Some(config.clone());
+                        }
+                        completions.push(CommandCompletion::Applied {
+                            channel,
+                            id,
+                            effect: pending.effect,
+                        });
+                    }
+                    CommandExecution::Failed(message) => {
+                        let message = match target {
+                            CommandTarget::Interface => format!(
+                                "interface update failed; the previous interface remains active: {message}"
+                            ),
+                            CommandTarget::MessageInterval(index) => {
+                                format!("message {index} interval update failed: {message}")
+                            }
+                            CommandTarget::Stop => format!("stop command failed: {message}"),
+                        };
+                        telemetry.record_command_failure(id, target, message.clone());
+                        completions.push(CommandCompletion::Failed {
+                            channel,
+                            id,
+                            target,
+                            message,
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -518,11 +766,12 @@ fn drain_statuses(
 
 #[cfg(test)]
 mod tests {
+    use std::net::UdpSocket;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::core::channel::Interface;
+    use crate::core::channel::{Interface, TcpClientConfig, UdpConfig};
     use crate::core::message::{MessageConfig, PayloadConfig};
 
     /// Start slot `i` on a caller-supplied interface (no real I/O), through
@@ -544,16 +793,24 @@ mod tests {
             .map(|d| d.thread)
             .collect();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(CMD_QUEUE_CAP);
+        let (control_tx, control_rx) = crossbeam_channel::bounded(CONTROL_QUEUE_CAP);
         let (status_tx, status_rx) = crossbeam_channel::bounded(STATUS_QUEUE_CAP);
         let policy = sup.policy;
         let thread = std::thread::spawn(move || {
             for pred in predecessors {
                 let _ = pred.join();
             }
-            runner::run(who, interface, schedule, cmd_rx, status_tx, None, policy);
+            runner::run(
+                who,
+                interface,
+                schedule,
+                cmd_rx,
+                runner::RunnerObserver::new(status_tx, policy).with_control(control_tx),
+            );
         });
         sup.slots[i].handle = Some(TalkerHandle {
             cmd_tx,
+            control_rx,
             status_rx,
             thread,
         });
@@ -591,6 +848,28 @@ mod tests {
         }
     }
 
+    fn poll_for_completion(sup: &mut TalkerSupervisor, id: CommandId) -> CommandCompletion {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "command {id:?} did not complete in 5 s"
+            );
+            let _ = sup.poll();
+            if let Some(completion) =
+                sup.take_command_completions()
+                    .into_iter()
+                    .find(|completion| match completion {
+                        CommandCompletion::Applied { id: completed, .. }
+                        | CommandCompletion::Failed { id: completed, .. } => *completed == id,
+                    })
+            {
+                return completion;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn start_poll_stop_reaps_and_reads_exact_totals_at_rest() {
         let mut sup = TalkerSupervisor::new(ObserverPolicy::every_send());
@@ -610,7 +889,7 @@ mod tests {
         let mut samples = Vec::new();
         poll_until(&mut sup, &mut samples, |s| s.telemetry(0).total_count >= 3);
 
-        assert_eq!(sup.stop(0), CommandOutcome::Delivered);
+        assert_eq!(sup.stop(0), CommandOutcome::Enqueued);
         assert!(!sup.is_running(0));
 
         // The draining runner's tail (final Counters) is still collected, so
@@ -633,7 +912,10 @@ mod tests {
         assert!(sup.telemetry(0).last_error.is_none());
         // …but a lost interval change is surfaced (§ the on-screen state
         // would silently diverge otherwise).
-        assert_eq!(sup.set_interval(0, 0, 50), CommandOutcome::NotRunning);
+        assert_eq!(
+            sup.set_interval(0, 0, 50).outcome,
+            CommandOutcome::NotRunning
+        );
         let t = sup.telemetry(0);
         assert_eq!(t.errors_total, 1);
         assert!(t
@@ -644,6 +926,142 @@ mod tests {
         assert!(t.banner_error().is_some());
     }
 
+    #[test]
+    fn interface_execution_result_controls_applied_state_and_scoped_error() {
+        let mut sup = TalkerSupervisor::new(ObserverPolicy::sampled());
+        sup.push_slot();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        start_with_interface(
+            &mut sup,
+            0,
+            Box::new(CountingInterface {
+                sent: Arc::clone(&sent),
+            }),
+            schedule(&[msg("AB", 5)]),
+        );
+
+        // The injected test interface stands in for this known applied config.
+        let original = InterfaceConfig::Udp(UdpConfig::unicast(
+            "127.0.0.1:9".parse().expect("socket address"),
+        ));
+        sup.slots[0].applied_interface = Some(original.clone());
+
+        let refused = InterfaceConfig::TcpClient(TcpClientConfig::new(
+            "127.0.0.1:1".parse().expect("socket address"),
+        ));
+        let failed = sup.update_interface(0, refused);
+        assert_eq!(failed.outcome, CommandOutcome::Enqueued);
+        assert_eq!(
+            sup.applied_interface(0),
+            Some(&original),
+            "enqueue alone must not change runtime truth"
+        );
+        assert!(matches!(
+            poll_for_completion(&mut sup, failed.id),
+            CommandCompletion::Failed {
+                target: CommandTarget::Interface,
+                ..
+            }
+        ));
+        assert_eq!(
+            sup.applied_interface(0),
+            Some(&original),
+            "failed reopen keeps the old working interface"
+        );
+        assert!(sup.telemetry(0).command_error.is_some());
+
+        // A healthy old interface and an unrelated successful interval command
+        // say nothing about the failed reopen; neither may clear its banner.
+        let interval = sup.set_interval(0, 0, 20);
+        assert_eq!(interval.outcome, CommandOutcome::Enqueued);
+        assert!(matches!(
+            poll_for_completion(&mut sup, interval.id),
+            CommandCompletion::Applied {
+                effect: CommandEffect::MessageInterval {
+                    index: 0,
+                    interval_ms: 20
+                },
+                ..
+            }
+        ));
+        assert!(sup.telemetry(0).command_error.is_some());
+
+        // Only a later success for the same target resolves the divergence.
+        let sink = UdpSocket::bind("127.0.0.1:0").expect("bind UDP sink");
+        let replacement =
+            InterfaceConfig::Udp(UdpConfig::unicast(sink.local_addr().expect("sink address")));
+        let succeeded = sup.update_interface(0, replacement.clone());
+        assert_eq!(succeeded.outcome, CommandOutcome::Enqueued);
+        assert!(matches!(
+            poll_for_completion(&mut sup, succeeded.id),
+            CommandCompletion::Applied {
+                effect: CommandEffect::Interface(_),
+                ..
+            }
+        ));
+        assert_eq!(sup.applied_interface(0), Some(&replacement));
+        assert!(sup.telemetry(0).command_error.is_none());
+
+        let _ = sup.stop(0);
+        let mut samples = Vec::new();
+        poll_until(&mut sup, &mut samples, |s| !s.any_draining());
+    }
+
+    #[test]
+    fn start_time_interface_becomes_applied_only_after_open_succeeds() {
+        let sink = UdpSocket::bind("127.0.0.1:0").expect("bind UDP sink");
+        let config =
+            InterfaceConfig::Udp(UdpConfig::unicast(sink.local_addr().expect("sink address")));
+        let mut sup = TalkerSupervisor::new(ObserverPolicy::sampled());
+        sup.push_slot();
+        sup.start(0, "1", config.clone(), schedule(&[msg("AB", 20)]));
+        assert!(
+            sup.applied_interface(0).is_none(),
+            "spawn is not proof that open completed"
+        );
+        let mut samples = Vec::new();
+        poll_until(&mut sup, &mut samples, |s| {
+            s.applied_interface(0) == Some(&config)
+        });
+        let _ = sup.stop(0);
+        poll_until(&mut sup, &mut samples, |s| !s.any_draining());
+    }
+
+    #[test]
+    fn rejected_interval_reports_execution_failure() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut sup = TalkerSupervisor::new(ObserverPolicy::sampled());
+        sup.push_slot();
+        start_with_interface(
+            &mut sup,
+            0,
+            Box::new(CountingInterface {
+                sent: Arc::clone(&sent),
+            }),
+            schedule(&[msg("AB", 20)]),
+        );
+
+        let submission = sup.set_interval(0, 7, 10);
+        assert_eq!(submission.outcome, CommandOutcome::Enqueued);
+        match poll_for_completion(&mut sup, submission.id) {
+            CommandCompletion::Failed {
+                target: CommandTarget::MessageInterval(7),
+                message,
+                ..
+            } => assert!(message.contains("outside the 1-message schedule")),
+            other => panic!("expected rejected interval completion, got {other:?}"),
+        }
+        assert!(sup
+            .telemetry(0)
+            .command_error
+            .as_deref()
+            .is_some_and(|message| message.contains("message 7 interval update failed")));
+
+        let _ = sup.stop(0);
+        let mut samples = Vec::new();
+        poll_until(&mut sup, &mut samples, |s| !s.any_draining());
+    }
+
     /// Error-class separation: a healthy payload sample clears an *interface*
     /// error but must NOT clear a *control-plane* one — the wire working says
     /// nothing about a command that never arrived.
@@ -651,7 +1069,7 @@ mod tests {
     fn samples_clear_interface_errors_but_not_command_errors() {
         let mut telemetry = ChannelTelemetry {
             last_error: Some("send failed".into()),
-            command_error: Some("the interval change was not delivered".into()),
+            command_error: Some("the interval change was not enqueued".into()),
             ..ChannelTelemetry::default()
         };
         let (tx, rx) = crossbeam_channel::bounded(4);

@@ -241,7 +241,7 @@ fn tcp_failed_send_storm_stays_bounded() {
         t.errors_total
     );
 
-    assert_eq!(sup.stop(0), CommandOutcome::Delivered, "Stop must deliver");
+    assert_eq!(sup.stop(0), CommandOutcome::Enqueued, "Stop must enqueue");
     poll_until(&mut sup, Duration::from_secs(15), |s| !s.any_draining());
     acceptor.join().expect("acceptor thread");
 }

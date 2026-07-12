@@ -17,7 +17,7 @@ use crate::core::{
     profile::Profile,
     runner,
     scheduler::Schedule,
-    supervisor::TalkerSupervisor,
+    supervisor::{CommandCompletion, CommandEffect, TalkerSupervisor},
 };
 
 use display::ChannelDisplay;
@@ -444,9 +444,18 @@ impl TalkerApp {
         let Some(applied) = self.profile.channels.get(i) else {
             return (false, false);
         };
-        let iface_drift = self.conn_drafts[i]
-            .to_config()
-            .is_some_and(|cfg| cfg != applied.interface);
+        let iface_drift = self.conn_drafts[i].to_config().is_some_and(|cfg| {
+            if self.sup.is_running(i) {
+                // Runtime truth comes only from the runner's reliable open/update
+                // result. The profile is desired/persisted state and can change on
+                // Save while a failed live update leaves the old interface active.
+                self.sup
+                    .applied_interface(i)
+                    .is_none_or(|live| cfg != *live)
+            } else {
+                cfg != applied.interface
+            }
+        });
         let draft_messages: Vec<_> = self
             .sched_drafts
             .get(i)
@@ -701,8 +710,8 @@ impl TalkerApp {
     }
 
     /// Stop channel `i` without blocking the UI (the supervisor parks the
-    /// runner to drain in the background; undeliverable commands surface in
-    /// the channel's telemetry).
+    /// runner to drain in the background; enqueue failures surface in the
+    /// channel's telemetry).
     fn stop_connection(&mut self, i: usize) {
         let _ = self.sup.stop(i);
     }
@@ -762,20 +771,48 @@ impl TalkerApp {
         let Some(cfg) = self.conn_drafts[i].to_config() else {
             return;
         };
-        if i < self.profile.channels.len() {
-            self.profile.channels[i].interface = cfg.clone();
+        if self.sup.is_running(i) {
+            // Enqueue is not application. The supervisor retains `cfg`; only the
+            // runner's reliable success result updates the applied baseline below.
+            let _ = self.sup.update_interface(i, cfg);
+        } else if i < self.profile.channels.len() {
+            self.profile.channels[i].interface = cfg;
         } else {
             self.profile.channels.push(ChannelConfig::named(
                 self.conn_drafts[i].name.clone(),
-                cfg.clone(),
+                cfg,
                 Vec::new(),
             ));
         }
-        if self.sup.is_running(i) {
-            // Undeliverable updates surface in the channel telemetry.
-            let _ = self.sup.update_interface(i, cfg);
-        }
         self.dirty = true;
+    }
+
+    /// Fold reliable runner command completions into the profile's last-applied
+    /// baseline. A failed command leaves that baseline untouched, so drift and the
+    /// error banner continue to state that the draft is not live.
+    fn apply_command_completions(&mut self) {
+        for completion in self.sup.take_command_completions() {
+            let CommandCompletion::Applied {
+                channel, effect, ..
+            } = completion
+            else {
+                continue;
+            };
+            let Some(i) = self.sup.slot_index(channel) else {
+                continue;
+            };
+            let Some(applied) = self.profile.channels.get_mut(i) else {
+                continue;
+            };
+            match effect {
+                CommandEffect::Interface(config) => applied.interface = config,
+                CommandEffect::MessageInterval { index, interval_ms } => {
+                    if let Some(message) = applied.messages.get_mut(index) {
+                        message.interval_ms = interval_ms;
+                    }
+                }
+            }
+        }
     }
 
     // ── Channel polling ───────────────────────────────────────────────────────
@@ -835,6 +872,7 @@ impl TalkerApp {
                 d.push(sample.payload);
             }
         }
+        self.apply_command_completions();
 
         // Refresh the per-channel send-rate samples (~1 s window).
         let now = Instant::now();

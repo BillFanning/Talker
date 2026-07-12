@@ -77,11 +77,10 @@ Cross off items as they are completed. Add new ones inline as they come up.
   samples/s; what remains is render cost. Measure egui frame time
   before/after porting listener's row-ring approach; do with the next GUI
   polish pass.
-- [x] **Command acks** — DONE (`6d4da3b`). Failed `Stop`/interface-update/
-  `SetInterval` sends surface in the channel's error banner via
-  `command_not_delivered` (gui/mod.rs), distinguishing queue-full (runner
-  wedged) from runner-exited (a moot Stop stays silent). Listener's sibling
-  landed in the same commit (listener TODO).
+- [x] **Command enqueue failures** — DONE (`6d4da3b`). Failed `Stop`/
+  interface-update/`SetInterval` enqueue attempts surface in the channel's
+  error banner, distinguishing queue-full (runner wedged) from runner-exited
+  (a moot Stop stays silent). Listener's sibling landed in the same commit.
 - [x] **TalkerSupervisor (ADR-019) — DONE 2026-07-11.**
   `core::supervisor::TalkerSupervisor` owns the channel slots (runner threads,
   channel pairs, draining, `ChannelTelemetry`); the GUI holds view-state only
@@ -119,9 +118,18 @@ Cross off items as they are completed. Add new ones inline as they come up.
 - [x] **Error-class separation for `last_error`** — `ChannelTelemetry` splits
   `last_error` (interface class; cleared by a live `SendSample`/
   `SendRecovered`) from `command_error` (control-plane class; cleared only by
-  a later delivered command or start), and the UI banner prefers the
+  a later successfully executed command for the same target, or start), and the UI banner prefers the
   command error (`banner_error()`). Pinned by
   `samples_clear_interface_errors_but_not_command_errors`.
+- [x] **Correlated command execution (ADR-021)** — enqueue success is no
+  longer presented as application. Live interface/interval commands carry
+  ids; the runner reports `Applied`/`Failed` on a reliable control lane; the
+  supervisor validates id + target, retains failures per target, and changes
+  applied runtime state only on confirmed success. Start-time interface state
+  is also confirmed by the runner. Pinned by
+  `interface_execution_result_controls_applied_state_and_scoped_error` and
+  `start_time_interface_becomes_applied_only_after_open_succeeds`, plus
+  `rejected_interval_reports_execution_failure`.
 - [x] **Sample lane rotates across messages** — the lane skips a repeat of the
   last sampled index while due (never longer than one full cycle), so an
   aligned multi-message schedule no longer shows message 0 forever. Pinned by

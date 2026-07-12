@@ -167,13 +167,16 @@ impl Schedule {
     ///
     /// An interval of 0 makes the message dormant. A non-zero interval
     /// (re)schedules it to fire at `now + interval`. An out-of-range index is
-    /// ignored.
-    pub fn set_interval(&mut self, index: usize, interval_ms: u64, now: Instant) {
+    /// rejected (`false`).
+    pub fn set_interval(&mut self, index: usize, interval_ms: u64, now: Instant) -> bool {
         if let Some(msg) = self.messages.get_mut(index) {
             msg.interval = Duration::from_millis(interval_ms);
             if msg.is_active() {
                 msg.next_fire = now + msg.interval;
             }
+            true
+        } else {
+            false
         }
     }
 }
@@ -372,7 +375,7 @@ mod tests {
     fn set_interval_to_zero_makes_dormant() {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
-        s.set_interval(0, 0, t0);
+        assert!(s.set_interval(0, 0, t0));
         assert_eq!(s.poll(t0), Tick::Idle);
     }
 
@@ -380,7 +383,7 @@ mod tests {
     fn set_interval_reschedules_from_now() {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
-        s.set_interval(0, 200, t0 + ms(50));
+        assert!(s.set_interval(0, 200, t0 + ms(50)));
         assert_eq!(s.poll(t0 + ms(50)), Tick::Wait(t0 + ms(250)));
         assert!(matches!(s.poll(t0 + ms(250)), Tick::Send { index: 0, .. }));
     }
@@ -390,7 +393,7 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("AB", 0)], t0).unwrap();
         assert_eq!(s.poll(t0), Tick::Idle);
-        s.set_interval(0, 100, t0);
+        assert!(s.set_interval(0, 100, t0));
         assert_eq!(s.poll(t0), Tick::Wait(t0 + ms(100)));
     }
 
@@ -398,7 +401,7 @@ mod tests {
     fn set_interval_out_of_range_is_ignored() {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
-        s.set_interval(99, 500, t0); // must not panic
+        assert!(!s.set_interval(99, 500, t0)); // must not panic
         assert!(matches!(s.poll(t0), Tick::Send { index: 0, .. }));
     }
 }

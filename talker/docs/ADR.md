@@ -391,8 +391,9 @@ error banner). The open points settled as:
 
 - **API shape: blocking methods, no command enum.** `start`/`stop`/
   `update_interface`/`set_interval` are direct calls returning a `CommandOutcome`
-  (`Delivered`/`QueueFull`/`NotRunning`); undeliverable commands are recorded in the
-  telemetry, so the caller can fire-and-forget. No supervisor thread, matching
+  (`Enqueued`/`QueueFull`/`NotRunning`); commands that cannot be enqueued are recorded
+  in telemetry. Successful enqueue is not proof of execution; ADR-021 adds correlated
+  execution results for live mutations. No supervisor thread, matching
   ADR-002 — everything runs on the caller's thread and never blocks (`join_all` is
   the one deliberate exception, exit-path only).
 - **Drain cadence: caller-owned poll.** `poll()` non-blockingly folds every runner's
@@ -464,6 +465,46 @@ scheme from its single-channel-era plumbing.
   start fall back to the id form ("channel #4").
 - `TalkerStatus` stays self-describing under the CLI's shared funnel with an
   identity that survives any future removal/reorder feature there.
+
+## ADR-021 — Correlated command execution and applied runtime state
+
+**Status:** Accepted 2026-07-12 (deep reliability review).
+
+**Context:** ADR-019 reported whether a live interface or interval command entered
+the runner queue, but the GUI immediately copied the requested interface into the
+profile and treated it as applied. `UpdateInterface` can still fail while the runner
+keeps its previous interface, and `SetInterval` can reject an invalid message index.
+The UI could therefore claim runtime state that never took effect. A later unrelated
+successful command also cleared the one shared command-error string, hiding the
+unresolved failure. Listener's lifecycle work established the applicable rule:
+observable state is reconciled from runtime facts, not from submitted intent.
+
+**Decision:** Live mutations carry a process-unique `CommandId` and a scoped
+`CommandTarget` (`Interface` or one message interval). The immediate supervisor result
+is explicitly an enqueue outcome. After executing a command, the runner emits a
+correlated `Applied` or `Failed` result on a dedicated reliable control channel,
+separate from ADR-018's sampled/drop-and-count observer queue. The supervisor retains
+each pending effect and accepts a completion only when its id and target match.
+
+The start-time interface is likewise not considered applied until the runner reports
+that `open` succeeded. A successful interface update replaces the supervisor's
+applied-interface baseline; a failed update leaves the previous baseline intact and
+states that fact in the channel banner. Command failures are retained independently
+per target, and only a later successful command for that same target resolves one.
+The GUI commits an effect to its profile baseline only after the correlated success.
+
+**Consequences:**
+- Queue acceptance and runtime application are no longer conflated in APIs, comments,
+  telemetry, or drift detection.
+- Observer congestion cannot erase configuration truth. The reliable channel is sized
+  for the start result plus the bounded command queue; its sends wake the GUI so it is
+  drained promptly.
+- Failed live interface edits remain visibly dirty against the confirmed live
+  interface, even if the draft/profile is saved while the old interface keeps running.
+- Results from stopped predecessors are drained only to let them finish; they cannot
+  mutate the replacement runner's applied state.
+- Tests pin failed-update retention, target-scoped error recovery, and start-time open
+  confirmation.
 
 ---
 

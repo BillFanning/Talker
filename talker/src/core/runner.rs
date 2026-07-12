@@ -30,13 +30,64 @@ pub struct RunnerIdentity {
     pub label: String,
 }
 
+/// Process-unique identity of a live control command. The id lets observers
+/// correlate an enqueue attempt with the runner's eventual execution result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CommandId(u64);
+
+impl CommandId {
+    pub fn mint() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// The independently recoverable control target a command mutates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CommandTarget {
+    Stop,
+    Interface,
+    MessageInterval(usize),
+}
+
+/// What the runner did with an enqueued command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandExecution {
+    Applied,
+    Failed(String),
+}
+
+/// Reliable runner-to-owner control state. This uses a dedicated bounded lane,
+/// separate from drop-and-count telemetry: configuration truth must not disappear
+/// merely because the sampled observer queue is full.
+#[derive(Clone, Debug)]
+pub enum RunnerControlStatus {
+    /// The runner successfully opened its start-time interface.
+    InterfaceOpened {
+        channel: ChannelId,
+        config: InterfaceConfig,
+    },
+    /// One enqueued live mutation finished executing.
+    CommandCompleted {
+        channel: ChannelId,
+        id: CommandId,
+        target: CommandTarget,
+        execution: CommandExecution,
+    },
+}
+
 /// A command sent from the owning thread (UI or CLI) to a channel's runner.
 pub enum TalkerCommand {
     Stop,
     /// Reopen the channel's interface with a new configuration.
-    UpdateInterface(InterfaceConfig),
+    UpdateInterface {
+        id: CommandId,
+        config: InterfaceConfig,
+    },
     /// Change message `index`'s send interval, effective immediately.
     SetInterval {
+        id: CommandId,
         index: usize,
         interval_ms: u64,
     },
@@ -84,7 +135,7 @@ pub enum TalkerStatus {
         /// Exact bytes put on the wire.
         payload: Vec<u8>,
     },
-    /// A send (or interface update) failed. **Edge-triggered** for sends: only
+    /// A send failed. **Edge-triggered**: only
     /// the *first* failure of a failing episode is reported; repeats are
     /// counted, not re-reported, and [`SendRecovered`](Self::SendRecovered)
     /// closes the episode with the totals.
@@ -170,6 +221,7 @@ struct FailureEpisode {
 /// The owning side's handle for a running talker thread.
 pub struct TalkerHandle {
     pub cmd_tx: Sender<TalkerCommand>,
+    pub control_rx: Receiver<RunnerControlStatus>,
     pub status_rx: Receiver<TalkerStatus>,
     pub thread: std::thread::JoinHandle<()>,
 }
@@ -178,6 +230,37 @@ pub struct TalkerHandle {
 /// can wake and drain instead of polling. Kept as a plain closure — core
 /// stays UI-framework-free; the GUI passes `ctx.request_repaint`.
 pub type StatusNotify = Box<dyn Fn() + Send>;
+
+/// Runner-to-owner reporting endpoints and cadence policy. Keeping this wiring
+/// together prevents entry points from growing parallel positional arguments as
+/// observer and reliable-control lanes evolve.
+pub struct RunnerObserver {
+    control_tx: Option<Sender<RunnerControlStatus>>,
+    status_tx: Sender<TalkerStatus>,
+    notify: Option<StatusNotify>,
+    policy: ObserverPolicy,
+}
+
+impl RunnerObserver {
+    pub fn new(status_tx: Sender<TalkerStatus>, policy: ObserverPolicy) -> Self {
+        Self {
+            control_tx: None,
+            status_tx,
+            notify: None,
+            policy,
+        }
+    }
+
+    pub fn with_control(mut self, control_tx: Sender<RunnerControlStatus>) -> Self {
+        self.control_tx = Some(control_tx);
+        self
+    }
+
+    pub fn with_notify(mut self, notify: StatusNotify) -> Self {
+        self.notify = Some(notify);
+        self
+    }
+}
 
 /// Open `cfg`'s interface, then run the send loop.
 ///
@@ -190,26 +273,35 @@ pub fn open_and_run(
     cfg: InterfaceConfig,
     schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
-    status_tx: Sender<TalkerStatus>,
-    notify: Option<StatusNotify>,
-    policy: ObserverPolicy,
+    observer: RunnerObserver,
 ) {
     match cfg.open() {
-        Ok(interface) => run(who, interface, schedule, cmd_rx, status_tx, notify, policy),
+        Ok(interface) => {
+            emit_control(
+                &observer.control_tx,
+                &observer.notify,
+                RunnerControlStatus::InterfaceOpened {
+                    channel: who.id,
+                    config: cfg,
+                },
+            );
+            run(who, interface, schedule, cmd_rx, observer);
+        }
         Err(e) => {
             tracing::error!(
                 channel = who.id.as_u64(),
                 "failed to open channel {}: {e:#}",
                 who.label
             );
-            if status_tx
+            if observer
+                .status_tx
                 .try_send(TalkerStatus::OpenFailed {
                     channel: who.id,
                     message: format!("{e:#}"),
                 })
                 .is_ok()
             {
-                if let Some(n) = &notify {
+                if let Some(n) = &observer.notify {
                     n();
                 }
             }
@@ -227,9 +319,7 @@ pub fn run(
     interface: Box<dyn Interface>,
     schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
-    status_tx: Sender<TalkerStatus>,
-    notify: Option<StatusNotify>,
-    policy: ObserverPolicy,
+    observer: RunnerObserver,
 ) {
     tracing::info!(
         channel = who.id.as_u64(),
@@ -237,7 +327,7 @@ pub fn run(
         who.label,
         schedule.len()
     );
-    run_loop(&who, interface, schedule, cmd_rx, status_tx, notify, policy);
+    run_loop(&who, interface, schedule, cmd_rx, observer);
     tracing::info!(channel = who.id.as_u64(), "channel {} stopped", who.label);
 }
 
@@ -251,10 +341,14 @@ fn run_loop(
     mut interface: Box<dyn Interface>,
     mut schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
-    status_tx: Sender<TalkerStatus>,
-    notify: Option<StatusNotify>,
-    policy: ObserverPolicy,
+    observer: RunnerObserver,
 ) {
+    let RunnerObserver {
+        control_tx,
+        status_tx,
+        notify,
+        policy,
+    } = observer;
     let mut total_count = 0u64;
     let mut total_bytes = 0u64;
     // Lane rate limits (ADR-018): `None` = nothing emitted yet, so the first
@@ -277,13 +371,12 @@ fn run_loop(
     let handle = |cmd: TalkerCommand,
                   interface: &mut Box<dyn Interface>,
                   schedule: &mut Schedule,
-                  episode: &mut Option<FailureEpisode>,
-                  dropped_statuses: &mut u64|
+                  episode: &mut Option<FailureEpisode>|
      -> Flow {
         match cmd {
             TalkerCommand::Stop => Flow::Stop,
-            TalkerCommand::UpdateInterface(cfg) => {
-                match cfg.open() {
+            TalkerCommand::UpdateInterface { id, config } => {
+                let execution = match config.open() {
                     Ok(new) => {
                         *interface = new;
                         // A fresh interface deserves an immediate attempt:
@@ -298,6 +391,7 @@ fn run_loop(
                             "channel {} interface updated",
                             who.label
                         );
+                        CommandExecution::Applied
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -305,22 +399,44 @@ fn run_loop(
                             "channel {} interface update failed: {e:#}",
                             who.label
                         );
-                        emit_status(
-                            &status_tx,
-                            &notify,
-                            who,
-                            dropped_statuses,
-                            TalkerStatus::ConnectionError {
-                                channel: who.id,
-                                message: format!("{e:#}"),
-                            },
-                        );
+                        CommandExecution::Failed(format!("{e:#}"))
                     }
-                }
+                };
+                emit_control(
+                    &control_tx,
+                    &notify,
+                    RunnerControlStatus::CommandCompleted {
+                        channel: who.id,
+                        id,
+                        target: CommandTarget::Interface,
+                        execution,
+                    },
+                );
                 Flow::Continue
             }
-            TalkerCommand::SetInterval { index, interval_ms } => {
-                schedule.set_interval(index, interval_ms, Instant::now());
+            TalkerCommand::SetInterval {
+                id,
+                index,
+                interval_ms,
+            } => {
+                let execution = if schedule.set_interval(index, interval_ms, Instant::now()) {
+                    CommandExecution::Applied
+                } else {
+                    CommandExecution::Failed(format!(
+                        "message index {index} is outside the {}-message schedule",
+                        schedule.len()
+                    ))
+                };
+                emit_control(
+                    &control_tx,
+                    &notify,
+                    RunnerControlStatus::CommandCompleted {
+                        channel: who.id,
+                        id,
+                        target: CommandTarget::MessageInterval(index),
+                        execution,
+                    },
+                );
                 Flow::Continue
             }
         }
@@ -347,13 +463,7 @@ fn run_loop(
         // Drain anything already queued so back-to-back sends can't starve
         // command handling.
         for cmd in cmd_rx.try_iter() {
-            if let Flow::Stop = handle(
-                cmd,
-                &mut interface,
-                &mut schedule,
-                &mut episode,
-                &mut dropped_statuses,
-            ) {
+            if let Flow::Stop = handle(cmd, &mut interface, &mut schedule, &mut episode) {
                 break 'run;
             }
         }
@@ -491,13 +601,7 @@ fn run_loop(
             // for the schedule, and detects a dropped handle.
             Tick::Wait(until) => match cmd_rx.recv_deadline(until) {
                 Ok(cmd) => {
-                    if let Flow::Stop = handle(
-                        cmd,
-                        &mut interface,
-                        &mut schedule,
-                        &mut episode,
-                        &mut dropped_statuses,
-                    ) {
+                    if let Flow::Stop = handle(cmd, &mut interface, &mut schedule, &mut episode) {
                         break 'run;
                     }
                 }
@@ -508,13 +612,7 @@ fn run_loop(
             // so block indefinitely — zero wakeups.
             Tick::Idle => match cmd_rx.recv() {
                 Ok(cmd) => {
-                    if let Flow::Stop = handle(
-                        cmd,
-                        &mut interface,
-                        &mut schedule,
-                        &mut episode,
-                        &mut dropped_statuses,
-                    ) {
+                    if let Flow::Stop = handle(cmd, &mut interface, &mut schedule, &mut episode) {
                         break 'run;
                     }
                 }
@@ -576,6 +674,24 @@ fn emit_status(
     }
 }
 
+/// Queue control truth reliably. Commands are rare and the control queue is sized
+/// from the command queue, so an owner that keeps polling cannot lose a completion;
+/// a dropped owner releases the send immediately with `Disconnected`.
+fn emit_control(
+    control_tx: &Option<Sender<RunnerControlStatus>>,
+    notify: &Option<StatusNotify>,
+    status: RunnerControlStatus,
+) {
+    let Some(control_tx) = control_tx else {
+        return;
+    };
+    if control_tx.send(status).is_ok() {
+        if let Some(n) = notify {
+            n();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -620,6 +736,7 @@ mod tests {
         });
         let schedule = Schedule::compile(messages, Instant::now()).unwrap();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
+        let (control_tx, control_rx) = crossbeam_channel::bounded(16);
         let (status_tx, status_rx) = crossbeam_channel::bounded(256);
         let who = RunnerIdentity {
             id: ChannelId::mint(),
@@ -627,12 +744,19 @@ mod tests {
         };
         let id = who.id;
         let thread = std::thread::spawn(move || {
-            run(who, interface, schedule, cmd_rx, status_tx, None, policy)
+            run(
+                who,
+                interface,
+                schedule,
+                cmd_rx,
+                RunnerObserver::new(status_tx, policy).with_control(control_tx),
+            )
         });
         (
             sent,
             TalkerHandle {
                 cmd_tx,
+                control_rx,
                 status_rx,
                 thread,
             },
@@ -805,6 +929,7 @@ mod tests {
         let (_, handle, _id) = spawn_runner(&[msg("AB", 0)], false);
         let TalkerHandle {
             cmd_tx,
+            control_rx: _control_rx,
             status_rx: _status_rx,
             thread,
         } = handle;
@@ -887,6 +1012,7 @@ mod tests {
         });
         let schedule = Schedule::compile(&[msg("AB", 5)], Instant::now()).unwrap();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
+        let (control_tx, control_rx) = crossbeam_channel::bounded(16);
         let (status_tx, status_rx) = crossbeam_channel::bounded(256);
         let who = RunnerIdentity {
             id: ChannelId::mint(),
@@ -898,13 +1024,13 @@ mod tests {
                 interface,
                 schedule,
                 cmd_rx,
-                status_tx,
-                None,
-                ObserverPolicy::every_send(),
+                RunnerObserver::new(status_tx, ObserverPolicy::every_send())
+                    .with_control(control_tx),
             )
         });
         let handle = TalkerHandle {
             cmd_tx,
+            control_rx,
             status_rx,
             thread,
         };
@@ -964,9 +1090,7 @@ mod tests {
             cfg,
             schedule,
             cmd_rx,
-            status_tx,
-            None,
-            ObserverPolicy::every_send(),
+            RunnerObserver::new(status_tx, ObserverPolicy::every_send()),
         );
         match status_rx.try_recv() {
             Ok(TalkerStatus::OpenFailed { channel, message }) => {
