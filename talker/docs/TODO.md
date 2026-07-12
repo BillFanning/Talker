@@ -154,11 +154,21 @@ Cross off items as they are completed. Add new ones inline as they come up.
   `cargo bench -- --test`; clippy covers them via `--all-targets`. These are
   the baselines gating every "(behind benchmarks)" item here and in the
   listener TODO — measure before optimizing.
-- [ ] **Soak tests (the harness's second half).** Long-running scenarios
-  criterion can't express: multi-channel talker sends at 100–1,000 Hz over
-  real sockets, failed-send storms (now bounded by the backoff policy),
-  slow-disk recording with rotation. Likely long-running integration binaries
-  invoked manually / nightly, not in the per-push CI gate.
+- [x] **Soak tests (the harness's second half)** — landed as `#[ignore]`d
+  integration tests, invoked manually / nightly (not the per-push gate):
+  `cargo test -p talker --test soak -- --ignored` and the listener sibling;
+  duration via `WIREDATA_SOAK_SECS` (default 10 s).
+  - `multi_channel_udp_soak_totals_exact_at_rest`: 4 channels × 1,000
+    sends/s over real loopback UDP; telemetry == wire exactly at rest.
+  - `tcp_failed_send_storm_stays_bounded`: ~500 fires/s against a dead peer
+    for the whole window → ONE edge-triggered error, live runner,
+    deliverable Stop.
+  - listener `sustained_recording_records_every_byte`: ~64 KB/s recorded to
+    a real file; sent == retained activity == `.raw` bytes, recording queue
+    never near the cap.
+  - Still open (needs an injectable slow writer, not just a real disk):
+    **slow-disk recording with rotation** — fold into whatever next touches
+    the recorder task's writer seam.
 - [ ] **`wiredata-display` extraction — only together with talker adopting the
   incremental renderer** (row-ring item above): the protocol-neutral
   Raw/Rendered/Hex stream machinery could move to an egui-free shared crate so
