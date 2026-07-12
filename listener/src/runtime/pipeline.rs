@@ -1063,6 +1063,15 @@ impl ChannelPipeline {
                         events.try_send(RuntimeEvent::ReceptionStalled(channel_id, stalled_for));
                 }
             }
+            TransportNotice::TransportFaulted { channel_id, cause } => {
+                // The fault's CAUSE, retained where an operator will look for
+                // it (the diagnostics log, which survives stop via the
+                // retained snapshot). The paired `ChannelFaulted` lifecycle
+                // event (§137) is emitted by the fault monitor, not here.
+                self.diagnostics.record(Diagnostic::error(format!(
+                    "transport fault on channel {channel_id}: {cause}"
+                )));
+            }
         }
     }
 
@@ -1401,6 +1410,7 @@ pub async fn run_channel(
 ) -> ChannelPipeline {
     let mut requests_open = true;
     let mut notices_open = true;
+    let mut ingest_open = true;
     // Periodic disk-space guard poll (§56.2, §168) — not per write. Cheap when no
     // guard is configured (the check returns immediately).
     let mut disk_check = tokio::time::interval(Duration::from_secs(5));
@@ -1440,7 +1450,14 @@ pub async fn run_channel(
             },
             notice = notices.recv(), if notices_open => match notice {
                 Some(notice) => pipeline.record_notice(notice),
-                None => notices_open = false, // transport gone; keep running
+                // Every notice sender is gone (transport ended, fault monitor
+                // done). Once ingest is closed too, nothing more can arrive.
+                None => {
+                    notices_open = false;
+                    if !ingest_open {
+                        break;
+                    }
+                }
             },
             _ = disk_check.tick() => pipeline.check_disk_guard().await,
             _ = idle_check.tick() => {
@@ -1450,7 +1467,7 @@ pub async fn run_channel(
                 // tick is the only place the fault gets reported (§56.1).
                 pipeline.check_recording_faults();
             }
-            maybe = ingest.recv() => match maybe {
+            maybe = ingest.recv(), if ingest_open => match maybe {
                 Some(data) => {
                     // Sample ingest occupancy for stress testing (§99): `len()` after a
                     // recv is the backlog still waiting — +1 for the item just taken is
@@ -1460,7 +1477,20 @@ pub async fn run_channel(
                     // A `Record` action may have been queued by a rule (§50.2).
                     pipeline.apply_pending_records().await;
                 }
-                None => break,
+                // Transport gone and backlog fully drained (mpsc `None` =
+                // closed AND empty, §110). Don't break yet: a spontaneous
+                // fault's CAUSE may still be in flight on the notices channel
+                // — the monitor learns the outcome only after the transport's
+                // senders drop, so the notice can trail the ingest close. The
+                // loop ends when the notices side closes too (the monitor
+                // always terminates right after the transport, so this cannot
+                // hang).
+                None => {
+                    if !notices_open {
+                        break;
+                    }
+                    ingest_open = false;
+                }
             },
         }
     }
@@ -1805,13 +1835,18 @@ mod tests {
         let cid = ChannelId::new();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let (_req_tx, req_rx) = tokio::sync::mpsc::channel(1);
-        let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(1);
+        let (notice_tx, notice_rx) = tokio::sync::mpsc::channel(1);
         let p = pipeline(cid, PipelineCapacities::default());
         let cancel = CancellationToken::new();
         let task = tokio::spawn(run_channel(rx, req_rx, notice_rx, p, cancel));
 
         tx.send(bytes_chunk(cid, b"abc")).await.unwrap();
+        // Natural end = BOTH senders gone (as in production: the transport
+        // and its fault monitor drop them after the transport ends). The loop
+        // deliberately outlives the ingest close alone, so a fault-cause
+        // notice can never be outrun.
         drop(tx);
+        drop(notice_tx);
         let p = task.await.unwrap();
         assert_eq!(&p.stream_tail()[..], &b"abc"[..]);
     }

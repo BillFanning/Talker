@@ -333,8 +333,12 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
     faulted: Arc<AtomicBool>,
-    notices_rx: Receiver<TransportNotice>,
+    // Both ends: the receiver feeds the pipeline; the monitor keeps the
+    // sender so a spontaneous fault's CAUSE reaches the diagnostics log
+    // (serial transports hold their own clone for stall notices).
+    notices: (Sender<TransportNotice>, Receiver<TransportNotice>),
 ) -> MonitoredChannel {
+    let (notices_tx, notices_rx) = notices;
     let monitor_events = events.clone();
     let ChannelTasks {
         channel_id,
@@ -360,9 +364,13 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     let monitor = tokio::spawn(async move {
         // A spontaneous fault surfaces as ChannelFaulted; cancel/EOF/pipeline-gone
         // outcomes are normal ends and emit nothing. The flag reconciles the
-        // orchestrator's internal state (ADR-006); the event informs observers.
-        if let TransportOutcome::Faulted(_) = transport.join().await {
+        // orchestrator's internal state (ADR-006); the event informs observers;
+        // the CAUSE goes to the pipeline as a notice so it lands in the
+        // channel's diagnostics (and survives stop via the retained log) —
+        // the string used to die unread here.
+        if let TransportOutcome::Faulted(cause) = transport.join().await {
             faulted.store(true, Ordering::Relaxed);
+            let _ = notices_tx.try_send(TransportNotice::TransportFaulted { channel_id, cause });
             let _ = monitor_events.try_send(RuntimeEvent::ChannelFaulted(channel_id));
         }
     });
@@ -458,9 +466,9 @@ pub fn start_data_channel<R: DataTransportRunner>(
 ) -> RunningChannel {
     let (event_tx, event_rx) = mpsc::channel(caps.events);
     let faulted = Arc::new(AtomicBool::new(false));
-    // A standalone channel has no serial loss reporter wired in; the notice sender
-    // is dropped, so the receiver stays empty for the channel's life.
-    let (_notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
+    // A standalone channel has no serial loss reporter; the monitor still
+    // holds the sender for fault-cause notices.
+    let (notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
     let tasks = spawn_monitored_channel(
         channel_id,
         runner,
@@ -472,7 +480,7 @@ pub fn start_data_channel<R: DataTransportRunner>(
         caps,
         event_tx,
         faulted.clone(),
-        notice_rx,
+        (notice_tx, notice_rx),
     );
     RunningChannel {
         tasks,
@@ -637,6 +645,17 @@ mod tests {
         // The same fault flips the shared state flag (ADR-006), so an orchestrator
         // reading it reconciles to Faulted without waiting for a command.
         assert!(running.is_faulted());
-        let _ = running.stop().await;
+        // The fault's CAUSE reaches the diagnostics (review round 2: the
+        // outcome string used to die unread in the monitor).
+        let pipeline = running.stop().await.expect("pipeline returns");
+        let snap = pipeline.snapshot();
+        assert!(
+            snap.diagnostics
+                .errors
+                .iter()
+                .any(|d| d.message.contains("device error")),
+            "diagnostics carry the transport fault cause: {:?}",
+            snap.diagnostics.errors
+        );
     }
 }

@@ -997,7 +997,7 @@ impl Listener {
                     .open()
                     .await
                     .map_err(OrchestratorError::SerialOpen)?
-                    .with_notice_sender(notice_tx)
+                    .with_notice_sender(notice_tx.clone())
                     .with_control(hooks);
                 // "Record on start" is begun by the pipeline (auto_begin_recording), not
                 // pre-built here — so its failure surfaces like the live toggle.
@@ -1009,7 +1009,7 @@ impl Listener {
                     display,
                     display_diag,
                     faulted,
-                    notice_rx,
+                    (notice_tx, notice_rx),
                 ));
                 Ok((
                     handle,
@@ -1027,8 +1027,9 @@ impl Listener {
                 // "Record on start" is begun by the pipeline (auto_begin_recording), not
                 // pre-built here — so its failure surfaces like the live toggle.
                 let (display, display_diag) = self.build_display_recorder(id, config).await;
-                // UDP is async and never stalls the reader; no notices to send.
-                let (_notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
+                // UDP is async and never stalls the reader — only the fault
+                // monitor uses the notice sender here.
+                let (notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
                 let handle = ChannelHandle::Data(self.spawn_data(
                     id,
                     bound,
@@ -1036,7 +1037,7 @@ impl Listener {
                     display,
                     display_diag,
                     faulted,
-                    notice_rx,
+                    (notice_tx, notice_rx),
                 ));
                 Ok((handle, None))
             }
@@ -1070,7 +1071,10 @@ impl Listener {
         // the new pipeline's log, so a display-recording start failure shows like raw's.
         display_diag: Option<crate::diagnostics::Diagnostic>,
         faulted: Arc<AtomicBool>,
-        notices_rx: mpsc::Receiver<TransportNotice>,
+        notices: (
+            mpsc::Sender<TransportNotice>,
+            mpsc::Receiver<TransportNotice>,
+        ),
     ) -> MonitoredChannel {
         spawn_monitored_channel(
             id,
@@ -1117,7 +1121,7 @@ impl Listener {
             self.channel_caps(config),
             self.events_tx.clone(),
             faulted,
-            notices_rx,
+            notices,
         )
     }
 

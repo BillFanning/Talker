@@ -103,7 +103,7 @@ pub enum TransportOutcome {
 /// **advisory**: the sender uses `try_send` and drops on a full channel (§99); a
 /// notice never blocks the reader (blocking the reader to announce a reader stall
 /// would cause the very stall it warns of).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransportNotice {
     /// The reader stalled on the Transport→Pipeline edge — the only edge that may
@@ -113,6 +113,14 @@ pub enum TransportNotice {
     ReceptionStalled {
         channel_id: ChannelId,
         stalled_for: Duration,
+    },
+    /// The transport ended on a spontaneous fault (§94). Sent by the channel's
+    /// fault monitor so the **cause** reaches the pipeline's diagnostics log —
+    /// the paired `ChannelFaulted` lifecycle event (§137) carries only the id,
+    /// and this string previously died unread with the transport outcome.
+    TransportFaulted {
+        channel_id: ChannelId,
+        cause: String,
     },
 }
 

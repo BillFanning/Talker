@@ -33,6 +33,10 @@ use super::pipeline::PipelineCapacities;
 struct Connection {
     transport_cancel: CancellationToken,
     pipeline_task: JoinHandle<super::pipeline::ChannelPipeline>,
+    /// Kept so a connection fault's CAUSE reaches the pipeline's diagnostics
+    /// before the pipeline drains and finishes (the `ChannelFaulted` event
+    /// carries only the id).
+    notice_tx: mpsc::Sender<crate::transport::TransportNotice>,
 }
 
 /// Handle to a running TCP listener and its connection channels.
@@ -100,9 +104,9 @@ pub fn start_tcp_listener(
 
                         let conn_id = ChannelId::new(); // runtime mints (§97.1)
                         let transport = TcpConnectionTransport::new(conn_id, new_conn.stream);
-                        // TCP is async and never stalls the reader (§97.1), so it
-                        // sends no transport notices; drop the sender.
-                        let (_notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
+                        // TCP is async and never stalls the reader (§97.1) —
+                        // the sender is kept only for fault-cause notices.
+                        let (notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
                         let tasks = spawn_channel_tasks(
                             conn_id,
                             transport,
@@ -138,7 +142,14 @@ pub fn start_tcp_listener(
                             let outcome = transport_join.join().await;
                             (conn_id, outcome)
                         });
-                        connections.insert(conn_id, Connection { transport_cancel, pipeline_task });
+                        connections.insert(
+                            conn_id,
+                            Connection {
+                                transport_cancel,
+                                pipeline_task,
+                                notice_tx,
+                            },
+                        );
                         let _ = events.try_send(RuntimeEvent::TcpClientConnected(conn_id));
                     }
                     None => listener_open = false, // acceptor ended; existing connections live on
@@ -147,12 +158,29 @@ pub fn start_tcp_listener(
                 Some(joined) = monitors.join_next(), if !monitors.is_empty() => {
                     if let Ok((conn_id, outcome)) = joined {
                         if let Some(conn) = connections.remove(&conn_id) {
-                            // Reception ended; drain the accepted backlog (§110).
-                            let _ = conn.pipeline_task.await;
-                            // A read fault is reported before the disconnect (§94/§101).
-                            if let TransportOutcome::Faulted(_) = outcome {
+                            let Connection {
+                                transport_cancel: _,
+                                pipeline_task,
+                                notice_tx,
+                            } = conn;
+                            // A read fault is reported before the disconnect
+                            // (§94/§101). The cause goes to the pipeline as a
+                            // notice BEFORE the drain below, so it lands in the
+                            // connection's diagnostics rather than dying here.
+                            if let TransportOutcome::Faulted(cause) = outcome {
+                                let _ = notice_tx.try_send(
+                                    crate::transport::TransportNotice::TransportFaulted {
+                                        channel_id: conn_id,
+                                        cause,
+                                    },
+                                );
                                 let _ = events.try_send(RuntimeEvent::ChannelFaulted(conn_id));
                             }
+                            // The pipeline runs until BOTH ingest and notices
+                            // close — drop our sender before awaiting it.
+                            drop(notice_tx);
+                            // Reception ended; drain the accepted backlog (§110).
+                            let _ = pipeline_task.await;
                             let _ = events.try_send(RuntimeEvent::TcpClientDisconnected(conn_id));
                         }
                     }
@@ -164,8 +192,16 @@ pub fn start_tcp_listener(
         listener_cancel.cancel();
         let _ = listener_handle.join().await;
         for (conn_id, conn) in connections.drain() {
-            conn.transport_cancel.cancel();
-            let _ = conn.pipeline_task.await;
+            let Connection {
+                transport_cancel,
+                pipeline_task,
+                notice_tx,
+            } = conn;
+            transport_cancel.cancel();
+            // The pipeline runs until BOTH its ingest and notices close —
+            // holding this sender across the await would deadlock the drain.
+            drop(notice_tx);
+            let _ = pipeline_task.await;
             let _ = events.try_send(RuntimeEvent::TcpClientDisconnected(conn_id));
         }
         monitors.shutdown().await;

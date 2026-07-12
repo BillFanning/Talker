@@ -252,6 +252,13 @@ fn run_loop(
     // send always produces both a sample and counters (instant first paint).
     let mut last_sample: Option<Instant> = None;
     let mut last_counters: Option<Instant> = None;
+    // Sample rotation: the scheduler breaks grid ties by lowest index, so an
+    // aligned multi-message schedule would sample message 0 forever if the
+    // lane just took the first due send. Skip a repeat of the last sampled
+    // message while due — but never longer than one full cycle, so a
+    // single-active-message schedule still samples.
+    let mut last_sampled_index: Option<usize> = None;
+    let mut repeats_skipped_while_due = 0u64;
     // Per-message send counts, indexed by the message's position in the
     // compiled schedule. The resize is defensive; the schedule's size is
     // fixed at compile time.
@@ -388,19 +395,27 @@ fn run_loop(
                         // the send cadence; cumulative counters self-correct
                         // via the next delivered update.
                         let now = Instant::now();
-                        if last_sample.is_none_or(|t| now - t >= policy.sample_interval) {
-                            last_sample = Some(now);
-                            emit_status(
-                                &status_tx,
-                                &notify,
-                                channel,
-                                &mut dropped_statuses,
-                                TalkerStatus::SendSample {
+                        let due = last_sample.is_none_or(|t| now - t >= policy.sample_interval);
+                        if due {
+                            let repeat = last_sampled_index == Some(index) && schedule.len() > 1;
+                            if !repeat || repeats_skipped_while_due >= schedule.len() as u64 {
+                                last_sample = Some(now);
+                                last_sampled_index = Some(index);
+                                repeats_skipped_while_due = 0;
+                                emit_status(
+                                    &status_tx,
+                                    &notify,
                                     channel,
-                                    message_index: index,
-                                    payload,
-                                },
-                            );
+                                    &mut dropped_statuses,
+                                    TalkerStatus::SendSample {
+                                        channel,
+                                        message_index: index,
+                                        payload,
+                                    },
+                                );
+                            } else {
+                                repeats_skipped_while_due += 1;
+                            }
                         }
                         if last_counters.is_none_or(|t| now - t >= policy.counter_interval) {
                             last_counters = Some(now);
@@ -691,6 +706,41 @@ mod tests {
         // the totals exact.
         assert_eq!(samples, payloads.len());
         assert_eq!(last_total as usize, payloads.len());
+    }
+
+    /// The sample lane rotates across message indices: with an aligned
+    /// two-message schedule the low-index tie-break used to sample message 0
+    /// forever; every message must reach the Output pane.
+    #[test]
+    fn sample_lane_rotates_across_messages() {
+        let policy = ObserverPolicy {
+            counter_interval: Duration::from_secs(3600),
+            sample_interval: Duration::from_millis(5),
+        };
+        let (sent, handle) = spawn_runner_with(&[msg("AB", 5), msg("CD", 5)], false, policy);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sent.lock().unwrap().len() < 40 {
+            assert!(Instant::now() < deadline, "expected sends within 2 s");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        let status_rx = handle.status_rx.clone();
+        join_within(handle, Duration::from_secs(2));
+
+        let mut seen = [false; 2];
+        for s in status_rx.try_iter() {
+            if let TalkerStatus::SendSample { message_index, .. } = s {
+                if message_index < 2 {
+                    seen[message_index] = true;
+                }
+            }
+        }
+        assert!(
+            seen[0] && seen[1],
+            "both messages must be sampled (got 0: {}, 1: {})",
+            seen[0],
+            seen[1]
+        );
     }
 
     #[test]

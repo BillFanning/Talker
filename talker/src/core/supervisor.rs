@@ -58,10 +58,24 @@ pub struct ChannelTelemetry {
     /// Errors observed since the channel started: connection/open errors
     /// plus undeliverable commands.
     pub errors_total: u64,
-    /// The current error banner, if any: the latest connection/open error or
-    /// undeliverable command. Cleared by a delivered payload sample or a
-    /// `SendRecovered` (live proof the interface works again), and on start.
+    /// The latest **interface** error (connection/open failure). Cleared by a
+    /// delivered payload sample or a `SendRecovered` — live proof the
+    /// interface works again — and on start.
     pub last_error: Option<String>,
+    /// The latest **control-plane** error (an undeliverable Stop/interface-
+    /// update/interval command). A healthy sample must NOT clear this — the
+    /// wire working says nothing about a command that never arrived. Cleared
+    /// only by a later delivered command, or on start.
+    pub command_error: Option<String>,
+}
+
+impl ChannelTelemetry {
+    /// The banner the UI shows: a pending control-plane failure (needs the
+    /// user's attention — the on-screen state diverged from the runner's)
+    /// wins over an interface error.
+    pub fn banner_error(&self) -> Option<&str> {
+        self.command_error.as_deref().or(self.last_error.as_deref())
+    }
 }
 
 /// One sampled send returned by [`TalkerSupervisor::poll`] — the exact wire
@@ -298,8 +312,15 @@ impl TalkerSupervisor {
             },
             None => CommandOutcome::NotRunning,
         };
-        if outcome != CommandOutcome::Delivered {
-            self.record_command_failure(i, what, outcome);
+        match outcome {
+            CommandOutcome::Delivered => {
+                // A delivered command supersedes a pending control-plane
+                // failure — the divergence the banner warned about is over.
+                if let Some(slot) = self.slots.get_mut(i) {
+                    slot.telemetry.command_error = None;
+                }
+            }
+            _ => self.record_command_failure(i, what, outcome),
         }
         outcome
     }
@@ -318,7 +339,9 @@ impl TalkerSupervisor {
         tracing::warn!(channel = i + 1, "channel {}: {msg}", i + 1);
         if let Some(slot) = self.slots.get_mut(i) {
             slot.telemetry.errors_total += 1;
-            slot.telemetry.last_error = Some(msg);
+            // Control-plane class: a healthy payload sample must not clear
+            // this (the wire working says nothing about the lost command).
+            slot.telemetry.command_error = Some(msg);
         }
     }
 
@@ -550,7 +573,40 @@ mod tests {
         assert_eq!(sup.set_interval(0, 0, 50), CommandOutcome::NotRunning);
         let t = sup.telemetry(0);
         assert_eq!(t.errors_total, 1);
-        assert!(t.last_error.as_deref().unwrap().contains("interval change"));
+        assert!(t
+            .command_error
+            .as_deref()
+            .unwrap()
+            .contains("interval change"));
+        assert!(t.banner_error().is_some());
+    }
+
+    /// Error-class separation: a healthy payload sample clears an *interface*
+    /// error but must NOT clear a *control-plane* one — the wire working says
+    /// nothing about a command that never arrived.
+    #[test]
+    fn samples_clear_interface_errors_but_not_command_errors() {
+        let mut telemetry = ChannelTelemetry {
+            last_error: Some("send failed".into()),
+            command_error: Some("the interval change was not delivered".into()),
+            ..ChannelTelemetry::default()
+        };
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        tx.send(TalkerStatus::SendSample {
+            channel: 0,
+            message_index: 0,
+            payload: vec![0xAB],
+        })
+        .unwrap();
+        drop(tx);
+        let mut samples = Vec::new();
+        drain_statuses(0, &rx, &mut telemetry, &mut samples);
+        assert!(telemetry.last_error.is_none(), "interface error cleared");
+        assert!(
+            telemetry.command_error.is_some(),
+            "control-plane error survives a healthy sample"
+        );
+        assert_eq!(samples.len(), 1);
     }
 
     #[test]

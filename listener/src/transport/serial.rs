@@ -713,6 +713,7 @@ mod tests {
                 assert_eq!(channel_id, cid);
                 assert!(stalled_for >= threshold);
             }
+            other => panic!("expected ReceptionStalled, got {other:?}"),
         }
 
         cancel.cancel();
@@ -759,6 +760,7 @@ mod tests {
                 assert_eq!(channel_id, cid);
                 assert!(stalled_for >= threshold);
             }
+            other => panic!("expected ReceptionStalled, got {other:?}"),
         }
 
         // Cancel while still stalled: the loop ends as Cancelled, not hung.

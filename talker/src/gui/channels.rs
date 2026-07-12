@@ -104,7 +104,7 @@ impl TalkerApp {
                     name: self.channel_name(i),
                     summary: interface_summary(&self.conn_drafts[i]),
                     running: self.is_connection_running(i),
-                    error: telemetry.last_error,
+                    error: telemetry.banner_error().map(str::to_owned),
                     sent: telemetry.total_count,
                     per_sec: self.rates.get(i).map(|r| r.per_sec).unwrap_or(0.0),
                     info: self.log_counts.get(i).map(|c| c.info).unwrap_or(0),
@@ -318,7 +318,7 @@ impl TalkerApp {
         let base = egui::TextStyle::Body.resolve(ui.style()).size;
         for i in 0..self.conn_drafts.len() {
             let running = self.is_connection_running(i);
-            let error = self.sup.telemetry(i).last_error.is_some();
+            let error = self.sup.telemetry(i).banner_error().is_some();
             let (glyph, color, _) = lifecycle_indicator(running, error, pal);
             let selected = self.selected == Some(i);
             let text = egui::RichText::new(glyph)

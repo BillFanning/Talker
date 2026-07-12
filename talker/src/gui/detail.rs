@@ -56,7 +56,7 @@ impl TalkerApp {
         // Owned snapshot of the channel's telemetry (ADR-019): the readouts
         // are rendered across several `&mut self` widget closures.
         let telemetry = self.sup.telemetry(i);
-        let error: Option<String> = telemetry.last_error.clone();
+        let error: Option<String> = telemetry.banner_error().map(str::to_owned);
         let (glyph, glyph_color, status_word) = lifecycle_indicator(running, error.is_some(), pal);
         let (iface_drift, msg_drift) = self.detect_drift(i);
 
