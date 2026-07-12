@@ -97,6 +97,43 @@ Cross off items as they are completed. Add new ones inline as they come up.
   (chrome rule, talker ADR-016 / listener ADR-019) — the next useful GUI
   convergence step.
 
+## Robustness (external review round 2, 2026-07-12)
+
+- [x] **Transactional draft → profile flush.** `flush_drafts_to_profile` was
+  a `filter_map`: an invalid draft silently vanished from Save AND compressed
+  the profile indices, so Start could read another channel's messages. Now
+  all-or-none and index-preserving (`drafts_to_channels`), with a blocking
+  dialog on save listing exactly what to fix; Start reads messages straight
+  from its own channel's drafts, strictly. Pinned by
+  `drafts_to_channels_is_all_or_none_with_reasons` +
+  `drafts_to_channels_preserves_indices_when_valid`.
+- [x] **`join_all` is safe on live handles** — the command sender is dropped
+  before the join (a live sender deadlocked: the runner kept waiting for
+  commands), and receivers are drained so a runner block-sending its final
+  counters always completes.
+- [x] **"Exact at rest" is now a guarantee, not best-effort** — the final
+  `Counters` at runner exit is a blocking send (cadence no longer matters at
+  exit; the owner drains stopped runners until thread exit). Error statuses
+  (`ConnectionError`/`SendRecovered`) now route through `emit_status`, so a
+  dropped one is at least counted in `dropped_statuses`.
+- [ ] **Error-class separation for `last_error`** — a `SendSample` clears the
+  banner even when the error was a control-plane failure (an undelivered
+  interval change vanishes on the next healthy sample). Split interface
+  errors (cleared by live samples) from command errors (cleared only by a
+  later successful command or start). (Tranche 2.)
+- [ ] **Sample lane starves later messages** — first-send-after-interval plus
+  the scheduler's low-index tie-break means an aligned multi-message schedule
+  shows message 0 forever in the Output pane. Rotate the sample across
+  message indices. (Tranche 2.)
+- [ ] **Stable ChannelIds** — slots shift on removal but running runners keep
+  their captured channel number, misrouting log-count attribution; listener-
+  style stable IDs are the fix. Own session + ADR note. (Tranche 3.)
+- [ ] **Bench the timestamp/checksum render path** — the `render_into` kill
+  verdict above covered static RawHex only; a timestamped+checksummed send
+  allocates several temporaries per send (`render_at`, timestamp format,
+  checksum Vec). Extend `benches/scheduler.rs` before generalizing that
+  verdict.
+
 ## Workspace items (external review, 2026-07-11)
 
 - [x] **Criterion benchmark harness** — landed: `talker/benches/scheduler.rs`

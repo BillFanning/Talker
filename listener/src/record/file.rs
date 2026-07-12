@@ -119,7 +119,11 @@ impl RawFileRecorder {
         // The one uncovered edge — a user pointing one channel's *main* destination at
         // another's sidecar path — is left unguarded as vanishingly unlikely.
         let lock = lock_recording_destination(path)?;
-        let file = BufWriter::new(open_recording_file(path, policy).await?);
+        // Sidecar BEFORE the main destination: opening can create/truncate,
+        // so the fallible pair must touch the derived artifact first — a
+        // failed begin must never have modified the main recording (the
+        // precious one). The inverse edge (main open fails after the sidecar
+        // truncated) only costs the derived `.idx`.
         let sidecar = if timestamps {
             Some(BufWriter::new(
                 open_recording_file(&sidecar_path(path), policy).await?,
@@ -127,6 +131,7 @@ impl RawFileRecorder {
         } else {
             None
         };
+        let file = BufWriter::new(open_recording_file(path, policy).await?);
         Ok(Self {
             file,
             sidecar,

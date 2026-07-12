@@ -118,6 +118,55 @@ fn zoom_percent(ppp: f32) -> u32 {
     (ppp / ZOOM_BASE_PPP * 100.0).round() as u32
 }
 
+/// All-or-none draft → profile conversion, **index-preserving**: any channel
+/// or message that cannot convert aborts the whole flush with human-readable
+/// reasons, so `profile.channels[i]` always corresponds to `conn_drafts[i]`.
+/// Free function (not a method) so it is unit-testable without a `TalkerApp`.
+fn drafts_to_channels(
+    conn_drafts: &[ConnDraft],
+    sched_drafts: &[Vec<ScheduleDraft>],
+) -> Result<Vec<ChannelConfig>, Vec<String>> {
+    let mut channels = Vec::with_capacity(conn_drafts.len());
+    let mut problems = Vec::new();
+    for (i, draft) in conn_drafts.iter().enumerate() {
+        let label = if draft.name.is_empty() {
+            format!("Channel {}", i + 1)
+        } else {
+            format!("Channel {} (\u{201C}{}\u{201D})", i + 1, draft.name)
+        };
+        let Some(interface) = draft.to_config() else {
+            problems.push(format!(
+                "{label}: interface configuration is incomplete or invalid"
+            ));
+            continue;
+        };
+        let mut messages = Vec::new();
+        for (m, d) in sched_drafts
+            .get(i)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+        {
+            match d.to_message_config() {
+                Some(mc) => messages.push(mc),
+                None => problems.push(format!(
+                    "{label}, message {}: invalid interval — fix or remove it",
+                    m + 1
+                )),
+            }
+        }
+        let mut cfg = ChannelConfig::new(interface, messages);
+        cfg.name = draft.name.clone();
+        channels.push(cfg);
+    }
+    if problems.is_empty() {
+        Ok(channels)
+    } else {
+        Err(problems)
+    }
+}
+
 struct TalkerApp {
     /// Repaint-on-status coalescer shared with every runner thread: a status
     /// wakes the UI instantly, but N statuses between frames cost **one**
@@ -363,11 +412,13 @@ impl TalkerApp {
                 .get(i)
                 .is_some_and(|d| d.to_config().is_some())
             && self.sched_drafts.get(i).is_some_and(|s| {
-                // At least one message must convert, and everything that
-                // converts must also compile (`validate` is the shared
-                // core surface — e.g. bad hex, NMEA framing characters).
-                let msgs: Vec<_> = s.iter().filter_map(|d| d.to_message_config()).collect();
-                !msgs.is_empty() && msgs.iter().all(|m| m.validate().is_ok())
+                // EVERY message must convert (a filter_map here once let an
+                // unconvertible draft silently vanish from the started
+                // schedule), there must be at least one, and each must
+                // compile (`validate` is the shared core surface — e.g. bad
+                // hex, NMEA framing characters).
+                let msgs: Option<Vec<_>> = s.iter().map(|d| d.to_message_config()).collect();
+                msgs.is_some_and(|m| !m.is_empty() && m.iter().all(|mc| mc.validate().is_ok()))
             })
     }
 
@@ -517,7 +568,9 @@ impl TalkerApp {
     }
 
     fn save_profile(&mut self) {
-        self.flush_drafts_to_profile();
+        if !self.flush_or_report() {
+            return;
+        }
         let path = match &self.profile_path {
             Some(p) => p.clone(),
             None => match self.pick_save_path() {
@@ -532,7 +585,9 @@ impl TalkerApp {
     /// current profile to a new file. On success the new path becomes
     /// the bound `profile_path`, so subsequent plain Save writes there.
     fn save_profile_as(&mut self) {
-        self.flush_drafts_to_profile();
+        if !self.flush_or_report() {
+            return;
+        }
         let Some(path) = self.pick_save_path() else {
             return;
         };
@@ -581,7 +636,6 @@ impl TalkerApp {
         // Park any currently-running runner as a predecessor; the interface
         // is opened on the new runner thread, never on the UI thread.
         self.stop_connection(i);
-        self.flush_drafts_to_profile();
 
         // Starting (or attempting to start) is an explicit commit —
         // flip the active UDP destination into strict validation so
@@ -605,12 +659,22 @@ impl TalkerApp {
             return;
         };
 
-        let messages = self
-            .profile
-            .channels
-            .get(i)
-            .map(|c| c.messages.clone())
-            .unwrap_or_default();
+        // Straight from this channel's drafts, strictly (all messages must
+        // convert). The old path flushed drafts into the profile and read
+        // `profile.channels[i]` back — an invalid *other* channel compressed
+        // the indices and this channel could start with someone else's
+        // messages.
+        let Some(messages) = self.sched_drafts.get(i).and_then(|ds| {
+            ds.iter()
+                .map(|d| d.to_message_config())
+                .collect::<Option<Vec<_>>>()
+        }) else {
+            tracing::warn!(
+                channel = n,
+                "channel {n} has an invalid message (bad interval?) — fix or remove it"
+            );
+            return;
+        };
         let schedule = match Schedule::compile(&messages, Instant::now()) {
             Ok(s) => s,
             Err(e) => {
@@ -648,25 +712,42 @@ impl TalkerApp {
         self.sup.stop_all();
     }
 
-    fn flush_drafts_to_profile(&mut self) {
-        self.profile.channels = (0..self.conn_drafts.len())
-            .filter_map(|i| {
-                let interface = self.conn_drafts[i].to_config()?;
-                let messages = self
-                    .sched_drafts
-                    .get(i)
-                    .map(|drafts| {
-                        drafts
-                            .iter()
-                            .filter_map(|d| d.to_message_config())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let mut cfg = ChannelConfig::new(interface, messages);
-                cfg.name = self.conn_drafts[i].name.clone();
-                Some(cfg)
-            })
-            .collect();
+    /// Commit every draft into `profile.channels`, **all or none**. On any
+    /// invalid draft the profile is left untouched and the reasons are
+    /// returned (and logged) — never silently drop or reindex a user's
+    /// channels. (The previous `filter_map` dropped invalid entries: Save
+    /// lost drafts permanently, and the compressed indices made Start read
+    /// another channel's messages.)
+    fn flush_drafts_to_profile(&mut self) -> Result<(), Vec<String>> {
+        match drafts_to_channels(&self.conn_drafts, &self.sched_drafts) {
+            Ok(channels) => {
+                self.profile.channels = channels;
+                Ok(())
+            }
+            Err(problems) => {
+                for p in &problems {
+                    tracing::error!("{p}");
+                }
+                Err(problems)
+            }
+        }
+    }
+
+    /// Flush for a save; on invalid drafts, block the save with a dialog
+    /// listing exactly what to fix (nothing is written).
+    fn flush_or_report(&mut self) -> bool {
+        if let Err(problems) = self.flush_drafts_to_profile() {
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("Profile not saved")
+                .set_description(format!(
+                    "Fix or remove these first — nothing was written:\n\n{}",
+                    problems.join("\n")
+                ))
+                .show();
+            return false;
+        }
+        true
     }
 
     fn apply_connection(&mut self, i: usize) {
@@ -1240,5 +1321,60 @@ mod tests {
     fn zoom_clamp_bounds_are_50_and_200() {
         assert_eq!(zoom_percent(ZOOM_MIN_PPP), 50);
         assert_eq!(zoom_percent(ZOOM_MAX_PPP), 200);
+    }
+
+    fn serial_draft(name: &str) -> ConnDraft {
+        ConnDraft {
+            name: name.to_string(),
+            kind: ConnKind::Serial,
+            serial_port: "COM9".to_string(),
+            ..ConnDraft::default()
+        }
+    }
+
+    fn message_draft(interval: &str) -> ScheduleDraft {
+        use crate::core::message::{MessageConfig, PayloadConfig};
+        let mut d = ScheduleDraft::from(&MessageConfig::new(PayloadConfig::raw_hex("AB"), 100));
+        d.interval_ms = interval.to_string();
+        d
+    }
+
+    /// The flush is all-or-none and index-preserving: one bad entry aborts
+    /// everything with a reason naming it — nothing is silently dropped or
+    /// shifted (a filter_map here once lost drafts on Save and made Start
+    /// read another channel's messages through compressed indices).
+    #[test]
+    fn drafts_to_channels_is_all_or_none_with_reasons() {
+        let conn = vec![serial_draft("A"), serial_draft("B")];
+        let sched = vec![
+            vec![message_draft("100")],
+            vec![message_draft("100"), message_draft("not-a-number")],
+        ];
+        let problems = drafts_to_channels(&conn, &sched).unwrap_err();
+        assert_eq!(problems.len(), 1);
+        assert!(
+            problems[0].contains("Channel 2") && problems[0].contains("message 2"),
+            "reason names the exact entry: {}",
+            problems[0]
+        );
+
+        // An invalid interface reports too, without dropping the channel.
+        let mut broken = serial_draft("C");
+        broken.serial_port.clear();
+        let conn = vec![serial_draft("A"), broken];
+        let sched = vec![vec![message_draft("100")], vec![message_draft("100")]];
+        let problems = drafts_to_channels(&conn, &sched).unwrap_err();
+        assert!(problems[0].contains("Channel 2"));
+    }
+
+    #[test]
+    fn drafts_to_channels_preserves_indices_when_valid() {
+        let conn = vec![serial_draft("A"), serial_draft("B")];
+        let sched = vec![vec![message_draft("100")], vec![message_draft("200")]];
+        let channels = drafts_to_channels(&conn, &sched).unwrap();
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].name, "A");
+        assert_eq!(channels[1].name, "B");
+        assert_eq!(channels[1].messages[0].interval_ms, 200);
     }
 }

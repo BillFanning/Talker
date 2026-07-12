@@ -215,10 +215,13 @@ Message-model removal). Everything below this block is verified done:
       `COMMAND_DROP_NOTICE_TTL`) in addition to the tracing warning — the
       user sees that the last click did nothing. Talker's sibling landed in
       the same commit (talker TODO).
-- [x] **Scrollback-eviction churn — MEASURED 2026-07-12, KILLED.** Ingest at
-      the byte cap costs the same as below it (142 ns vs 145 ns per 64-byte
-      chunk, `cargo bench -p listener`, baseline `main`): the feared
-      `VecDeque` front-drain cost does not exist. No work needed.
+- [x] **Scrollback-eviction churn — MEASURED 2026-07-12 (re-measured after a
+      bench fix), KILLED.** The first "floor" bench reused one pipeline until
+      it filled to the cap, so it compared the capped state to itself
+      (external review round 2 caught it). Fixed floor (fresh warmed pipeline
+      per iteration): below-cap 460 ns vs at-cap 436 ns per 64-byte chunk,
+      same-run, overlapping CIs — eviction is genuinely free. Absolute
+      numbers swing ~3× with ambient load; only same-run comparisons count.
 - [ ] **Match-scanning cost — MEASURED 2026-07-12, PARKED with threshold.**
       Linear at ~195 ns/rule/chunk (400 ns @ 1 rule, 6.4 µs @ 32, 64-byte
       chunks): 32 rules at 1k chunks/s is 0.6% of a core. Aho–Corasick (plus a
@@ -238,6 +241,47 @@ Message-model removal). Everything below this block is verified done:
       dropped it); stale scrollback-size claims vs. the current default; ADR
       text still says the app lacks a dark theme (dark mode landed, Phase 7,
       `66cb1f1`).
+
+## Robustness (external review round 2, 2026-07-12)
+
+- [x] **Recorder stop honesty (§56.1)** — a stop that truncates the accepted
+      backlog or fails finalize no longer reads as clean: the recorder task
+      publishes drain/finalize failures into the fault cell,
+      `Recording::finalize` returns the fault, and the pipeline reports it
+      (error diagnostic + `RecordingFaulted`) via `note_recording_stop` in
+      every stop path (live toggle, match-action stop, channel finish).
+      Pinned by `dirty_stop_truncating_backlog_reports_a_fault` +
+      `clean_stop_reports_no_fault`.
+- [x] **Faulted recordings are restartable from the UI** — Begin on a faulted
+      Raw/Display recording drops the dead recording and recreates it instead
+      of no-op'ing as "already recording" (the button says Record; it works
+      without a channel restart). Pinned by
+      `begin_after_fault_recreates_the_recording`.
+- [x] **Sidecar opens before the main destination** — a failed Raw begin can
+      no longer have created/truncated the main `.raw` (only the derived
+      `.idx` is at risk on the inverse edge).
+- [ ] **Transport fault cause is discarded** (`TransportOutcome::Faulted(_)`
+      in `runtime/channel.rs`'s monitor): the string never reaches diagnostics
+      — only a bare `ChannelFaulted(id)` event survives. Propagate the cause
+      into the channel's retained diagnostics. (Tranche 2.)
+- [ ] **Lifecycle state must self-correct via snapshots** — GUI status is
+      event-derived over two lossy `try_send` hops and neither `ChannelStats`
+      nor `ChannelSnapshot` carries `ChannelState`; ADR-006's self-correction
+      claim is currently FALSE. Add lifecycle state to the polled surfaces,
+      reconcile in the reducer, and correct/vindicate ADR-006. (Tranche 2.)
+- [ ] **Typed per-tap recording events** — `RecordingStarted/Faulted` don't
+      say Raw vs Display; `clear_error_if_recording_ok` clears a *display*
+      fault on *raw* health (`gui/state.rs`). Type the events, split the
+      clearing. (Tranche 2.)
+- [ ] **Serial control-line poll cadence** — reception polls CTS/DSR/DCD/RI
+      via four driver calls before every read (`transport/serial.rs`);
+      measure, then poll inputs at ~5–10 Hz instead. (Tranche 2.)
+- [ ] **Dense-match bench case** before the Aho–Corasick parking is final:
+      the current rules-benches never match, so firing costs (action clones,
+      events, marks) are unmeasured.
+- [ ] **Frame-time items** (with the talker row-ring methodology): mark-string
+      hashing per repaint and repeated `make_contiguous` in
+      `gui/detail/stream_view.rs` — generation/dirty-offset tracking instead.
 
 ## Future work — deferred (spec Appendix A)
 

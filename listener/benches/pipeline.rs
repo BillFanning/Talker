@@ -53,15 +53,22 @@ fn bench_ingest(c: &mut Criterion) {
     let payload = payload_64b();
     let cid = ChannelId::new();
 
-    // Floor: fresh pipeline, sub-cap scrollback for the first ~2000 chunks.
-    // (The measurement window will cross the cap on long runs; the dedicated
-    // at-cap case below is the one to compare against.)
-    let mut pipeline = ChannelPipeline::new(cid, PipelineCapacities::default());
-    c.bench_function("ingest/64B/no-rules", |b| {
+    // TRUE below-cap floor: a fresh, lightly warmed pipeline per iteration
+    // (setup is untimed), so no sample ever measures the capped state. The
+    // first version reused one pipeline across the whole run — it filled to
+    // the cap after ~2k iterations, so "floor" and "at-cap" measured the
+    // same thing and the eviction-cost comparison was self-to-self.
+    c.bench_function("ingest/64B/below-cap", |b| {
         b.iter_batched(
-            || chunk(cid, &payload),
-            |data| pipeline.ingest(data),
-            BatchSize::SmallInput,
+            || {
+                let mut p = ChannelPipeline::new(cid, PipelineCapacities::default());
+                for _ in 0..16 {
+                    p.ingest(chunk(cid, &payload));
+                }
+                (p, chunk(cid, &payload))
+            },
+            |(mut p, data)| p.ingest(data),
+            BatchSize::LargeInput,
         )
     });
 

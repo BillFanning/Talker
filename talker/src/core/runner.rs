@@ -261,7 +261,8 @@ fn run_loop(
     let handle = |cmd: TalkerCommand,
                   interface: &mut Box<dyn Interface>,
                   schedule: &mut Schedule,
-                  episode: &mut Option<FailureEpisode>|
+                  episode: &mut Option<FailureEpisode>,
+                  dropped_statuses: &mut u64|
      -> Flow {
         match cmd {
             TalkerCommand::Stop => Flow::Stop,
@@ -288,17 +289,16 @@ fn run_loop(
                             "channel {} interface update failed: {e:#}",
                             channel + 1
                         );
-                        let sent = status_tx
-                            .try_send(TalkerStatus::ConnectionError {
+                        emit_status(
+                            &status_tx,
+                            &notify,
+                            channel,
+                            dropped_statuses,
+                            TalkerStatus::ConnectionError {
                                 channel,
                                 message: format!("{e:#}"),
-                            })
-                            .is_ok();
-                        if sent {
-                            if let Some(n) = &notify {
-                                n();
-                            }
-                        }
+                            },
+                        );
                     }
                 }
                 Flow::Continue
@@ -331,7 +331,13 @@ fn run_loop(
         // Drain anything already queued so back-to-back sends can't starve
         // command handling.
         for cmd in cmd_rx.try_iter() {
-            if let Flow::Stop = handle(cmd, &mut interface, &mut schedule, &mut episode) {
+            if let Flow::Stop = handle(
+                cmd,
+                &mut interface,
+                &mut schedule,
+                &mut episode,
+                &mut dropped_statuses,
+            ) {
                 break 'run;
             }
         }
@@ -357,18 +363,17 @@ fn run_loop(
                             ep.failures,
                             ep.suppressed
                         );
-                            if status_tx
-                                .try_send(TalkerStatus::SendRecovered {
+                            emit_status(
+                                &status_tx,
+                                &notify,
+                                channel,
+                                &mut dropped_statuses,
+                                TalkerStatus::SendRecovered {
                                     channel,
                                     failures: ep.failures,
                                     suppressed: ep.suppressed,
-                                })
-                                .is_ok()
-                            {
-                                if let Some(n) = &notify {
-                                    n();
-                                }
-                            }
+                                },
+                            );
                         }
                         total_count += 1;
                         total_bytes += payload.len() as u64;
@@ -431,17 +436,16 @@ fn run_loop(
                                 backoff: RETRY_BACKOFF_INITIAL,
                                 next_attempt: Instant::now() + RETRY_BACKOFF_INITIAL,
                             });
-                            let sent = status_tx
-                                .try_send(TalkerStatus::ConnectionError {
+                            emit_status(
+                                &status_tx,
+                                &notify,
+                                channel,
+                                &mut dropped_statuses,
+                                TalkerStatus::ConnectionError {
                                     channel,
                                     message: format!("{e:#}"),
-                                })
-                                .is_ok();
-                            if sent {
-                                if let Some(n) = &notify {
-                                    n();
-                                }
-                            }
+                                },
+                            );
                         }
                         // A failed retry deepens the backoff; no re-report.
                         Some(ep) => {
@@ -463,7 +467,13 @@ fn run_loop(
             // for the schedule, and detects a dropped handle.
             Tick::Wait(until) => match cmd_rx.recv_deadline(until) {
                 Ok(cmd) => {
-                    if let Flow::Stop = handle(cmd, &mut interface, &mut schedule, &mut episode) {
+                    if let Flow::Stop = handle(
+                        cmd,
+                        &mut interface,
+                        &mut schedule,
+                        &mut episode,
+                        &mut dropped_statuses,
+                    ) {
                         break 'run;
                     }
                 }
@@ -474,7 +484,13 @@ fn run_loop(
             // so block indefinitely — zero wakeups.
             Tick::Idle => match cmd_rx.recv() {
                 Ok(cmd) => {
-                    if let Flow::Stop = handle(cmd, &mut interface, &mut schedule, &mut episode) {
+                    if let Flow::Stop = handle(
+                        cmd,
+                        &mut interface,
+                        &mut schedule,
+                        &mut episode,
+                        &mut dropped_statuses,
+                    ) {
                         break 'run;
                     }
                 }
@@ -485,22 +501,24 @@ fn run_loop(
 
     // Final counters (ADR-018): the rate-limited lane can be up to one
     // interval stale when the runner stops — emit once more so the observer's
-    // totals are exact at rest. Best-effort like every status.
-    let drops_so_far = dropped_statuses;
-    emit_status(
-        &status_tx,
-        &notify,
+    // totals are exact at rest. A **blocking** send, deliberately: the runner
+    // is exiting so cadence no longer matters, and this is the one status
+    // that must not be lost to a momentarily full queue ("exact at rest" is
+    // a promise, not best-effort). The owner keeps draining a stopped
+    // runner's receiver until the thread exits (supervisor `poll`/`join_all`,
+    // the CLI's funnel loop), and a dropped receiver returns an error
+    // immediately — so this cannot hang.
+    let _ = status_tx.send(TalkerStatus::Counters {
         channel,
-        &mut dropped_statuses,
-        TalkerStatus::Counters {
-            channel,
-            total_count,
-            total_bytes,
-            per_message_counts,
-            dropped_statuses: drops_so_far,
-            missed_sends: schedule.missed_sends(),
-        },
-    );
+        total_count,
+        total_bytes,
+        per_message_counts,
+        dropped_statuses,
+        missed_sends: schedule.missed_sends(),
+    });
+    if let Some(n) = &notify {
+        n();
+    }
 }
 
 /// Queue one status update, best-effort (never blocks the send cadence): a

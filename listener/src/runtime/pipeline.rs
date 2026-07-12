@@ -794,8 +794,18 @@ impl ChannelPipeline {
     /// existing file under a Refuse policy) reports the reason without faulting the
     /// Channel (§55).
     async fn begin_recording(&mut self) {
-        if self.raw_recorder.is_some() {
-            return; // already recording — `Begin` is idempotent
+        match self.raw_recorder.as_ref().map(|r| r.state()) {
+            // Already recording — `Begin` is idempotent.
+            Some(state) if state != RecordingState::Faulted => return,
+            // A faulted recording still occupies the slot, and Begin is the
+            // user's retry (the button reads "Record" — it must work without
+            // a channel restart). Drop the dead recording, then recreate.
+            Some(_) => {
+                if let Some(recorder) = self.raw_recorder.take() {
+                    let _ = recorder.finalize(RecordingStopReason::Disabled).await;
+                }
+            }
+            None => {}
         }
         let Some(settings) = self.recording_settings.clone() else {
             // No destination set — a Begin can't record. Surface it instead of a
@@ -870,10 +880,41 @@ impl ChannelPipeline {
     async fn stop_recording(&mut self) {
         self.begin_faulted = false;
         if let Some(recorder) = self.raw_recorder.take() {
-            recorder.finalize(RecordingStopReason::Disabled).await;
-            // Only log when a recording was actually active — a no-op stop is silent.
-            self.diagnostics
-                .record(Diagnostic::event("Raw recording stopped"));
+            let already_reported = self.recording_fault_reported;
+            let fault = recorder.finalize(RecordingStopReason::Disabled).await;
+            self.note_recording_stop("Raw recording", already_reported, fault, true);
+        }
+    }
+
+    /// Record the outcome of a recording stop honestly (§56.1): a clean stop
+    /// gets its INFO note (when `announce_clean`); a dirty one — accepted
+    /// backlog truncated or finalize failed — gets an error diagnostic and a
+    /// `RecordingFaulted` event, unless that fault was already reported live.
+    fn note_recording_stop(
+        &mut self,
+        what: &str,
+        already_reported: bool,
+        fault: Option<String>,
+        announce_clean: bool,
+    ) {
+        match fault {
+            None => {
+                if announce_clean {
+                    self.diagnostics
+                        .record(Diagnostic::event(format!("{what} stopped")));
+                }
+            }
+            Some(why) => {
+                if !already_reported {
+                    self.diagnostics.record(Diagnostic::error(format!(
+                        "{what} faulted while stopping on channel {}: {why}",
+                        self.channel_id
+                    )));
+                    if let Some(events) = &self.events {
+                        let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+                    }
+                }
+            }
         }
     }
 
@@ -907,12 +948,28 @@ impl ChannelPipeline {
     /// is already active; no destination reports a fault rather than a silent
     /// no-op; an open failure reports the reason without faulting the Channel.
     async fn begin_display_recording(&mut self) {
-        if self
+        match self
             .display_views
             .first()
-            .is_some_and(|v| v.recorder.is_some())
+            .and_then(|v| v.recorder.as_ref())
+            .map(|r| r.recording.state())
         {
-            return; // already recording — begin is idempotent
+            // Already recording — begin is idempotent.
+            Some(state) if state != RecordingState::Faulted => return,
+            // Faulted: Begin is the retry — drop the dead recording first
+            // (the Raw sibling's rule).
+            Some(_) => {
+                if let Some(rec) = self
+                    .display_views
+                    .first_mut()
+                    .and_then(|v| v.recorder.take())
+                {
+                    let _ =
+                        finalize_view_recorder(self.channel_id, rec, RecordingStopReason::Disabled)
+                            .await;
+                }
+            }
+            None => {}
         }
         let Some(settings) = self.display_recording_settings.clone() else {
             self.display_begin_faulted = true;
@@ -976,9 +1033,10 @@ impl ChannelPipeline {
             .first_mut()
             .and_then(|v| v.recorder.take());
         if let Some(rec) = taken {
-            finalize_view_recorder(self.channel_id, rec, RecordingStopReason::Disabled).await;
-            self.diagnostics
-                .record(Diagnostic::event("Display recording stopped"));
+            let already_reported = self.display_fault_reported;
+            let fault =
+                finalize_view_recorder(self.channel_id, rec, RecordingStopReason::Disabled).await;
+            self.note_recording_stop("Display recording", already_reported, fault, true);
         }
     }
 
@@ -1050,12 +1108,22 @@ impl ChannelPipeline {
     /// display, and the scrollback are unaffected (§96).
     async fn stop_all_recording(&mut self) {
         if let Some(recorder) = self.raw_recorder.take() {
-            recorder.finalize(RecordingStopReason::Disabled).await;
+            let already = self.recording_fault_reported;
+            let fault = recorder.finalize(RecordingStopReason::Disabled).await;
+            self.note_recording_stop("Raw recording", already, fault, false);
         }
+        let mut display_faults = Vec::new();
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.take() {
-                finalize_view_recorder(self.channel_id, rec, RecordingStopReason::Disabled).await;
+                display_faults.push(
+                    finalize_view_recorder(self.channel_id, rec, RecordingStopReason::Disabled)
+                        .await,
+                );
             }
+        }
+        for fault in display_faults {
+            let already = self.display_fault_reported;
+            self.note_recording_stop("Display recording", already, fault, false);
         }
     }
 
@@ -1070,14 +1138,26 @@ impl ChannelPipeline {
     /// one final snapshot of the returned pipeline after this runs (see `drain_handle`).
     pub async fn finish(&mut self) {
         if let Some(recorder) = self.raw_recorder.take() {
-            recorder.finalize(RecordingStopReason::ChannelStopped).await;
-            self.record_event("Raw recording stopped");
+            let already = self.recording_fault_reported;
+            let fault = recorder.finalize(RecordingStopReason::ChannelStopped).await;
+            self.note_recording_stop("Raw recording", already, fault, true);
         }
+        let mut display_faults = Vec::new();
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.take() {
-                finalize_view_recorder(self.channel_id, rec, RecordingStopReason::ChannelStopped)
-                    .await;
+                display_faults.push(
+                    finalize_view_recorder(
+                        self.channel_id,
+                        rec,
+                        RecordingStopReason::ChannelStopped,
+                    )
+                    .await,
+                );
             }
+        }
+        for fault in display_faults {
+            let already = self.display_fault_reported;
+            self.note_recording_stop("Display recording", already, fault, false);
         }
         self.record_event("Channel stopped");
     }
@@ -1276,7 +1356,7 @@ async fn finalize_view_recorder(
     channel_id: ChannelId,
     mut rec: ViewRecorder,
     reason: RecordingStopReason,
-) {
+) -> Option<String> {
     let tail = rec.renderer.finish();
     if !tail.is_empty() {
         rec.recording.try_record(RenderedOutput {
@@ -1285,7 +1365,7 @@ async fn finalize_view_recorder(
             timestamp: None,
         });
     }
-    rec.recording.finalize(reason).await;
+    rec.recording.finalize(reason).await
 }
 
 /// Whether `free` bytes is below the disk-guard threshold (§168).
@@ -2353,6 +2433,40 @@ mod tests {
         assert!(disp.contains("captured"), "{disp:?}");
         let _ = tokio::fs::remove_file(&raw_path).await;
         let _ = tokio::fs::remove_file(&disp_path).await;
+    }
+
+    #[tokio::test]
+    async fn begin_after_fault_recreates_the_recording() {
+        // A faulted recording still occupies the recorder slot; Begin must be
+        // the user's retry, not a silent "already recording" no-op that
+        // forces a channel restart. Fault deterministically via queue
+        // overflow: capacity 1, and the recorder task is starved (no await
+        // between ingests on the single-threaded test runtime).
+        let cid = ChannelId::new();
+        let path = temp_path("refault");
+        let settings = RawRecordingSettings {
+            destination: path.clone(),
+            channel_name: "refault".to_string(),
+            overwrite: OverwritePolicy::Overwrite,
+            timestamps: false,
+            file_rotation: FileRotationPolicy::None,
+            capacity: 1,
+        };
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        p.set_recording(true, Some(settings.clone())).await;
+        assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
+
+        p.ingest(bytes_chunk(cid, b"a"));
+        p.ingest(bytes_chunk(cid, b"b"));
+        p.ingest(bytes_chunk(cid, b"c")); // queue full → overflow fault
+        assert_eq!(p.raw_recording_state(), Some(RecordingState::Faulted));
+
+        // Begin again = retry: the dead recording is dropped and recreated.
+        p.set_recording(true, Some(settings)).await;
+        assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
+
+        p.finish().await;
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]

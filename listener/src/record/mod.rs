@@ -174,14 +174,23 @@ async fn run_recorder<I, W>(
             reason = &mut terminate => {
                 let reason = reason.unwrap_or(RecordingStopReason::ChannelStopped);
                 if !reason.is_fault() {
-                    // Graceful: drain the already-accepted backlog (§110).
+                    // Graceful: drain the already-accepted backlog (§110). A
+                    // write failure mid-drain truncates ACCEPTED data — that
+                    // is a fault, not a clean stop: publish it and finalize
+                    // at the truncation point (§56.1), never report clean.
                     while let Ok(item) = items.try_recv() {
-                        if writer.write(&item).await.is_err() {
-                            break;
+                        if let Err(err) = writer.write(&item).await {
+                            let _ = fault.set(err.to_string());
+                            let _ = writer.finalize(RecordingStopReason::Faulted(err)).await;
+                            return;
                         }
                     }
                 }
-                let _ = writer.finalize(reason).await;
+                // A failed finalize (flush/close) is equally a dirty stop —
+                // the buffered tail may be gone. Publish it.
+                if let Err(err) = writer.finalize(reason).await {
+                    let _ = fault.set(format!("finalize failed: {err}"));
+                }
                 return;
             }
             maybe = items.recv() => match maybe {
@@ -197,7 +206,9 @@ async fn run_recorder<I, W>(
                     }
                 }
                 None => {
-                    let _ = writer.finalize(RecordingStopReason::ChannelStopped).await;
+                    if let Err(err) = writer.finalize(RecordingStopReason::ChannelStopped).await {
+                        let _ = fault.set(format!("finalize failed: {err}"));
+                    }
                     return;
                 }
             },
@@ -288,7 +299,13 @@ impl<I: Send + 'static> Recording<I> {
 
     /// Stop recording for a non-fault reason (user disable or Channel stop),
     /// letting the recorder drain the accepted backlog and finalize (§56, §110).
-    pub async fn finalize(mut self, reason: RecordingStopReason) {
+    ///
+    /// Returns the terminal fault if the stop was **not clean**: a backlog
+    /// write failure (accepted data truncated at that point) or a failed
+    /// finalize (the buffered tail may be lost). A stop that lost data must
+    /// never read as clean (§56.1) — callers surface `Some` as a recording
+    /// fault, not a "stopped" note.
+    pub async fn finalize(mut self, reason: RecordingStopReason) -> Option<String> {
         if self.state == RecordingState::Enabled {
             self.state = RecordingState::Disabled;
             if let Some(terminate) = self.terminate.take() {
@@ -297,6 +314,7 @@ impl<I: Send + 'static> Recording<I> {
         }
         drop(self.items);
         let _ = self.task.await;
+        self.fault.get().cloned()
     }
 }
 
@@ -414,6 +432,57 @@ mod tests {
         }
         let why = recording.fault_error().expect("fault carries its error");
         assert!(why.contains("disk full"), "unexpected fault message: {why}");
+    }
+
+    /// A recorder whose first write succeeds and second fails — the
+    /// backlog-drain-during-stop fault path.
+    #[derive(Default)]
+    struct SecondWriteFails {
+        writes: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl RawRecorder for SecondWriteFails {
+        async fn write_chunk(&mut self, _chunk: &ReceivedData) -> Result<(), RecordError> {
+            self.writes += 1;
+            if self.writes >= 2 {
+                Err(RecordError::Io(std::io::Error::other("disk full")))
+            } else {
+                Ok(())
+            }
+        }
+        async fn flush(&mut self) -> Result<(), RecordError> {
+            Ok(())
+        }
+        async fn finalize(&mut self, _reason: RecordingStopReason) -> Result<(), RecordError> {
+            Ok(())
+        }
+    }
+
+    /// §56.1 honesty: a stop that truncates the accepted backlog (a write
+    /// fails while draining) must NOT read as clean — `finalize` returns the
+    /// fault instead of `None`.
+    #[tokio::test]
+    async fn dirty_stop_truncating_backlog_reports_a_fault() {
+        let mut recording = start_raw_recording(SecondWriteFails::default(), 8);
+        recording.try_record(chunk(b"one"));
+        recording.try_record(chunk(b"two")); // this write fails
+        let fault = recording.finalize(RecordingStopReason::Disabled).await;
+        assert!(
+            fault
+                .expect("dirty stop must surface")
+                .contains("disk full"),
+            "the fault carries the cause"
+        );
+    }
+
+    /// The counterpart: a stop with a healthy writer reads clean.
+    #[tokio::test]
+    async fn clean_stop_reports_no_fault() {
+        let mut recording = start_raw_recording(CountingRecorder::default(), 8);
+        recording.try_record(chunk(b"data"));
+        let fault = recording.finalize(RecordingStopReason::Disabled).await;
+        assert!(fault.is_none());
     }
 
     /// A recorder whose writes succeed but whose periodic flush fails — the

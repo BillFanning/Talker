@@ -322,20 +322,35 @@ impl TalkerSupervisor {
         }
     }
 
-    /// Join every runner thread — running (stop first), draining, and
-    /// orphaned. **Blocks**, bounded by the interfaces' send timeouts; exit
-    /// path only, so serial ports and sockets close cleanly before the
-    /// process dies instead of being killed mid-write.
+    /// Join every runner thread — running, draining, and orphaned.
+    /// **Blocks**, bounded by the interfaces' send timeouts; exit path only,
+    /// so serial ports and sockets close cleanly before the process dies
+    /// instead of being killed mid-write.
+    ///
+    /// Safe on live handles: the command sender is dropped *before* the join,
+    /// so a runner that never received Stop still exits on the disconnect
+    /// (joining with the sender alive would deadlock — the runner would keep
+    /// waiting for commands forever). Status receivers are drained first so a
+    /// runner block-sending its final `Counters` can always complete.
     pub fn join_all(&mut self) {
         for slot in &mut self.slots {
             if let Some(h) = slot.handle.take() {
-                let _ = h.thread.join();
+                let TalkerHandle {
+                    cmd_tx,
+                    status_rx,
+                    thread,
+                } = h;
+                drop(cmd_tx);
+                for _ in status_rx.try_iter() {}
+                let _ = thread.join();
             }
             for d in slot.draining.drain(..) {
+                for _ in d.status_rx.try_iter() {}
                 let _ = d.thread.join();
             }
         }
         for d in self.orphans.drain(..) {
+            for _ in d.status_rx.try_iter() {}
             let _ = d.thread.join();
         }
     }
