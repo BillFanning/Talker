@@ -215,21 +215,24 @@ Message-model removal). Everything below this block is verified done:
       `COMMAND_DROP_NOTICE_TTL`) in addition to the tracing warning — the
       user sees that the last click did nothing. Talker's sibling landed in
       the same commit (talker TODO).
-- [ ] **Match-scanning cost** (behind the workspace benchmark harness — talker
-      TODO): `MatchRuleSet::evaluate_stream` scans each rule naively
-      (`windows()`), allocates a boundary-carry buffer per chunk, clones actions
-      per occurrence, and `note_activity` loops all rules on every chunk to
-      re-arm idle ones. Compile the byte patterns into one overlapping
-      Aho–Corasick automaton and track idle rules in their own list. Rule counts
-      are small today — measure first.
-- [ ] **Selected-channel diagnostics are cloned and sorted per poll** (behind
-      benchmarks): retained diagnostics are cloned in `ChannelPipeline::snapshot`,
-      cloned again crossing the GUI bridge (`gui/bridge.rs`), then sorted every
-      poll tick (`gui/state.rs`). Add per-diagnostic sequence numbers and send
-      deltas, or consume the snapshot vectors without re-cloning.
-- [ ] **One round-trip for the on-screen channel** (behind benchmarks): the GUI
-      issues `Snapshot` and `StreamDelta` as separate `PipelineRequest`s each
-      poll; combine them into one request per tick.
+- [x] **Scrollback-eviction churn — MEASURED 2026-07-12, KILLED.** Ingest at
+      the byte cap costs the same as below it (142 ns vs 145 ns per 64-byte
+      chunk, `cargo bench -p listener`, baseline `main`): the feared
+      `VecDeque` front-drain cost does not exist. No work needed.
+- [ ] **Match-scanning cost — MEASURED 2026-07-12, PARKED with threshold.**
+      Linear at ~195 ns/rule/chunk (400 ns @ 1 rule, 6.4 µs @ 32, 64-byte
+      chunks): 32 rules at 1k chunks/s is 0.6% of a core. Aho–Corasick (plus a
+      separate idle-rule list) is only worth building if rule counts pass ~50
+      or sustained chunk rates pass ~2k/s — revisit against baseline `main` if
+      either becomes real.
+- [ ] **Selected-channel diagnostics are cloned and sorted per poll — needs
+      its micro-bench before any work**: bench `ChannelPipeline::snapshot` +
+      `into_sorted_vec` at the 1,500-diagnostic cap (estimate says ~1 ms/s at
+      the 5 Hz poll, i.e. a kill — verify, don't guess). Only if it
+      surprises: sequence numbers + deltas, or consume without re-cloning.
+- [ ] **One round-trip for the on-screen channel** — a request-count nicety,
+      not a measured cost: fold into whatever next touches `PipelineRequest`;
+      don't do standalone.
 - [ ] **Doc-drift batch (fold into the next spec/doc pass, no bump alone):**
       removed on-screen Highlight still appears in requirements prose (ADR-015
       dropped it); stale scrollback-size claims vs. the current default; ADR

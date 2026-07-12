@@ -60,13 +60,23 @@ Cross off items as they are completed. Add new ones inline as they come up.
   `--echo`). Pinned by `sampled_policy_bounds_payload_traffic` + the reworked
   `sends_on_schedule_and_reports_self_describing_counts`. Spec "status"
   wording: fold into the next spec pass (no bump alone).
-- [ ] **Observer-path allocations** (behind the workspace benchmark harness
-  below): compiled static messages should send without a fresh wire `Vec` per
-  send (`render_into`/reusable buffer, `core::message::compile`); cache
-  `Schedule::min_active_interval` instead of rescanning each runner loop pass;
-  replace the GUI output Vec with an incremental row ring + `show_rows`
-  (listener's rendering lessons). Adopt a scheduler heap only if benchmarks
-  show message-count scans matter.
+- [x] **Observer-path allocations — MEASURED 2026-07-12, three of four killed
+  by the baselines** (`cargo bench -p talker`, criterion baseline `main`).
+  Decision rule: proceed only above ~1% of a core at 100 Hz–1 kHz. Verdicts:
+  - Scheduler heap: KILLED. `poll` idle-scan is linear at ~1.7 ns/message
+    (19 ns @ 8, 874 ns @ 512); even 512 messages at 1 kHz is 0.09% CPU.
+  - `render_into`/reusable send buffer: KILLED. `poll` due-send is 130 ns @
+    64 B and 136 ns @ 1 KiB — the per-send clone is a memcpy; ADR-018 already
+    removed the expensive per-send observer copies.
+  - `min_active_interval` caching: KILLED. 761 ns @ 512 messages, ~25 ns at
+    realistic counts; 0.08% CPU at 1 kHz.
+  - GUI output row ring: still OPEN, tracked below (frame-time, not criterion).
+- [ ] **Output-pane row ring + `show_rows` (frame-time driven).** The one
+  surviving perf item: the pane rebuilds the full string + selectable label
+  per repaint over 200 retained rows. ADR-018 capped its *input* at ≤10
+  samples/s; what remains is render cost. Measure egui frame time
+  before/after porting listener's row-ring approach; do with the next GUI
+  polish pass.
 - [x] **Command acks** — DONE (`6d4da3b`). Failed `Stop`/interface-update/
   `SetInterval` sends surface in the channel's error banner via
   `command_not_delivered` (gui/mod.rs), distinguishing queue-full (runner
