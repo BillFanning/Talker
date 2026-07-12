@@ -134,11 +134,15 @@ Cross off items as they are completed. Add new ones inline as they come up.
   only where position is the meaning (`PayloadSample::slot`, CLI echo tag).
   Pinned by `channel_ids_are_stable_across_slot_removal` + the id assertions
   in the runner status tests.
-- [ ] **Bench the timestamp/checksum render path** — the `render_into` kill
-  verdict above covered static RawHex only; a timestamped+checksummed send
-  allocates several temporaries per send (`render_at`, timestamp format,
-  checksum Vec). Extend `benches/scheduler.rs` before generalizing that
-  verdict.
+- [x] **Timestamp/checksum render path — MEASURED 2026-07-12, KILLED (with a
+  threshold).** `schedule/poll-due-send/64B-timestamp-crc16`: ~2.1 µs/send
+  vs ~126 ns for the static 64B clone — the "render is ~free" reading does
+  **not** generalize (17×, mostly the three chrono `format().to_string()`
+  temporaries), but the decision does: at the ADR-017 practical ceiling
+  (~1 kHz) that is ~0.2% of a core, well under the ~1% action rule.
+  `render_into` + a preformatted timestamp buffer becomes worth building
+  only if dynamically-rendered sends approach ~5 kHz sustained. Same-run
+  comparisons only; absolute numbers swing with ambient load.
 
 ## Workspace items (external review, 2026-07-11)
 

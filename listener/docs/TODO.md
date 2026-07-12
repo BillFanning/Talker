@@ -227,12 +227,20 @@ Message-model removal). Everything below this block is verified done:
       chunks): 32 rules at 1k chunks/s is 0.6% of a core. Aho–Corasick (plus a
       separate idle-rule list) is only worth building if rule counts pass ~50
       or sustained chunk rates pass ~2k/s — revisit against baseline `main` if
-      either becomes real.
-- [ ] **Selected-channel diagnostics are cloned and sorted per poll — needs
-      its micro-bench before any work**: bench `ChannelPipeline::snapshot` +
-      `into_sorted_vec` at the 1,500-diagnostic cap (estimate says ~1 ms/s at
-      the 5 Hz poll, i.e. a kill — verify, don't guess). Only if it
-      surprises: sequence numbers + deltas, or consume without re-cloning.
+      either becomes real. **Dense-match addendum (2026-07-12): the parking
+      survives firing costs.** Same-run: 1 rule firing every chunk ~420 ns vs
+      ~336 ns never-matching (+~85 ns/firing); 8 rules firing ~1.84 µs vs
+      ~1.52 µs (+~40 ns/firing amortized); a `Notify` action adds ~330 ns per
+      firing (its diagnostic record). Even an every-chunk Notify at the 2k
+      chunks/s threshold is ~0.15% of a core — firing overhead is the same
+      order as the scan it rides on and cannot move the threshold.
+- [x] **Selected-channel diagnostics clone+sort — MEASURED 2026-07-12,
+      KILLED.** At the retained cap (seeded past every per-severity bound):
+      `snapshot/full-at-diagnostics-cap` ~82 µs, the GUI's per-arrival
+      `clone` + `into_sorted_vec` ~18 µs. At the 5 Hz selected-channel poll
+      that is ~0.5 ms/s ≈ 0.05% of a core — half the filed estimate and ~20×
+      under the ~1% action rule. Sequence-numbers/deltas are not justified;
+      the once-per-arrival `Rc` cache already keeps it off the frame path.
 - [ ] **One round-trip for the on-screen channel** — a request-count nicety,
       not a measured cost: fold into whatever next touches `PipelineRequest`;
       don't do standalone.
@@ -295,9 +303,9 @@ Message-model removal). Everything below this block is verified done:
       re-poll immediately. Done without a dedicated bench: the change is a
       strict bounded reduction (~40 ioctls/s worst case vs. 4×chunk-rate).
       Pinned by `input_line_polling_is_throttled_not_per_read`.
-- [ ] **Dense-match bench case** before the Aho–Corasick parking is final:
-      the current rules-benches never match, so firing costs (action clones,
-      events, marks) are unmeasured.
+- [x] **Dense-match bench case** — landed (`ingest/64B/{1,8}-rules-firing-
+      every-chunk`, `1-rule-notify-every-chunk`); numbers and the confirmed
+      parking verdict are in the match-scanning item above.
 - [ ] **Frame-time items** (with the talker row-ring methodology): mark-string
       hashing per repaint and repeated `make_contiguous` in
       `gui/detail/stream_view.rs` — generation/dirty-offset tracking instead.

@@ -17,7 +17,9 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use talker::core::message::{MessageConfig, PayloadConfig};
+use talker::core::message::{
+    ChecksumAlgorithm, ChecksumConfig, MessageConfig, PayloadConfig, TimestampConfig,
+};
 use talker::core::scheduler::{Schedule, Tick};
 
 fn msg(byte_len: usize, interval_ms: u64) -> MessageConfig {
@@ -58,6 +60,36 @@ fn bench_poll_due_send(c: &mut Criterion) {
     }
 }
 
+/// The dynamic-render counterpart of `poll-due-send`: the same 64-byte payload
+/// with a full timestamp (date+millis+timezone, three chrono format calls into
+/// a temporary `String`) prepended and a CRC-16/CCITT appended per send. The
+/// static case's `render_into` KILL verdict covered only the plain payload
+/// clone; this is the case that says whether that verdict generalizes to the
+/// per-send rendering path (the "observer-path allocations" TODO).
+// The config structs are `#[non_exhaustive]`, so a bench (outside the crate)
+// cannot use struct literals — Default + field assignment is the only way in.
+#[allow(clippy::field_reassign_with_default)]
+fn bench_poll_due_send_rendered(c: &mut Criterion) {
+    let start = Instant::now();
+    let mut message = msg(64, 1);
+    let mut ts = TimestampConfig::default();
+    ts.include_date = true;
+    ts.include_millis = true;
+    ts.include_timezone = true;
+    message.timestamp = Some(ts);
+    let mut cs = ChecksumConfig::default();
+    cs.algorithm = ChecksumAlgorithm::Crc16Ccitt;
+    message.checksum = Some(cs);
+    let mut schedule = Schedule::compile(&[message], start).unwrap();
+    let mut now = start;
+    c.bench_function("schedule/poll-due-send/64B-timestamp-crc16", |b| {
+        b.iter(|| {
+            now += Duration::from_millis(1);
+            black_box(schedule.poll(now))
+        })
+    });
+}
+
 fn bench_min_active_interval(c: &mut Criterion) {
     let start = Instant::now();
     let messages: Vec<MessageConfig> = (0..512).map(|_| msg(32, 1_000)).collect();
@@ -71,6 +103,7 @@ criterion_group!(
     benches,
     bench_poll_scan,
     bench_poll_due_send,
+    bench_poll_due_send_rendered,
     bench_min_active_interval
 );
 criterion_main!(benches);
