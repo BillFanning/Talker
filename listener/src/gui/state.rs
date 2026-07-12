@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::config::ChannelConfig;
-use crate::core::{ChannelId, MatchRuleId, RecordingState, RuntimeEvent};
+use crate::core::{
+    ChannelId, ChannelState, MatchRuleId, RecordingState, RecordingTap, RuntimeEvent,
+};
 use crate::diagnostics::Diagnostic;
 use crate::runtime::{ChannelSnapshot, TriggeredMatch};
 use crate::transport::SerialControlLines;
@@ -78,6 +80,11 @@ pub struct ChannelView {
     /// (re)start. `None` when there's nothing to report. (Not a diagnostic — the fault is
     /// recorded as an ERROR diagnostic by the runtime; this is just the inline status.)
     pub last_error: Option<String>,
+    /// When `last_error` reports a **recording** fault, which lane it refers to —
+    /// so only that lane's recovery (its `RecordingStarted`, or its polled state
+    /// reading Enabled) clears the message; the other lane starting must not.
+    /// `None` when `last_error` is absent or a non-recording (command) error.
+    pub recording_fault: Option<RecordingTap>,
     /// The most recent snapshot, for detail panes (diagnostics, match firings,
     /// view pause, recording state). The stream bytes are *not* here — they
     /// accumulate separately in `stream_bytes` from incremental deltas. `None` until
@@ -136,6 +143,7 @@ impl ChannelView {
             warnings: 0,
             errors: 0,
             last_error: None,
+            recording_fault: None,
             snapshot: None,
             sorted_diagnostics: Rc::new(Vec::new()),
             control_lines: None,
@@ -340,11 +348,14 @@ impl AppState {
             UiUpdate::ChannelError(id, message) => {
                 if let Some(view) = self.views.get_mut(&id) {
                     view.last_error = Some(message);
+                    // The message now reports a command error, not a recording fault.
+                    view.recording_fault = None;
                 }
             }
             UiUpdate::Event(event) => self.apply_event(event),
             UiUpdate::Snapshot(id, snapshot) => {
                 if let Some(view) = self.views.get_mut(&id) {
+                    reconcile_status(view, snapshot.state, snapshot.reconnect_pending);
                     view.bytes_total = snapshot.activity.total_bytes;
                     view.bytes_per_sec = snapshot.activity.bytes_per_sec;
                     view.info = snapshot.diagnostics.events.len();
@@ -367,6 +378,7 @@ impl AppState {
             // Cheap per-tab health for non-selected channels (no scrollback bytes).
             UiUpdate::Stats(id, stats) => {
                 if let Some(view) = self.views.get_mut(&id) {
+                    reconcile_status(view, stats.state, stats.reconnect_pending);
                     view.bytes_total = stats.activity.total_bytes;
                     view.bytes_per_sec = stats.activity.bytes_per_sec;
                     view.info = stats.event_count;
@@ -419,9 +431,10 @@ impl AppState {
                 self.set_status(id, ChannelStatus::Running);
                 if let Some(view) = self.views.get_mut(&id) {
                     view.last_error = None; // a successful start clears the prior error
-                                            // A fresh Start resets the runtime's stream offset to 0, so drop
-                                            // any accumulated bytes/cursor/marks from a previous run to avoid
-                                            // mixing old and new streams (§8.5).
+                    view.recording_fault = None;
+                    // A fresh Start resets the runtime's stream offset to 0, so drop
+                    // any accumulated bytes/cursor/marks from a previous run to avoid
+                    // mixing old and new streams (§8.5).
                     view.stream_bytes.clear();
                     view.marks.clear();
                     view.stream_cursor = 0;
@@ -458,22 +471,28 @@ impl AppState {
             // A recording fault (e.g. a begin that couldn't open the file — Refuse over
             // an existing file) surfaces inline so "Record now" gives feedback instead
             // of silently doing nothing. The specific reason is in the diagnostics log.
-            RuntimeEvent::RecordingFaulted(id) => {
+            RuntimeEvent::RecordingFaulted(id, tap) => {
                 if let Some(view) = self.views.get_mut(&id) {
                     let msg = format!(
-                        "{}: recording could not start — see Diagnostics (check the \
-                         destination and on-exists policy)",
-                        view.name
+                        "{}: {} recording faulted — see Diagnostics for the reason \
+                         (check the destination and on-exists policy)",
+                        view.name,
+                        tap.label()
                     );
                     view.last_error = Some(msg);
+                    view.recording_fault = Some(tap);
                 }
             }
-            RuntimeEvent::RecordingStarted(id) => {
-                // Recording now began OK — clear a prior recording fault. A recording
-                // fault leaves the Channel Running, so ChannelStarted never re-fires to
-                // clear it; this is the only signal that the recourse worked.
+            RuntimeEvent::RecordingStarted(id, tap) => {
+                // This lane's recording now began OK — clear a prior recording fault
+                // **on the same lane**. A recording fault leaves the Channel Running,
+                // so ChannelStarted never re-fires to clear it; and the *other* lane
+                // starting says nothing about this one, so it must not clear it.
                 if let Some(view) = self.views.get_mut(&id) {
-                    view.last_error = None;
+                    if view.recording_fault == Some(tap) {
+                        view.last_error = None;
+                        view.recording_fault = None;
+                    }
                 }
             }
             // `MessageReceived` no longer drives the list: liveness is byte-based now
@@ -493,14 +512,45 @@ impl AppState {
     }
 }
 
-/// Clear a recording-fault `last_error` once the snapshot/stats poll shows recording is
-/// actually enabled. The `RecordingStarted` event already clears it, but events use
-/// `try_send` and can drop under load; the poll always runs, so this guarantees a stale
-/// recording error doesn't outlive a recording that's now working. A bind/start fault
-/// leaves the channel Faulted (recording can't be Enabled), so this never clears one.
+/// Reconcile the view's derived status against the lifecycle state a poll served
+/// (ADR-006). Lifecycle `RuntimeEvent`s are advisory `try_send`s and can drop under
+/// load; the snapshot/stats poll always runs and carries the orchestrator's
+/// effective state, so a dropped Started/Stopped/Faulted/Reconnect event
+/// self-corrects within one poll instead of leaving the row stale forever.
+///
+/// `Faulted` splits on `reconnect_pending`: a fault the runtime is still retrying
+/// reads as Reconnecting (matching the `ChannelReconnecting` event), a fault it
+/// gave up on (or never retries) reads as Faulted — so neither direction depends
+/// on the corresponding event having arrived. The transitional states are left
+/// alone: they resolve within the runtime's own command call, and the event (or
+/// the next poll) settles the row without flapping it through an intermediate.
+fn reconcile_status(view: &mut ChannelView, state: ChannelState, reconnect_pending: bool) {
+    view.status = match state {
+        ChannelState::Running => ChannelStatus::Running,
+        ChannelState::Stopped => ChannelStatus::Stopped,
+        ChannelState::Faulted if reconnect_pending => ChannelStatus::Reconnecting,
+        ChannelState::Faulted => ChannelStatus::Faulted,
+        ChannelState::Starting | ChannelState::Stopping => return,
+    };
+}
+
+/// Clear a recording-fault `last_error` once the snapshot/stats poll shows **the
+/// faulted lane's** recording is actually enabled. The `RecordingStarted` event
+/// already clears it, but events use `try_send` and can drop under load; the poll
+/// always runs, so this guarantees a stale recording error doesn't outlive a
+/// recording that's now working. Tap-aware: a Display fault is cleared only by the
+/// Display lane reading Enabled (and vice versa) — the Raw lane recording happily
+/// says nothing about a broken Display recording. A non-recording `last_error`
+/// (`recording_fault == None`, e.g. a command error) is never cleared here.
 fn clear_error_if_recording_ok(view: &mut ChannelView) {
-    if view.last_error.is_some() && view.recording == Some(RecordingState::Enabled) {
+    let lane_ok = match view.recording_fault {
+        Some(RecordingTap::Raw) => view.recording == Some(RecordingState::Enabled),
+        Some(RecordingTap::Display) => view.display_recording == Some(RecordingState::Enabled),
+        None => false,
+    };
+    if lane_ok {
         view.last_error = None;
+        view.recording_fault = None;
     }
 }
 
@@ -543,6 +593,8 @@ mod tests {
     ) -> ChannelSnapshot {
         ChannelSnapshot {
             channel_id: id,
+            state: ChannelState::Running,
+            reconnect_pending: false,
             display_views: vec![],
             diagnostics: DiagnosticsSnapshot {
                 warnings: vec![crate::diagnostics::Diagnostic::warning("w"); warnings],
@@ -655,6 +707,164 @@ mod tests {
             "no recording indicator on a faulted channel"
         );
         assert_eq!(view.bytes_total, 4096, "byte liveness is kept");
+    }
+
+    /// A `Stats` update carrying just a lifecycle state (zeros elsewhere), for the
+    /// poll-reconciliation tests.
+    fn stats_with_state(id: ChannelId, state: ChannelState, reconnect_pending: bool) -> UiUpdate {
+        UiUpdate::Stats(
+            id,
+            Box::new(crate::runtime::ChannelStats {
+                state,
+                reconnect_pending,
+                activity: ChannelActivity {
+                    last_data_at: None,
+                    bytes_per_sec: 0.0,
+                    total_bytes: 0,
+                },
+                event_count: 0,
+                warning_count: 0,
+                error_count: 0,
+                raw_recording: None,
+                display_recording: None,
+                match_boundary_saves: 0,
+                ingest_queue: crate::runtime::QueueDepth::default(),
+                raw_recording_queue: None,
+            }),
+        )
+    }
+
+    #[test]
+    fn a_dropped_lifecycle_event_self_corrects_on_the_next_poll() {
+        // ADR-006: lifecycle events are advisory try_sends. Simulate a dropped
+        // ChannelFaulted (no event ever arrives) — the polled stats carry the
+        // orchestrator's effective state and correct the row; a later Stopped
+        // poll corrects again.
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(id)));
+        assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
+
+        state.apply(stats_with_state(id, ChannelState::Faulted, false));
+        assert_eq!(
+            state.channel(id).unwrap().status,
+            ChannelStatus::Faulted,
+            "polled state corrects a dropped ChannelFaulted"
+        );
+
+        state.apply(stats_with_state(id, ChannelState::Stopped, false));
+        assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Stopped);
+    }
+
+    #[test]
+    fn polled_fault_with_reconnect_pending_reads_reconnecting() {
+        // While the runtime is still retrying, the effective state is Faulted but
+        // reconnect_pending distinguishes it — the row reads Reconnecting without
+        // needing the ChannelReconnecting event; once the backoff gives up,
+        // pending drops and the same polled state reads Faulted.
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "serial", "Serial · COM3"));
+
+        state.apply(stats_with_state(id, ChannelState::Faulted, true));
+        assert_eq!(
+            state.channel(id).unwrap().status,
+            ChannelStatus::Reconnecting
+        );
+        state.apply(stats_with_state(id, ChannelState::Faulted, false));
+        assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Faulted);
+    }
+
+    #[test]
+    fn transitional_polled_states_do_not_flap_the_row() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(id)));
+
+        // A poll racing a stop command may catch Stopping — leave the row alone;
+        // the ChannelStopped event (or the next Stopped poll) settles it.
+        state.apply(stats_with_state(id, ChannelState::Stopping, false));
+        assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
+        state.apply(stats_with_state(id, ChannelState::Starting, false));
+        assert_eq!(state.channel(id).unwrap().status, ChannelStatus::Running);
+    }
+
+    #[test]
+    fn recording_fault_clearing_is_tap_aware() {
+        // Raw and Display recordings fault and recover independently: the Display
+        // lane starting (event) or the Raw lane polling Enabled must not clear a
+        // fault on the *other* lane — only the faulted lane's own recovery does.
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+
+        state.apply(UiUpdate::Event(RuntimeEvent::RecordingFaulted(
+            id,
+            RecordingTap::Display,
+        )));
+        assert!(state.channel(id).unwrap().last_error.is_some());
+
+        // The RAW lane starting says nothing about the Display fault.
+        state.apply(UiUpdate::Event(RuntimeEvent::RecordingStarted(
+            id,
+            RecordingTap::Raw,
+        )));
+        assert!(
+            state.channel(id).unwrap().last_error.is_some(),
+            "a Raw start must not clear a Display recording fault"
+        );
+
+        // Nor does a poll showing the RAW lane Enabled.
+        let mut snap = snapshot_with(id, 0, 0.0, 0);
+        snap.raw_recording = Some(RecordingState::Enabled);
+        state.apply(UiUpdate::Snapshot(id, Box::new(snap)));
+        assert!(
+            state.channel(id).unwrap().last_error.is_some(),
+            "the Raw lane polling Enabled must not clear a Display fault"
+        );
+
+        // The Display lane's own recovery clears it.
+        state.apply(UiUpdate::Event(RuntimeEvent::RecordingStarted(
+            id,
+            RecordingTap::Display,
+        )));
+        assert!(state.channel(id).unwrap().last_error.is_none());
+    }
+
+    #[test]
+    fn polled_recording_state_clears_only_the_faulted_lane() {
+        // The event-lane clear can drop (try_send); the poll is the guaranteed
+        // path. A Display fault clears when the poll shows the DISPLAY lane
+        // Enabled — and a command error (no recording fault) is never cleared
+        // by recording state at all.
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+
+        state.apply(UiUpdate::Event(RuntimeEvent::RecordingFaulted(
+            id,
+            RecordingTap::Display,
+        )));
+        let mut snap = snapshot_with(id, 0, 0.0, 0);
+        snap.display_recording = Some(RecordingState::Enabled);
+        state.apply(UiUpdate::Snapshot(id, Box::new(snap)));
+        assert!(
+            state.channel(id).unwrap().last_error.is_none(),
+            "the faulted lane polling Enabled clears its fault"
+        );
+
+        // A command error is not a recording fault: recording states can't clear it.
+        state.apply(UiUpdate::ChannelError(id, "illegal transition".into()));
+        let mut snap = snapshot_with(id, 0, 0.0, 0);
+        snap.raw_recording = Some(RecordingState::Enabled);
+        snap.display_recording = Some(RecordingState::Enabled);
+        state.apply(UiUpdate::Snapshot(id, Box::new(snap)));
+        assert!(
+            state.channel(id).unwrap().last_error.is_some(),
+            "recording state must not clear a command error"
+        );
     }
 
     #[test]

@@ -92,6 +92,16 @@ const STALL_WARNING: Duration = Duration::from_millis(250);
 /// stalled, when reception is degraded anyway.
 const STALL_POLL: Duration = Duration::from_millis(5);
 
+/// How often the input control lines (CTS/DSR/DCD/RI, §161) are polled. Each poll
+/// is four synchronous driver ioctls; doing them before *every* read put four
+/// driver round-trips on the hot reception path per chunk — at high chunk rates,
+/// far more driver traffic than the data itself. Line changes are human-scale
+/// events (a device asserting DTR, a cable unplugged); ~10 Hz shows them as
+/// instantly as the GUI can render while costing a bounded ~40 driver calls/s.
+/// Pending RTS/DTR **commands** are still applied every pass (operator actions
+/// stay immediate), and applying one polls the inputs right away for feedback.
+const CONTROL_LINE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// An unopened serial transport description (§14, §74). Call
 /// [`open`](Self::open) at Channel Start to acquire the port.
 ///
@@ -362,15 +372,24 @@ fn run_blocking_receive_loop(
     let mut stall_warned = false;
     // Live control-line state (§161), tracked across the session.
     let mut lines = SerialControlLines::default();
+    // First input-line poll happens immediately (initial state), then throttled.
+    let mut next_line_poll = Instant::now();
     loop {
         // Cooperative cancellation, observed between bounded reads (§111).
         if cancel.is_cancelled() {
             return TransportOutcome::Cancelled;
         }
-        // Live control lines (§161): apply pending RTS/DTR commands and poll the
-        // input lines between reads, so this never interferes with reception (§100).
+        // Live control lines (§161): apply pending RTS/DTR commands every pass and
+        // poll the input lines at a bounded cadence between reads, so this never
+        // interferes with reception (§100) nor floods the driver with ioctls.
         if let Some(ctl) = control.as_mut() {
-            service_control_lines(&mut reader, ctl, &mut lines, channel_id);
+            service_control_lines(
+                &mut reader,
+                ctl,
+                &mut lines,
+                channel_id,
+                &mut next_line_poll,
+            );
         }
         match reader.read(&mut buf) {
             // Timeout / no data: loop back to re-check cancellation.
@@ -439,11 +458,17 @@ fn run_blocking_receive_loop(
 /// change, update the shared state cell and signal `ControlLinesChanged` (§137) —
 /// the cell is the truth, the event is the lightweight signal (ADR-006). A
 /// control-line I/O error is ignored (it does not fault the Channel, §96).
+///
+/// Commands are drained every call; the four input-line ioctls run only when
+/// `next_line_poll` is due ([`CONTROL_LINE_POLL_INTERVAL`]) or a command was just
+/// applied — they used to run before every read, which at high chunk rates was
+/// more driver traffic than the data itself.
 fn service_control_lines(
     reader: &mut impl BlockingReader,
     ctl: &mut SerialControlHooks,
     lines: &mut SerialControlLines,
     channel_id: ChannelId,
+    next_line_poll: &mut Instant,
 ) {
     let mut changed = false;
     while let Ok(cmd) = ctl.commands.try_recv() {
@@ -453,6 +478,13 @@ fn service_control_lines(
         };
         changed |= applied.is_ok();
     }
+    // A just-applied command re-polls immediately (fresh feedback on lines a
+    // driven RTS/DTR may loop back); otherwise honor the cadence.
+    let now = Instant::now();
+    if !changed && now < *next_line_poll {
+        return;
+    }
+    *next_line_poll = now + CONTROL_LINE_POLL_INTERVAL;
     if let Ok((cts, dsr, dcd, ri)) = reader.read_inputs() {
         if (cts, dsr, dcd, ri) != (lines.cts, lines.dsr, lines.dcd, lines.ri) {
             lines.cts = cts;
@@ -592,6 +624,72 @@ mod tests {
         }
 
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn input_line_polling_is_throttled_not_per_read() {
+        // The four input-line ioctls used to run before EVERY read — at high chunk
+        // rates, more driver round-trips than the data itself. They are now gated
+        // to CONTROL_LINE_POLL_INTERVAL. The idle ControlReader turns a read
+        // around in ~1 ms, so ~150 ms of loop means ~150 reads: per-read polling
+        // would count ~150; the throttle allows the initial poll plus one due
+        // refresh (a generous ceiling absorbs scheduler jitter).
+        #[derive(Clone, Default)]
+        struct CountingReader {
+            inner: ControlReader,
+            input_polls: Arc<Mutex<usize>>,
+        }
+        impl BlockingReader for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.inner.read(buf)
+            }
+            fn read_inputs(&mut self) -> io::Result<(bool, bool, bool, bool)> {
+                *self.input_polls.lock().unwrap() += 1;
+                self.inner.read_inputs()
+            }
+            fn set_rts(&mut self, on: bool) -> io::Result<()> {
+                self.inner.set_rts(on)
+            }
+            fn set_dtr(&mut self, on: bool) -> io::Result<()> {
+                self.inner.set_dtr(on)
+            }
+        }
+
+        let reader = CountingReader::default();
+        let polls = reader.input_polls.clone();
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (ev_tx, _ev_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let hooks = SerialControlHooks {
+            commands: cmd_rx,
+            state: Arc::new(Mutex::new(SerialControlLines::default())),
+            events: ev_tx,
+        };
+        let loop_cancel = cancel.clone();
+        let handle = std::thread::spawn(move || {
+            run_blocking_receive_loop(
+                ChannelId::new(),
+                reader,
+                tx,
+                loop_cancel,
+                STALL_WARNING,
+                None,
+                Some(hooks),
+            )
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel.cancel();
+        handle.join().unwrap();
+
+        let count = *polls.lock().unwrap();
+        assert!(count >= 1, "the initial input-line poll must happen");
+        assert!(
+            count <= 5,
+            "input polling must follow the ~10 Hz cadence, not per-read \
+             (got {count} polls in ~150 ms of ~1 ms reads)"
+        );
     }
 
     #[tokio::test]

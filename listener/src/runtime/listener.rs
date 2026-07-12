@@ -62,6 +62,10 @@ fn retained_snapshot(
 ) -> ChannelSnapshot {
     ChannelSnapshot {
         channel_id: id,
+        // Placeholders — the caller stamps the effective lifecycle state, exactly
+        // as it does over a live pipeline's snapshot.
+        state: ChannelState::Stopped,
+        reconnect_pending: false,
         display_views: Vec::new(),
         diagnostics: DiagnosticsSnapshot::from_diagnostics(diagnostics.iter().cloned()),
         raw_recording: None,
@@ -74,6 +78,35 @@ fn retained_snapshot(
         matches: Vec::new(),
         match_boundary_saves: boundary_saves,
         stream_end_offset: 0,
+        ingest_queue: crate::runtime::QueueDepth::default(),
+        raw_recording_queue: None,
+    }
+}
+
+/// The [`ChannelStats`] counterpart of [`retained_snapshot`]: cheap per-tab health
+/// for a Channel with no live pipeline, so the polled stats lane keeps serving
+/// (and self-correcting) the lifecycle state and the retained totals after a
+/// stop or fault instead of going silent.
+fn retained_stats(channel: &ManagedChannel) -> ChannelStats {
+    let (mut events, mut warnings, mut errors) = (0, 0, 0);
+    for d in &channel.retained_diagnostics {
+        match d.severity {
+            crate::diagnostics::DiagnosticSeverity::Event => events += 1,
+            crate::diagnostics::DiagnosticSeverity::Warning => warnings += 1,
+            crate::diagnostics::DiagnosticSeverity::Error => errors += 1,
+        }
+    }
+    ChannelStats {
+        // Placeholders — the caller stamps the effective lifecycle state.
+        state: ChannelState::Stopped,
+        reconnect_pending: false,
+        activity: channel.retained_activity,
+        event_count: events,
+        warning_count: warnings,
+        error_count: errors,
+        raw_recording: None,
+        display_recording: None,
+        match_boundary_saves: channel.retained_boundary_saves,
         ingest_queue: crate::runtime::QueueDepth::default(),
         raw_recording_queue: None,
     }
@@ -162,6 +195,14 @@ impl ManagedChannel {
         } else {
             self.state
         }
+    }
+
+    /// Whether an auto-reconnect is armed or in progress (§9.1) — the poll-lane
+    /// counterpart of the `ChannelReconnecting` event, so a UI can distinguish
+    /// "Faulted, retrying" from "Faulted, given up / not retrying" without
+    /// depending on the advisory event stream.
+    fn reconnect_pending(&self) -> bool {
+        self.reconnect_state.as_ref().is_some_and(|r| !r.gave_up)
     }
 }
 
@@ -303,45 +344,57 @@ impl Listener {
         }
     }
 
-    /// Request an on-demand snapshot of a running Channel's *small* observable state
-    /// (§137, ADR-006): diagnostics, recent match firings, per-view pause state,
-    /// recording state, liveness, and the stream end offset. The scrollback bytes
-    /// come separately via [`stream_delta`](Self::stream_delta). Returns `None` when
-    /// the Channel is unknown, not running, or a TCP listener (its connections are
-    /// snapshot targets in their own right; per-connection snapshots are deferred).
-    /// The `RuntimeEvent` stream stays the authoritative liveness signal.
+    /// Request an on-demand snapshot of a Channel's *small* observable state (§137,
+    /// ADR-006): diagnostics, recent match firings, per-view pause state, recording
+    /// state, liveness, and the stream end offset. The scrollback bytes come
+    /// separately via [`stream_delta`](Self::stream_delta).
+    ///
+    /// Always serves for a known Channel — a live pipeline answers when running;
+    /// otherwise a minimal snapshot carries the retained history (the last run's
+    /// diagnostics and its final liveness facts, so a stopped channel's byte total
+    /// reads exact at rest). Every reply is stamped with the **effective lifecycle
+    /// state**, which is what lets a polling consumer self-correct a lifecycle
+    /// event that dropped (ADR-006: events are advisory; the poll is the truth).
+    /// `None` only for an unknown id.
     pub async fn snapshot(&self, id: ChannelId) -> Option<ChannelSnapshot> {
         let channel = self.channels.get(&id)?;
-        match channel.handle.as_ref() {
+        let live = match channel.handle.as_ref() {
             Some(ChannelHandle::Data(tasks)) => tasks.snapshot().await,
-            Some(ChannelHandle::TcpListener(_)) => None,
-            // Not running (Stopped/Faulted): there's no live pipeline, so serve a
-            // minimal snapshot carrying the retained history — the last run's
-            // diagnostics (its log, the stop notes, any start fault) AND its final
-            // liveness facts, so a stopped channel's byte total reads exact at rest
-            // instead of zeroing on the first post-stop poll.
-            None if !channel.retained_diagnostics.is_empty()
-                || channel.retained_activity.total_bytes > 0 =>
-            {
-                Some(retained_snapshot(
-                    id,
-                    &channel.retained_diagnostics,
-                    channel.retained_activity,
-                    channel.retained_boundary_saves,
-                ))
-            }
-            None => None,
-        }
+            // A TCP listener has no pipeline of its own (its connections are
+            // snapshot targets in their own right; per-connection snapshots are
+            // deferred) — serve the retained/lifecycle shell below.
+            Some(ChannelHandle::TcpListener(_)) | None => None,
+        };
+        let mut snap = live.unwrap_or_else(|| {
+            retained_snapshot(
+                id,
+                &channel.retained_diagnostics,
+                channel.retained_activity,
+                channel.retained_boundary_saves,
+            )
+        });
+        snap.state = channel.effective_state();
+        snap.reconnect_pending = channel.reconnect_pending();
+        Some(snap)
     }
 
-    /// Cheap O(1) liveness stats for a running data Channel (§91.1, ADR-006) — the
-    /// counters a multi-channel overview shows per tab, without cloning the
-    /// scrollback. `None` when unknown, not running, or a TCP listener.
+    /// Cheap O(1) liveness stats for a data Channel (§91.1, ADR-006) — the counters
+    /// a multi-channel overview shows per tab, without cloning the scrollback.
+    /// Like [`snapshot`](Self::snapshot), always serves for a known Channel (live
+    /// counters when running, retained totals otherwise) and stamps the effective
+    /// lifecycle state — the overview polls this for *every* tab, so this lane is
+    /// what self-corrects a dropped lifecycle event on non-selected channels.
+    /// `None` only for an unknown id.
     pub async fn channel_stats(&self, id: ChannelId) -> Option<ChannelStats> {
-        match self.channels.get(&id)?.handle.as_ref()? {
-            ChannelHandle::Data(tasks) => tasks.stats().await,
-            ChannelHandle::TcpListener(_) => None,
-        }
+        let channel = self.channels.get(&id)?;
+        let live = match channel.handle.as_ref() {
+            Some(ChannelHandle::Data(tasks)) => tasks.stats().await,
+            Some(ChannelHandle::TcpListener(_)) | None => None,
+        };
+        let mut stats = live.unwrap_or_else(|| retained_stats(channel));
+        stats.state = channel.effective_state();
+        stats.reconnect_pending = channel.reconnect_pending();
+        Some(stats)
     }
 
     /// Incremental stream bytes since the consumer's cursor (§87, ADR-009): only
@@ -1194,7 +1247,10 @@ impl Listener {
         }
         let name = config.name.as_str();
         let Some(destination) = &recording.destination else {
-            let _ = self.events_tx.try_send(RuntimeEvent::RecordingFaulted(id));
+            let _ = self.events_tx.try_send(RuntimeEvent::RecordingFaulted(
+                id,
+                crate::core::RecordingTap::Display,
+            ));
             return (
                 None,
                 Some(Diagnostic::error(format!(
@@ -1229,7 +1285,10 @@ impl Listener {
         match created {
             Ok(recording) => (Some((renderer, recording)), None),
             Err(err) => {
-                let _ = self.events_tx.try_send(RuntimeEvent::RecordingFaulted(id));
+                let _ = self.events_tx.try_send(RuntimeEvent::RecordingFaulted(
+                    id,
+                    crate::core::RecordingTap::Display,
+                ));
                 (
                     None,
                     Some(Diagnostic::error(format!(
@@ -1868,7 +1927,8 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
-                Ok(Some(RuntimeEvent::RecordingFaulted(_))) => {
+                Ok(Some(RuntimeEvent::RecordingFaulted(_, tap))) => {
+                    assert_eq!(tap, crate::core::RecordingTap::Raw, "raw lane faulted");
                     saw_recording_fault = true;
                     break;
                 }
@@ -1931,11 +1991,15 @@ mod tests {
         }
 
         listener.stop(id).await.unwrap();
-        // No live pipeline: cheap stats are gone…
-        assert!(listener.channel_stats(id).await.is_none());
-        // …but the snapshot serves the retained final liveness — exact total,
-        // zero rate — alongside the retained diagnostics.
+        // No live pipeline: both polled lanes keep serving the retained final
+        // liveness — exact total, zero rate — stamped with the effective state,
+        // so an overview tab (stats) and the detail pane (snapshot) both read
+        // exact at rest and self-correct a dropped ChannelStopped event.
+        let stats = listener.channel_stats(id).await.expect("retained stats");
+        assert_eq!(stats.state, ChannelState::Stopped, "state served at rest");
+        assert_eq!(stats.activity.total_bytes, expected, "exact total at rest");
         let snap = listener.snapshot(id).await.expect("retained snapshot");
+        assert_eq!(snap.state, ChannelState::Stopped, "state served at rest");
         assert_eq!(snap.activity.total_bytes, expected, "exact total at rest");
         assert_eq!(snap.activity.bytes_per_sec, 0.0, "no rate at rest");
     }
@@ -1982,7 +2046,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
-                Ok(Some(RuntimeEvent::RecordingFaulted(id))) if id == second_id => {
+                Ok(Some(RuntimeEvent::RecordingFaulted(id, _))) if id == second_id => {
                     saw_recording_fault = true;
                     break;
                 }

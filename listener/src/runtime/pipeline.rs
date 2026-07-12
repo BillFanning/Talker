@@ -32,7 +32,9 @@ use crate::config::{
     RecordTarget,
 };
 
-use crate::core::{ChannelId, ChunkTime, DisplayViewId, MatchRuleId, RecordingState, RuntimeEvent};
+use crate::core::{
+    ChannelId, ChunkTime, DisplayViewId, MatchRuleId, RecordingState, RecordingTap, RuntimeEvent,
+};
 use crate::diagnostics::{Diagnostic, DiagnosticLog};
 use crate::display::{
     AnnotationPlacement, DisplayView, RenderAnnotation, RenderedOutput, StreamRenderer,
@@ -539,7 +541,10 @@ impl ChannelPipeline {
                 self.channel_id
             )));
             if let Some(events) = &self.events {
-                let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+                let _ = events.try_send(RuntimeEvent::RecordingFaulted(
+                    self.channel_id,
+                    RecordingTap::Raw,
+                ));
             }
         }
         let display_fault = self.display_views.iter().find_map(|v| {
@@ -561,7 +566,10 @@ impl ChannelPipeline {
                     self.channel_id
                 )));
                 if let Some(events) = &self.events {
-                    let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+                    let _ = events.try_send(RuntimeEvent::RecordingFaulted(
+                        self.channel_id,
+                        RecordingTap::Display,
+                    ));
                 }
             }
         }
@@ -816,7 +824,10 @@ impl ChannelPipeline {
                  recording setup, then press Record again",
             ));
             if let Some(events) = &self.events {
-                let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+                let _ = events.try_send(RuntimeEvent::RecordingFaulted(
+                    self.channel_id,
+                    RecordingTap::Raw,
+                ));
             }
             return;
         };
@@ -853,7 +864,10 @@ impl ChannelPipeline {
                     settings.destination.display(),
                 )));
                 if let Some(events) = &self.events {
-                    let _ = events.try_send(RuntimeEvent::RecordingStarted(self.channel_id));
+                    let _ = events.try_send(RuntimeEvent::RecordingStarted(
+                        self.channel_id,
+                        RecordingTap::Raw,
+                    ));
                 }
             }
             Err(err) => {
@@ -868,7 +882,10 @@ impl ChannelPipeline {
                     settings.overwrite,
                 )));
                 if let Some(events) = &self.events {
-                    let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+                    let _ = events.try_send(RuntimeEvent::RecordingFaulted(
+                        self.channel_id,
+                        RecordingTap::Raw,
+                    ));
                 }
             }
         }
@@ -882,7 +899,7 @@ impl ChannelPipeline {
         if let Some(recorder) = self.raw_recorder.take() {
             let already_reported = self.recording_fault_reported;
             let fault = recorder.finalize(RecordingStopReason::Disabled).await;
-            self.note_recording_stop("Raw recording", already_reported, fault, true);
+            self.note_recording_stop(RecordingTap::Raw, already_reported, fault, true);
         }
     }
 
@@ -892,11 +909,12 @@ impl ChannelPipeline {
     /// `RecordingFaulted` event, unless that fault was already reported live.
     fn note_recording_stop(
         &mut self,
-        what: &str,
+        tap: RecordingTap,
         already_reported: bool,
         fault: Option<String>,
         announce_clean: bool,
     ) {
+        let what = format!("{} recording", tap.label());
         match fault {
             None => {
                 if announce_clean {
@@ -911,7 +929,8 @@ impl ChannelPipeline {
                         self.channel_id
                     )));
                     if let Some(events) = &self.events {
-                        let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+                        let _ =
+                            events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id, tap));
                     }
                 }
             }
@@ -977,7 +996,10 @@ impl ChannelPipeline {
                 "can't begin Display recording: no destination is set — set one in the                  Record Display setup, then press Record again",
             ));
             if let Some(events) = &self.events {
-                let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+                let _ = events.try_send(RuntimeEvent::RecordingFaulted(
+                    self.channel_id,
+                    RecordingTap::Display,
+                ));
             }
             return;
         };
@@ -1006,7 +1028,10 @@ impl ChannelPipeline {
                     settings.destination.display(),
                 )));
                 if let Some(events) = &self.events {
-                    let _ = events.try_send(RuntimeEvent::RecordingStarted(self.channel_id));
+                    let _ = events.try_send(RuntimeEvent::RecordingStarted(
+                        self.channel_id,
+                        RecordingTap::Display,
+                    ));
                 }
             }
             Err(err) => {
@@ -1017,7 +1042,10 @@ impl ChannelPipeline {
                     settings.overwrite,
                 )));
                 if let Some(events) = &self.events {
-                    let _ = events.try_send(RuntimeEvent::RecordingFaulted(self.channel_id));
+                    let _ = events.try_send(RuntimeEvent::RecordingFaulted(
+                        self.channel_id,
+                        RecordingTap::Display,
+                    ));
                 }
             }
         }
@@ -1036,7 +1064,7 @@ impl ChannelPipeline {
             let already_reported = self.display_fault_reported;
             let fault =
                 finalize_view_recorder(self.channel_id, rec, RecordingStopReason::Disabled).await;
-            self.note_recording_stop("Display recording", already_reported, fault, true);
+            self.note_recording_stop(RecordingTap::Display, already_reported, fault, true);
         }
     }
 
@@ -1119,7 +1147,7 @@ impl ChannelPipeline {
         if let Some(recorder) = self.raw_recorder.take() {
             let already = self.recording_fault_reported;
             let fault = recorder.finalize(RecordingStopReason::Disabled).await;
-            self.note_recording_stop("Raw recording", already, fault, false);
+            self.note_recording_stop(RecordingTap::Raw, already, fault, false);
         }
         let mut display_faults = Vec::new();
         for view in &mut self.display_views {
@@ -1132,7 +1160,7 @@ impl ChannelPipeline {
         }
         for fault in display_faults {
             let already = self.display_fault_reported;
-            self.note_recording_stop("Display recording", already, fault, false);
+            self.note_recording_stop(RecordingTap::Display, already, fault, false);
         }
     }
 
@@ -1149,7 +1177,7 @@ impl ChannelPipeline {
         if let Some(recorder) = self.raw_recorder.take() {
             let already = self.recording_fault_reported;
             let fault = recorder.finalize(RecordingStopReason::ChannelStopped).await;
-            self.note_recording_stop("Raw recording", already, fault, true);
+            self.note_recording_stop(RecordingTap::Raw, already, fault, true);
         }
         let mut display_faults = Vec::new();
         for view in &mut self.display_views {
@@ -1166,7 +1194,7 @@ impl ChannelPipeline {
         }
         for fault in display_faults {
             let already = self.display_fault_reported;
-            self.note_recording_stop("Display recording", already, fault, false);
+            self.note_recording_stop(RecordingTap::Display, already, fault, false);
         }
         self.record_event("Channel stopped");
     }
@@ -1244,6 +1272,10 @@ impl ChannelPipeline {
     /// scrollback.
     pub fn stats(&self) -> ChannelStats {
         ChannelStats {
+            // Placeholders: lifecycle is the orchestrator's, not the pipeline's —
+            // `Listener::channel_stats` stamps the effective state before serving.
+            state: crate::core::ChannelState::Running,
+            reconnect_pending: false,
             activity: self.activity.snapshot(Instant::now()),
             event_count: self.diagnostics.events().count(),
             warning_count: self.diagnostics.warnings().count(),
@@ -1285,6 +1317,10 @@ impl ChannelPipeline {
     pub fn snapshot(&self) -> ChannelSnapshot {
         ChannelSnapshot {
             channel_id: self.channel_id,
+            // Placeholders — the orchestrator stamps the effective lifecycle state
+            // before serving (see `ChannelStats::state`).
+            state: crate::core::ChannelState::Running,
+            reconnect_pending: false,
             display_views: self
                 .display_views
                 .iter()
@@ -1823,7 +1859,7 @@ mod tests {
         assert_eq!(p.snapshot().activity.total_bytes, 8);
         let mut saw_fault = false;
         while let Ok(ev) = event_rx.try_recv() {
-            if matches!(ev, RuntimeEvent::RecordingFaulted(id) if id == cid) {
+            if matches!(ev, RuntimeEvent::RecordingFaulted(id, RecordingTap::Raw) if id == cid) {
                 saw_fault = true;
             }
         }

@@ -11,7 +11,7 @@ pub mod ids;
 pub mod state;
 pub mod timing;
 
-pub use command::RuntimeEvent;
+pub use command::{RecordingTap, RuntimeEvent};
 pub use error::RecordError;
 pub use ids::{ChannelId, ChannelName, DisplayViewId, MatchRuleId, StableConfigId};
 pub use state::{ChannelKind, ChannelState, DisplayState, RecordingState};

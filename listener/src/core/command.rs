@@ -11,6 +11,27 @@ use std::time::Duration;
 
 use super::ids::{ChannelId, MatchRuleId};
 
+/// Which recording lane an event refers to (§53/§54). A Channel runs its Raw
+/// (verbatim bytes) and Display (rendered text) recordings independently, and
+/// their faults and recoveries are independent too — an observer must not clear
+/// a Display fault because the Raw lane started, or vice versa, so the events
+/// carry the lane instead of leaving observers to guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordingTap {
+    Raw,
+    Display,
+}
+
+impl RecordingTap {
+    /// Human label for messages: "Raw" / "Display".
+    pub fn label(self) -> &'static str {
+        match self {
+            RecordingTap::Raw => "Raw",
+            RecordingTap::Display => "Display",
+        }
+    }
+}
+
 /// Something the runtime reports happened (§137).
 ///
 /// `#[non_exhaustive]`: the event vocabulary grows across versions, so observers
@@ -22,11 +43,15 @@ pub enum RuntimeEvent {
     ChannelStarted(ChannelId),
     ChannelStopped(ChannelId),
     ChannelFaulted(ChannelId),
-    RecordingFaulted(ChannelId),
-    /// A Raw recording successfully began (§50.2): the file is open and recording.
-    /// Lets observers clear a prior `RecordingFaulted` state — a recording fault leaves
-    /// the Channel Running, so `ChannelStarted` doesn't re-fire to clear it.
-    RecordingStarted(ChannelId),
+    /// A recording on the carried lane faulted (§55, §56.1): a begin that couldn't
+    /// open the file, a mid-run write/flush failure, or a dirty stop.
+    RecordingFaulted(ChannelId, RecordingTap),
+    /// A recording on the carried lane successfully began (§50.2, §54): the file is
+    /// open and recording. Lets observers clear a prior `RecordingFaulted` on the
+    /// **same lane** — a recording fault leaves the Channel Running, so
+    /// `ChannelStarted` doesn't re-fire to clear it, and the other lane's begin
+    /// must not clear it either.
+    RecordingStarted(ChannelId, RecordingTap),
     WarningRaised(ChannelId),
     TcpClientConnected(ChannelId),
     TcpClientDisconnected(ChannelId),

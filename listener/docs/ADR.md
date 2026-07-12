@@ -185,6 +185,25 @@ clean path and does not foreclose it.
 - Pinned by tests: `runtime::channel` (`is_faulted` after a fault) and
   `runtime::listener` (`state()` reconciles to `Faulted`, then clears on `stop`).
 
+**Correction (2026-07-12).** The claim above that "the effective channel state
+live[s] in the periodically-polled snapshot" was **aspirational, not true as
+built**: until now neither `ChannelStats` nor `ChannelSnapshot` carried a
+`ChannelState`, and both lanes went silent (`None`) for a non-running channel —
+so a dropped lifecycle event did *not* self-correct; the GUI row stayed stale
+(external review round 2, High). Now made true as written: both structs carry
+`state` (the orchestrator stamps `effective_state()` over the pipeline's
+placeholder — lifecycle belongs to the orchestrator, not the pipeline) plus
+`reconnect_pending` (so a polled `Faulted` distinguishes "still retrying" =
+Reconnecting from "gave up / not retrying" = Faulted without depending on the
+advisory reconnect events), and `snapshot`/`channel_stats` always serve for a
+known channel — live when running, synthesized from the retained
+diagnostics/activity otherwise. The GUI reducer reconciles its derived status
+from every polled update, leaving the transitional `Starting`/`Stopping` states
+to settle on their own. Pinned by
+`a_dropped_lifecycle_event_self_corrects_on_the_next_poll`,
+`polled_fault_with_reconnect_pending_reads_reconnecting`, and
+`transitional_polled_states_do_not_flap_the_row`.
+
 ## ADR-007 — Transport data-loss observability boundary
 
 **Authoritative context:** spec §99 (backpressure matrix), §100 (reception

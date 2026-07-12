@@ -260,22 +260,41 @@ Message-model removal). Everything below this block is verified done:
 - [x] **Sidecar opens before the main destination** — a failed Raw begin can
       no longer have created/truncated the main `.raw` (only the derived
       `.idx` is at risk on the inverse edge).
-- [ ] **Transport fault cause is discarded** (`TransportOutcome::Faulted(_)`
-      in `runtime/channel.rs`'s monitor): the string never reaches diagnostics
-      — only a bare `ChannelFaulted(id)` event survives. Propagate the cause
-      into the channel's retained diagnostics. (Tranche 2.)
-- [ ] **Lifecycle state must self-correct via snapshots** — GUI status is
-      event-derived over two lossy `try_send` hops and neither `ChannelStats`
-      nor `ChannelSnapshot` carries `ChannelState`; ADR-006's self-correction
-      claim is currently FALSE. Add lifecycle state to the polled surfaces,
-      reconcile in the reducer, and correct/vindicate ADR-006. (Tranche 2.)
-- [ ] **Typed per-tap recording events** — `RecordingStarted/Faulted` don't
-      say Raw vs Display; `clear_error_if_recording_ok` clears a *display*
-      fault on *raw* health (`gui/state.rs`). Type the events, split the
-      clearing. (Tranche 2.)
-- [ ] **Serial control-line poll cadence** — reception polls CTS/DSR/DCD/RI
-      via four driver calls before every read (`transport/serial.rs`);
-      measure, then poll inputs at ~5–10 Hz instead. (Tranche 2.)
+- [x] **Transport fault cause is no longer discarded** —
+      `TransportNotice::TransportFaulted { channel_id, cause }` carries the
+      `TransportOutcome::Faulted` string from the fault monitor (and the TCP
+      supervisor, per connection) into the pipeline's diagnostics as an error;
+      `run_channel` exits only when BOTH its ingest and notices channels close,
+      so the cause can't race the pipeline's drain. Pinned by
+      `spontaneous_transport_fault_emits_channel_faulted` (asserts the cause
+      lands in diagnostics).
+- [x] **Lifecycle state self-corrects via the polled surfaces** —
+      `ChannelStats`/`ChannelSnapshot` now carry `state` (orchestrator-stamped
+      `effective_state()`) + `reconnect_pending`, and `snapshot`/`channel_stats`
+      always serve for a known channel (live when running, synthesized from the
+      retained diagnostics/activity otherwise) — so both the overview (stats)
+      and detail (snapshot) lanes re-derive status every poll. The reducer
+      reconciles on every polled update (transitional Starting/Stopping left to
+      settle). ADR-006 carries the dated correction (its claim was aspirational
+      until now). Pinned by
+      `a_dropped_lifecycle_event_self_corrects_on_the_next_poll`,
+      `polled_fault_with_reconnect_pending_reads_reconnecting`,
+      `transitional_polled_states_do_not_flap_the_row`, and the retained-stats
+      assertions in `stopped_channel_retains_exact_totals_at_rest`.
+- [x] **Typed per-tap recording events** — `RecordingStarted/Faulted` carry
+      `RecordingTap::{Raw, Display}`; the reducer tracks which lane
+      `last_error` refers to (`ChannelView::recording_fault`) and both clear
+      paths (same-lane `RecordingStarted`, same-lane polled Enabled) are
+      tap-aware — a Raw start/health no longer clears a Display fault, and a
+      command error is never cleared by recording health at all. Pinned by
+      `recording_fault_clearing_is_tap_aware` +
+      `polled_recording_state_clears_only_the_faulted_lane`.
+- [x] **Serial control-line poll cadence** — input lines (CTS/DSR/DCD/RI) now
+      poll at `CONTROL_LINE_POLL_INTERVAL` (100 ms) instead of four driver
+      ioctls before every read; RTS/DTR commands still apply every pass and
+      re-poll immediately. Done without a dedicated bench: the change is a
+      strict bounded reduction (~40 ioctls/s worst case vs. 4×chunk-rate).
+      Pinned by `input_line_polling_is_throttled_not_per_read`.
 - [ ] **Dense-match bench case** before the Aho–Corasick parking is final:
       the current rules-benches never match, so firing costs (action clones,
       events, marks) are unmeasured.

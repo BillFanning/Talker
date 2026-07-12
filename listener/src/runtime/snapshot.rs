@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
-use crate::core::{ChannelId, DisplayViewId, MatchRuleId, RecordingState};
+use crate::core::{ChannelId, ChannelState, DisplayViewId, MatchRuleId, RecordingState};
 use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
 
 use super::activity::ChannelActivity;
@@ -102,6 +102,18 @@ pub struct QueueDepth {
 /// part of a full [`ChannelSnapshot`]).
 #[derive(Clone, Debug)]
 pub struct ChannelStats {
+    /// The Channel's effective lifecycle state (§8) at serve time, stamped by the
+    /// orchestrator (the lifecycle authority — the pipeline can't know it and fills
+    /// a placeholder). This is what makes the polled lane **self-correcting**
+    /// (ADR-006): lifecycle `RuntimeEvent`s are advisory `try_send`s that can drop
+    /// under load, and a consumer that folds only events would then show a stale
+    /// state forever; the poll re-derives it.
+    pub state: ChannelState,
+    /// Whether an auto-reconnect is armed or in progress for a `Faulted` channel
+    /// (§9.1, §162) — pending reads as "Reconnecting" in a UI. `false` once the
+    /// backoff gives up (that is a plain `Faulted`). Orchestrator-stamped, like
+    /// `state`.
+    pub reconnect_pending: bool,
     /// Liveness facts: rolling throughput, total bytes + last-data time (§91.1, §166).
     pub activity: ChannelActivity,
     /// Retained-diagnostic counts by severity (§88) — for per-tab health.
@@ -137,6 +149,10 @@ pub struct ChannelStats {
 #[derive(Clone, Debug)]
 pub struct ChannelSnapshot {
     pub channel_id: ChannelId,
+    /// Effective lifecycle state at serve time — see [`ChannelStats::state`].
+    pub state: ChannelState,
+    /// Auto-reconnect armed/in progress — see [`ChannelStats::reconnect_pending`].
+    pub reconnect_pending: bool,
     /// One entry per Display View (§48), in creation order (default view first).
     pub display_views: Vec<DisplayViewSnapshot>,
     /// Retained diagnostics, separated by severity (§88).
