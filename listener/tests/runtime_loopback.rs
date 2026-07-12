@@ -11,21 +11,44 @@ use listener::runtime::{ChannelSnapshot, Listener};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::Receiver;
 
-/// Bind an ephemeral loopback UDP port, then release it for the channel to claim.
+/// Reserve a loopback port for a channel to bind, without the classic
+/// bind-drop-rebind race.
+///
+/// The naive helper let the OS pick an ephemeral port, read its number, dropped
+/// the socket, and returned the bare number — leaving a window in which a
+/// sibling test (the OS reuses a just-freed ephemeral port) grabbed the same
+/// number and won the rebind, failing the test with `AddrInUse`. Instead we
+/// walk a private cursor so concurrent in-process callers never pick the same
+/// candidate, seed it from the pid so separate test binaries don't march in
+/// lockstep, and verify each candidate is bindable before handing it out. A
+/// window against an *external* binder remains (no socket-handoff API), but the
+/// in-process collision this suite hit is gone.
+///
+/// This is a copy of the crate's `test_ports` helper: an integration test is a
+/// separate crate and cannot see the library's `#[cfg(test)]` items — and it
+/// runs in its own process, so a private cursor here is the right scope.
+fn reserve_port(bindable: impl Fn(u16) -> bool) -> u16 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const BASE: u32 = 45_000;
+    const SPAN: u32 = 20_000; // 45000..=64999
+    static CURSOR: AtomicU32 = AtomicU32::new(0);
+    let seed = std::process::id() % SPAN;
+    for _ in 0..SPAN {
+        let n = CURSOR.fetch_add(1, Ordering::Relaxed);
+        let port = (BASE + (seed + n) % SPAN) as u16;
+        if bindable(port) {
+            return port;
+        }
+    }
+    panic!("no free loopback port found for the test");
+}
+
 fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    reserve_port(|p| std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok())
 }
 
 fn free_tcp_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    reserve_port(|p| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok())
 }
 
 /// Poll a running channel's snapshot until `pred` is satisfied, or time out.

@@ -1954,13 +1954,7 @@ mod tests {
     /// exactly when the user compares it against the sender's total.
     #[tokio::test]
     async fn stopped_channel_retains_exact_totals_at_rest() {
-        let port = {
-            std::net::UdpSocket::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
-        };
+        let port = crate::test_ports::reserve_udp_port();
         let mut listener = Listener::with_default_capacities();
         let mut config = udp_channel();
         if let InterfaceConfig::Udp(udp) = &mut config.interface {

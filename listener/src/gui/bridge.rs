@@ -655,13 +655,9 @@ mod tests {
     use super::*;
     use crate::config::{templates, InterfaceConfig};
 
-    fn free_udp_port() -> u16 {
-        std::net::UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
-    }
+    // Shared with the other lib-test modules so concurrent callers in this one
+    // test process never pick the same port (the AddrInUse-flake fix).
+    use crate::test_ports::reserve_udp_port as free_udp_port;
 
     fn udp_config(port: u16) -> ChannelConfig {
         let mut config = templates::udp_template();
