@@ -781,11 +781,15 @@ impl ChannelPipeline {
     ///
     /// `settings`, when present, replace the pipeline's recording settings first — so
     /// the live toggle records to whatever the editor showed at click time, with no
-    /// restart. They're only swapped in while not actively recording, so a begin can't
-    /// change the destination out from under an open file.
+    /// restart. They're only swapped in while not actively recording (including while
+    /// faulted), so a begin can't change the destination out from under an open file.
     pub async fn set_recording(&mut self, enabled: bool, settings: Option<RawRecordingSettings>) {
         if let Some(settings) = settings {
-            if self.raw_recorder.is_none() {
+            if self
+                .raw_recorder
+                .as_ref()
+                .is_none_or(|recorder| recorder.state() == RecordingState::Faulted)
+            {
                 self.recording_settings = Some(settings);
             }
         }
@@ -940,8 +944,8 @@ impl ChannelPipeline {
     /// Begin or stop **Display** recording live, without a restart (§54, ADR-012)
     /// — the Raw toggle's sibling, driving the same lazy begin / clean finalize
     /// shape. `settings`, when present, replace the stored display settings first;
-    /// they're only swapped in while not actively recording, so a begin can't
-    /// change the destination out from under an open file.
+    /// they're only swapped in while not actively recording (including while
+    /// faulted), so a begin can't change the destination out from under an open file.
     pub async fn set_display_recording(
         &mut self,
         enabled: bool,
@@ -951,7 +955,8 @@ impl ChannelPipeline {
             if self
                 .display_views
                 .first()
-                .is_none_or(|v| v.recorder.is_none())
+                .and_then(|view| view.recorder.as_ref())
+                .is_none_or(|recorder| recorder.recording.state() == RecordingState::Faulted)
             {
                 self.display_recording_settings = Some(settings);
             }
@@ -2507,16 +2512,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn begin_after_fault_recreates_the_recording() {
+    async fn faulted_raw_retry_uses_the_latest_settings() {
         // A faulted recording still occupies the recorder slot; Begin must be
         // the user's retry, not a silent "already recording" no-op that
         // forces a channel restart. Fault deterministically via queue
         // overflow: capacity 1, and the recorder task is starved (no await
         // between ingests on the single-threaded test runtime).
         let cid = ChannelId::new();
-        let path = temp_path("refault");
-        let settings = RawRecordingSettings {
-            destination: path.clone(),
+        let first_path = temp_path("refault-first");
+        let retry_path = temp_path("refault-retry");
+        let first_settings = RawRecordingSettings {
+            destination: first_path.clone(),
             channel_name: "refault".to_string(),
             overwrite: OverwritePolicy::Overwrite,
             timestamps: false,
@@ -2524,7 +2530,7 @@ mod tests {
             capacity: 1,
         };
         let mut p = pipeline(cid, PipelineCapacities::default());
-        p.set_recording(true, Some(settings.clone())).await;
+        p.set_recording(true, Some(first_settings.clone())).await;
         assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
 
         p.ingest(bytes_chunk(cid, b"a"));
@@ -2532,12 +2538,26 @@ mod tests {
         p.ingest(bytes_chunk(cid, b"c")); // queue full → overflow fault
         assert_eq!(p.raw_recording_state(), Some(RecordingState::Faulted));
 
-        // Begin again = retry: the dead recording is dropped and recreated.
-        p.set_recording(true, Some(settings)).await;
+        // The editor changed after the fault. Begin again must drop the dead
+        // recorder and recreate it from the click-time settings, not reopen
+        // the old destination merely because its handle still occupied the slot.
+        let retry_settings = RawRecordingSettings {
+            destination: retry_path.clone(),
+            capacity: 64,
+            ..first_settings
+        };
+        p.set_recording(true, Some(retry_settings)).await;
         assert_eq!(p.raw_recording_state(), Some(RecordingState::Enabled));
+        p.ingest(bytes_chunk(cid, b"recovered"));
 
         p.finish().await;
-        let _ = tokio::fs::remove_file(&path).await;
+        assert_eq!(
+            tokio::fs::read(&retry_path).await.unwrap(),
+            b"recovered",
+            "the retry must use the latest destination and capacity"
+        );
+        let _ = tokio::fs::remove_file(&first_path).await;
+        let _ = tokio::fs::remove_file(&retry_path).await;
     }
 
     #[tokio::test]
@@ -2666,6 +2686,50 @@ mod tests {
             "only the toggled span is recorded: {written:?}"
         );
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn faulted_display_retry_uses_the_latest_settings() {
+        // Display has the same retry contract as Raw: a faulted recorder is
+        // inactive, so click-time settings may replace its old destination.
+        let cid = ChannelId::new();
+        let first_path = temp_path("disp-refault-first");
+        let retry_path = temp_path("disp-refault-retry");
+        let first_settings = DisplayRecordingSettings {
+            destination: first_path.clone(),
+            channel_name: "disp-refault".to_string(),
+            overwrite: OverwritePolicy::Overwrite,
+            file_rotation: FileRotationPolicy::None,
+            capacity: 1,
+            renderer: DisplayView::default(),
+        };
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        p.set_display_recording(true, Some(first_settings.clone()))
+            .await;
+        assert_eq!(p.display_recording_state(), Some(RecordingState::Enabled));
+
+        p.ingest(bytes_chunk(cid, b"a"));
+        p.ingest(bytes_chunk(cid, b"b"));
+        p.ingest(bytes_chunk(cid, b"c")); // queue full -> overflow fault
+        assert_eq!(p.display_recording_state(), Some(RecordingState::Faulted));
+
+        let retry_settings = DisplayRecordingSettings {
+            destination: retry_path.clone(),
+            capacity: 64,
+            ..first_settings
+        };
+        p.set_display_recording(true, Some(retry_settings)).await;
+        assert_eq!(p.display_recording_state(), Some(RecordingState::Enabled));
+        p.ingest(bytes_chunk(cid, b"recovered"));
+        p.finish().await;
+
+        let written = tokio::fs::read_to_string(&retry_path).await.unwrap();
+        assert!(
+            written.contains("recovered"),
+            "the Display retry must use the latest destination: {written:?}"
+        );
+        let _ = tokio::fs::remove_file(&first_path).await;
+        let _ = tokio::fs::remove_file(&retry_path).await;
     }
 
     #[tokio::test]

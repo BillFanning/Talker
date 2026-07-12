@@ -25,7 +25,9 @@ use crate::core::{ChannelId, RuntimeEvent};
 use crate::transport::tcp::{BoundTcpListenerTransport, TcpConnectionTransport};
 use crate::transport::{ConnectionAcceptorRunner, NewConnection, TransportOutcome};
 
-use super::channel::{spawn_channel_tasks, ChannelTasks, MatchSetup, TRANSPORT_NOTICES};
+use super::channel::{
+    report_transport_fault, spawn_channel_tasks, ChannelTasks, MatchSetup, TRANSPORT_NOTICES,
+};
 use super::pipeline::PipelineCapacities;
 
 /// Per-connection state retained by the supervisor for shutdown and disconnect
@@ -168,12 +170,7 @@ pub fn start_tcp_listener(
                             // notice BEFORE the drain below, so it lands in the
                             // connection's diagnostics rather than dying here.
                             if let TransportOutcome::Faulted(cause) = outcome {
-                                let _ = notice_tx.try_send(
-                                    crate::transport::TransportNotice::TransportFaulted {
-                                        channel_id: conn_id,
-                                        cause,
-                                    },
-                                );
+                                report_transport_fault(&notice_tx, conn_id, cause).await;
                                 let _ = events.try_send(RuntimeEvent::ChannelFaulted(conn_id));
                             }
                             // The pipeline runs until BOTH ingest and notices

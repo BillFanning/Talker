@@ -263,8 +263,11 @@ Message-model removal). Everything below this block is verified done:
 - [x] **Faulted recordings are restartable from the UI** — Begin on a faulted
       Raw/Display recording drops the dead recording and recreates it instead
       of no-op'ing as "already recording" (the button says Record; it works
-      without a channel restart). Pinned by
-      `begin_after_fault_recreates_the_recording`.
+      without a channel restart). A faulted recorder is inactive, so retry also
+      adopts the editor's latest destination/policy/capacity rather than silently
+      reopening the old path. Pinned by
+      `faulted_raw_retry_uses_the_latest_settings` +
+      `faulted_display_retry_uses_the_latest_settings`.
 - [x] **Sidecar opens before the main destination** — a failed Raw begin can
       no longer have created/truncated the main `.raw` (only the derived
       `.idx` is at risk on the inverse edge).
@@ -273,9 +276,11 @@ Message-model removal). Everything below this block is verified done:
       `TransportOutcome::Faulted` string from the fault monitor (and the TCP
       supervisor, per connection) into the pipeline's diagnostics as an error;
       `run_channel` exits only when BOTH its ingest and notices channels close,
-      so the cause can't race the pipeline's drain. Pinned by
-      `spontaneous_transport_fault_emits_channel_faulted` (asserts the cause
-      lands in diagnostics).
+      so the cause can't race the pipeline's drain. Unlike live advisory stall
+      notices, terminal delivery awaits bounded queue capacity after reception
+      ends, so saturation cannot discard the reason. Pinned by
+      `spontaneous_transport_fault_emits_channel_faulted` (cause reaches retained
+      diagnostics) + `terminal_fault_waits_for_space_in_a_full_notice_queue`.
 - [x] **Lifecycle state self-corrects via the polled surfaces** —
       `ChannelStats`/`ChannelSnapshot` now carry `state` (orchestrator-stamped
       `effective_state()`) + `reconnect_pending`, and `snapshot`/`channel_stats`

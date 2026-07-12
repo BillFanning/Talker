@@ -274,24 +274,29 @@ owner — decides how it is recorded and reported. `run_channel` drains a bounde
 requests) and calls `record_notice`, which writes a Warning `Diagnostic` (naming
 the channel and stall duration) **and** emits the spec-appropriate §137 event —
 `ReceptionStalled` (carrying the duration) under spec v1.2 — keeping the §95 record
-and the §137 event paired in one owner. The notice channel is created by the
-orchestrator; only the serial transport is given the sender (`with_notice_sender`),
-because only serial can stall the reader (§97.1). The §95 record is now visible in
-a live `ChannelSnapshot.diagnostics`, which is what a GUI reads.
+and the §137 event paired in one owner. The notice channel is created for every
+data channel. Only the live serial reader receives a sender clone
+(`with_notice_sender`), because only serial can stall the reader (§97.1); every
+runtime monitor retains the original sender for the terminal-fault contract added
+by ADR-020. The §95 record is visible in `ChannelSnapshot.diagnostics`, which is
+what a GUI reads.
 
 Why this shape (vs. the alternatives): the transport must not depend on
 `diagnostics`/`RuntimeEvent` (§128 layering), so it emits a transport-local notice,
 not a `Diagnostic`. The notice is **self-describing** (carries its `channel_id`) so
 the pipeline formats and routes it without assuming which channel a notice is for.
 The `run()` transport contract is left unchanged — UDP/TCP are async and never
-stall the reader, so burdening every transport with a notice sender would imply a
-capability they don't have; serial attaches it via a builder instead.
+stall the reader, so their transport implementations do not receive a notice
+sender; serial attaches one via a builder. Terminal outcomes are joined and
+reported by runtime monitors outside that transport contract (ADR-020).
 
-The notice channel is **advisory and bounded** (`TRANSPORT_NOTICES`, 16): the
-sender uses `try_send` and drops on full, named explicitly because the dropped item
-is itself a loss-warning — we accept losing a warning under overload, but we never
-block the reader to keep one (that would cause the stall it warns of). A
-dropped-notice counter can be added later only if the drop rate proves to matter.
+The live-stall notice path is **advisory and bounded** (`TRANSPORT_NOTICES`, 16):
+the serial reader uses `try_send` and drops on full, named explicitly because the
+dropped item is itself a loss-warning — we accept losing a warning under overload,
+but never block the reader to keep one (that would cause the stall it warns of).
+A dropped-advisory counter can be added later only if the drop rate proves to
+matter. Terminal fault causes later gained a distinct delivery contract in
+ADR-020: they share the bounded queue but await capacity after reception ends.
 
 **Consequences:**
 - `WarningRaised` was shared with recording-enable failures (§55), so a UI could
@@ -664,6 +669,33 @@ The live viewer was rebasing `TriggeredMatch.byte_offset` (stream space) onto it
 - `listener/assets/fonts/` moved to `wiredata-ui/assets/fonts/` (README and licenses included); the font rationale doc lives there now.
 - Anything app-specific stays put: view-models, widgets with runtime knowledge, the stream-view `ColorScheme` (user-chosen content colors are not chrome).
 - A change to the shared look lands in both apps by construction — the drift risk that motivated the crate is gone.
+
+## ADR-020 — Terminal transport fault causes use lossless post-reception delivery
+
+**Status:** Accepted 2026-07-12. **Context:** spec §94/§95/§101, ADR-006
+(polled lifecycle truth), and ADR-007 (advisory live-stall notices).
+
+**Problem.** A spontaneous transport fault has two observable parts: the lifecycle
+state (`Faulted`) and the cause retained in channel diagnostics. The state already
+self-corrects through polled snapshots, but the cause was sent with `try_send`
+through the same 16-entry queue as advisory `ReceptionStalled` warnings. If that
+queue was full at failure time, the only explanatory string was discarded even
+though the receive hot path had already ended and no longer needed protection from
+blocking.
+
+**Decision.** Keep one bounded transport-condition queue and give its variants two
+delivery classes. `ReceptionStalled` remains advisory and uses `try_send` from the
+live Serial receive loop. `TransportFaulted` is sent by the runtime monitor only
+after joining a failed transport and awaits queue capacity; TCP connection
+supervision uses the same helper. `run_channel` remains alive until both ingest and
+notice senders close, so it drains the terminal cause before retaining diagnostics.
+
+**Consequences.** Reception throughput and cancellation behavior are unchanged:
+only a post-reception monitor may wait. A full advisory queue can delay fault
+finalization but cannot erase its reason; a pipeline that has already been forcibly
+removed simply closes the receiver and releases the send. Pinned by
+`terminal_fault_waits_for_space_in_a_full_notice_queue` plus the end-to-end
+`spontaneous_transport_fault_emits_channel_faulted` diagnostic assertion.
 
 ## Open questions
 

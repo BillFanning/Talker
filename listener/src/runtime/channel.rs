@@ -80,15 +80,28 @@ const SNAPSHOT_REQUESTS: usize = 8;
 
 /// Bounded capacity for the transport-notice channel (§95, §101, ADR-007).
 ///
-/// Transport notices are **advisory and bounded**, like the other observer paths
-/// (§99): the sender uses `try_send` and drops on a full channel. This is
-/// deliberate — a notice is itself a warning about *possible* reader-stall loss,
-/// and blocking the reader to deliver it would cause the very stall it warns of.
-/// Small but not tiny, so a short burst isn't lost to a transient drain delay; a
-/// dropped-notice counter can be added later if the drop rate ever matters. Only a
-/// serial transport sends here (§97.1); other transports leave the sender
-/// unattached, so the receiver stays empty for the channel's life.
+/// Advisory stall notices are bounded and use `try_send` (§99): blocking the live
+/// reader to announce a reader stall would cause the very stall being reported.
+/// The capacity is large enough for a short burst; a dropped-advisory counter can
+/// be added if the rate ever matters. Every data-transport monitor also retains a
+/// sender for its one terminal fault cause; that post-reception path awaits capacity
+/// through [`report_transport_fault`] instead of dropping (ADR-020).
 pub(crate) const TRANSPORT_NOTICES: usize = 16;
+
+/// Deliver a terminal transport fault to the pipeline after reception has ended.
+///
+/// Unlike advisory notices emitted from a live receive loop, this path may await
+/// bounded capacity: no reader remains to stall, and losing the terminal cause
+/// would leave the retained diagnostics unable to explain the faulted state.
+pub(crate) async fn report_transport_fault(
+    notices: &Sender<TransportNotice>,
+    channel_id: ChannelId,
+    cause: String,
+) {
+    let _ = notices
+        .send(TransportNotice::TransportFaulted { channel_id, cause })
+        .await;
+}
 
 /// The transport + pipeline tasks for one Channel. A plain holder, destructured
 /// by [`spawn_monitored_channel`] and the TCP listener supervisor (which each do
@@ -370,7 +383,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         // the string used to die unread here.
         if let TransportOutcome::Faulted(cause) = transport.join().await {
             faulted.store(true, Ordering::Relaxed);
-            let _ = notices_tx.try_send(TransportNotice::TransportFaulted { channel_id, cause });
+            report_transport_fault(&notices_tx, channel_id, cause).await;
             let _ = monitor_events.try_send(RuntimeEvent::ChannelFaulted(channel_id));
         }
     });
@@ -656,6 +669,52 @@ mod tests {
                 .any(|d| d.message.contains("device error")),
             "diagnostics carry the transport fault cause: {:?}",
             snap.diagnostics.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_fault_waits_for_space_in_a_full_notice_queue() {
+        // Advisory stall notices may drop on saturation because they are emitted
+        // from the receive hot path. A terminal fault is different: reception has
+        // already ended, so its cause must wait for capacity and remain observable.
+        let cid = ChannelId::new();
+        let (notice_tx, mut notice_rx) = mpsc::channel(1);
+        notice_tx
+            .try_send(TransportNotice::ReceptionStalled {
+                channel_id: cid,
+                stalled_for: Duration::from_secs(1),
+            })
+            .unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let delivery = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            report_transport_fault(&notice_tx, cid, "device error".to_string()).await;
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !delivery.is_finished(),
+            "terminal delivery must wait rather than drop on a full queue"
+        );
+
+        assert!(matches!(
+            notice_rx.recv().await,
+            Some(TransportNotice::ReceptionStalled { .. })
+        ));
+        tokio::time::timeout(Duration::from_secs(1), delivery)
+            .await
+            .expect("terminal delivery stayed blocked after capacity opened")
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), notice_rx.recv())
+                .await
+                .expect("terminal fault was dropped")
+                .unwrap(),
+            TransportNotice::TransportFaulted {
+                channel_id: cid,
+                cause: "device error".to_string(),
+            }
         );
     }
 }

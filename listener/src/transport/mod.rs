@@ -92,17 +92,16 @@ pub enum TransportOutcome {
     Faulted(String),
 }
 
-/// A non-terminal, advisory signal from a running transport to its pipeline
-/// (§95, §101; listener ADR-007).
+/// A transport condition delivered to its pipeline for retained diagnostics
+/// (§94, §95, §101; listener ADR-007 / ADR-020).
 ///
-/// Unlike [`TransportOutcome`] (terminal), a notice reports a condition the
-/// transport detects *while still running*. The transport stays free of the
-/// diagnostics/event vocabulary: it states what happened (self-describing, incl.
-/// which channel), and the pipeline — the owner of the channel's `DiagnosticLog` —
-/// records the `Diagnostic` and emits the matching `RuntimeEvent`. Notices are
-/// **advisory**: the sender uses `try_send` and drops on a full channel (§99); a
-/// notice never blocks the reader (blocking the reader to announce a reader stall
-/// would cause the very stall it warns of).
+/// The transport stays free of the diagnostics/event vocabulary: it states what
+/// happened (self-describing, including which channel), and the pipeline — owner
+/// of the channel's `DiagnosticLog` — records it. Delivery follows the condition:
+/// a live [`ReceptionStalled`](Self::ReceptionStalled) warning uses `try_send` and
+/// may drop rather than block reception, while a terminal
+/// [`TransportFaulted`](Self::TransportFaulted) is awaited by the runtime monitor
+/// after reception ends, when no reader remains to stall.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransportNotice {
@@ -117,7 +116,8 @@ pub enum TransportNotice {
     /// The transport ended on a spontaneous fault (§94). Sent by the channel's
     /// fault monitor so the **cause** reaches the pipeline's diagnostics log —
     /// the paired `ChannelFaulted` lifecycle event (§137) carries only the id,
-    /// and this string previously died unread with the transport outcome.
+    /// and this string previously died unread with the transport outcome. Terminal
+    /// delivery waits for bounded queue capacity rather than dropping (ADR-020).
     TransportFaulted {
         channel_id: ChannelId,
         cause: String,
