@@ -1352,21 +1352,37 @@ pub(super) fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay)
             });
         });
         ui.separator();
+        // Monospace metrics: the uniform row height `show_rows` virtualizes on,
+        // and one glyph's width to turn the available pixel width into a column
+        // count for soft-wrapping.
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let (row_h, char_w) =
+            ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0').max(1.0)));
+        // Reserve the vertical scrollbar so a full row ends just before it, not
+        // under it. One const so the reservation and any future bar drawing agree.
+        const SCROLLBAR_WIDTH: f32 = 12.0;
+        let avail_w = (ui.available_width() - SCROLLBAR_WIDTH).max(char_w);
+        let wrap_cols = (avail_w / char_w).floor().max(8.0) as usize;
+        // Rows are memoized (buffer/mode/style/width keyed): the split runs only
+        // when one of those changes, and the flow semantics are unchanged — the
+        // same concatenated text, just chunked into lines so the ScrollArea can
+        // lay out only the visible ones. A single selectable Label over the whole
+        // buffer re-laid it out every frame (listener's stream view hit the same
+        // wall and moved to this same `show_rows` virtualization).
+        let rows = display.rows(wrap_cols);
+        ui.style_mut().interaction.selectable_labels = true; // select across rows
         egui::ScrollArea::vertical()
             .max_height(150.0)
             .stick_to_bottom(true)
             .auto_shrink([false, true])
-            .show(ui, |ui| {
-                // One Label for the whole pane so consecutive sends flow
-                // into each other (per-message labels gained a padding gap
-                // that read as a stray newline). The text is memoized in
-                // ChannelDisplay — re-rendered only when the buffer or the
-                // view settings change, not per repaint.
-                ui.add(
-                    egui::Label::new(egui::RichText::new(display.rendered()).monospace())
-                        .wrap()
-                        .selectable(true),
-                );
+            .show_rows(ui, row_h, rows.len().max(1), |ui, range| {
+                for row in &rows[range] {
+                    // Already wrapped to fit; Extend so egui doesn't re-wrap.
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(row).monospace())
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                }
             });
     });
 }

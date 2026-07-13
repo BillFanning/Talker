@@ -71,12 +71,31 @@ Cross off items as they are completed. Add new ones inline as they come up.
   - `min_active_interval` caching: KILLED. 761 ns @ 512 messages, ~25 ns at
     realistic counts; 0.08% CPU at 1 kHz.
   - GUI output row ring: still OPEN, tracked below (frame-time, not criterion).
-- [ ] **Output-pane row ring + `show_rows` (frame-time driven).** The one
-  surviving perf item: the pane rebuilds the full string + selectable label
-  per repaint over 200 retained rows. ADR-018 capped its *input* at ≤10
-  samples/s; what remains is render cost. Measure egui frame time
-  before/after porting listener's row-ring approach; do with the next GUI
-  polish pass.
+- [x] **Output-pane virtualization (`show_rows`) — ported 2026-07-12.** The
+  pane rendered one giant selectable `Label` over the whole memoized string,
+  the exact "re-lay-out the whole buffer every frame" pattern listener's
+  stream view moved away from. `ChannelDisplay` now memoizes uniform-height
+  rows keyed on (generation, mode, style, wrap-cols) via a pure `split_rows`
+  (mirror of listener's `split_stream_rows`), and `show_display_pane` uses
+  `ScrollArea::show_rows` to lay out only the visible rows. Flow semantics are
+  unchanged — the same concatenated text, just chunked into lines (rows rejoin
+  to the flow on a non-wrapping width). Pinned by `split_rows_*`,
+  `rows_rejoin_to_the_flow_when_nothing_soft_wraps`,
+  `rows_rebuild_on_content_and_width_change`.
+  - **Still needs a human at the running GUI:** the before/after egui
+    *frame-time* number and a visual check (selection across rows,
+    stick-to-bottom, resize re-wrap) — neither is measurable headlessly. At
+    talker's 200-message cap the CPU win is smaller than listener's ~1 MB
+    case that forced the change; the port is primarily the correct,
+    consistent architecture. Confirm the frame-time delta before claiming a
+    perf win.
+  - **Readout built in:** the top bar's **"ms"** toggle shows smoothed
+    per-frame build time + recent peak, and repaints continuously while on
+    (`FrameStats` / `show_frame_time`, `gui/mod.rs`). Measure like-for-like:
+    build `--release`, open the Output pane on a fast channel (full
+    200-message buffer), toggle it on, and drag the window edge to read the
+    layout cost under resize — compare this revision against the pre-port
+    commit (`33f611e`-era).
 - [x] **Command enqueue failures** — DONE (`6d4da3b`). Failed `Stop`/
   interface-update/`SetInterval` enqueue attempts surface in the channel's
   error banner, distinguishing queue-full (runner wedged) from runner-exited
