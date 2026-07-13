@@ -40,7 +40,9 @@ impl TalkerApp {
                 ui.separator();
                 self.show_channel_body(ui, i, running);
                 ui.separator();
-                show_display_pane(ui, &mut self.displays[i]);
+                // The send rate drives the Output pane's sub-sampling badge.
+                let send_rate = self.rates.get(i).map(|r| r.per_sec).unwrap_or(0.0);
+                show_display_pane(ui, &mut self.displays[i], send_rate);
             });
         });
     }
@@ -121,8 +123,19 @@ impl TalkerApp {
             });
         });
 
-        // Sent totals + rolling throughput (listener's byte-based liveness
-        // line, plus talker's message-count view of the same traffic).
+        // One weak readout line per signal (listener's queue-readout pattern),
+        // amber once its pressure threshold trips. Always rendered so the header
+        // doesn't jump when a value appears.
+        let perf_line = |ui: &mut egui::Ui, text: String, hot: bool, tip: &str| {
+            let rt = egui::RichText::new(text).weak();
+            ui.label(if hot { rt.color(pal.warning_amber) } else { rt })
+                .on_hover_text(tip);
+        };
+
+        // ── Wire facts: what actually went out, how fast, and the cadence
+        // shortfall — grouped together because they are all about the wire.
+        // Sent totals + rolling throughput (listener's byte-based liveness line,
+        // plus talker's message-count view of the same traffic).
         let msgs = telemetry.total_count;
         let bytes = telemetry.total_bytes;
         let (mps, bps) = self
@@ -136,49 +149,52 @@ impl TalkerApp {
             bps / 1000.0,
             mps
         ));
-
-        // Performance under load (listener's queue-readout pattern): one
-        // weak line per signal, amber once its pressure threshold trips.
-        // Always rendered so the header doesn't jump when a value appears.
-        let perf_line = |ui: &mut egui::Ui, text: String, hot: bool, tip: &str| {
-            let rt = egui::RichText::new(text).weak();
-            ui.label(if hot { rt.color(pal.warning_amber) } else { rt })
-                .on_hover_text(tip);
+        // Missed sends sits with Sent/throughput (not with the observer queue
+        // below): it is a wire fact — the cadence shortfall. Expressed as a
+        // share of total attempts (attempts = sent + missed), so it reads
+        // directly against what was sent and against the throughput: N% missed
+        // means the channel is holding ~(100−N)% of its configured rate.
+        let missed = telemetry.missed_sends;
+        let attempts = msgs + missed;
+        let missed_pct = if attempts > 0 {
+            missed as f64 / attempts as f64 * 100.0
+        } else {
+            0.0
         };
-        let qlen = telemetry.queue_len;
-        let qpeak = telemetry.queue_peak;
         perf_line(
             ui,
-            format!(
-                "Status queue: {qlen}/{} (peak {qpeak})",
-                super::STATUS_QUEUE_CAP
-            ),
-            qpeak * 2 >= super::STATUS_QUEUE_CAP,
-            "The runner→UI observer queue carries rate-limited counters, payload \
-             samples, and immediate send errors; the UI drains it every frame. \
-             A peak near capacity means observer updates are about to be dropped \
-             and counted — sends themselves are never delayed. Reliable command \
-             results use a separate queue.",
+            format!("Missed sends: {missed}  ({missed_pct:.1}% of {attempts} attempts)"),
+            missed > 0,
+            "Sends skipped to stay on cadence after a stall — an interface send \
+             blocking longer than the message interval, or machine sleep. The \
+             scheduler fires once, then jumps to the next future grid point. \
+             attempts = sent + missed; a nonzero share means the channel can't \
+             keep its configured rate, so the throughput above is running at \
+             roughly (100 − share)% of target.",
         );
+
+        // ── Observer-path health: the runner→UI queue. A separate subsystem
+        // from the wire above — pressure here never delays a send. The drop
+        // count is folded in: the peak is the graduated headroom gauge (how
+        // close the queue came to full), the drop count the alarm (whether it
+        // ever ran out).
+        let qlen = telemetry.queue_len;
+        let qpeak = telemetry.queue_peak;
         let drops = telemetry.dropped_statuses;
         perf_line(
             ui,
-            format!("Display updates dropped: {drops}"),
-            drops > 0,
-            "Status updates the runner discarded because the queue above was \
-             full. Counts stay exact (each counter update is cumulative); only \
-             the Output pane is sampled.",
-        );
-        let missed = telemetry.missed_sends;
-        perf_line(
-            ui,
-            format!("Missed sends: {missed}"),
-            missed > 0,
-            "Sends skipped to stay on cadence after a stall — an interface \
-             send blocking longer than the message interval, or machine sleep. \
-             The scheduler fires once, then jumps to the next future point of \
-             the cadence grid; a growing value means this channel can't keep \
-             the configured rate.",
+            format!(
+                "Display backlog: {qlen}/{} (peak {qpeak}, {drops} dropped)",
+                super::STATUS_QUEUE_CAP
+            ),
+            qpeak * 2 >= super::STATUS_QUEUE_CAP || drops > 0,
+            "The runner→UI update queue behind the readouts and Output pane: \
+             rate-limited counters, payload samples, and immediate send errors, \
+             drained every frame. The peak is how close it came to full; \
+             'dropped' counts updates discarded while it was full — the Output \
+             pane is sampled and the tallies stay exact regardless (each counter \
+             update is cumulative). Sends are never delayed for this; reliable \
+             command results use a separate queue.",
         );
 
         if let Some(err) = &error {

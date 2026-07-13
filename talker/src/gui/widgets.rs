@@ -1315,8 +1315,35 @@ fn show_insert_popup<F>(
 // ── Display pane ──────────────────────────────────────────────────────────────
 
 /// Render a channel's real-time outbound display pane (spec §5.7).
-pub(super) fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay) {
+pub(super) fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay, send_rate: f32) {
     ui.collapsing("Output", |ui| {
+        // Sub-sampling badge (ADR-018): above the sample cadence the pane shows
+        // a rate-limited live sample, not every message — say so, with the
+        // numbers, so it isn't misread as a complete log. The Sent count and
+        // byte totals in the header stay exact regardless of this. The badge is
+        // latched (hysteresis) so the throughput estimator's jitter across the
+        // cadence threshold doesn't flicker it.
+        let sample_hz = 1.0
+            / crate::core::runner::ObserverPolicy::sampled()
+                .sample_interval
+                .as_secs_f32();
+        if let Some(rate) = display.sampling_badge(send_rate > sample_hz, send_rate) {
+            let pal = theme_palette(ui);
+            ui.label(
+                egui::RichText::new(format!(
+                    "sampled · showing ~{sample_hz:.0}/s of ~{rate:.0}/s"
+                ))
+                .small()
+                .color(pal.info_grey),
+            )
+            .on_hover_text(format!(
+                "Above ~{sample_hz:.0} messages/s the Output pane shows a \
+                 rate-limited live sample (ADR-018), not every message, so its \
+                 render cost stays constant at any send rate. Only the payloads \
+                 shown here are sampled — the Sent count and byte totals are exact."
+            ));
+            ui.separator();
+        }
         ui.horizontal(|ui| {
             ui.label("View:").on_hover_text(
                 "These are display modes — the bytes on the wire are the \

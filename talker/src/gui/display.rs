@@ -4,6 +4,14 @@
 //! them on demand in the chosen view mode. This is GUI-only state and is never
 //! saved to a profile.
 
+use std::time::{Duration, Instant};
+
+/// How long the sub-sampling badge stays lit after the last frame the send rate
+/// exceeded the sample cadence. The throughput estimator updates only ~once a
+/// second, so its value jitters across the cadence threshold; latching past the
+/// last above-threshold reading stops the badge flickering (hysteresis).
+const SAMPLING_BADGE_HOLD: Duration = Duration::from_secs(2);
+
 /// How a channel's outgoing data is shown in its display pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DisplayMode {
@@ -53,6 +61,10 @@ pub struct ChannelDisplay {
     /// the pane re-splits only when the buffer, the view settings, or the pane
     /// width change — not on every repaint.
     cache: Option<RowCache>,
+    /// Sub-sampling badge latch: the last time the send rate was above the
+    /// sample cadence, and that rate. Smooths the throughput estimator's
+    /// jitter so the badge doesn't flicker near the threshold.
+    sampling_latch: Option<(Instant, f32)>,
 }
 
 impl ChannelDisplay {
@@ -105,6 +117,25 @@ impl ChannelDisplay {
             self.cache = Some(RowCache { key, rows });
         }
         &self.cache.as_ref().expect("cache was just filled").rows
+    }
+
+    /// Whether to show the sub-sampling badge, and at what rate. `active` = the
+    /// send rate is currently above the sample cadence. The badge stays lit for
+    /// [`SAMPLING_BADGE_HOLD`] past the last `active` frame and reports the rate
+    /// from that frame, so the throughput estimator's ~1 Hz jitter across the
+    /// threshold can't flicker it (hysteresis).
+    pub(super) fn sampling_badge(&mut self, active: bool, rate: f32) -> Option<f32> {
+        self.sampling_badge_at(active, rate, Instant::now())
+    }
+
+    /// [`sampling_badge`](Self::sampling_badge) with an injectable clock, for tests.
+    fn sampling_badge_at(&mut self, active: bool, rate: f32, now: Instant) -> Option<f32> {
+        if active {
+            self.sampling_latch = Some((now, rate));
+        }
+        self.sampling_latch
+            .filter(|(t, _)| now.saturating_duration_since(*t) < SAMPLING_BADGE_HOLD)
+            .map(|(_, r)| r)
     }
 }
 
@@ -393,6 +424,26 @@ mod tests {
         let rows = d.rows(200).to_vec();
         assert_eq!(rows, vec!["AB".to_string(), "CD".to_string()]);
         assert_eq!(rows.join("\n"), flow);
+    }
+
+    #[test]
+    fn sampling_badge_latches_past_a_rate_dip() {
+        // The throughput estimator jitters across the cadence threshold ~1 Hz;
+        // the latch keeps the badge lit (and its rate stable) through a dip so
+        // it doesn't flicker, and clears only after the hold with no activity.
+        let mut d = ChannelDisplay::default();
+        let t0 = Instant::now();
+        // Above the cadence → badge shows that rate.
+        assert_eq!(d.sampling_badge_at(true, 500.0, t0), Some(500.0));
+        // A dip to below-cadence shortly after still shows (latched), keeping
+        // the last rate — no flicker.
+        let t1 = t0 + Duration::from_millis(500);
+        assert_eq!(d.sampling_badge_at(false, 0.0, t1), Some(500.0));
+        // Well past the hold with no new activity → badge clears.
+        let t2 = t0 + Duration::from_secs(3);
+        assert_eq!(d.sampling_badge_at(false, 0.0, t2), None);
+        // A fresh above-cadence reading re-latches with the new rate.
+        assert_eq!(d.sampling_badge_at(true, 300.0, t2), Some(300.0));
     }
 
     #[test]
