@@ -215,11 +215,6 @@ struct TalkerApp {
     show_info: bool,
     show_warn: bool,
     show_error: bool,
-    /// Optional top-bar per-frame build-time readout (the ⏱ button), a
-    /// measurement aid for the Output-pane virtualization. Off by default; while
-    /// on, the app repaints continuously so the number reflects sustained cost.
-    show_frame_time: bool,
-    frame_stats: FrameStats,
     /// Recently loaded/saved profile paths, most recent first (max
     /// [`MAX_RECENT_PROFILES`]); persisted via eframe storage.
     recent_profiles: Vec<PathBuf>,
@@ -257,29 +252,6 @@ struct LogCounts {
     info: u32,
     warn: u32,
     error: u32,
-}
-
-/// Rolling per-frame build time (the egui `ui()` phase) for the optional
-/// top-bar readout — a measurement aid for the Output-pane virtualization
-/// (talker TODO): the frame cost that a headless bench can't see. An EMA for a
-/// steady number, plus a slowly-decaying peak so a resize spike lingers long
-/// enough to read. Updated every frame; costs nothing when the readout is off.
-#[derive(Clone, Copy, Default)]
-struct FrameStats {
-    /// Smoothed per-frame build time, milliseconds.
-    ema_ms: f32,
-    /// Recent worst frame, decaying toward the EMA.
-    peak_ms: f32,
-}
-
-impl FrameStats {
-    fn record(&mut self, dt_ms: f32) {
-        // ~0.1 smoothing: responsive without jitter.
-        self.ema_ms += (dt_ms - self.ema_ms) * 0.1;
-        // Peak jumps instantly, decays slowly, so a drag spike stays visible.
-        self.peak_ms = self.peak_ms.max(dt_ms);
-        self.peak_ms += (self.ema_ms - self.peak_ms) * 0.02;
-    }
 }
 
 /// Lightweight throughput estimator for a channel: samples the cumulative
@@ -387,8 +359,6 @@ impl TalkerApp {
             show_info: true,
             show_warn: true,
             show_error: true,
-            show_frame_time: false,
-            frame_stats: FrameStats::default(),
             recent_profiles: storage
                 .and_then(|s| s.get_string(RECENT_PROFILES_KEY))
                 .map(|joined| {
@@ -932,10 +902,6 @@ impl TalkerApp {
 
 impl eframe::App for TalkerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Frame-build timer for the optional readout: brackets the whole egui
-        // build phase (this method), which is where the Output-pane layout cost
-        // lives. The value is displayed next frame (standard one-frame lag).
-        let frame_start = std::time::Instant::now();
         ui.ctx().set_pixels_per_point(self.pixels_per_point);
         // Re-arm the repaint coalescer BEFORE draining statuses, so a status
         // arriving mid-drain either lands in this frame's batch or triggers a
@@ -972,17 +938,6 @@ impl eframe::App for TalkerApp {
         // Apply user-requested mutations AFTER the layout closes — never
         // inside it — so egui's two-pass layout sees one consistent state.
         self.process_deferred();
-
-        // Fold this frame's build time into the readout. While the readout is
-        // on, drive continuous repaints so the number reflects sustained
-        // per-frame cost (and a resize drag) rather than the sparse
-        // event-driven repaints — the one measurement mode where a pegged
-        // frame loop is the point.
-        self.frame_stats
-            .record(frame_start.elapsed().as_secs_f32() * 1000.0);
-        if self.show_frame_time {
-            ui.ctx().request_repaint();
-        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1088,38 +1043,6 @@ impl TalkerApp {
                 if ui.small_button(glyph).on_hover_text(tip).clicked() {
                     self.dark_mode = !self.dark_mode;
                     apply_theme(ui.ctx(), self.dark_mode);
-                }
-
-                ui.separator();
-                // Frame-time readout toggle (measurement aid). A plain "ms"
-                // button — a clock glyph (U+23F1) isn't guaranteed in the
-                // bundled font, same coverage reason the theme toggle avoids the
-                // ☀/☾ dingbats. While shown the app repaints continuously (see
-                // `ui`), so the number is live — grab the window edge with the
-                // Output pane open on a busy channel to read the layout cost
-                // under a resize.
-                let time_tip = if self.show_frame_time {
-                    "Hide the frame-time readout (stops continuous repaint)"
-                } else {
-                    "Show per-frame build time (repaints continuously while on)"
-                };
-                if ui.small_button("ms").on_hover_text(time_tip).clicked() {
-                    self.show_frame_time = !self.show_frame_time;
-                }
-                if self.show_frame_time {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{:.2} ms  (peak {:.2})",
-                            self.frame_stats.ema_ms, self.frame_stats.peak_ms
-                        ))
-                        .monospace()
-                        .weak(),
-                    )
-                    .on_hover_text(
-                        "Smoothed time to build one UI frame (the egui layout \
-                         phase), and the recent peak. The Output-pane cost shows \
-                         up here during a window/pane resize.",
-                    );
                 }
             });
             ui.add_space(4.0);

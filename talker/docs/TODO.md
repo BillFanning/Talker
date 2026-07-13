@@ -82,20 +82,18 @@ Cross off items as they are completed. Add new ones inline as they come up.
   to the flow on a non-wrapping width). Pinned by `split_rows_*`,
   `rows_rejoin_to_the_flow_when_nothing_soft_wraps`,
   `rows_rebuild_on_content_and_width_change`.
-  - **Still needs a human at the running GUI:** the before/after egui
-    *frame-time* number and a visual check (selection across rows,
-    stick-to-bottom, resize re-wrap) — neither is measurable headlessly. At
-    talker's 200-message cap the CPU win is smaller than listener's ~1 MB
-    case that forced the change; the port is primarily the correct,
-    consistent architecture. Confirm the frame-time delta before claiming a
-    perf win.
-  - **Readout built in:** the top bar's **"ms"** toggle shows smoothed
-    per-frame build time + recent peak, and repaints continuously while on
-    (`FrameStats` / `show_frame_time`, `gui/mod.rs`). Measure like-for-like:
-    build `--release`, open the Output pane on a fast channel (full
-    200-message buffer), toggle it on, and drag the window edge to read the
-    layout cost under resize — compare this revision against the pre-port
-    commit (`33f611e`-era).
+  - **MEASURED 2026-07-13 (release, live GUI), KILLED on perf grounds.** A
+    temporary top-bar frame-time readout (since removed) measured the egui
+    build phase with a channel sending at 1 kHz, the Output pane open and
+    full (200 messages), under a window-resize drag — the worst case that
+    invalidates the text galley every frame. Whole-UI frame time was ~0.7 ms
+    steady / ~1.25 ms peak, and — the decisive result — **identical with the
+    channel stopped and the pane cleared**: the pane's contribution is below
+    the measurement noise floor at talker's 200-message scale (80× smaller
+    than the ~1 MB listener case that forced `show_rows`). No measurable
+    frame-time win; the port stands as **architectural consistency** with
+    listener, not a speedup. The readout was a measurement aid and was
+    removed once the number was in hand.
 - [x] **Command enqueue failures** — DONE (`6d4da3b`). Failed `Stop`/
   interface-update/`SetInterval` enqueue attempts surface in the channel's
   error banner, distinguishing queue-full (runner wedged) from runner-exited
@@ -240,6 +238,13 @@ Cross off items as they are completed. Add new ones inline as they come up.
     ~500 Hz–1 kHz is wake-quantization territory (hybrid spin-wait was
     considered and deliberately not built — one pegged core per fast channel,
     worse when oversubscribed; revisit only on a real ≥1 kHz UDP need).
+    **Measured 2026-07-13 (release, one dev Win11 box), UDP loopback:**
+    500 Hz (2 ms) missed ~1.5% of grid points — essentially on-target;
+    1 kHz (1 ms) missed ~⅓ of grid points (~667 Hz effective) — the 1 ms
+    send grid sits right at the ~1 ms Windows timer granularity, so wake
+    jitter overshoots and the stall policy skips. This is the documented
+    ceiling, not a regression; CPU/observer cost is not the bottleneck
+    (timer resolution is), so only the deferred spin-wait would move it.
   - Serial line-rate math: `payload_bytes × 10 / baud` must fit the interval
     (a 40-byte sentence at 115200 baud ≈ 3.5 ms → 1 kHz is physically
     impossible regardless of timers).
