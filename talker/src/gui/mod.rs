@@ -707,6 +707,23 @@ impl TalkerApp {
             self.log_counts.remove(&id);
         }
         self.sup.start(i, label, cfg, schedule);
+
+        // A restart (Apply & Restart) applies this channel's message drafts
+        // wholesale — the schedule just compiled and started IS what runs. Fold
+        // those messages into the profile baseline so message drift clears and
+        // the button reverts from "Apply & Restart" to a greyed "Start Channel".
+        // Without this, any message edit — an interval change that missed the
+        // live `set_interval` path, or an add/remove that has no live path at
+        // all — left the channel reading as permanently drifted after Apply &
+        // Restart, because nothing else updates the baseline for structural
+        // message changes. (The interface baseline is reconciled separately from
+        // the runner's confirmed open — ADR-021 — since a *live* interface
+        // update can fail where a whole-schedule restart cannot partially apply.)
+        // Only channel `i` is touched, so an invalid *other* channel can't shift
+        // indices (the round-2 flush bug).
+        if let Some(applied) = self.profile.channels.get_mut(i) {
+            applied.messages = messages;
+        }
     }
 
     /// Stop channel `i` without blocking the UI (the supervisor parks the
