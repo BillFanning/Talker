@@ -134,15 +134,13 @@ fn multi_channel_udp_soak_totals_exact_at_rest() {
     for i in 0..CHANNELS {
         let sink = UdpSink::spawn();
         sup.push_slot();
-        let schedule = Schedule::compile(
-            &[msg(&payload_hex_a, 2), msg(&payload_hex_b, 2)],
-            Instant::now(),
-        )
-        .unwrap();
+        let messages = vec![msg(&payload_hex_a, 2), msg(&payload_hex_b, 2)];
+        let schedule = Schedule::compile(&messages, Instant::now()).unwrap();
         sup.start(
             i,
             (i + 1).to_string(),
             InterfaceConfig::Udp(UdpConfig::unicast(sink.addr)),
+            messages,
             schedule,
         );
         sinks.push(sink);
@@ -207,11 +205,13 @@ fn tcp_failed_send_storm_stays_bounded() {
 
     let mut sup = TalkerSupervisor::new(ObserverPolicy::sampled());
     sup.push_slot();
-    let schedule = Schedule::compile(&[msg("ABCD", 2)], Instant::now()).unwrap();
+    let messages = vec![msg("ABCD", 2)];
+    let schedule = Schedule::compile(&messages, Instant::now()).unwrap();
     sup.start(
         0,
         "1",
         InterfaceConfig::TcpClient(TcpClientConfig::new(addr)),
+        messages,
         schedule,
     );
 

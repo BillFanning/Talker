@@ -2,7 +2,7 @@ use std::net::{SocketAddr, UdpSocket};
 
 use anyhow::Context;
 
-use super::config::{UdpConfig, UdpMode};
+use super::config::{InterfaceConfig, UdpConfig, UdpMode};
 use super::Interface;
 
 pub(super) struct UdpInterface {
@@ -13,57 +13,12 @@ pub(super) struct UdpInterface {
 impl UdpInterface {
     pub(super) fn open(config: &UdpConfig) -> anyhow::Result<Self> {
         let local_port = config.local_port.unwrap_or(0);
-
-        match &config.mode {
-            UdpMode::Unicast { destination } => {
-                let socket =
-                    UdpSocket::bind(("0.0.0.0", local_port)).context("binding UDP socket")?;
-                Ok(Self {
-                    socket,
-                    destination: *destination,
-                })
-            }
-            UdpMode::Broadcast { destination } => {
-                let socket =
-                    UdpSocket::bind(("0.0.0.0", local_port)).context("binding UDP socket")?;
-                socket
-                    .set_broadcast(true)
-                    .context("enabling UDP broadcast")?;
-                Ok(Self {
-                    socket,
-                    destination: *destination,
-                })
-            }
-            UdpMode::Multicast {
-                group,
-                port,
-                interface,
-                ttl,
-            } => {
-                let socket =
-                    UdpSocket::bind(("0.0.0.0", local_port)).context("binding UDP socket")?;
-                // Outgoing interface (IP_MULTICAST_IF): std has no setter, so
-                // reach through socket2's SockRef over the already-bound socket.
-                if let Some(iface) = interface {
-                    socket2::SockRef::from(&socket)
-                        .set_multicast_if_v4(iface)
-                        .with_context(|| {
-                            format!("selecting multicast interface {iface} (IP_MULTICAST_IF)")
-                        })?;
-                }
-                // Hop limit (IP_MULTICAST_TTL); OS default is 1 (local subnet).
-                if let Some(ttl) = ttl {
-                    socket
-                        .set_multicast_ttl_v4(*ttl)
-                        .with_context(|| format!("setting multicast TTL {ttl}"))?;
-                }
-                let destination = SocketAddr::from((*group, *port));
-                Ok(Self {
-                    socket,
-                    destination,
-                })
-            }
-        }
+        let socket = UdpSocket::bind(("0.0.0.0", local_port)).context("binding UDP socket")?;
+        let destination = apply_socket_config(&socket, config, false)?;
+        Ok(Self {
+            socket,
+            destination,
+        })
     }
 }
 
@@ -74,6 +29,83 @@ impl Interface for UdpInterface {
             .context("sending UDP datagram")?;
         Ok(())
     }
+
+    fn reconfigure(
+        &mut self,
+        current: &InterfaceConfig,
+        next: &InterfaceConfig,
+    ) -> anyhow::Result<bool> {
+        let (InterfaceConfig::Udp(current), InterfaceConfig::Udp(next)) = (current, next) else {
+            return Ok(false);
+        };
+        if current.local_port != next.local_port {
+            return Ok(false);
+        }
+
+        let reset_for_next = is_multicast(&current.mode) && !is_multicast(&next.mode);
+        match apply_socket_config(&self.socket, next, reset_for_next) {
+            Ok(destination) => {
+                self.destination = destination;
+                Ok(true)
+            }
+            Err(change_err) => {
+                let reset_for_rollback = is_multicast(&next.mode) && !is_multicast(&current.mode);
+                match apply_socket_config(&self.socket, current, reset_for_rollback) {
+                    Ok(destination) => {
+                        self.destination = destination;
+                        Err(change_err
+                            .context("applying UDP settings; previous settings were restored"))
+                    }
+                    Err(rollback_err) => Err(change_err.context(format!(
+                        "applying UDP settings; restoring the previous settings also failed: \
+                     {rollback_err:#}"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+fn is_multicast(mode: &UdpMode) -> bool {
+    matches!(mode, UdpMode::Multicast { .. })
+}
+
+fn apply_socket_config(
+    socket: &UdpSocket,
+    config: &UdpConfig,
+    reset_inactive_multicast_options: bool,
+) -> anyhow::Result<SocketAddr> {
+    socket
+        .set_broadcast(matches!(&config.mode, UdpMode::Broadcast { .. }))
+        .context("updating UDP broadcast mode")?;
+    let destination = match &config.mode {
+        UdpMode::Unicast { destination } | UdpMode::Broadcast { destination } => {
+            if reset_inactive_multicast_options {
+                socket2::SockRef::from(socket)
+                    .set_multicast_if_v4(&std::net::Ipv4Addr::UNSPECIFIED)
+                    .context("resetting UDP multicast interface")?;
+                socket
+                    .set_multicast_ttl_v4(1)
+                    .context("resetting UDP multicast TTL")?;
+            }
+            *destination
+        }
+        UdpMode::Multicast {
+            group,
+            port,
+            interface,
+            ttl,
+        } => {
+            socket2::SockRef::from(socket)
+                .set_multicast_if_v4(&interface.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED))
+                .context("updating UDP multicast interface")?;
+            socket
+                .set_multicast_ttl_v4(ttl.unwrap_or(1))
+                .context("updating UDP multicast TTL")?;
+            SocketAddr::from((*group, *port))
+        }
+    };
+    Ok(destination)
 }
 
 #[cfg(test)]
@@ -96,6 +128,60 @@ mod tests {
             .unwrap();
         let (n, _) = receiver.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[test]
+    fn same_bound_port_reconfigures_without_a_second_bind() {
+        let first_receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let second_receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port_probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+
+        let mut current = UdpConfig::unicast(first_receiver.local_addr().unwrap());
+        current.local_port = Some(local_port);
+        let mut next = UdpConfig::unicast(second_receiver.local_addr().unwrap());
+        next.local_port = Some(local_port);
+        let mut interface = UdpInterface::open(&current).unwrap();
+
+        assert!(interface
+            .reconfigure(&InterfaceConfig::Udp(current), &InterfaceConfig::Udp(next))
+            .unwrap());
+        interface.send(b"new destination").unwrap();
+        second_receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut buf = [0; 32];
+        let (n, _) = second_receiver.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"new destination");
+    }
+
+    #[test]
+    fn leaving_multicast_resets_ttl_and_reuses_the_bound_socket() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port_probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let local_port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+
+        let mut current =
+            UdpConfig::multicast_with("239.0.0.1".parse().unwrap(), 20_000, None, Some(7));
+        current.local_port = Some(local_port);
+        let mut next = UdpConfig::unicast(receiver.local_addr().unwrap());
+        next.local_port = Some(local_port);
+        let mut interface = UdpInterface::open(&current).unwrap();
+        assert_eq!(interface.socket.multicast_ttl_v4().unwrap(), 7);
+
+        assert!(interface
+            .reconfigure(&InterfaceConfig::Udp(current), &InterfaceConfig::Udp(next))
+            .unwrap());
+        assert_eq!(interface.socket.multicast_ttl_v4().unwrap(), 1);
+        interface.send(b"unicast").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut buf = [0; 16];
+        let (n, _) = receiver.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"unicast");
     }
 
     #[test]

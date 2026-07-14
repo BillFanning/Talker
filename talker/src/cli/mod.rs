@@ -256,6 +256,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             runner::run(
                 who,
                 interface,
+                None,
                 schedule,
                 cmd_rx,
                 runner::RunnerObserver::new(status_tx, policy),

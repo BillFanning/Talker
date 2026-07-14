@@ -151,6 +151,15 @@ impl Schedule {
         self.missed_sends
     }
 
+    /// Lossy code-page substitution positions for one compiled message.
+    /// This metadata is copied only when a rate-limited display sample is
+    /// emitted, keeping it out of the normal send path.
+    pub(crate) fn replacement_wire_offsets(&self, index: usize) -> &[usize] {
+        self.messages
+            .get(index)
+            .map_or(&[], |message| message.compiled.replacement_wire_offsets())
+    }
+
     /// The shortest **active** interval, or `None` when every message is
     /// dormant. Drives the runner's high-resolution-timer decision
     /// (`core::timing`, ADR-017): re-checked each loop pass, so

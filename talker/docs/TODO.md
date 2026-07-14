@@ -70,30 +70,16 @@ Cross off items as they are completed. Add new ones inline as they come up.
     removed the expensive per-send observer copies.
   - `min_active_interval` caching: KILLED. 761 ns @ 512 messages, ~25 ns at
     realistic counts; 0.08% CPU at 1 kHz.
-  - GUI output row ring: still OPEN, tracked below (frame-time, not criterion).
-- [x] **Output-pane virtualization (`show_rows`) — ported 2026-07-12.** The
-  pane rendered one giant selectable `Label` over the whole memoized string,
-  the exact "re-lay-out the whole buffer every frame" pattern listener's
-  stream view moved away from. `ChannelDisplay` now memoizes uniform-height
-  rows keyed on (generation, mode, style, wrap-cols) via a pure `split_rows`
-  (mirror of listener's `split_stream_rows`), and `show_display_pane` uses
-  `ScrollArea::show_rows` to lay out only the visible rows. Flow semantics are
-  unchanged — the same concatenated text, just chunked into lines (rows rejoin
-  to the flow on a non-wrapping width). Pinned by `split_rows_*`,
-  `rows_rejoin_to_the_flow_when_nothing_soft_wraps`,
-  `rows_rebuild_on_content_and_width_change`.
-  - **MEASURED 2026-07-13 (release, live GUI), KILLED on perf grounds.** A
-    temporary top-bar frame-time readout (since removed) measured the egui
-    build phase with a channel sending at 1 kHz, the Output pane open and
-    full (200 messages), under a window-resize drag — the worst case that
-    invalidates the text galley every frame. Whole-UI frame time was ~0.7 ms
-    steady / ~1.25 ms peak, and — the decisive result — **identical with the
-    channel stopped and the pane cleared**: the pane's contribution is below
-    the measurement noise floor at talker's 200-message scale (80× smaller
-    than the ~1 MB listener case that forced `show_rows`). No measurable
-    frame-time win; the port stands as **architectural consistency** with
-    listener, not a speedup. The readout was a measurement aid and was
-    removed once the number was in hand.
+  - GUI output row ring/virtualization: KILLED and reverted. See below.
+- [x] **Output-pane virtualization experiment — REVERTED 2026-07-13.** The
+  `show_rows` port measured no frame-time improvement at talker's 200-message
+  cap (~0.7 ms steady / ~1.25 ms peak for the whole UI, identical with the
+  pane stopped and cleared). Review then found a correctness cost: soft wraps
+  became separate selectable labels, so copied text gained synthetic newlines
+  and selection could not retain an offscreen virtualized endpoint. The pane
+  is again one memoized selectable label, preserving exact logical flow.
+  Listener keeps virtualization because its byte-bounded window is ~1 MB and
+  its custom stream view owns logical offsets; the workloads are not equivalent.
 - [x] **Command enqueue failures** — DONE (`6d4da3b`). Failed `Stop`/
   interface-update/`SetInterval` enqueue attempts surface in the channel's
   error banner, distinguishing queue-full (runner wedged) from runner-exited
@@ -147,6 +133,32 @@ Cross off items as they are completed. Add new ones inline as they come up.
   `interface_execution_result_controls_applied_state_and_scoped_error` and
   `start_time_interface_becomes_applied_only_after_open_succeeds`, plus
   `rejected_interval_reports_execution_failure`.
+- [x] **Whole-run reconciliation + exclusive-resource updates (ADR-022).**
+  `AppliedRunConfig` confirms interface and messages together; failed opens
+  leave both pending; unexpected runner exit fails every accepted command.
+  Same-port serial and same-bound-port UDP changes reconfigure the owned
+  handle with rollback instead of attempting an impossible double-open. Stop
+  resolves unobserved command results and clears the applied-run baseline.
+  Pinned by `accepted_command_fails_when_runner_exits_before_execution` and
+  `same_bound_port_reconfigures_without_a_second_bind`.
+- [x] **Complete scheduled-send outcomes.** Cumulative counters now distinguish
+  successful, interface-failed, retry-suppressed, and scheduler-missed sends.
+  The GUI's shortfall percentage uses all four outcomes instead of calling
+  `sent + missed` "attempts" while silently excluding failures/suppression.
+- [x] **Per-run GUI rate state.** Apply & Restart resets the throughput
+  estimator and Output sampling latch, so the prior run cannot advertise a
+  stale rate or sampling badge during the new run's first measurement window.
+- [x] **Code-page fallback (ADR-023).** Unsupported
+  Unicode scalars in ASCII/code-page payloads become visible `?` (`0x3F`)
+  substitutions instead of rejecting the schedule; malformed byte markers
+  remain errors. Contrast-aware amber backgrounds identify unsupported source
+  characters and their fallback bytes in both Wire preview and live Output
+  without marking literal question marks. Replacement offsets are compiled once
+  and travel only with the rate-limited display sample.
+- [x] **Bounded multiline message editors (ADR-024).** UTF-8, UTF-16, and
+  ASCII editors show explicit line breaks, never soft-wrap, grow from three
+  through eight visible rows, and provide horizontal and vertical scrolling
+  on overflow.
 - [x] **Sample lane rotates across messages** — the lane skips a repeat of the
   last sampled index while due (never longer than one full cycle), so an
   aligned multi-message schedule no longer shows message 0 forever. Pinned by

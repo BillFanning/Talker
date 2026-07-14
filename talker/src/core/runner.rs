@@ -122,6 +122,10 @@ pub enum TalkerStatus {
         /// policy (`Schedule::missed_sends`) — the channel couldn't keep to
         /// its configured cadence.
         missed_sends: u64,
+        /// Cumulative send calls that reached the interface and failed.
+        failed_sends: u64,
+        /// Cumulative due fires suppressed by the bounded-backoff gate.
+        suppressed_sends: u64,
     },
     /// A sampled send (ADR-018 lane 2): the exact wire bytes of one send,
     /// for the Output pane. Newest-per-interval — the first send after
@@ -134,6 +138,9 @@ pub enum TalkerStatus {
         message_index: usize,
         /// Exact bytes put on the wire.
         payload: Vec<u8>,
+        /// Byte positions in `payload` produced by lossy code-page fallback.
+        /// Literal `?` bytes are deliberately absent.
+        replacement_wire_offsets: Vec<usize>,
     },
     /// A send failed. **Edge-triggered**: only
     /// the *first* failure of a failing episode is reported; repeats are
@@ -282,10 +289,10 @@ pub fn open_and_run(
                 &observer.notify,
                 RunnerControlStatus::InterfaceOpened {
                     channel: who.id,
-                    config: cfg,
+                    config: cfg.clone(),
                 },
             );
-            run(who, interface, schedule, cmd_rx, observer);
+            run(who, interface, Some(cfg), schedule, cmd_rx, observer);
         }
         Err(e) => {
             tracing::error!(
@@ -317,6 +324,7 @@ pub fn open_and_run(
 pub fn run(
     who: RunnerIdentity,
     interface: Box<dyn Interface>,
+    current_config: Option<InterfaceConfig>,
     schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
     observer: RunnerObserver,
@@ -327,7 +335,7 @@ pub fn run(
         who.label,
         schedule.len()
     );
-    run_loop(&who, interface, schedule, cmd_rx, observer);
+    run_loop(&who, interface, current_config, schedule, cmd_rx, observer);
     tracing::info!(channel = who.id.as_u64(), "channel {} stopped", who.label);
 }
 
@@ -339,6 +347,7 @@ enum Flow {
 fn run_loop(
     who: &RunnerIdentity,
     mut interface: Box<dyn Interface>,
+    mut current_config: Option<InterfaceConfig>,
     mut schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
     observer: RunnerObserver,
@@ -351,6 +360,8 @@ fn run_loop(
     } = observer;
     let mut total_count = 0u64;
     let mut total_bytes = 0u64;
+    let mut failed_sends = 0u64;
+    let mut suppressed_sends = 0u64;
     // Lane rate limits (ADR-018): `None` = nothing emitted yet, so the first
     // send always produces both a sample and counters (instant first paint).
     let mut last_sample: Option<Instant> = None;
@@ -370,15 +381,36 @@ fn run_loop(
 
     let handle = |cmd: TalkerCommand,
                   interface: &mut Box<dyn Interface>,
+                  current_config: &mut Option<InterfaceConfig>,
                   schedule: &mut Schedule,
                   episode: &mut Option<FailureEpisode>|
      -> Flow {
         match cmd {
             TalkerCommand::Stop => Flow::Stop,
             TalkerCommand::UpdateInterface { id, config } => {
-                let execution = match config.open() {
-                    Ok(new) => {
-                        *interface = new;
+                let execution = match current_config.as_ref() {
+                    Some(current) => match interface.reconfigure(current, &config) {
+                        Ok(true) => CommandExecution::Applied,
+                        Ok(false) => match config.open() {
+                            Ok(new) => {
+                                *interface = new;
+                                CommandExecution::Applied
+                            }
+                            Err(e) => CommandExecution::Failed(format!("{e:#}")),
+                        },
+                        Err(e) => CommandExecution::Failed(format!("{e:#}")),
+                    },
+                    None => match config.open() {
+                        Ok(new) => {
+                            *interface = new;
+                            CommandExecution::Applied
+                        }
+                        Err(e) => CommandExecution::Failed(format!("{e:#}")),
+                    },
+                };
+                match &execution {
+                    CommandExecution::Applied => {
+                        *current_config = Some(config);
                         // A fresh interface deserves an immediate attempt:
                         // pull the next retry forward. The episode's counts
                         // stay — only a successful send closes it (and
@@ -391,17 +423,15 @@ fn run_loop(
                             "channel {} interface updated",
                             who.label
                         );
-                        CommandExecution::Applied
                     }
-                    Err(e) => {
+                    CommandExecution::Failed(message) => {
                         tracing::warn!(
                             channel = who.id.as_u64(),
-                            "channel {} interface update failed: {e:#}",
-                            who.label
+                            "channel {} interface update failed: {message}",
+                            who.label,
                         );
-                        CommandExecution::Failed(format!("{e:#}"))
                     }
-                };
+                }
                 emit_control(
                     &control_tx,
                     &notify,
@@ -463,137 +493,158 @@ fn run_loop(
         // Drain anything already queued so back-to-back sends can't starve
         // command handling.
         for cmd in cmd_rx.try_iter() {
-            if let Flow::Stop = handle(cmd, &mut interface, &mut schedule, &mut episode) {
+            if let Flow::Stop = handle(
+                cmd,
+                &mut interface,
+                &mut current_config,
+                &mut schedule,
+                &mut episode,
+            ) {
                 break 'run;
             }
         }
 
         match schedule.poll(Instant::now()) {
             Tick::Send { index, payload } => {
-                if let Some(ep) = episode.as_mut() {
-                    if Instant::now() < ep.next_attempt {
-                        // Backoff gate: this due fire is suppressed — counted,
-                        // not attempted. The scheduler has already advanced,
-                        // consistent with the stall policy (cadence over count).
+                let suppressed = episode
+                    .as_ref()
+                    .is_some_and(|ep| Instant::now() < ep.next_attempt);
+                if suppressed {
+                    // Backoff gate: this due fire is suppressed — counted,
+                    // not attempted. The scheduler has already advanced,
+                    // consistent with the stall policy (cadence over count).
+                    if let Some(ep) = episode.as_mut() {
                         ep.suppressed += 1;
-                        continue;
                     }
-                }
-                match interface.send(&payload) {
-                    Ok(()) => {
-                        if let Some(ep) = episode.take() {
-                            tracing::info!(
+                    suppressed_sends += 1;
+                } else {
+                    match interface.send(&payload) {
+                        Ok(()) => {
+                            if let Some(ep) = episode.take() {
+                                tracing::info!(
                             channel = who.id.as_u64(),
                             "channel {} sending recovered after {} failed and {} suppressed sends",
                             who.label,
                             ep.failures,
                             ep.suppressed
                         );
-                            emit_status(
-                                &status_tx,
-                                &notify,
-                                who,
-                                &mut dropped_statuses,
-                                TalkerStatus::SendRecovered {
-                                    channel: who.id,
-                                    failures: ep.failures,
-                                    suppressed: ep.suppressed,
-                                },
-                            );
-                        }
-                        total_count += 1;
-                        total_bytes += payload.len() as u64;
-                        if index >= per_message_counts.len() {
-                            per_message_counts.resize(index + 1, 0);
-                        }
-                        per_message_counts[index] += 1;
-                        // Rate-limited observer lanes (ADR-018): a payload
-                        // sample and/or a counters update, each at most once
-                        // per its policy interval. Best-effort sends — a full
-                        // receiver drops the update rather than backpressuring
-                        // the send cadence; cumulative counters self-correct
-                        // via the next delivered update.
-                        let now = Instant::now();
-                        let due = last_sample.is_none_or(|t| now - t >= policy.sample_interval);
-                        if due {
-                            let repeat = last_sampled_index == Some(index) && schedule.len() > 1;
-                            if !repeat || repeats_skipped_while_due >= schedule.len() as u64 {
-                                last_sample = Some(now);
-                                last_sampled_index = Some(index);
-                                repeats_skipped_while_due = 0;
                                 emit_status(
                                     &status_tx,
                                     &notify,
                                     who,
                                     &mut dropped_statuses,
-                                    TalkerStatus::SendSample {
+                                    TalkerStatus::SendRecovered {
                                         channel: who.id,
-                                        message_index: index,
-                                        payload,
+                                        failures: ep.failures,
+                                        suppressed: ep.suppressed,
                                     },
                                 );
-                            } else {
-                                repeats_skipped_while_due += 1;
+                            }
+                            total_count += 1;
+                            total_bytes += payload.len() as u64;
+                            if index >= per_message_counts.len() {
+                                per_message_counts.resize(index + 1, 0);
+                            }
+                            per_message_counts[index] += 1;
+                            // The payload observer lane is rate-limited and
+                            // best-effort (ADR-018): a full receiver drops the
+                            // sample rather than backpressuring send cadence.
+                            let now = Instant::now();
+                            let due = last_sample.is_none_or(|t| now - t >= policy.sample_interval);
+                            if due {
+                                let repeat =
+                                    last_sampled_index == Some(index) && schedule.len() > 1;
+                                if !repeat || repeats_skipped_while_due >= schedule.len() as u64 {
+                                    last_sample = Some(now);
+                                    last_sampled_index = Some(index);
+                                    repeats_skipped_while_due = 0;
+                                    let replacement_wire_offsets =
+                                        schedule.replacement_wire_offsets(index).to_vec();
+                                    emit_status(
+                                        &status_tx,
+                                        &notify,
+                                        who,
+                                        &mut dropped_statuses,
+                                        TalkerStatus::SendSample {
+                                            channel: who.id,
+                                            message_index: index,
+                                            payload,
+                                            replacement_wire_offsets,
+                                        },
+                                    );
+                                } else {
+                                    repeats_skipped_while_due += 1;
+                                }
                             }
                         }
-                        if last_counters.is_none_or(|t| now - t >= policy.counter_interval) {
-                            last_counters = Some(now);
-                            let drops_so_far = dropped_statuses;
-                            emit_status(
-                                &status_tx,
-                                &notify,
-                                who,
-                                &mut dropped_statuses,
-                                TalkerStatus::Counters {
-                                    channel: who.id,
-                                    total_count,
-                                    total_bytes,
-                                    per_message_counts: per_message_counts.clone(),
-                                    dropped_statuses: drops_so_far,
-                                    missed_sends: schedule.missed_sends(),
-                                },
-                            );
+                        Err(e) => {
+                            failed_sends += 1;
+                            match episode.as_mut() {
+                                // Edge-triggered: only the episode's first failure is
+                                // reported (warn + `ConnectionError`); it opens the episode.
+                                None => {
+                                    tracing::warn!(
+                                        channel = who.id.as_u64(),
+                                        "channel {} send failed (retrying with backoff): {e:#}",
+                                        who.label
+                                    );
+                                    episode = Some(FailureEpisode {
+                                        failures: 1,
+                                        suppressed: 0,
+                                        backoff: RETRY_BACKOFF_INITIAL,
+                                        next_attempt: Instant::now() + RETRY_BACKOFF_INITIAL,
+                                    });
+                                    emit_status(
+                                        &status_tx,
+                                        &notify,
+                                        who,
+                                        &mut dropped_statuses,
+                                        TalkerStatus::ConnectionError {
+                                            channel: who.id,
+                                            message: format!("{e:#}"),
+                                        },
+                                    );
+                                }
+                                // A failed retry deepens the backoff; no re-report.
+                                Some(ep) => {
+                                    ep.failures += 1;
+                                    ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
+                                    ep.next_attempt = Instant::now() + ep.backoff;
+                                    tracing::debug!(
+                                        channel = who.id.as_u64(),
+                                        "channel {} send still failing ({} failures so far): {e:#}",
+                                        who.label,
+                                        ep.failures
+                                    );
+                                }
+                            }
                         }
                     }
-                    Err(e) => match episode.as_mut() {
-                        // Edge-triggered: only the episode's first failure is
-                        // reported (warn + `ConnectionError`); it opens the episode.
-                        None => {
-                            tracing::warn!(
-                                channel = who.id.as_u64(),
-                                "channel {} send failed (retrying with backoff): {e:#}",
-                                who.label
-                            );
-                            episode = Some(FailureEpisode {
-                                failures: 1,
-                                suppressed: 0,
-                                backoff: RETRY_BACKOFF_INITIAL,
-                                next_attempt: Instant::now() + RETRY_BACKOFF_INITIAL,
-                            });
-                            emit_status(
-                                &status_tx,
-                                &notify,
-                                who,
-                                &mut dropped_statuses,
-                                TalkerStatus::ConnectionError {
-                                    channel: who.id,
-                                    message: format!("{e:#}"),
-                                },
-                            );
-                        }
-                        // A failed retry deepens the backoff; no re-report.
-                        Some(ep) => {
-                            ep.failures += 1;
-                            ep.backoff = (ep.backoff * 2).min(RETRY_BACKOFF_MAX);
-                            ep.next_attempt = Instant::now() + ep.backoff;
-                            tracing::debug!(
-                                channel = who.id.as_u64(),
-                                "channel {} send still failing ({} failures so far): {e:#}",
-                                who.label,
-                                ep.failures
-                            );
-                        }
-                    },
+                }
+
+                // Cumulative outcomes remain observable even when every due
+                // send is failing or suppressed. This lane is rate-limited
+                // and best-effort, so it cannot slow the scheduler hot path.
+                let now = Instant::now();
+                if last_counters.is_none_or(|t| now - t >= policy.counter_interval) {
+                    last_counters = Some(now);
+                    let drops_so_far = dropped_statuses;
+                    emit_status(
+                        &status_tx,
+                        &notify,
+                        who,
+                        &mut dropped_statuses,
+                        TalkerStatus::Counters {
+                            channel: who.id,
+                            total_count,
+                            total_bytes,
+                            per_message_counts: per_message_counts.clone(),
+                            dropped_statuses: drops_so_far,
+                            missed_sends: schedule.missed_sends(),
+                            failed_sends,
+                            suppressed_sends,
+                        },
+                    );
                 }
             }
             // Nothing due yet: block on the command channel until the next
@@ -601,7 +652,13 @@ fn run_loop(
             // for the schedule, and detects a dropped handle.
             Tick::Wait(until) => match cmd_rx.recv_deadline(until) {
                 Ok(cmd) => {
-                    if let Flow::Stop = handle(cmd, &mut interface, &mut schedule, &mut episode) {
+                    if let Flow::Stop = handle(
+                        cmd,
+                        &mut interface,
+                        &mut current_config,
+                        &mut schedule,
+                        &mut episode,
+                    ) {
                         break 'run;
                     }
                 }
@@ -612,7 +669,13 @@ fn run_loop(
             // so block indefinitely — zero wakeups.
             Tick::Idle => match cmd_rx.recv() {
                 Ok(cmd) => {
-                    if let Flow::Stop = handle(cmd, &mut interface, &mut schedule, &mut episode) {
+                    if let Flow::Stop = handle(
+                        cmd,
+                        &mut interface,
+                        &mut current_config,
+                        &mut schedule,
+                        &mut episode,
+                    ) {
                         break 'run;
                     }
                 }
@@ -637,6 +700,8 @@ fn run_loop(
         per_message_counts,
         dropped_statuses,
         missed_sends: schedule.missed_sends(),
+        failed_sends,
+        suppressed_sends,
     });
     if let Some(n) = &notify {
         n();
@@ -699,7 +764,7 @@ mod tests {
 
     use super::*;
     use crate::core::channel::TcpClientConfig;
-    use crate::core::message::{MessageConfig, PayloadConfig};
+    use crate::core::message::{CodePage, MessageConfig, PayloadConfig};
 
     /// An [`Interface`] that records every payload (or fails on demand).
     struct MockInterface {
@@ -747,6 +812,7 @@ mod tests {
             run(
                 who,
                 interface,
+                None,
                 schedule,
                 cmd_rx,
                 RunnerObserver::new(status_tx, policy).with_control(control_tx),
@@ -815,10 +881,12 @@ mod tests {
                     channel,
                     message_index,
                     payload,
+                    replacement_wire_offsets,
                 } => {
                     assert_eq!(*channel, id, "samples carry the stable id");
                     assert_eq!(*message_index, 0);
                     assert_eq!(payload, &vec![0xAB]);
+                    assert!(replacement_wire_offsets.is_empty());
                     samples += 1;
                 }
                 TalkerStatus::Counters {
@@ -845,6 +913,40 @@ mod tests {
         // the totals exact.
         assert_eq!(samples, payloads.len());
         assert_eq!(last_total as usize, payloads.len());
+    }
+
+    #[test]
+    fn send_sample_carries_code_page_replacement_provenance() {
+        let message = MessageConfig::new(
+            PayloadConfig::Ascii {
+                text: "?—".to_string(),
+                code_page: CodePage::Iso8859_1,
+            },
+            10,
+        );
+        let (sent, handle, _) = spawn_runner(&[message], false);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sent.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "expected one send within 2 s");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        let status_rx = handle.status_rx.clone();
+        join_within(handle, Duration::from_secs(2));
+
+        let sample = status_rx
+            .try_iter()
+            .find_map(|status| match status {
+                TalkerStatus::SendSample {
+                    payload,
+                    replacement_wire_offsets,
+                    ..
+                } => Some((payload, replacement_wire_offsets)),
+                _ => None,
+            })
+            .expect("runner should emit a payload sample");
+        assert_eq!(sample.0, b"??");
+        assert_eq!(sample.1, vec![1]);
     }
 
     /// The sample lane rotates across message indices: with an aligned
@@ -966,19 +1068,55 @@ mod tests {
     #[test]
     fn repeated_send_failures_report_one_connection_error() {
         // 5 ms fires against a permanently failing interface: without the
-        // edge trigger this would be ~20 ConnectionErrors in 100 ms; with it,
-        // exactly one (the retry backoff starts at 250 ms, so no second
-        // attempt happens inside the window).
+        // edge trigger every retry could emit a ConnectionError; with it,
+        // exactly one is emitted for the whole failure episode.
         let (_, handle, _id) = spawn_runner(&[msg("AB", 5)], true);
-        std::thread::sleep(Duration::from_millis(100));
-        let errors = handle
-            .status_rx
-            .try_iter()
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut statuses = Vec::new();
+        loop {
+            statuses.extend(handle.status_rx.try_iter());
+            let saw_live_outcomes = statuses.iter().any(|status| {
+                matches!(
+                    status,
+                    TalkerStatus::Counters {
+                        failed_sends,
+                        suppressed_sends,
+                        ..
+                    } if *failed_sends >= 1 && *suppressed_sends >= 1
+                )
+            });
+            if saw_live_outcomes {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "failed and suppressed counters did not become live"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let errors = statuses
+            .iter()
             .filter(|s| matches!(s, TalkerStatus::ConnectionError { .. }))
             .count();
         assert_eq!(
             errors, 1,
             "edge-triggered: only the episode's first failure is reported"
+        );
+        let outcomes = statuses.iter().rev().find_map(|status| match status {
+            TalkerStatus::Counters {
+                total_count,
+                failed_sends,
+                suppressed_sends,
+                ..
+            } => Some((*total_count, *failed_sends, *suppressed_sends)),
+            _ => None,
+        });
+        let (sent, failed, suppressed) = outcomes.expect("live cumulative counters");
+        assert_eq!(sent, 0);
+        assert!(failed >= 1, "the failed attempt is visible before stop");
+        assert!(
+            suppressed >= 1,
+            "backoff-suppressed sends are visible before stop"
         );
         handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
         join_within(handle, Duration::from_secs(2));
@@ -1022,6 +1160,7 @@ mod tests {
             run(
                 who,
                 interface,
+                None,
                 schedule,
                 cmd_rx,
                 RunnerObserver::new(status_tx, ObserverPolicy::every_send())
@@ -1069,8 +1208,20 @@ mod tests {
             !sent.lock().unwrap().is_empty(),
             "sending resumed after recovery"
         );
+        let final_statuses = handle.status_rx.clone();
         handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
         join_within(handle, Duration::from_secs(2));
+        let final_outcomes = final_statuses.try_iter().find_map(|status| match status {
+            TalkerStatus::Counters {
+                failed_sends,
+                suppressed_sends,
+                ..
+            } => Some((failed_sends, suppressed_sends)),
+            _ => None,
+        });
+        let (failed_total, suppressed_total) = final_outcomes.expect("final cumulative counters");
+        assert!(failed_total >= failures);
+        assert!(suppressed_total >= suppressed);
     }
 
     #[test]

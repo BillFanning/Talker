@@ -1,6 +1,6 @@
 use anyhow::Context;
 
-use super::config::{DataBits, FlowControl, Parity, SerialConfig, StopBits};
+use super::config::{DataBits, FlowControl, InterfaceConfig, Parity, SerialConfig, StopBits};
 use super::Interface;
 
 pub(super) struct SerialInterface {
@@ -26,6 +26,56 @@ impl Interface for SerialInterface {
         use std::io::Write;
         self.port.write_all(data).context("writing to serial port")
     }
+
+    fn reconfigure(
+        &mut self,
+        current: &InterfaceConfig,
+        next: &InterfaceConfig,
+    ) -> anyhow::Result<bool> {
+        let (InterfaceConfig::Serial(current), InterfaceConfig::Serial(next)) = (current, next)
+        else {
+            return Ok(false);
+        };
+        if !can_reconfigure_in_place(current, next) {
+            return Ok(false);
+        }
+
+        if let Err(change_err) = apply_config(self.port.as_mut(), next) {
+            let rollback = apply_config(self.port.as_mut(), current);
+            return match rollback {
+                Ok(()) => {
+                    Err(change_err
+                        .context("applying serial settings; previous settings were restored"))
+                }
+                Err(rollback_err) => Err(change_err.context(format!(
+                    "applying serial settings; restoring the previous settings also failed: \
+                     {rollback_err:#}"
+                ))),
+            };
+        }
+        Ok(true)
+    }
+}
+
+fn apply_config(
+    port: &mut dyn serialport::SerialPort,
+    config: &SerialConfig,
+) -> anyhow::Result<()> {
+    port.set_baud_rate(config.baud_rate)
+        .context("setting serial baud rate")?;
+    port.set_data_bits(to_sp_data_bits(config.data_bits))
+        .context("setting serial data bits")?;
+    port.set_parity(to_sp_parity(config.parity))
+        .context("setting serial parity")?;
+    port.set_stop_bits(to_sp_stop_bits(config.stop_bits))
+        .context("setting serial stop bits")?;
+    port.set_flow_control(to_sp_flow_control(config.flow_control))
+        .context("setting serial flow control")?;
+    Ok(())
+}
+
+fn can_reconfigure_in_place(current: &SerialConfig, next: &SerialConfig) -> bool {
+    current.port == next.port
 }
 
 fn to_sp_data_bits(d: DataBits) -> serialport::DataBits {
@@ -73,6 +123,18 @@ mod tests {
             .expect("expected error opening nonexistent port")
             .to_string();
         assert!(msg.contains("does_not_exist_xyz"));
+    }
+
+    #[test]
+    fn only_the_same_serial_port_can_reconfigure_in_place() {
+        let current = SerialConfig::new("COM1");
+        let mut same_port = current.clone();
+        same_port.baud_rate = 115_200;
+        assert!(can_reconfigure_in_place(&current, &same_port));
+        assert!(!can_reconfigure_in_place(
+            &current,
+            &SerialConfig::new("COM2")
+        ));
     }
 
     #[test]

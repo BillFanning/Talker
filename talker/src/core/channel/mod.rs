@@ -57,6 +57,17 @@ impl std::fmt::Display for ChannelId {
 /// can be moved into that thread.
 pub trait Interface: Send {
     fn send(&mut self, data: &[u8]) -> anyhow::Result<()>;
+
+    /// Apply `next` to the existing handle when reopening would conflict with
+    /// the resource it already owns. Returns `true` when applied in place;
+    /// `false` asks the runner to open a replacement and swap on success.
+    fn reconfigure(
+        &mut self,
+        _current: &InterfaceConfig,
+        _next: &InterfaceConfig,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
 }
 
 impl InterfaceConfig {

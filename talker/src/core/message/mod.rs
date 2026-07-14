@@ -51,6 +51,54 @@ pub fn decode_utf8_lossy_latin1(bytes: &[u8]) -> String {
 }
 
 pub use marker::{repair_after_edit, segments, Segment};
+
+/// Unsupported characters that an ASCII/code-page payload will replace.
+/// Valid `‹XX›` byte markers are excluded because they already describe an
+/// exact wire byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodePageReplacementSummary {
+    pub count: usize,
+    pub characters: Vec<char>,
+    /// Byte offsets within the compiled payload where fallback `?` bytes occur.
+    pub payload_offsets: Vec<usize>,
+}
+
+pub(crate) fn code_page_encodes(c: char, code_page: CodePage) -> bool {
+    codepage::encode_char(c, code_page).is_some()
+}
+
+pub(crate) fn code_page_replacements(
+    text: &str,
+    code_page: CodePage,
+) -> Option<CodePageReplacementSummary> {
+    let mut count = 0;
+    let mut characters = std::collections::BTreeSet::new();
+    let mut payload_offsets = Vec::new();
+    let mut payload_offset = 0;
+    for (range, segment) in segments(text) {
+        match segment {
+            Segment::Text => {
+                for c in text[range].chars() {
+                    // Literal marker delimiters are syntax errors handled by
+                    // `compile_ascii`, not lossy code-page replacements.
+                    if !matches!(c, '\u{2039}' | '\u{203A}') && !code_page_encodes(c, code_page) {
+                        count += 1;
+                        characters.insert(c);
+                        payload_offsets.push(payload_offset);
+                    }
+                    payload_offset += 1;
+                }
+            }
+            Segment::Byte(_) => payload_offset += 1,
+        }
+    }
+    (count > 0).then(|| CodePageReplacementSummary {
+        count,
+        characters: characters.into_iter().collect(),
+        payload_offsets,
+    })
+}
+
 pub use timestamp::TimestampConfig;
 
 use serde::{Deserialize, Serialize};
@@ -122,10 +170,25 @@ impl MessageConfig {
     /// Compile the static parts of this message. The payload is encoded once;
     /// the timestamp and checksum settings are kept for per-send rendering.
     pub fn compile(&self) -> anyhow::Result<CompiledMessage> {
+        let payload = self.payload.compile()?;
+        let timestamp_len = self.timestamp.map_or(0, |timestamp| timestamp.wire_len());
+        let replacement_wire_offsets = match &self.payload {
+            PayloadConfig::Ascii { text, code_page } => code_page_replacements(text, *code_page)
+                .map(|summary| {
+                    summary
+                        .payload_offsets
+                        .into_iter()
+                        .map(|offset| timestamp_len + offset)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         Ok(CompiledMessage {
-            payload: self.payload.compile()?,
+            payload,
             timestamp: self.timestamp,
             checksum: self.checksum,
+            replacement_wire_offsets,
         })
     }
 
@@ -146,6 +209,10 @@ pub struct CompiledMessage {
     payload: Vec<u8>,
     timestamp: Option<TimestampConfig>,
     checksum: Option<ChecksumConfig>,
+    /// Positions of lossy code-page fallback bytes in the final wire message.
+    /// The timestamp prefix is included; the appended checksum cannot shift
+    /// these positions.
+    replacement_wire_offsets: Vec<usize>,
 }
 
 impl CompiledMessage {
@@ -155,6 +222,12 @@ impl CompiledMessage {
     /// computed over the timestamp and payload together.
     pub fn render(&self) -> Vec<u8> {
         self.render_at(chrono::Utc::now())
+    }
+
+    /// Byte positions that should be visually identified as lossy code-page
+    /// substitutions. Computed once at compile time, never on the send path.
+    pub(crate) fn replacement_wire_offsets(&self) -> &[usize] {
+        &self.replacement_wire_offsets
     }
 
     /// Like [`Self::render`], but uses `now` as the timestamp instant
@@ -321,23 +394,13 @@ fn compile_ascii(text: &str, code_page: CodePage) -> anyhow::Result<Vec<u8>> {
         match segment {
             Segment::Text => {
                 let chunk = &text[range];
-                let bytes = codepage::encode(chunk, code_page).map_err(|e| {
-                    // A stray '‹' or '›' likely means a half-typed or
-                    // partially-deleted byte marker. Most code pages can't
-                    // encode these characters, so the raw "U+2039 not
-                    // representable" error is unhelpful — add a hint that
-                    // points at the marker syntax.
-                    if chunk.contains('\u{2039}') || chunk.contains('\u{203A}') {
-                        e.context(
-                            "text contains '‹' or '›' that isn't part of a complete \
-                             ‹XX› byte marker — complete it with two hex digits and a \
-                             closing '›' (e.g. ‹1B›), or remove the character",
-                        )
-                    } else {
-                        e
-                    }
-                })?;
-                out.extend(bytes);
+                anyhow::ensure!(
+                    !chunk.contains('\u{2039}') && !chunk.contains('\u{203A}'),
+                    "text contains '‹' or '›' that isn't part of a complete \
+                     ‹XX› byte marker — complete it with two hex digits and a \
+                     closing '›' (e.g. ‹1B›), or remove the character"
+                );
+                out.extend(codepage::encode(chunk, code_page));
             }
             Segment::Byte(b) => out.push(b),
         }
@@ -483,6 +546,30 @@ mod tests {
         assert_eq!(p.compile().unwrap(), "héllo".as_bytes());
     }
 
+    #[test]
+    fn text_formats_preserve_explicit_line_feeds() {
+        let utf8 = PayloadConfig::Utf8 {
+            text: "first\nsecond".to_string(),
+        };
+        let ascii = PayloadConfig::Ascii {
+            text: "first\nsecond".to_string(),
+            code_page: CodePage::Iso8859_1,
+        };
+        let utf16 = PayloadConfig::Utf16 {
+            text: "A\nB".to_string(),
+            byte_order: ByteOrder::BigEndian,
+            bom: false,
+            allow_raw_bytes: false,
+        };
+
+        assert_eq!(utf8.compile().unwrap(), b"first\nsecond");
+        assert_eq!(ascii.compile().unwrap(), b"first\nsecond");
+        assert_eq!(
+            utf16.compile().unwrap(),
+            vec![0x00, b'A', 0x00, b'\n', 0x00, b'B']
+        );
+    }
+
     // ── UTF-16 ────────────────────────────────────────────────────────────────
 
     #[test]
@@ -577,12 +664,41 @@ mod tests {
     }
 
     #[test]
-    fn compile_ascii_unrepresentable_errors() {
+    fn compile_ascii_replaces_unrepresentable_characters() {
         let p = PayloadConfig::Ascii {
-            text: "€".to_string(),
+            text: "—…→↔✅".to_string(),
             code_page: CodePage::Iso8859_1,
         };
-        assert!(p.compile().is_err());
+        assert_eq!(p.compile().unwrap(), b"?????");
+    }
+
+    #[test]
+    fn replacement_summary_counts_occurrences_and_ignores_byte_markers() {
+        let summary = code_page_replacements("—‹FF›—✅", CodePage::Iso8859_1).unwrap();
+        assert_eq!(summary.count, 3);
+        assert_eq!(summary.characters, vec!['—', '✅']);
+        assert_eq!(summary.payload_offsets, vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn compiled_replacement_offsets_include_timestamp_prefix() {
+        let message = MessageConfig {
+            payload: PayloadConfig::Ascii {
+                text: "?—‹FF›✅".to_string(),
+                code_page: CodePage::Iso8859_1,
+            },
+            interval_ms: 100,
+            timestamp: Some(TimestampConfig {
+                include_date: true,
+                include_millis: true,
+                include_timezone: true,
+            }),
+            checksum: None,
+        };
+        let compiled = message.compile().unwrap();
+
+        assert_eq!(compiled.render_at(chrono::Utc::now()).len(), 24 + 4);
+        assert_eq!(compiled.replacement_wire_offsets(), &[25, 27]);
     }
 
     #[test]

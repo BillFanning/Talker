@@ -4,7 +4,12 @@
 //! them on demand in the chosen view mode. This is GUI-only state and is never
 //! saved to a profile.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    fmt::Write as _,
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 /// How long the sub-sampling badge stays lit after the last frame the send rate
 /// exceeded the sample cadence. The throughput estimator updates only ~once a
@@ -40,40 +45,70 @@ pub enum ControlStyle {
 /// Maximum number of recent messages kept per channel pane.
 const CAPACITY: usize = 200;
 
-/// Memoized virtualization rows for the pane, plus the key they were built for.
-struct RowCache {
-    /// (generation, mode, style, wrap columns) — every input the rows depend on.
-    key: (u64, DisplayMode, ControlStyle, usize),
-    rows: Vec<String>,
-}
-
 /// One channel's display pane: a capped buffer of recent sent messages plus
 /// the chosen view settings.
-#[derive(Default)]
 pub struct ChannelDisplay {
     /// Recent sent messages, oldest first; capped at [`CAPACITY`].
-    buffer: Vec<Vec<u8>>,
+    buffer: VecDeque<DisplaySample>,
     pub mode: DisplayMode,
     pub control_style: ControlStyle,
-    /// Bumped on every buffer mutation; keys the row cache below.
+    /// Bumped on every buffer mutation; keys the render cache below.
     generation: u64,
-    /// Memoized pane rows, keyed by (generation, mode, style, wrap columns) so
-    /// the pane re-splits only when the buffer, the view settings, or the pane
-    /// width change — not on every repaint.
-    cache: Option<RowCache>,
+    /// Memoized whole-pane render, keyed by (generation, mode, style) so the
+    /// pane re-renders only when the buffer or view settings change.
+    cache: Option<(u64, DisplayMode, ControlStyle, RenderedOutput)>,
     /// Sub-sampling badge latch: the last time the send rate was above the
     /// sample cadence, and that rate. Smooths the throughput estimator's
     /// jitter so the badge doesn't flicker near the threshold.
     sampling_latch: Option<(Instant, f32)>,
 }
 
+struct DisplaySample {
+    payload: Vec<u8>,
+    /// Sorted positions of `?` bytes created by code-page fallback. Keeping
+    /// provenance here prevents literal question marks from being painted as
+    /// substitutions later.
+    replacement_wire_offsets: Vec<usize>,
+}
+
+#[derive(Default)]
+struct RenderedOutput {
+    text: String,
+    /// UTF-8 byte ranges in `text`, suitable for egui `LayoutJob` sections.
+    replacement_ranges: Vec<Range<usize>>,
+}
+
+impl Default for ChannelDisplay {
+    fn default() -> Self {
+        Self {
+            buffer: VecDeque::with_capacity(CAPACITY),
+            mode: DisplayMode::Rendered,
+            // Keep this explicit at the channel boundary: a newly added
+            // channel always has one ctrl-char radio selected before Raw view
+            // is first opened.
+            control_style: ControlStyle::Pictures,
+            generation: 0,
+            cache: None,
+            sampling_latch: None,
+        }
+    }
+}
+
 impl ChannelDisplay {
     /// Record a message that was just sent.
-    pub fn push(&mut self, payload: Vec<u8>) {
-        self.buffer.push(payload);
+    pub fn push(&mut self, payload: Vec<u8>, mut replacement_wire_offsets: Vec<usize>) {
+        // Samples originate in compiled-message metadata, but normalize at
+        // this UI boundary as a defense against stale or malformed observer
+        // data. Only an actual fallback byte can receive the background.
+        replacement_wire_offsets.retain(|&offset| payload.get(offset) == Some(&b'?'));
+        replacement_wire_offsets.sort_unstable();
+        replacement_wire_offsets.dedup();
+        self.buffer.push_back(DisplaySample {
+            payload,
+            replacement_wire_offsets,
+        });
         if self.buffer.len() > CAPACITY {
-            let excess = self.buffer.len() - CAPACITY;
-            self.buffer.drain(..excess);
+            self.buffer.pop_front();
         }
         self.generation += 1;
     }
@@ -83,40 +118,40 @@ impl ChannelDisplay {
         self.generation += 1;
     }
 
-    /// The whole pane's content as one flowing string in the current view.
+    /// Reset state that belongs to one runner lifetime without discarding the
+    /// retained Output history or the user's view choices.
+    pub(super) fn reset_run_state(&mut self) {
+        self.sampling_latch = None;
+    }
+
+    /// The whole pane's text in the current view, memoized.
     ///
     /// Messages are joined with a single space in Hex mode (so byte groups
     /// stay readable: "34 0D 0A 34", not "34 0D 0A34") and concatenated
     /// verbatim otherwise — any line breaks the user sees come from the
-    /// bytes themselves, never synthesized by the display. This is the content
-    /// the pane shows; [`rows`](Self::rows) splits it for virtualized layout.
-    fn flow_text(&self) -> String {
-        let sep = if self.mode == DisplayMode::Hex {
-            " "
-        } else {
-            ""
-        };
-        self.buffer
-            .iter()
-            .map(|msg| render(msg, self.mode, self.control_style))
-            .collect::<Vec<_>>()
-            .join(sep)
-    }
-
-    /// The pane content split into uniform-height virtualization rows,
-    /// soft-wrapped to `wrap_cols` monospace columns (memoized).
-    ///
-    /// Rendering one giant selectable `Label` over the whole buffer re-lays it
-    /// out every frame; splitting into fixed-height rows lets the `ScrollArea`
-    /// lay out only the visible ones (`show_rows`). Listener's stream view hit
-    /// the same wall and moved to this same split + virtualization.
-    pub(super) fn rows(&mut self, wrap_cols: usize) -> &[String] {
-        let key = (self.generation, self.mode, self.control_style, wrap_cols);
-        if !matches!(&self.cache, Some(c) if c.key == key) {
-            let rows = split_rows(&self.flow_text(), wrap_cols);
-            self.cache = Some(RowCache { key, rows });
+    /// bytes themselves, never synthesized by the display. One label owns the
+    /// full logical flow so selection and copied text preserve those bytes.
+    pub(super) fn rendered(&mut self) -> (&str, &[Range<usize>]) {
+        let key = (self.generation, self.mode, self.control_style);
+        let stale = !matches!(&self.cache, Some((g, m, s, _)) if (*g, *m, *s) == key);
+        if stale {
+            let mut output = RenderedOutput::default();
+            for (index, sample) in self.buffer.iter().enumerate() {
+                if index > 0 && self.mode == DisplayMode::Hex {
+                    output.text.push(' ');
+                }
+                append_rendered(
+                    &mut output,
+                    &sample.payload,
+                    &sample.replacement_wire_offsets,
+                    self.mode,
+                    self.control_style,
+                );
+            }
+            self.cache = Some((key.0, key.1, key.2, output));
         }
-        &self.cache.as_ref().expect("cache was just filled").rows
+        let output = &self.cache.as_ref().expect("cache was just filled").3;
+        (&output.text, &output.replacement_ranges)
     }
 
     /// Whether to show the sub-sampling badge, and at what rate. `active` = the
@@ -139,47 +174,75 @@ impl ChannelDisplay {
     }
 }
 
-/// Split flow text into virtualization rows: a hard break at every real
-/// newline, and a soft wrap of any line longer than `wrap_cols` monospace
-/// columns, so every row is exactly one visual line (the uniform height
-/// `show_rows` needs). Char-based, not byte-based, so a multi-byte UTF-8
-/// codepoint is never split. Mirrors listener's `split_stream_rows`.
-fn split_rows(text: &str, wrap_cols: usize) -> Vec<String> {
-    let cols = wrap_cols.max(8);
-    let mut rows: Vec<String> = Vec::new();
-    for line in text.split('\n') {
-        if line.is_empty() {
-            rows.push(String::new());
-            continue;
-        }
-        let chars: Vec<char> = line.chars().collect();
-        for chunk in chars.chunks(cols) {
-            rows.push(chunk.iter().collect());
-        }
-    }
-    rows
+/// Render one message's bytes to a display string.
+#[cfg(test)]
+pub fn render(bytes: &[u8], mode: DisplayMode, control_style: ControlStyle) -> String {
+    let mut output = RenderedOutput::default();
+    append_rendered(&mut output, bytes, &[], mode, control_style);
+    output.text
 }
 
-/// Render one message's bytes to a display string.
-pub fn render(bytes: &[u8], mode: DisplayMode, control_style: ControlStyle) -> String {
+/// Append one wire message and map its replacement byte positions into ranges
+/// in the rendered UTF-8 string. Replacement boundaries are always standalone
+/// ASCII `?` bytes, so splitting Rendered-mode decoding at them cannot divide a
+/// valid multi-byte UTF-8 scalar.
+fn append_rendered(
+    output: &mut RenderedOutput,
+    bytes: &[u8],
+    replacement_offsets: &[usize],
+    mode: DisplayMode,
+    control_style: ControlStyle,
+) {
     match mode {
-        DisplayMode::Hex => bytes
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<Vec<_>>()
-            .join(" "),
-        DisplayMode::Raw => {
-            let mut s = String::new();
-            for &b in bytes {
-                if (0x20..=0x7E).contains(&b) {
-                    s.push(b as char);
-                } else {
-                    s.push_str(&render_control(b, control_style));
+        DisplayMode::Hex => {
+            let mut replacement_index = 0;
+            for (offset, byte) in bytes.iter().enumerate() {
+                if offset > 0 {
+                    output.text.push(' ');
+                }
+                let start = output.text.len();
+                write!(output.text, "{byte:02X}").expect("writing to String cannot fail");
+                if replacement_offsets.get(replacement_index) == Some(&offset) {
+                    output.replacement_ranges.push(start..output.text.len());
+                    replacement_index += 1;
                 }
             }
-            s
         }
-        DisplayMode::Rendered => crate::core::message::decode_utf8_lossy_latin1(bytes),
+        DisplayMode::Raw => {
+            let mut replacement_index = 0;
+            for (offset, &byte) in bytes.iter().enumerate() {
+                let start = output.text.len();
+                if (0x20..=0x7E).contains(&byte) {
+                    output.text.push(byte as char);
+                } else {
+                    output.text.push_str(&render_control(byte, control_style));
+                }
+                if replacement_offsets.get(replacement_index) == Some(&offset) {
+                    output.replacement_ranges.push(start..output.text.len());
+                    replacement_index += 1;
+                }
+            }
+        }
+        DisplayMode::Rendered => {
+            let mut cursor = 0;
+            for &offset in replacement_offsets {
+                debug_assert_eq!(bytes.get(offset), Some(&b'?'));
+                output
+                    .text
+                    .push_str(&crate::core::message::decode_utf8_lossy_latin1(
+                        &bytes[cursor..offset],
+                    ));
+                let start = output.text.len();
+                output.text.push('?');
+                output.replacement_ranges.push(start..output.text.len());
+                cursor = offset + 1;
+            }
+            output
+                .text
+                .push_str(&crate::core::message::decode_utf8_lossy_latin1(
+                    &bytes[cursor..],
+                ));
+        }
     }
 }
 
@@ -341,9 +404,9 @@ mod tests {
             ..Default::default()
         };
         for i in 0..(CAPACITY + 25) {
-            d.push(vec![i as u8]);
+            d.push(vec![i as u8], Vec::new());
         }
-        let text = d.flow_text();
+        let text = d.rendered().0.to_string();
         assert_eq!(text.split(' ').count(), CAPACITY);
         // The oldest entries were dropped; the newest is last.
         assert!(text.ends_with(&format!("{:02X}", (CAPACITY + 24) as u8)));
@@ -352,78 +415,65 @@ mod tests {
     #[test]
     fn clear_empties_the_buffer() {
         let mut d = ChannelDisplay::default();
-        d.push(vec![0x01]);
+        d.push(vec![0x01], Vec::new());
         d.clear();
-        assert_eq!(d.flow_text(), "");
+        assert_eq!(d.rendered().0, "");
     }
 
     #[test]
-    fn flow_text_follows_the_current_mode() {
+    fn rendered_follows_the_current_mode_and_memoizes() {
         let mut d = ChannelDisplay {
             mode: DisplayMode::Hex,
             ..Default::default()
         };
-        d.push(vec![0x41, 0x42]);
-        assert_eq!(d.flow_text(), "41 42");
-        // A view change re-renders in the new mode…
+        d.push(vec![0x41, 0x42], Vec::new());
+        assert_eq!(d.rendered().0, "41 42");
+        // A view change invalidates the cache…
         d.mode = DisplayMode::Raw;
-        assert_eq!(d.flow_text(), "AB");
-        // …and a new payload flows on verbatim (no synthesized break).
-        d.push(vec![0x43]);
-        assert_eq!(d.flow_text(), "ABC");
-    }
-
-    // ── Virtualization rows ───────────────────────────────────────────────────
-
-    #[test]
-    fn split_rows_hard_breaks_on_newlines() {
-        // Real newlines in the data become row boundaries; short lines are one
-        // row each; an empty line is a blank row.
-        assert_eq!(
-            split_rows("ab\n\ncd", 80),
-            vec!["ab".to_string(), String::new(), "cd".to_string()]
-        );
+        assert_eq!(d.rendered().0, "AB");
+        // …and a new payload does too.
+        d.push(vec![0x43], Vec::new());
+        assert_eq!(d.rendered().0, "ABC");
     }
 
     #[test]
-    fn split_rows_soft_wraps_long_lines() {
-        // A line longer than the column count wraps into uniform rows (the
-        // column floor is 8).
-        assert_eq!(
-            split_rows("abcdefghij", 8),
-            vec!["abcdefgh".to_string(), "ij".to_string()]
-        );
-        // An unbroken run with no newline (e.g. a hex byte stream) wraps too.
-        assert_eq!(split_rows(&"x".repeat(20), 8).len(), 3); // 8 + 8 + 4
+    fn new_channel_has_an_explicit_ctrl_character_style() {
+        let display = ChannelDisplay::default();
+        assert_eq!(display.mode, DisplayMode::Rendered);
+        assert_eq!(display.control_style, ControlStyle::Pictures);
     }
 
     #[test]
-    fn split_rows_never_splits_a_multibyte_codepoint() {
-        // 9 'é's = 18 UTF-8 bytes. Char-based wrapping at 8 columns yields
-        // 8 + 1 whole chars; byte-based wrapping at 8 would have cut the 4th 'é'.
-        let rows = split_rows(&"é".repeat(9), 8);
-        assert_eq!(rows, vec!["é".repeat(8), "é".to_string()]);
-        assert!(rows
-            .iter()
-            .all(|r| std::str::from_utf8(r.as_bytes()).is_ok()));
+    fn output_tracks_only_fallback_question_marks_in_every_view() {
+        let mut display = ChannelDisplay::default();
+        display.push(b"?A?".to_vec(), vec![2]);
+
+        let (text, ranges) = display.rendered();
+        assert_eq!(text, "?A?");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 2..3);
+
+        display.mode = DisplayMode::Raw;
+        let (text, ranges) = display.rendered();
+        assert_eq!(text, "?A?");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 2..3);
+
+        display.mode = DisplayMode::Hex;
+        let (text, ranges) = display.rendered();
+        assert_eq!(text, "3F 41 3F");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 6..8);
     }
 
     #[test]
-    fn rows_rejoin_to_the_flow_when_nothing_soft_wraps() {
-        // At a width wide enough that no line exceeds it, the rows are exactly
-        // the flow's newline-separated lines — the split adds no content. A
-        // real '\n' in the data (Rendered mode honors it) is the row boundary.
-        let mut d = ChannelDisplay {
-            mode: DisplayMode::Rendered,
-            ..Default::default()
-        };
-        d.push(b"AB\n".to_vec());
-        d.push(b"CD".to_vec());
-        let flow = d.flow_text();
-        assert_eq!(flow, "AB\nCD");
-        let rows = d.rows(200).to_vec();
-        assert_eq!(rows, vec!["AB".to_string(), "CD".to_string()]);
-        assert_eq!(rows.join("\n"), flow);
+    fn output_rejects_invalid_replacement_metadata() {
+        let mut display = ChannelDisplay::default();
+        display.push(b"A?".to_vec(), vec![0, 1, 1, 99]);
+        let (text, ranges) = display.rendered();
+        assert_eq!(text, "A?");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 1..2);
     }
 
     #[test]
@@ -444,20 +494,7 @@ mod tests {
         assert_eq!(d.sampling_badge_at(false, 0.0, t2), None);
         // A fresh above-cadence reading re-latches with the new rate.
         assert_eq!(d.sampling_badge_at(true, 300.0, t2), Some(300.0));
-    }
-
-    #[test]
-    fn rows_rebuild_on_content_and_width_change() {
-        let mut d = ChannelDisplay {
-            mode: DisplayMode::Hex,
-            ..Default::default()
-        };
-        d.push(vec![0x41, 0x42, 0x43, 0x44]); // "41 42 43 44" (11 chars)
-        assert_eq!(d.rows(80), &["41 42 43 44".to_string()]);
-        // A narrow pane (the 8-column floor) re-wraps the same content…
-        assert_eq!(d.rows(8), &["41 42 43".to_string(), " 44".to_string()]);
-        // …and a new send changes the rows.
-        d.push(vec![0x45]);
-        assert_eq!(d.rows(80), &["41 42 43 44 45".to_string()]);
+        d.reset_run_state();
+        assert_eq!(d.sampling_badge_at(false, 0.0, t2), None);
     }
 }

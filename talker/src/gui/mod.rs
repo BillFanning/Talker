@@ -17,7 +17,7 @@ use crate::core::{
     profile::Profile,
     runner,
     scheduler::Schedule,
-    supervisor::{CommandCompletion, CommandEffect, TalkerSupervisor},
+    supervisor::TalkerSupervisor,
 };
 
 use display::ChannelDisplay;
@@ -441,28 +441,33 @@ impl TalkerApp {
     ///   to apply — the scheduler is compiled at channel open time and
     ///   can't be hot-swapped today.
     fn detect_drift(&self, i: usize) -> (bool, bool) {
-        let Some(applied) = self.profile.channels.get(i) else {
-            return (false, false);
-        };
-        let iface_drift = self.conn_drafts[i].to_config().is_some_and(|cfg| {
-            if self.sup.is_running(i) {
-                // Runtime truth comes only from the runner's reliable open/update
-                // result. The profile is desired/persisted state and can change on
-                // Save while a failed live update leaves the old interface active.
-                self.sup
-                    .applied_interface(i)
-                    .is_none_or(|live| cfg != *live)
-            } else {
-                cfg != applied.interface
-            }
-        });
-        let draft_messages: Vec<_> = self
+        let draft_interface = self.conn_drafts.get(i).and_then(ConnDraft::to_config);
+        let draft_messages: Option<Vec<_>> = self
             .sched_drafts
             .get(i)
-            .map(|s| s.iter().filter_map(|d| d.to_message_config()).collect())
+            .map(|s| s.iter().map(ScheduleDraft::to_message_config).collect())
             .unwrap_or_default();
-        let msg_drift = draft_messages != applied.messages;
-        (iface_drift, msg_drift)
+
+        if self.sup.is_running(i) {
+            // Interface and schedule are one runner-confirmed fact. Until open
+            // succeeds there is no applied baseline, so valid drafts remain
+            // visibly pending instead of being inferred from spawn intent.
+            let Some(applied) = self.sup.applied_run_config(i) else {
+                return (draft_interface.is_some(), draft_messages.is_some());
+            };
+            return (
+                draft_interface.as_ref() != Some(&applied.interface),
+                draft_messages.as_ref() != Some(&applied.messages),
+            );
+        }
+
+        let Some(profile) = self.profile.channels.get(i) else {
+            return (false, false);
+        };
+        (
+            draft_interface.as_ref() != Some(&profile.interface),
+            draft_messages.as_ref() != Some(&profile.messages),
+        )
     }
 
     fn refresh_serial_ports(&mut self) {
@@ -706,24 +711,13 @@ impl TalkerApp {
         if let Some(id) = self.sup.channel_id(i) {
             self.log_counts.remove(&id);
         }
-        self.sup.start(i, label, cfg, schedule);
-
-        // A restart (Apply & Restart) applies this channel's message drafts
-        // wholesale — the schedule just compiled and started IS what runs. Fold
-        // those messages into the profile baseline so message drift clears and
-        // the button reverts from "Apply & Restart" to a greyed "Start Channel".
-        // Without this, any message edit — an interval change that missed the
-        // live `set_interval` path, or an add/remove that has no live path at
-        // all — left the channel reading as permanently drifted after Apply &
-        // Restart, because nothing else updates the baseline for structural
-        // message changes. (The interface baseline is reconciled separately from
-        // the runner's confirmed open — ADR-021 — since a *live* interface
-        // update can fail where a whole-schedule restart cannot partially apply.)
-        // Only channel `i` is touched, so an invalid *other* channel can't shift
-        // indices (the round-2 flush bug).
-        if let Some(applied) = self.profile.channels.get_mut(i) {
-            applied.messages = messages;
+        if let Some(rate) = self.rates.get_mut(i) {
+            *rate = RateTracker::new();
         }
+        if let Some(display) = self.displays.get_mut(i) {
+            display.reset_run_state();
+        }
+        self.sup.start(i, label, cfg, messages, schedule);
     }
 
     /// Stop channel `i` without blocking the UI (the supervisor parks the
@@ -804,34 +798,6 @@ impl TalkerApp {
         self.dirty = true;
     }
 
-    /// Fold reliable runner command completions into the profile's last-applied
-    /// baseline. A failed command leaves that baseline untouched, so drift and the
-    /// error banner continue to state that the draft is not live.
-    fn apply_command_completions(&mut self) {
-        for completion in self.sup.take_command_completions() {
-            let CommandCompletion::Applied {
-                channel, effect, ..
-            } = completion
-            else {
-                continue;
-            };
-            let Some(i) = self.sup.slot_index(channel) else {
-                continue;
-            };
-            let Some(applied) = self.profile.channels.get_mut(i) else {
-                continue;
-            };
-            match effect {
-                CommandEffect::Interface(config) => applied.interface = config,
-                CommandEffect::MessageInterval { index, interval_ms } => {
-                    if let Some(message) = applied.messages.get_mut(index) {
-                        message.interval_ms = interval_ms;
-                    }
-                }
-            }
-        }
-    }
-
     // ── Channel polling ───────────────────────────────────────────────────────
 
     fn poll_channels(&mut self, ctx: &egui::Context) {
@@ -886,10 +852,13 @@ impl TalkerApp {
         // payloads into the Output panes.
         for sample in self.sup.poll() {
             if let Some(d) = self.displays.get_mut(sample.slot) {
-                d.push(sample.payload);
+                d.push(sample.payload, sample.replacement_wire_offsets);
             }
         }
-        self.apply_command_completions();
+        // The supervisor has already reconciled applied runtime state and
+        // telemetry. The GUI currently needs no per-completion animation, but
+        // drains the public completion feed so it stays bounded.
+        let _ = self.sup.take_command_completions();
 
         // Refresh the per-channel send-rate samples (~1 s window).
         let now = Instant::now();

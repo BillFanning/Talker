@@ -5,17 +5,17 @@
 
 use egui::{Align, Layout};
 
-use crate::core::message::NmeaChecksumMode;
+use crate::core::message::{code_page_replacements, NmeaChecksumMode};
 
 use wiredata_ui::{fonts::bold, format::human_bytes, glyphs};
 
 use super::draft::{ConnKind, PayloadKind, ScheduleDraft};
 use super::widgets::{
     checksum_label, code_page_label, hex_valid, invalid_parse, lifecycle_indicator,
-    marker_aware_text_edit, plain_text_edit_with_cursor, preview_ascii, preview_text, red_bordered,
-    show_display_pane, show_insert_byte_button, show_insert_unit_button, show_interface_summary,
-    show_serial_fields, show_tcp_fields, show_udp_fields, start_blockers, start_button,
-    theme_palette, UppercaseHex,
+    marker_aware_text_edit, message_editor_max_height, plain_text_edit_with_cursor,
+    preview_ascii_layout_job, preview_text, red_bordered, show_display_pane,
+    show_insert_byte_button, show_insert_unit_button, show_interface_summary, show_serial_fields,
+    show_tcp_fields, show_udp_fields, start_blockers, start_button, theme_palette, UppercaseHex,
 };
 use super::TalkerApp;
 
@@ -49,7 +49,7 @@ impl TalkerApp {
 
     /// The detail header, laid out like listener's channel block so the two
     /// apps read as one product: name row (status glyph · name · label ·
-    /// kind), a `status · interface` row, sent totals + throughput, the
+    /// kind), a `status · interface` row, sent/unsent totals, throughput, the
     /// performance readouts for high-rate health, and the lifecycle button
     /// pair. Channel removal lives on the channel-list rows (the ✕ overlay),
     /// as in listener.
@@ -134,8 +134,7 @@ impl TalkerApp {
 
         // ── Wire facts: what actually went out, how fast, and the cadence
         // shortfall — grouped together because they are all about the wire.
-        // Sent totals + rolling throughput (listener's byte-based liveness line,
-        // plus talker's message-count view of the same traffic).
+        // Sent and unsent totals share the primary wire-accounting line.
         let msgs = telemetry.total_count;
         let bytes = telemetry.total_bytes;
         let (mps, bps) = self
@@ -143,34 +142,42 @@ impl TalkerApp {
             .get(i)
             .map(|r| (r.per_sec, r.bytes_per_sec))
             .unwrap_or((0.0, 0.0));
-        ui.label(format!(
-            "Sent: {} · {msgs} msgs    Throughput: {:.1} kB/s · {:.1} msg/s",
-            human_bytes(bytes),
-            bps / 1000.0,
-            mps
-        ));
-        // Missed sends sits with Sent/throughput (not with the observer queue
-        // below): it is a wire fact — the cadence shortfall. Expressed as a
-        // share of total attempts (attempts = sent + missed), so it reads
-        // directly against what was sent and against the throughput: N% missed
-        // means the channel is holding ~(100−N)% of its configured rate.
         let missed = telemetry.missed_sends;
-        let attempts = msgs + missed;
-        let missed_pct = if attempts > 0 {
-            missed as f64 / attempts as f64 * 100.0
+        let failed = telemetry.failed_sends;
+        let suppressed = telemetry.suppressed_sends;
+        let unsent = missed.saturating_add(failed).saturating_add(suppressed);
+        let scheduled = msgs.saturating_add(unsent);
+        let unsent_pct = if scheduled > 0 {
+            unsent as f64 / scheduled as f64 * 100.0
         } else {
             0.0
         };
+        let unsent_tip = format!(
+            "Scheduled sends that did not reach the wire: {failed} interface \
+                 attempts failed, {suppressed} due fires were suppressed during \
+                 retry backoff, and {missed} cadence points were skipped after a \
+                 stall or machine sleep. Sent + these three cumulative outcomes \
+                 equals the scheduled total shown here."
+        );
+        ui.horizontal(|ui| {
+            ui.label(format!("Sent: {} · {msgs} msgs", human_bytes(bytes)));
+            let unsent_text = egui::RichText::new(format!(
+                "Unsent: {unsent} ({unsent_pct:.1}% of {scheduled} scheduled)"
+            ));
+            ui.label(if unsent > 0 {
+                unsent_text.color(pal.warning_amber)
+            } else {
+                unsent_text
+            })
+            .on_hover_text(&unsent_tip);
+        });
+
+        // Rolling throughput now occupies the secondary wire-health line.
         perf_line(
             ui,
-            format!("Missed sends: {missed}  ({missed_pct:.1}% of {attempts} attempts)"),
-            missed > 0,
-            "Sends skipped to stay on cadence after a stall — an interface send \
-             blocking longer than the message interval, or machine sleep. The \
-             scheduler fires once, then jumps to the next future grid point. \
-             attempts = sent + missed; a nonzero share means the channel can't \
-             keep its configured rate, so the throughput above is running at \
-             roughly (100 − share)% of target.",
+            format!("Throughput: {:.1} kB/s · {:.1} msg/s", bps / 1000.0, mps),
+            false,
+            "Rolling observed rate calculated from cumulative successful sends.",
         );
 
         // ── Observer-path health: the runner→UI queue. A separate subsystem
@@ -485,6 +492,24 @@ fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     }
 }
 
+/// Fill a grid cell's known row height while placing its contents at the top.
+/// egui grids otherwise center every cell vertically, which is undesirable for
+/// the multiline text rows.
+fn top_aligned_grid_cell<R>(
+    ui: &mut egui::Ui,
+    height: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.scope_builder(
+        egui::UiBuilder::new().layout(egui::Layout::left_to_right(egui::Align::Min)),
+        |ui| {
+            ui.set_min_height(height);
+            add_contents(ui)
+        },
+    )
+    .inner
+}
+
 fn show_hex_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     let bad_hex = !entry.hex_data.is_empty() && !hex_valid(&entry.hex_data);
     ui.label("Data (hex)");
@@ -505,12 +530,14 @@ fn show_hex_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
 }
 
 fn show_utf8_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
-    ui.label("Text");
-    ui.horizontal(|ui| {
+    let row_height = message_editor_max_height(ui, &entry.utf8_text);
+    top_aligned_grid_cell(ui, row_height, |ui| ui.label("Text"));
+    top_aligned_grid_cell(ui, row_height, |ui| {
         marker_aware_text_edit(
             ui,
             &mut entry.utf8_text,
             "payload_utf8",
+            None,
             300.0,
             "Unicode text",
         );
@@ -525,8 +552,9 @@ fn show_utf8_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
 }
 
 fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
-    ui.label("Text");
-    ui.horizontal(|ui| {
+    let row_height = message_editor_max_height(ui, &entry.utf16_text);
+    top_aligned_grid_cell(ui, row_height, |ui| ui.label("Text"));
+    top_aligned_grid_cell(ui, row_height, |ui| {
         // Two editor modes, chosen by `Allow raw bytes`:
         //   off — plain Unicode editor (what you see is what gets
         //         encoded). Insert Code Unit inserts the decoded
@@ -539,6 +567,7 @@ fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                 ui,
                 &mut entry.utf16_text,
                 "payload_utf16",
+                None,
                 300.0,
                 "Unicode text",
             );
@@ -584,9 +613,17 @@ fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
 }
 
 fn show_ascii_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
-    ui.label("Text");
-    ui.horizontal(|ui| {
-        marker_aware_text_edit(ui, &mut entry.ascii_text, "payload_ascii", 300.0, "text");
+    let row_height = message_editor_max_height(ui, &entry.ascii_text);
+    top_aligned_grid_cell(ui, row_height, |ui| ui.label("Text"));
+    top_aligned_grid_cell(ui, row_height, |ui| {
+        marker_aware_text_edit(
+            ui,
+            &mut entry.ascii_text,
+            "payload_ascii",
+            Some(entry.ascii_code_page),
+            300.0,
+            "text",
+        );
         show_insert_byte_button(
             ui,
             &mut entry.ascii_text,
@@ -596,18 +633,38 @@ fn show_ascii_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
     });
     ui.end_row();
     ui.label("Code page");
-    egui::ComboBox::from_id_salt("code_page")
-        .selected_text(code_page_label(entry.ascii_code_page))
-        .show_ui(ui, |ui| {
-            for cp in [
-                crate::core::message::CodePage::Iso8859_1,
-                crate::core::message::CodePage::Windows1252,
-                crate::core::message::CodePage::Cp437,
-                crate::core::message::CodePage::MacRoman,
-            ] {
-                ui.selectable_value(&mut entry.ascii_code_page, cp, code_page_label(cp));
-            }
-        });
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("code_page")
+            .selected_text(code_page_label(entry.ascii_code_page))
+            .show_ui(ui, |ui| {
+                for cp in [
+                    crate::core::message::CodePage::Iso8859_1,
+                    crate::core::message::CodePage::Windows1252,
+                    crate::core::message::CodePage::Cp437,
+                    crate::core::message::CodePage::MacRoman,
+                ] {
+                    ui.selectable_value(&mut entry.ascii_code_page, cp, code_page_label(cp));
+                }
+            });
+        if let Some(summary) = code_page_replacements(&entry.ascii_text, entry.ascii_code_page) {
+            let characters = summary
+                .characters
+                .iter()
+                .map(|c| format!("'{c}' (U+{:04X})", *c as u32))
+                .collect::<Vec<_>>()
+                .join(", ");
+            ui.colored_label(
+                theme_palette(ui).warning_amber,
+                format!("{} replaced with ?; use UTF-8", summary.count),
+            )
+            .on_hover_text(format!(
+                "{} cannot represent: {characters}. Each occurrence will be sent as '?' \
+                 (0x3F). Switch the message Format to UTF-8 (recommended) or UTF-16, \
+                 or insert exact bytes when substitution is not appropriate.",
+                code_page_label(entry.ascii_code_page)
+            ));
+        }
+    });
     ui.end_row();
 }
 
@@ -846,27 +903,64 @@ fn show_message_preview(ui: &mut egui::Ui, entry: &ScheduleDraft) {
                  reference instant so the value doesn't tick — the \
                  actual send uses the wall clock.",
         );
-        let text = match entry.to_message_config().and_then(|m| m.compile().ok()) {
-            Some(compiled) => {
-                let bytes = compiled.render_at(reference);
-                match entry.payload_kind {
-                    // ASCII previews through the message's code page,
-                    // so the user sees what a receiver decoding via
-                    // the same code page would render: byte `0xE9` is
-                    // `é` in ISO-8859-1, `Θ` in CP437, `È` in Mac
-                    // Roman, etc.
-                    PayloadKind::Ascii => preview_ascii(&bytes, entry.ascii_code_page),
-                    PayloadKind::Utf8 | PayloadKind::Nmea => preview_text(&bytes),
-                    PayloadKind::Hex | PayloadKind::Utf16 => bytes
-                        .iter()
-                        .map(|b| format!("{b:02X}"))
-                        .collect::<Vec<_>>()
-                        .join(" "),
+        let preview: egui::WidgetText = match entry.to_message_config() {
+            Some(config) => match config.compile() {
+                Ok(compiled) => {
+                    let timestamp_len = config
+                        .timestamp
+                        .as_ref()
+                        .map(|timestamp| timestamp.format(reference).len())
+                        .unwrap_or(0);
+                    let bytes = compiled.render_at(reference);
+                    match entry.payload_kind {
+                        // ASCII previews through the message's code page,
+                        // so the user sees what a receiver decoding via
+                        // the same code page would render: byte `0xE9` is
+                        // `é` in ISO-8859-1, `Θ` in CP437, `È` in Mac
+                        // Roman, etc. Only lossy fallback bytes receive
+                        // warning backgrounds; literal `?` bytes do not.
+                        PayloadKind::Ascii => {
+                            let replacement_offsets =
+                                code_page_replacements(&entry.ascii_text, entry.ascii_code_page)
+                                    .map(|summary| {
+                                        summary
+                                            .payload_offsets
+                                            .into_iter()
+                                            .map(|offset| timestamp_len + offset)
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+                            preview_ascii_layout_job(
+                                ui,
+                                &bytes,
+                                entry.ascii_code_page,
+                                &replacement_offsets,
+                            )
+                            .into()
+                        }
+                        PayloadKind::Utf8 | PayloadKind::Nmea => {
+                            egui::RichText::new(preview_text(&bytes)).monospace().into()
+                        }
+                        PayloadKind::Hex | PayloadKind::Utf16 => egui::RichText::new(
+                            bytes
+                                .iter()
+                                .map(|b| format!("{b:02X}"))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        )
+                        .monospace()
+                        .into(),
+                    }
                 }
-            }
-            None => "(message is incomplete)".to_string(),
+                Err(_) => egui::RichText::new("(message is incomplete)")
+                    .monospace()
+                    .into(),
+            },
+            None => egui::RichText::new("(message is incomplete)")
+                .monospace()
+                .into(),
         };
-        ui.label(egui::RichText::new(text).monospace());
+        ui.label(preview);
     });
 }
 
@@ -972,4 +1066,32 @@ fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             ui.checkbox(&mut entry.checksum_wrong, "Intentionally wrong");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::top_aligned_grid_cell;
+
+    #[test]
+    fn multiline_grid_cells_share_the_same_top_edge() {
+        let mut measured_tops = None;
+        egui::__run_test_ui(|ui| {
+            egui::Grid::new("top_aligned_grid_test")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    let label = top_aligned_grid_cell(ui, 80.0, |ui| ui.label("Text"));
+                    let editor = top_aligned_grid_cell(ui, 80.0, |ui| {
+                        ui.allocate_response(egui::vec2(300.0, 60.0), egui::Sense::hover())
+                    });
+                    ui.end_row();
+                    measured_tops = Some((label.rect.top(), editor.rect.top()));
+                });
+        });
+
+        let (label_top, editor_top) = measured_tops.expect("grid contents should be measured");
+        assert!(
+            (label_top - editor_top).abs() <= 0.5,
+            "label top {label_top} did not align with editor top {editor_top}"
+        );
+    }
 }

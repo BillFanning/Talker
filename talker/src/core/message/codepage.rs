@@ -25,33 +25,13 @@ pub enum CodePage {
 
 /// Encode `text` into bytes using `code_page`.
 ///
-/// On failure, the error lists *every* distinct character the code page
-/// cannot represent — not just the first — so a user fixing the text
-/// doesn't have to recompile after each individual character.
-pub(super) fn encode(text: &str, code_page: CodePage) -> anyhow::Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len());
-    let mut bad: std::collections::BTreeSet<char> = std::collections::BTreeSet::new();
-    for c in text.chars() {
-        match encode_char(c, code_page) {
-            Some(b) => out.push(b),
-            None => {
-                bad.insert(c);
-            }
-        }
-    }
-    if bad.is_empty() {
-        return Ok(out);
-    }
-    let list: Vec<String> = bad
-        .iter()
-        .map(|c| format!("'{c}' (U+{:04X})", *c as u32))
-        .collect();
-    anyhow::bail!(
-        "{} character{} not representable in code page {code_page:?}: {}",
-        bad.len(),
-        if bad.len() == 1 { "" } else { "s" },
-        list.join(", ")
-    )
+/// A Unicode scalar that the selected single-byte code page cannot represent
+/// becomes `?` (`0x3F`), the conventional lossy-encoding fallback. Callers
+/// surface replacements before sending via [`encode_char`].
+pub(super) fn encode(text: &str, code_page: CodePage) -> Vec<u8> {
+    text.chars()
+        .map(|c| encode_char(c, code_page).unwrap_or(b'?'))
+        .collect()
 }
 
 /// Decode one byte through `code_page`. Inverse of [`encode_char`].
@@ -85,7 +65,7 @@ fn decode_windows1252(b: u8) -> char {
         .map_or('\u{FFFD}', |&(_, c)| c)
 }
 
-fn encode_char(c: char, code_page: CodePage) -> Option<u8> {
+pub(super) fn encode_char(c: char, code_page: CodePage) -> Option<u8> {
     let cp = c as u32;
     if cp < 0x80 {
         return Some(cp as u8);
@@ -187,66 +167,51 @@ mod tests {
             CodePage::Cp437,
             CodePage::MacRoman,
         ] {
-            assert_eq!(encode("Hello, world!", cp).unwrap(), b"Hello, world!");
+            assert_eq!(encode("Hello, world!", cp), b"Hello, world!");
         }
     }
 
     #[test]
     fn iso8859_1_maps_latin1_directly() {
         // é = U+00E9 -> 0xE9; ÿ = U+00FF -> 0xFF
-        assert_eq!(encode("é", CodePage::Iso8859_1).unwrap(), vec![0xE9]);
-        assert_eq!(encode("ÿ", CodePage::Iso8859_1).unwrap(), vec![0xFF]);
+        assert_eq!(encode("é", CodePage::Iso8859_1), vec![0xE9]);
+        assert_eq!(encode("ÿ", CodePage::Iso8859_1), vec![0xFF]);
     }
 
     #[test]
-    fn iso8859_1_rejects_non_latin1() {
-        // Euro sign is not in Latin-1.
-        assert!(encode("€", CodePage::Iso8859_1).is_err());
+    fn iso8859_1_replaces_non_latin1() {
+        // Euro sign is not in Latin-1, so it uses the conventional fallback.
+        assert_eq!(encode("€", CodePage::Iso8859_1), b"?");
     }
 
     #[test]
     fn windows1252_special_and_latin1_ranges() {
-        assert_eq!(encode("€", CodePage::Windows1252).unwrap(), vec![0x80]);
-        assert_eq!(encode("™", CodePage::Windows1252).unwrap(), vec![0x99]);
-        assert_eq!(encode("Ÿ", CodePage::Windows1252).unwrap(), vec![0x9F]);
+        assert_eq!(encode("€", CodePage::Windows1252), vec![0x80]);
+        assert_eq!(encode("™", CodePage::Windows1252), vec![0x99]);
+        assert_eq!(encode("Ÿ", CodePage::Windows1252), vec![0x9F]);
         // 0xA0..0xFF identical to Latin-1
-        assert_eq!(encode("é", CodePage::Windows1252).unwrap(), vec![0xE9]);
+        assert_eq!(encode("é", CodePage::Windows1252), vec![0xE9]);
     }
 
     #[test]
     fn cp437_known_mappings() {
-        assert_eq!(encode("Ç", CodePage::Cp437).unwrap(), vec![0x80]);
-        assert_eq!(encode("ƒ", CodePage::Cp437).unwrap(), vec![0x9F]);
-        assert_eq!(encode("░", CodePage::Cp437).unwrap(), vec![0xB0]);
-        assert_eq!(encode("√", CodePage::Cp437).unwrap(), vec![0xFB]);
+        assert_eq!(encode("Ç", CodePage::Cp437), vec![0x80]);
+        assert_eq!(encode("ƒ", CodePage::Cp437), vec![0x9F]);
+        assert_eq!(encode("░", CodePage::Cp437), vec![0xB0]);
+        assert_eq!(encode("√", CodePage::Cp437), vec![0xFB]);
     }
 
     #[test]
     fn mac_roman_known_mappings() {
-        assert_eq!(encode("Ä", CodePage::MacRoman).unwrap(), vec![0x80]);
-        assert_eq!(encode("†", CodePage::MacRoman).unwrap(), vec![0xA0]);
-        assert_eq!(encode("€", CodePage::MacRoman).unwrap(), vec![0xDB]);
-        assert_eq!(encode("ˇ", CodePage::MacRoman).unwrap(), vec![0xFF]);
+        assert_eq!(encode("Ä", CodePage::MacRoman), vec![0x80]);
+        assert_eq!(encode("†", CodePage::MacRoman), vec![0xA0]);
+        assert_eq!(encode("€", CodePage::MacRoman), vec![0xDB]);
+        assert_eq!(encode("ˇ", CodePage::MacRoman), vec![0xFF]);
     }
 
     #[test]
-    fn unrepresentable_character_is_an_error() {
-        let err = encode("中", CodePage::Cp437).unwrap_err();
-        assert!(err.to_string().contains("not representable"));
-    }
-
-    #[test]
-    fn error_lists_all_distinct_bad_characters() {
-        // Three different unrepresentable chars (plus a dupe), interleaved
-        // with representable ones — the error should mention all three
-        // distinct ones, deduped.
-        let err = encode("a中b中c日d月", CodePage::Cp437).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("中"), "{msg}");
-        assert!(msg.contains("日"), "{msg}");
-        assert!(msg.contains("月"), "{msg}");
-        // Should be reported as 3 chars, not 4 (中 was deduped).
-        assert!(msg.contains("3 characters"), "{msg}");
+    fn each_unrepresentable_scalar_becomes_one_question_mark() {
+        assert_eq!(encode("a中b中c日d月", CodePage::Cp437), b"a?b?c?d?");
     }
 
     /// Every byte 0x80..=0xFF in CP437 and Mac Roman round-trips, and each
@@ -297,7 +262,7 @@ mod tests {
         for b in 0x80u8..=0xFF {
             let mut s = String::new();
             s.push(decode_byte(b, CodePage::Cp437));
-            assert_eq!(encode(&s, CodePage::Cp437).unwrap(), vec![b]);
+            assert_eq!(encode(&s, CodePage::Cp437), vec![b]);
         }
     }
 

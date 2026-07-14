@@ -22,6 +22,14 @@ pub struct TimestampConfig {
 }
 
 impl TimestampConfig {
+    /// Number of ASCII bytes produced by [`Self::format`]. All timestamp
+    /// components are fixed-width, so this is independent of the instant.
+    pub(crate) const fn wire_len(&self) -> usize {
+        8 + if self.include_date { 11 } else { 0 }
+            + if self.include_millis { 4 } else { 0 }
+            + if self.include_timezone { 1 } else { 0 }
+    }
+
     /// Format `now` (UTC) as an ISO 8601 timestamp per this configuration.
     pub fn format(&self, now: DateTime<Utc>) -> String {
         let mut s = String::new();
@@ -85,5 +93,21 @@ mod tests {
     #[test]
     fn time_only_is_the_default() {
         assert_eq!(TimestampConfig::default().format(sample()), "14:30:45");
+    }
+
+    #[test]
+    fn wire_len_matches_every_formatted_shape() {
+        for include_date in [false, true] {
+            for include_millis in [false, true] {
+                for include_timezone in [false, true] {
+                    let cfg = TimestampConfig {
+                        include_date,
+                        include_millis,
+                        include_timezone,
+                    };
+                    assert_eq!(cfg.wire_len(), cfg.format(sample()).len());
+                }
+            }
+        }
     }
 }

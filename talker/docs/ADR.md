@@ -491,7 +491,8 @@ that `open` succeeded. A successful interface update replaces the supervisor's
 applied-interface baseline; a failed update leaves the previous baseline intact and
 states that fact in the channel banner. Command failures are retained independently
 per target, and only a later successful command for that same target resolves one.
-The GUI commits an effect to its profile baseline only after the correlated success.
+The supervisor commits an effect to its applied-runtime baseline only after the
+correlated success; the profile remains desired/persisted state.
 
 **Consequences:**
 - Queue acceptance and runtime application are no longer conflated in APIs, comments,
@@ -505,6 +506,103 @@ The GUI commits an effect to its profile baseline only after the correlated succ
   mutate the replacement runner's applied state.
 - Tests pin failed-update retention, target-scoped error recovery, and start-time open
   confirmation.
+
+## ADR-022 — Confirm whole-run state and reconfigure owned resources in place
+
+**Status:** Accepted 2026-07-13 (post-ADR-021 reliability review).
+
+**Context:** ADR-021 confirmed only the interface at start, while message drift still
+used the profile as an ersatz applied baseline. The GUI consequently wrote message
+drafts into the profile immediately after spawning a runner, before `open` succeeded.
+The same review found two control/reopen gaps: a command accepted while the initial
+open was blocking disappeared if that open failed, and opening a replacement before
+dropping the old handle made same-port serial and explicitly bound UDP changes fail on
+exclusive resources. These contradicted both ADR-021's runtime-truth rule and spec
+§4.3's live parameter-change contract.
+
+**Decision:**
+- `TalkerSupervisor` retains the requested interface **and messages** as a pending
+  start. `InterfaceOpened` atomically promotes them to one `AppliedRunConfig`; an
+  open failure promotes nothing. GUI drift compares drafts with this confirmed whole
+  run while live and with the profile only while stopped.
+- If a live runner exits unexpectedly after accepting commands, `poll` converts every
+  remaining pending id into a scoped failed completion. An explicit stop likewise
+  fails any result that has not yet been observed and clears the applied-run state.
+  `Enqueued` therefore always reaches either `Applied` or `Failed`, including the
+  initial-open race.
+- `Interface::reconfigure` handles resources that cannot be double-opened. Same-port
+  serial settings are applied to the owned serial handle with rollback to the prior
+  settings on error. UDP changes retaining the same local bind update socket options
+  and destination in place, also with rollback. Different serial ports, different UDP
+  local ports, and TCP continue to open a replacement first and swap only on success.
+- Successful live interface and interval commands update `AppliedRunConfig` inside the
+  supervisor. They do not mutate persisted profile state.
+
+**Consequences:**
+- A failed start cannot clear interface or message drift, and Save remains an explicit
+  draft-to-profile operation rather than a side effect of runtime reconciliation.
+- Same-port serial baud/parity/etc. edits and same-bound-port UDP destination/mode
+  edits no longer fail merely because the runner correctly owns the old handle.
+- The command-result lane now covers both execution rejection and runner exit before
+  execution. Tests pin the exit race and same-bound-port UDP update.
+
+## ADR-023 — Lossy fallback for unsupported code-page text
+
+**Status:** Accepted 2026-07-13 (message-builder usability fix). The editor-geometry
+portion is superseded by ADR-024; the lossy code-page fallback remains current.
+
+**Context:** The ASCII payload editor accepts Unicode text, but a selected single-byte
+code page cannot represent every Unicode scalar. Compilation previously rejected the
+entire schedule when pasted text contained typographic punctuation, arrows, emoji, or
+other unsupported characters. The same marker-aware editor also supplied a wrapping
+layout job to an egui `TextEdit::singleline`; long messages therefore grew into many
+visual rows and displaced neighboring controls.
+
+**Decision:** Each character unsupported by the selected code page encodes as ASCII
+`?` (`0x3F`), one replacement byte per Unicode scalar. The GUI shows an amber count
+and UTF-8 recommendation beside the code-page selector and lists the affected
+characters on hover. Unsupported source characters and only their resulting `?`
+bytes in the wire preview and live Output pane receive a contrast-aware amber
+background; literal question marks remain unmarked. The compiled message records
+replacement byte positions once, and only the already rate-limited Output sample
+carries that small provenance list, so the send hot path never rescans source text.
+Light mode uses a pale amber background with dark text; dark mode retains the stronger
+amber background with black text. Valid `‹XX›` markers continue to emit exact bytes,
+while malformed marker syntax remains an error. The initial editor fix
+also disabled soft wrapping inside a fixed-width, single-line editor; ADR-024 replaces
+that geometry with bounded multiline editing.
+
+**Consequences:** Pasted Unicode no longer prevents a channel from starting merely
+because an ASCII code page cannot encode every character. Substitution remains
+visible before and after transmission, and users needing exact Unicode or exact
+arbitrary bytes can choose UTF-8/UTF-16 or byte markers/Hex. Tests pin the reported
+example, both-theme contrast, end-to-end Output provenance, and the visual distinction
+between fallback and literal question marks.
+
+## ADR-024 — Bounded multiline message text editors
+
+**Status:** Accepted 2026-07-13 (message-builder usability fix).
+
+**Context:** No supported legacy single-byte code page can represent the full reported
+set of typographic punctuation, arrows, and symbols. UTF-8 and UTF-16 can, but users
+also need to compose intentional line-oriented payloads in any text format. A
+single-line field concealed line feeds, while unbounded vertical growth or soft
+wrapping could again displace the channel controls around a large message.
+
+**Decision:** UTF-8 is the recommended format for preserving unrestricted Unicode;
+it remains a message format rather than an entry in the ASCII code-page selector.
+The UTF-8, UTF-16, and ASCII message editors are multiline and preserve each explicit
+line feed in the compiled payload. They never soft-wrap. Each editor grows from three
+visible rows up to eight as explicit lines are added, then scrolls vertically. A line
+wider than the viewport scrolls horizontally. Both scrollbars appear only when their
+axis overflows, and the outer editor width remains bounded so adjacent controls keep
+their space.
+
+**Consequences:** Users can see and edit line-oriented messages without allowing a
+large paste to take over the detail pane. Exact Unicode requires UTF-8 or UTF-16;
+legacy code pages retain ADR-023's visible `?` substitution. Tests pin explicit line
+feed encoding, no-soft-wrap layout, horizontal overflow, vertical growth, and the
+eight-row viewport cap for both editor variants.
 
 ---
 

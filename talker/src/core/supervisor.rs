@@ -25,6 +25,7 @@ use std::sync::Arc;
 use crossbeam_channel::{Receiver, TrySendError};
 
 use crate::core::channel::{ChannelId, InterfaceConfig};
+use crate::core::message::MessageConfig;
 use crate::core::runner::{
     self, CommandExecution, CommandId, CommandTarget, ObserverPolicy, RunnerControlStatus,
     RunnerIdentity, TalkerCommand, TalkerHandle, TalkerStatus,
@@ -66,6 +67,10 @@ pub struct ChannelTelemetry {
     pub dropped_statuses: u64,
     /// Sends skipped under the scheduler's stall policy — cadence health.
     pub missed_sends: u64,
+    /// Interface send attempts that failed.
+    pub failed_sends: u64,
+    /// Due fires intentionally suppressed while send retry backoff was active.
+    pub suppressed_sends: u64,
     /// Status-queue occupancy sampled at the last poll, and its high-water
     /// mark since the channel started.
     pub queue_len: usize,
@@ -138,6 +143,8 @@ pub struct PayloadSample {
     /// embedded stable id serves consumers outside the slot structure).
     pub slot: usize,
     pub payload: Vec<u8>,
+    /// Byte positions in `payload` produced by lossy code-page fallback.
+    pub replacement_wire_offsets: Vec<usize>,
 }
 
 /// How a command enqueue attempt went. `NotRunning` covers both "no runner in this
@@ -158,6 +165,14 @@ pub enum CommandOutcome {
 pub struct CommandSubmission {
     pub id: CommandId,
     pub outcome: CommandOutcome,
+}
+
+/// Configuration positively confirmed as owned by the live runner. Draft and
+/// profile state are intentionally separate from this runtime fact.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppliedRunConfig {
+    pub interface: InterfaceConfig,
+    pub messages: Vec<MessageConfig>,
 }
 
 /// The effect retained by the supervisor until the runner confirms execution.
@@ -217,8 +232,10 @@ struct Slot {
     handle: Option<TalkerHandle>,
     draining: Vec<DrainingRunner>,
     telemetry: ChannelTelemetry,
-    /// Interface the live runner confirmed it opened. Never inferred from drafts.
-    applied_interface: Option<InterfaceConfig>,
+    /// Whole run configuration confirmed by the runner's successful open.
+    applied_run: Option<AppliedRunConfig>,
+    /// Start request retained until `InterfaceOpened` confirms it.
+    pending_start: Option<AppliedRunConfig>,
     pending_commands: BTreeMap<CommandId, PendingCommand>,
 }
 
@@ -230,7 +247,8 @@ impl Slot {
             handle: None,
             draining: Vec::new(),
             telemetry: ChannelTelemetry::default(),
-            applied_interface: None,
+            applied_run: None,
+            pending_start: None,
             pending_commands: BTreeMap::new(),
         }
     }
@@ -298,7 +316,12 @@ impl TalkerSupervisor {
 
     /// Interface the current runner has positively confirmed open.
     pub fn applied_interface(&self, i: usize) -> Option<&InterfaceConfig> {
-        self.slots.get(i)?.applied_interface.as_ref()
+        Some(&self.slots.get(i)?.applied_run.as_ref()?.interface)
+    }
+
+    /// Whole configuration the current runner positively confirmed open.
+    pub fn applied_run_config(&self, i: usize) -> Option<&AppliedRunConfig> {
+        self.slots.get(i)?.applied_run.as_ref()
     }
 
     /// Drain reliable command completions accumulated by [`poll`](Self::poll).
@@ -363,6 +386,7 @@ impl TalkerSupervisor {
         i: usize,
         label: impl Into<String>,
         cfg: InterfaceConfig,
+        messages: Vec<MessageConfig>,
         schedule: Schedule,
     ) {
         let message_count = schedule.len();
@@ -372,6 +396,10 @@ impl TalkerSupervisor {
         };
         let label = label.into();
         slot.label = Some(label.clone());
+        slot.pending_start = Some(AppliedRunConfig {
+            interface: cfg.clone(),
+            messages,
+        });
         let who = RunnerIdentity { id: slot.id, label };
         let predecessors: Vec<_> = std::mem::take(&mut slot.draining)
             .into_iter()
@@ -418,7 +446,8 @@ impl TalkerSupervisor {
                 per_message_counts: vec![0; message_count],
                 ..ChannelTelemetry::default()
             };
-            slot.applied_interface = None;
+            slot.applied_run = None;
+            slot.pending_start = None;
             slot.pending_commands.clear();
         }
     }
@@ -445,7 +474,15 @@ impl TalkerSupervisor {
             control_rx: handle.control_rx,
             status_rx: handle.status_rx,
         });
-        slot.pending_commands.clear();
+        fail_unfinished_commands(
+            slot.id,
+            &mut slot.pending_commands,
+            &mut slot.telemetry,
+            &mut self.command_completions,
+            "the run was stopped before the command result was observed",
+        );
+        slot.pending_start = None;
+        slot.applied_run = None;
         if outcome == CommandOutcome::QueueFull {
             self.record_enqueue_failure(
                 i,
@@ -613,13 +650,22 @@ impl TalkerSupervisor {
                 drain_control_statuses(
                     &h.control_rx,
                     slot.id,
-                    &mut slot.applied_interface,
+                    &mut slot.applied_run,
+                    &mut slot.pending_start,
                     &mut slot.pending_commands,
                     &mut slot.telemetry,
                     &mut command_completions,
                 );
                 drain_statuses(i, &h.status_rx, &mut slot.telemetry, &mut samples);
                 if finished {
+                    fail_unfinished_commands(
+                        slot.id,
+                        &mut slot.pending_commands,
+                        &mut slot.telemetry,
+                        &mut command_completions,
+                        "the runner exited before executing the command",
+                    );
+                    slot.pending_start = None;
                     slot.handle = None; // runner exited on its own (open failed / disconnect)
                 }
             }
@@ -649,7 +695,8 @@ impl TalkerSupervisor {
 fn drain_control_statuses(
     control_rx: &Receiver<RunnerControlStatus>,
     slot_id: ChannelId,
-    applied_interface: &mut Option<InterfaceConfig>,
+    applied_run: &mut Option<AppliedRunConfig>,
+    pending_start: &mut Option<AppliedRunConfig>,
     pending_commands: &mut BTreeMap<CommandId, PendingCommand>,
     telemetry: &mut ChannelTelemetry,
     completions: &mut Vec<CommandCompletion>,
@@ -657,8 +704,22 @@ fn drain_control_statuses(
     for status in control_rx.try_iter() {
         match status {
             RunnerControlStatus::InterfaceOpened { channel, config } => {
-                if channel == slot_id {
-                    *applied_interface = Some(config);
+                if channel != slot_id {
+                    continue;
+                }
+                match pending_start.take() {
+                    Some(run) if run.interface == config => *applied_run = Some(run),
+                    Some(run) => {
+                        tracing::warn!(
+                            channel = channel.as_u64(),
+                            "runner opened a different interface than its pending start"
+                        );
+                        *pending_start = Some(run);
+                    }
+                    None => tracing::warn!(
+                        channel = channel.as_u64(),
+                        "runner confirmed an interface with no pending start"
+                    ),
                 }
             }
             RunnerControlStatus::CommandCompleted {
@@ -687,8 +748,17 @@ fn drain_control_statuses(
                 match execution {
                     CommandExecution::Applied => {
                         telemetry.resolve_command(id, target);
-                        if let CommandEffect::Interface(config) = &pending.effect {
-                            *applied_interface = Some(config.clone());
+                        if let Some(run) = applied_run.as_mut() {
+                            match &pending.effect {
+                                CommandEffect::Interface(config) => {
+                                    run.interface = config.clone();
+                                }
+                                CommandEffect::MessageInterval { index, interval_ms } => {
+                                    if let Some(message) = run.messages.get_mut(*index) {
+                                        message.interval_ms = *interval_ms;
+                                    }
+                                }
+                            }
                         }
                         completions.push(CommandCompletion::Applied {
                             channel,
@@ -699,7 +769,7 @@ fn drain_control_statuses(
                     CommandExecution::Failed(message) => {
                         let message = match target {
                             CommandTarget::Interface => format!(
-                                "interface update failed; the previous interface remains active: {message}"
+                                "interface update failed; the existing interface handle was retained: {message}"
                             ),
                             CommandTarget::MessageInterval(index) => {
                                 format!("message {index} interval update failed: {message}")
@@ -720,6 +790,32 @@ fn drain_control_statuses(
     }
 }
 
+fn fail_unfinished_commands(
+    channel: ChannelId,
+    pending_commands: &mut BTreeMap<CommandId, PendingCommand>,
+    telemetry: &mut ChannelTelemetry,
+    completions: &mut Vec<CommandCompletion>,
+    reason: &str,
+) {
+    for (id, pending) in std::mem::take(pending_commands) {
+        let target = pending.effect.target();
+        let message = match target {
+            CommandTarget::Interface => format!("interface update did not complete: {reason}"),
+            CommandTarget::MessageInterval(index) => {
+                format!("message {index} interval update did not complete: {reason}")
+            }
+            CommandTarget::Stop => format!("stop command did not complete: {reason}"),
+        };
+        telemetry.record_command_failure(id, target, message.clone());
+        completions.push(CommandCompletion::Failed {
+            channel,
+            id,
+            target,
+            message,
+        });
+    }
+}
+
 /// Fold one receiver's pending statuses into `telemetry`, collecting payload
 /// samples tagged with the slot the receiver currently occupies. Shared by
 /// the live and draining paths.
@@ -737,6 +833,8 @@ fn drain_statuses(
                 per_message_counts,
                 dropped_statuses,
                 missed_sends,
+                failed_sends,
+                suppressed_sends,
                 ..
             } => {
                 telemetry.total_count = total_count;
@@ -744,13 +842,23 @@ fn drain_statuses(
                 telemetry.per_message_counts = per_message_counts;
                 telemetry.dropped_statuses = dropped_statuses;
                 telemetry.missed_sends = missed_sends;
+                telemetry.failed_sends = failed_sends;
+                telemetry.suppressed_sends = suppressed_sends;
             }
-            TalkerStatus::SendSample { payload, .. } => {
+            TalkerStatus::SendSample {
+                payload,
+                replacement_wire_offsets,
+                ..
+            } => {
                 // Live proof of a working interface: clear the banner. During
                 // a failing episode sends are suppressed, so no samples
                 // arrive and the banner correctly persists.
                 telemetry.last_error = None;
-                samples.push(PayloadSample { slot, payload });
+                samples.push(PayloadSample {
+                    slot,
+                    payload,
+                    replacement_wire_offsets,
+                });
             }
             TalkerStatus::ConnectionError { message, .. }
             | TalkerStatus::OpenFailed { message, .. } => {
@@ -803,6 +911,7 @@ mod tests {
             runner::run(
                 who,
                 interface,
+                None,
                 schedule,
                 cmd_rx,
                 runner::RunnerObserver::new(status_tx, policy).with_control(control_tx),
@@ -944,7 +1053,10 @@ mod tests {
         let original = InterfaceConfig::Udp(UdpConfig::unicast(
             "127.0.0.1:9".parse().expect("socket address"),
         ));
-        sup.slots[0].applied_interface = Some(original.clone());
+        sup.slots[0].applied_run = Some(AppliedRunConfig {
+            interface: original.clone(),
+            messages: vec![msg("AB", 20)],
+        });
 
         let refused = InterfaceConfig::TcpClient(TcpClientConfig::new(
             "127.0.0.1:1".parse().expect("socket address"),
@@ -972,18 +1084,22 @@ mod tests {
 
         // A healthy old interface and an unrelated successful interval command
         // say nothing about the failed reopen; neither may clear its banner.
-        let interval = sup.set_interval(0, 0, 20);
+        let interval = sup.set_interval(0, 0, 35);
         assert_eq!(interval.outcome, CommandOutcome::Enqueued);
         assert!(matches!(
             poll_for_completion(&mut sup, interval.id),
             CommandCompletion::Applied {
                 effect: CommandEffect::MessageInterval {
                     index: 0,
-                    interval_ms: 20
+                    interval_ms: 35
                 },
                 ..
             }
         ));
+        assert_eq!(
+            sup.applied_run_config(0).unwrap().messages[0].interval_ms,
+            35
+        );
         assert!(sup.telemetry(0).command_error.is_some());
 
         // Only a later success for the same target resolves the divergence.
@@ -1014,7 +1130,14 @@ mod tests {
             InterfaceConfig::Udp(UdpConfig::unicast(sink.local_addr().expect("sink address")));
         let mut sup = TalkerSupervisor::new(ObserverPolicy::sampled());
         sup.push_slot();
-        sup.start(0, "1", config.clone(), schedule(&[msg("AB", 20)]));
+        let messages = vec![msg("AB", 20)];
+        sup.start(
+            0,
+            "1",
+            config.clone(),
+            messages.clone(),
+            schedule(&messages),
+        );
         assert!(
             sup.applied_interface(0).is_none(),
             "spawn is not proof that open completed"
@@ -1023,7 +1146,89 @@ mod tests {
         poll_until(&mut sup, &mut samples, |s| {
             s.applied_interface(0) == Some(&config)
         });
+        assert_eq!(sup.applied_run_config(0).unwrap().messages, messages);
         let _ = sup.stop(0);
+        poll_until(&mut sup, &mut samples, |s| !s.any_draining());
+    }
+
+    #[test]
+    fn accepted_command_fails_when_runner_exits_before_execution() {
+        let mut sup = TalkerSupervisor::new(ObserverPolicy::sampled());
+        sup.push_slot();
+        sup.begin_start(0, 1);
+        let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(CMD_QUEUE_CAP);
+        let (control_tx, control_rx) = crossbeam_channel::bounded(CONTROL_QUEUE_CAP);
+        let (status_tx, status_rx) = crossbeam_channel::bounded(STATUS_QUEUE_CAP);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(0);
+        let thread = std::thread::spawn(move || {
+            release_rx.recv().unwrap();
+            drop(cmd_rx);
+            drop(control_tx);
+            drop(status_tx);
+        });
+        sup.slots[0].handle = Some(TalkerHandle {
+            cmd_tx,
+            control_rx,
+            status_rx,
+            thread,
+        });
+
+        let submission = sup.set_interval(0, 0, 10);
+        assert_eq!(submission.outcome, CommandOutcome::Enqueued);
+        release_tx.send(()).unwrap();
+        let mut samples = Vec::new();
+        poll_until(&mut sup, &mut samples, |s| !s.is_running(0));
+
+        assert!(sup.slots[0].pending_commands.is_empty());
+        assert!(matches!(
+            sup.take_command_completions().as_slice(),
+            [CommandCompletion::Failed {
+                id,
+                target: CommandTarget::MessageInterval(0),
+                message,
+                ..
+            }] if *id == submission.id && message.contains("runner exited")
+        ));
+        assert!(sup.telemetry(0).command_error.is_some());
+    }
+
+    #[test]
+    fn stop_resolves_pending_commands_and_clears_applied_run() {
+        let mut sup = TalkerSupervisor::new(ObserverPolicy::sampled());
+        sup.push_slot();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        start_with_interface(
+            &mut sup,
+            0,
+            Box::new(CountingInterface {
+                sent: Arc::clone(&sent),
+            }),
+            schedule(&[msg("AB", 20)]),
+        );
+        sup.slots[0].applied_run = Some(AppliedRunConfig {
+            interface: InterfaceConfig::Udp(UdpConfig::unicast(
+                "127.0.0.1:9".parse().expect("socket address"),
+            )),
+            messages: vec![msg("AB", 20)],
+        });
+
+        let submission = sup.set_interval(0, 0, 10);
+        assert_eq!(submission.outcome, CommandOutcome::Enqueued);
+        assert_eq!(sup.stop(0), CommandOutcome::Enqueued);
+
+        assert!(sup.applied_run_config(0).is_none());
+        assert!(sup.slots[0].pending_commands.is_empty());
+        assert!(matches!(
+            sup.take_command_completions().as_slice(),
+            [CommandCompletion::Failed {
+                id,
+                target: CommandTarget::MessageInterval(0),
+                message,
+                ..
+            }] if *id == submission.id && message.contains("run was stopped")
+        ));
+
+        let mut samples = Vec::new();
         poll_until(&mut sup, &mut samples, |s| !s.any_draining());
     }
 
@@ -1076,7 +1281,8 @@ mod tests {
         tx.send(TalkerStatus::SendSample {
             channel: ChannelId::mint(),
             message_index: 0,
-            payload: vec![0xAB],
+            payload: b"??".to_vec(),
+            replacement_wire_offsets: vec![1],
         })
         .unwrap();
         drop(tx);
@@ -1088,6 +1294,8 @@ mod tests {
             "control-plane error survives a healthy sample"
         );
         assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].payload, b"??");
+        assert_eq!(samples[0].replacement_wire_offsets, vec![1]);
     }
 
     #[test]

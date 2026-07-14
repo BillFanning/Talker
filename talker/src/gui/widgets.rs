@@ -8,7 +8,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use egui::{Align, Layout};
 
 use crate::core::message::{
-    decode_codepage_byte, repair_after_edit, segments, ChecksumAlgorithm, CodePage, Segment,
+    code_page_encodes, decode_codepage_byte, repair_after_edit, segments, ChecksumAlgorithm,
+    CodePage, Segment,
 };
 
 use super::display::{ChannelDisplay, ControlStyle, DisplayMode};
@@ -20,6 +21,20 @@ pub(super) fn theme_palette(ui: &egui::Ui) -> &'static wiredata_ui::palette::Pal
         &wiredata_ui::palette::DARK
     } else {
         &wiredata_ui::palette::LIGHT
+    }
+}
+
+/// Foreground/background pair for a lossy code-page substitution. The shared
+/// palette's amber is a readable foreground in light mode but too dark behind
+/// black text, so the light theme uses a pale amber field with dark-brown text.
+fn replacement_highlight_colors(ui: &egui::Ui) -> (egui::Color32, egui::Color32) {
+    if ui.visuals().dark_mode {
+        (egui::Color32::BLACK, theme_palette(ui).warning_amber)
+    } else {
+        (
+            egui::Color32::from_rgb(45, 30, 0),
+            egui::Color32::from_rgb(255, 225, 150),
+        )
     }
 }
 
@@ -777,22 +792,45 @@ pub(super) fn preview_text(bytes: &[u8]) -> String {
     preview_with(bytes, |b| (0x20..=0x7E).contains(&b).then_some(b as char))
 }
 
-/// Preview text for an `Ascii` payload, decoding high bytes through
-/// `code_page` so the user sees what a code-page-aware receiver would
-/// render. Control bytes (0x00–0x1F and 0x7F) still show as `‹XX›`
-/// byte markers so they're never invisible.
-pub(super) fn preview_ascii(bytes: &[u8], code_page: CodePage) -> String {
-    preview_with(bytes, |b| match b {
-        0x00..=0x1F | 0x7F => None,
-        _ => Some(decode_codepage_byte(b, code_page)),
-    })
+/// Code-page preview with provenance: fallback `?` bytes receive an amber
+/// background, while literal question marks remain ordinary text.
+pub(super) fn preview_ascii_layout_job(
+    ui: &egui::Ui,
+    bytes: &[u8],
+    code_page: CodePage,
+    replacement_wire_offsets: &[usize],
+) -> egui::text::LayoutJob {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let normal = ui.visuals().text_color();
+    let (replacement_text, replacement_background) = replacement_highlight_colors(ui);
+    let mut job = egui::text::LayoutJob::default();
+
+    for (offset, &byte) in bytes.iter().enumerate() {
+        let text = match byte {
+            0x00..=0x1F | 0x7F => format!("\u{2039}{byte:02X}\u{203A}"),
+            _ => decode_codepage_byte(byte, code_page).to_string(),
+        };
+        let replaced = replacement_wire_offsets.binary_search(&offset).is_ok();
+        job.append(
+            &text,
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: if replaced { replacement_text } else { normal },
+                background: if replaced {
+                    replacement_background
+                } else {
+                    egui::Color32::TRANSPARENT
+                },
+                ..Default::default()
+            },
+        );
+    }
+    job
 }
 
-/// Shared body of [`preview_text`] / [`preview_ascii`]: walk `bytes`
-/// and produce one output character per input byte — either the
-/// caller-supplied glyph or, when the caller returns `None`, the
-/// `‹XX›` byte marker. Keeping the marker format and the loop in one
-/// place means new preview variants only need a closure.
+/// Shared byte-preview loop: emit either the caller-supplied glyph or a
+/// visible `‹XX›` marker when the caller returns `None`.
 fn preview_with<F: Fn(u8) -> Option<char>>(bytes: &[u8], decode: F) -> String {
     let mut out = String::with_capacity(bytes.len());
     for &b in bytes {
@@ -850,38 +888,182 @@ impl egui::TextBuffer for UppercaseHex<'_> {
     }
 }
 
-/// Lay out a UTF-8/ASCII text field, drawing `‹XX›` byte markers in a
-/// distinct colour from surrounding text (spec §5.3).
-fn marker_layouter(
+/// Build the editor layout, including marker color and optional code-page
+/// replacement backgrounds.
+fn marker_layout_job(
     ui: &egui::Ui,
-    buf: &dyn egui::TextBuffer,
-    wrap_width: f32,
-) -> std::sync::Arc<egui::Galley> {
-    let text = buf.as_str();
+    text: &str,
+    code_page: Option<CodePage>,
+) -> egui::text::LayoutJob {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let normal = ui.visuals().text_color();
     let marker = egui::Color32::from_rgb(110, 170, 255);
+    let (replacement_text, replacement_background) = replacement_highlight_colors(ui);
     let mut job = egui::text::LayoutJob::default();
-    job.wrap.max_width = wrap_width;
+    // Soft wrapping would make long pasted lines grow vertically and displace
+    // unrelated controls. The surrounding two-axis ScrollArea handles long
+    // lines, while LayoutJob still honors explicit newline characters.
+    job.wrap.max_width = f32::INFINITY;
     for (range, segment) in segments(text) {
-        let color = match segment {
-            Segment::Byte(_) => marker,
-            Segment::Text => normal,
-        };
-        job.append(
-            &text[range],
-            0.0,
-            egui::TextFormat {
-                font_id: font.clone(),
-                color,
-                ..Default::default()
-            },
-        );
+        match (segment, code_page) {
+            (Segment::Byte(_), _) => {
+                job.append(
+                    &text[range],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: font.clone(),
+                        color: marker,
+                        ..Default::default()
+                    },
+                );
+            }
+            (Segment::Text, None) => {
+                job.append(
+                    &text[range],
+                    0.0,
+                    egui::TextFormat {
+                        font_id: font.clone(),
+                        color: normal,
+                        ..Default::default()
+                    },
+                );
+            }
+            (Segment::Text, Some(code_page)) => {
+                let chunk = &text[range];
+                let mut run_start = 0;
+                let mut run_replaced = None;
+                for (offset, character) in chunk.char_indices() {
+                    let replaced = !matches!(character, '\u{2039}' | '\u{203A}')
+                        && !code_page_encodes(character, code_page);
+                    if run_replaced.is_some_and(|current| current != replaced) {
+                        append_code_page_run(
+                            &mut job,
+                            &chunk[run_start..offset],
+                            run_replaced.unwrap_or(false),
+                            &font,
+                            normal,
+                            replacement_text,
+                            replacement_background,
+                        );
+                        run_start = offset;
+                    }
+                    run_replaced = Some(replaced);
+                }
+                append_code_page_run(
+                    &mut job,
+                    &chunk[run_start..],
+                    run_replaced.unwrap_or(false),
+                    &font,
+                    normal,
+                    replacement_text,
+                    replacement_background,
+                );
+            }
+        }
     }
+    job
+}
+
+fn append_code_page_run(
+    job: &mut egui::text::LayoutJob,
+    text: &str,
+    replaced: bool,
+    font: &egui::FontId,
+    normal: egui::Color32,
+    replacement_text: egui::Color32,
+    replacement_background: egui::Color32,
+) {
+    if text.is_empty() {
+        return;
+    }
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: font.clone(),
+            color: if replaced { replacement_text } else { normal },
+            background: if replaced {
+                replacement_background
+            } else {
+                egui::Color32::TRANSPARENT
+            },
+            ..Default::default()
+        },
+    );
+}
+
+/// Lay out a UTF-8/ASCII text field. Explicit newlines create rows and long
+/// lines never soft-wrap.
+fn marker_layouter(
+    ui: &egui::Ui,
+    buf: &dyn egui::TextBuffer,
+    code_page: Option<CodePage>,
+    _wrap_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let job = marker_layout_job(ui, buf.as_str(), code_page);
     ui.fonts_mut(|f| f.layout_job(job))
 }
 
-/// Single-line TextEdit for text that may contain `‹XX›` byte markers.
+const MESSAGE_EDITOR_MIN_ROWS: usize = 3;
+const MESSAGE_EDITOR_MAX_ROWS: usize = 8;
+
+fn message_editor_visible_rows(text: &str) -> usize {
+    text.split('\n')
+        .count()
+        .clamp(MESSAGE_EDITOR_MIN_ROWS, MESSAGE_EDITOR_MAX_ROWS)
+}
+
+fn message_editor_content_width(ui: &egui::Ui, text: &str, viewport_width: f32) -> f32 {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let longest_line = ui.fonts_mut(|fonts| {
+        text.split('\n')
+            .map(|line| {
+                line.chars()
+                    .map(|c| {
+                        let width = fonts.glyph_width(&font, c);
+                        if width > 0.0 {
+                            width
+                        } else {
+                            // Headless tests and a temporarily unavailable fallback
+                            // font can report zero. Reserve one em so content is never
+                            // silently clipped merely because measurement failed.
+                            font.size
+                        }
+                    })
+                    .sum::<f32>()
+            })
+            .fold(0.0_f32, f32::max)
+    });
+    // TextEdit's horizontal frame margin needs a little room beyond glyphs.
+    (longest_line + 12.0).max(viewport_width)
+}
+
+pub(super) fn message_editor_max_height(ui: &egui::Ui, text: &str) -> f32 {
+    let rows = message_editor_visible_rows(text) as f32;
+    let text_height = rows * ui.text_style_height(&egui::TextStyle::Body);
+    // Frame margins plus room for a horizontal scrollbar when a line is long.
+    text_height + 8.0 + ui.spacing().scroll.allocated_width()
+}
+
+fn message_editor_content<R>(
+    ui: &mut egui::Ui,
+    salt: &'static str,
+    width: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let mut content_rect = ui.available_rect_before_wrap();
+    content_rect.max.x = content_rect.min.x + width;
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .id_salt(("message_editor_content", salt))
+            .max_rect(content_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        add_contents,
+    )
+    .inner
+}
+
+/// Bounded multiline TextEdit for text that may contain `‹XX›` byte markers.
 ///
 /// Three marker-aware behaviours layered on a plain `TextEdit`:
 ///
@@ -902,6 +1084,7 @@ pub(super) fn marker_aware_text_edit(
     ui: &mut egui::Ui,
     text: &mut String,
     salt: &'static str,
+    code_page: Option<CodePage>,
     width: f32,
     hint: &str,
 ) -> egui::Response {
@@ -916,13 +1099,30 @@ pub(super) fn marker_aware_text_edit(
         .unwrap_or_else(|| text.clone());
     let prev_cursor: Option<usize> = ui.memory(|m| m.data.get_temp(stash_prev_cursor));
 
-    let mut layouter = marker_layouter;
-    let output = egui::TextEdit::singleline(text)
-        .id_salt(salt)
-        .desired_width(width)
-        .hint_text(hint)
-        .layouter(&mut layouter)
-        .show(ui);
+    let viewport_width = (width - ui.spacing().scroll.allocated_width()).max(64.0);
+    let content_width = message_editor_content_width(ui, text, viewport_width);
+    let max_height = message_editor_max_height(ui, text);
+    let rows = message_editor_visible_rows(text);
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+        marker_layouter(ui, buf, code_page, wrap_width)
+    };
+    let output = egui::ScrollArea::both()
+        .id_salt(("message_editor_scroll", salt))
+        .max_width(width)
+        .max_height(max_height)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            message_editor_content(ui, salt, content_width, |ui| {
+                egui::TextEdit::multiline(text)
+                    .id_salt(salt)
+                    .desired_width(content_width)
+                    .desired_rows(rows)
+                    .hint_text(hint)
+                    .layouter(&mut layouter)
+                    .show(ui)
+            })
+        })
+        .inner;
 
     // TextEdit::show returns AtomLayoutResponse wrapping the actual
     // Response — unwrap once here so the rest reads naturally.
@@ -983,7 +1183,7 @@ pub(super) fn marker_aware_text_edit(
     resp
 }
 
-/// Plain single-line TextEdit that stashes its cursor + widget id
+/// Plain bounded multiline TextEdit that stashes its cursor + widget id
 /// under the same shared ids [`marker_aware_text_edit`] uses, so the
 /// matching `Insert …` popup can find them. Use this for fields
 /// that don't recognise `‹XX›` markers (UTF-16 in its default
@@ -997,11 +1197,26 @@ pub(super) fn plain_text_edit_with_cursor(
 ) -> egui::Response {
     let shared_cursor_id = egui::Id::new("marker_target_cursor").with(salt);
     let shared_widget_id = egui::Id::new("marker_target_widget").with(salt);
-    let output = egui::TextEdit::singleline(text)
-        .id_salt(salt)
-        .desired_width(width)
-        .hint_text(hint)
-        .show(ui);
+    let viewport_width = (width - ui.spacing().scroll.allocated_width()).max(64.0);
+    let content_width = message_editor_content_width(ui, text, viewport_width);
+    let max_height = message_editor_max_height(ui, text);
+    let rows = message_editor_visible_rows(text);
+    let output = egui::ScrollArea::both()
+        .id_salt(("message_editor_scroll", salt))
+        .max_width(width)
+        .max_height(max_height)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            message_editor_content(ui, salt, content_width, |ui| {
+                egui::TextEdit::multiline(text)
+                    .id_salt(salt)
+                    .desired_width(content_width)
+                    .desired_rows(rows)
+                    .hint_text(hint)
+                    .show(ui)
+            })
+        })
+        .inner;
     let resp = output.response.response;
     ui.memory_mut(|m| m.data.insert_temp(shared_widget_id, resp.id));
     if let Some(range) = output.cursor_range {
@@ -1314,6 +1529,55 @@ fn show_insert_popup<F>(
 
 // ── Display pane ──────────────────────────────────────────────────────────────
 
+fn output_layout_job(
+    ui: &egui::Ui,
+    text: &str,
+    replacement_ranges: &[std::ops::Range<usize>],
+) -> egui::text::LayoutJob {
+    let font = egui::TextStyle::Monospace.resolve(ui.style());
+    let normal = ui.visuals().text_color();
+    let (replacement_text, replacement_background) = replacement_highlight_colors(ui);
+    let mut job = egui::text::LayoutJob::default();
+    let mut cursor = 0;
+    for range in replacement_ranges {
+        debug_assert!(range.start >= cursor && range.end <= text.len());
+        if cursor < range.start {
+            job.append(
+                &text[cursor..range.start],
+                0.0,
+                egui::TextFormat {
+                    font_id: font.clone(),
+                    color: normal,
+                    ..Default::default()
+                },
+            );
+        }
+        job.append(
+            &text[range.clone()],
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: replacement_text,
+                background: replacement_background,
+                ..Default::default()
+            },
+        );
+        cursor = range.end;
+    }
+    if cursor < text.len() || text.is_empty() {
+        job.append(
+            &text[cursor..],
+            0.0,
+            egui::TextFormat {
+                font_id: font,
+                color: normal,
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
 /// Render a channel's real-time outbound display pane (spec §5.7).
 pub(super) fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay, send_rate: f32) {
     ui.collapsing("Output", |ui| {
@@ -1366,7 +1630,7 @@ pub(super) fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay,
                     ui.radio_value(
                         &mut display.control_style,
                         ControlStyle::Pictures,
-                        "\u{240A}",
+                        "Pictures (\u{240A})",
                     );
                     ui.radio_value(&mut display.control_style, ControlStyle::Brackets, "[LF]");
                     ui.radio_value(&mut display.control_style, ControlStyle::HexEscapes, "<0A>");
@@ -1379,37 +1643,17 @@ pub(super) fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay,
             });
         });
         ui.separator();
-        // Monospace metrics: the uniform row height `show_rows` virtualizes on,
-        // and one glyph's width to turn the available pixel width into a column
-        // count for soft-wrapping.
-        let font = egui::TextStyle::Monospace.resolve(ui.style());
-        let (row_h, char_w) =
-            ui.fonts_mut(|f| (f.row_height(&font), f.glyph_width(&font, '0').max(1.0)));
-        // Reserve the vertical scrollbar so a full row ends just before it, not
-        // under it. One const so the reservation and any future bar drawing agree.
-        const SCROLLBAR_WIDTH: f32 = 12.0;
-        let avail_w = (ui.available_width() - SCROLLBAR_WIDTH).max(char_w);
-        let wrap_cols = (avail_w / char_w).floor().max(8.0) as usize;
-        // Rows are memoized (buffer/mode/style/width keyed): the split runs only
-        // when one of those changes, and the flow semantics are unchanged — the
-        // same concatenated text, just chunked into lines so the ScrollArea can
-        // lay out only the visible ones. A single selectable Label over the whole
-        // buffer re-laid it out every frame (listener's stream view hit the same
-        // wall and moved to this same `show_rows` virtualization).
-        let rows = display.rows(wrap_cols);
-        ui.style_mut().interaction.selectable_labels = true; // select across rows
         egui::ScrollArea::vertical()
             .max_height(150.0)
             .stick_to_bottom(true)
             .auto_shrink([false, true])
-            .show_rows(ui, row_h, rows.len().max(1), |ui, range| {
-                for row in &rows[range] {
-                    // Already wrapped to fit; Extend so egui doesn't re-wrap.
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(row).monospace())
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                    );
-                }
+            .show(ui, |ui| {
+                // One logical label preserves exact selection and copying:
+                // egui's multi-widget selection inserts separators between
+                // labels and cannot retain virtualized-offscreen endpoints.
+                let (text, replacement_ranges) = display.rendered();
+                let job = output_layout_job(ui, text, replacement_ranges);
+                ui.add(egui::Label::new(job).wrap().selectable(true));
             });
     });
 }
@@ -1547,6 +1791,114 @@ pub(super) fn checksum_label(algorithm: ChecksumAlgorithm) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marker_layouter_preserves_newlines_without_soft_wrapping() {
+        egui::__run_test_ui(|ui| {
+            let text = format!("{}\nsecond line", "long ‹0D› ".repeat(500));
+            let galley = marker_layouter(ui, &text, None, 100.0);
+            assert_eq!(galley.rows.len(), 2, "long lines must not soft-wrap");
+        });
+    }
+
+    #[test]
+    fn replacement_background_distinguishes_fallback_from_literal_question_mark() {
+        egui::__run_test_ui(|ui| {
+            let editor = marker_layout_job(ui, "?—", Some(CodePage::Iso8859_1));
+            assert_eq!(&editor.text[editor.sections[0].byte_range.clone()], "?");
+            assert_eq!(
+                editor.sections[0].format.background,
+                egui::Color32::TRANSPARENT
+            );
+            assert_eq!(&editor.text[editor.sections[1].byte_range.clone()], "—");
+            assert_ne!(
+                editor.sections[1].format.background,
+                egui::Color32::TRANSPARENT
+            );
+
+            let preview = preview_ascii_layout_job(ui, b"??", CodePage::Iso8859_1, &[1]);
+            assert_eq!(
+                preview.sections[0].format.background,
+                egui::Color32::TRANSPARENT
+            );
+            assert_ne!(
+                preview.sections[1].format.background,
+                egui::Color32::TRANSPARENT
+            );
+        });
+    }
+
+    #[test]
+    fn replacement_background_has_contrast_in_both_themes_and_output() {
+        egui::__run_test_ui(|ui| {
+            ui.visuals_mut().dark_mode = false;
+            let (light_text, light_background) = replacement_highlight_colors(ui);
+            assert_eq!(light_text, egui::Color32::from_rgb(45, 30, 0));
+            assert_eq!(light_background, egui::Color32::from_rgb(255, 225, 150));
+
+            let replacement_range = 1..2;
+            let output = output_layout_job(ui, "??", std::slice::from_ref(&replacement_range));
+            assert_eq!(
+                output.sections[0].format.background,
+                egui::Color32::TRANSPARENT
+            );
+            assert_eq!(output.sections[1].format.color, light_text);
+            assert_eq!(output.sections[1].format.background, light_background);
+
+            ui.visuals_mut().dark_mode = true;
+            let (dark_text, dark_background) = replacement_highlight_colors(ui);
+            assert_eq!(dark_text, egui::Color32::BLACK);
+            assert_eq!(dark_background, wiredata_ui::palette::DARK.warning_amber);
+        });
+    }
+
+    #[test]
+    fn message_editor_grows_for_newlines_then_caps_its_viewport() {
+        assert_eq!(message_editor_visible_rows("one line"), 3);
+        assert_eq!(message_editor_visible_rows("1\n2\n3\n4\n5"), 5);
+        assert_eq!(message_editor_visible_rows(&"line\n".repeat(20)), 8);
+
+        egui::__run_test_ui(|ui| {
+            ui.set_width(500.0);
+            let mut text = format!("{}\n{}", "wide ".repeat(500), "line\n".repeat(20));
+            let before = ui.min_rect().bottom();
+            let max_height = message_editor_max_height(ui, &text);
+            let content_width = message_editor_content_width(ui, &text, 300.0);
+            let response =
+                marker_aware_text_edit(ui, &mut text, "bounded_editor_test", None, 300.0, "text");
+            let consumed = ui.min_rect().bottom() - before;
+            assert!(
+                consumed <= max_height + 1.0,
+                "editor consumed {consumed} px despite a {max_height} px cap"
+            );
+            assert!(
+                response.rect.width() > 300.0,
+                "long lines must scroll: response={} content={content_width}",
+                response.rect.width()
+            );
+            assert!(
+                response.rect.height() > 8.0 * ui.text_style_height(&egui::TextStyle::Body),
+                "all explicit lines should remain in scrollable content"
+            );
+        });
+    }
+
+    #[test]
+    fn plain_message_editor_uses_the_same_bounded_scroll_geometry() {
+        egui::__run_test_ui(|ui| {
+            ui.set_width(500.0);
+            let mut text = format!("{}\n{}", "wide ".repeat(500), "line\n".repeat(20));
+            let before = ui.min_rect().bottom();
+            let max_height = message_editor_max_height(ui, &text);
+            let response =
+                plain_text_edit_with_cursor(ui, &mut text, "plain_editor_test", 300.0, "text");
+            let consumed = ui.min_rect().bottom() - before;
+
+            assert!(consumed <= max_height + 1.0);
+            assert!(response.rect.width() > 300.0);
+            assert!(response.rect.height() > 8.0 * ui.text_style_height(&egui::TextStyle::Body));
+        });
+    }
 
     // ── parse_hex_bytes ───────────────────────────────────────────────────────
 
