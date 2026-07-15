@@ -18,6 +18,7 @@ mod view_prefs;
 mod widgets;
 
 use anyhow::anyhow;
+use wiredata_ui::selection;
 
 use crate::config::ChannelConfig;
 use crate::core::ChannelId;
@@ -591,7 +592,7 @@ impl eframe::App for ListenerApp {
         self.drain_updates();
         self.handle_tab_keys(ui.ctx());
         self.show_command_drop_banner(ui);
-        if self.channels_collapsed {
+        let channel_panel = if self.channels_collapsed {
             // Collapsed: a thin strip — an expand button plus mini tabs (a status dot
             // per channel, click to select, name on hover) (#1).
             egui::Panel::left("channel_list_collapsed")
@@ -608,31 +609,37 @@ impl eframe::App for ListenerApp {
                     let mini: Vec<(ChannelId, ChannelStatus, String)> = self
                         .state
                         .channels()
-                        .map(|v| (v.id, v.status, v.name.clone()))
+                        .enumerate()
+                        .map(|(index, v)| {
+                            (v.id, v.status, selection::channel_title(index + 1, &v.name))
+                        })
                         .collect();
                     let base = egui::TextStyle::Body.resolve(ui.style()).size;
+                    let mut selected_tab_rect = None;
                     for (cid, status, name) in mini {
                         let selected = self.selected == Some(cid);
                         let (glyph, scale) = status_glyph(status);
                         let dot = egui::RichText::new(glyph)
                             .size(base * scale)
                             .color(status_color(status));
-                        if ui
-                            .selectable_label(selected, dot)
-                            .on_hover_text(name)
-                            .clicked()
-                        {
+                        let response = selection::mini_tab(ui, selected, dot).on_hover_text(name);
+                        if selected && ui.is_rect_visible(response.rect) {
+                            selected_tab_rect = Some(response.rect);
+                        }
+                        if response.clicked() {
                             self.selected = Some(cid);
                         }
                     }
-                });
+                    selected_tab_rect
+                })
         } else {
             egui::Panel::left("channel_list")
                 .resizable(true)
                 .default_size(320.0)
-                .show_inside(ui, |ui| self.show_channel_list(ui));
-        }
+                .show_inside(ui, |ui| self.show_channel_list(ui))
+        };
         egui::CentralPanel::default().show_inside(ui, |ui| self.show_detail(ui));
+        selection::connect_tab_to_page(ui, channel_panel.response.rect, channel_panel.inner);
         self.show_remove_confirm(ui.ctx());
         // Tell the driver which channel is on screen so it full-snapshots only that
         // one (others get cheap stats). Sent only on change.

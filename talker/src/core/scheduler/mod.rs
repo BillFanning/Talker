@@ -63,7 +63,7 @@ impl Schedule {
             .map(|(i, m)| {
                 let compiled = m
                     .compile()
-                    .with_context(|| format!("compiling message {i}"))?;
+                    .with_context(|| format!("compiling message {}", i + 1))?;
                 Ok(ScheduledMessage {
                     compiled,
                     interval: Duration::from_millis(m.interval_ms),
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn compile_bad_payload_returns_error_with_context() {
         let err = Schedule::compile(&[msg("XYZ", 100)], Instant::now()).unwrap_err();
-        assert!(err.to_string().contains("message 0"));
+        assert!(err.to_string().contains("message 1"));
     }
 
     // ── poll ──────────────────────────────────────────────────────────────────

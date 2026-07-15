@@ -2,7 +2,7 @@
 //! collapsed mini-strip. Rows are snapshotted before rendering so the list
 //! isn't borrowing the app state while a click mutates the selection.
 
-use wiredata_ui::{glyphs, palette::Palette};
+use wiredata_ui::{glyphs, palette::Palette, selection};
 
 use super::draft::ConnKind;
 use super::widgets::{interface_summary, lifecycle_indicator, theme_palette};
@@ -48,7 +48,7 @@ impl TalkerApp {
         }
     }
 
-    pub(super) fn show_channel_list(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn show_channel_list(&mut self, ui: &mut egui::Ui) -> Option<egui::Rect> {
         let pal = theme_palette(ui);
 
         // Header: collapse, title, + Add and Profile menus (listener's header
@@ -119,7 +119,7 @@ impl TalkerApp {
                     .and_then(|id| self.log_counts.get(&id).copied())
                     .unwrap_or_default();
                 ChannelRow {
-                    name: self.channel_name(i),
+                    name: selection::channel_title(i + 1, &self.conn_drafts[i].name),
                     summary: interface_summary(&self.conn_drafts[i]),
                     running: self.is_connection_running(i),
                     error: telemetry.banner_error().map(str::to_owned),
@@ -132,15 +132,19 @@ impl TalkerApp {
             })
             .collect();
 
+        let mut selected_tab_rect = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, row) in rows.iter().enumerate() {
-                self.show_channel_row(ui, i, row, pal);
+                if let Some(rect) = self.show_channel_row(ui, i, row, pal) {
+                    selected_tab_rect = Some(rect);
+                }
                 ui.add_space(6.0);
             }
             if rows.is_empty() {
                 ui.weak("No channels yet — “+ Add” above.");
             }
         });
+        selected_tab_rect
     }
 
     /// The Profile menu (listener's structure): the Recent section, then
@@ -198,22 +202,19 @@ impl TalkerApp {
         });
     }
 
-    fn show_channel_row(&mut self, ui: &mut egui::Ui, i: usize, row: &ChannelRow, pal: &Palette) {
+    fn show_channel_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        i: usize,
+        row: &ChannelRow,
+        pal: &Palette,
+    ) -> Option<egui::Rect> {
         let selected = self.selected == Some(i);
-        // Listener's row chrome: rounded, padded, box_stroke border; the
-        // selected row uses the theme's selection fill and stroke.
-        let mut frame = egui::Frame::group(ui.style())
-            .inner_margin(8.0)
-            .corner_radius(egui::CornerRadius::same(6))
-            .stroke(egui::Stroke::new(1.5_f32, pal.box_stroke));
-        if selected {
-            frame.fill = ui.visuals().selection.bg_fill;
-            frame.stroke = egui::Stroke::new(1.5_f32, ui.visuals().selection.stroke.color);
-        }
+        // The shared connector opens the selected card's right edge into the
+        // detail page after both panels have rendered.
         let (box_resp, remove_clicked) = ui
             .push_id(i, |ui| {
-                let inner = frame.show(ui, |ui| {
-                    ui.set_width(ui.available_width());
+                let inner = selection::channel_card(ui, selected, |ui| {
                     // Line 1: status glyph + name, as one LayoutJob so the
                     // enlarged glyph centers on the text line instead of
                     // stretching the row (listener's line-1 pattern; same
@@ -312,6 +313,8 @@ impl TalkerApp {
                 (box_resp, remove_clicked)
             })
             .inner;
+        let selected_tab_rect =
+            (selected && ui.is_rect_visible(box_resp.rect)).then_some(box_resp.rect);
         // Removal confirms through the shared modal; a box click that
         // wasn't the ✕ selects the channel.
         if remove_clicked {
@@ -319,11 +322,12 @@ impl TalkerApp {
         } else if box_resp.clicked() {
             self.deferred.select = Some(i);
         }
+        selected_tab_rect
     }
 
     /// The collapsed variant: a thin strip — an expand button plus one
     /// status dot per channel (click to select, name on hover).
-    pub(super) fn show_channel_strip(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn show_channel_strip(&mut self, ui: &mut egui::Ui) -> Option<egui::Rect> {
         let pal = theme_palette(ui);
         if ui
             .button("\u{25B6}")
@@ -334,6 +338,7 @@ impl TalkerApp {
         }
         ui.separator();
         let base = egui::TextStyle::Body.resolve(ui.style()).size;
+        let mut selected_tab_rect = None;
         for i in 0..self.conn_drafts.len() {
             let running = self.is_connection_running(i);
             let error = self.sup.telemetry(i).banner_error().is_some();
@@ -342,13 +347,15 @@ impl TalkerApp {
             let text = egui::RichText::new(glyph)
                 .color(color)
                 .size(base * glyphs::glyph_size(glyph));
-            if ui
-                .selectable_label(selected, text)
-                .on_hover_text(self.channel_name(i))
-                .clicked()
-            {
+            let title = selection::channel_title(i + 1, &self.conn_drafts[i].name);
+            let response = selection::mini_tab(ui, selected, text).on_hover_text(title);
+            if selected && ui.is_rect_visible(response.rect) {
+                selected_tab_rect = Some(response.rect);
+            }
+            if response.clicked() {
                 self.deferred.select = Some(i);
             }
         }
+        selected_tab_rect
     }
 }

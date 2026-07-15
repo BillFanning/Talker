@@ -1,6 +1,7 @@
 //! The channel-list (tabs) panel and its row snapshot, split out of `mod.rs`.
 
 use crate::core::ChannelId;
+use wiredata_ui::selection;
 
 use super::bridge::UiCommand;
 use super::state::ChannelStatus;
@@ -26,7 +27,7 @@ struct ChannelRow {
 }
 
 impl ListenerApp {
-    pub(super) fn show_channel_list(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn show_channel_list(&mut self, ui: &mut egui::Ui) -> Option<egui::Rect> {
         // Heading + the "Add" menu (the only place channels are created now), plus
         // bulk Start all / Stop all (#5).
         ui.horizontal(|ui| {
@@ -137,9 +138,10 @@ impl ListenerApp {
         let rows: Vec<ChannelRow> = self
             .state
             .channels()
-            .map(|v| ChannelRow {
+            .enumerate()
+            .map(|(index, v)| ChannelRow {
                 id: v.id,
-                name: v.name.clone(),
+                name: selection::channel_title(index + 1, &v.name),
                 details: v.details.clone(),
                 status: v.status,
                 bytes_total: v.bytes_total,
@@ -153,10 +155,11 @@ impl ListenerApp {
 
         if rows.is_empty() {
             ui.label("No channels yet — use “+ Add”.");
-            return;
+            return None;
         }
 
         let base = egui::TextStyle::Body.resolve(ui.style()).size;
+        let mut selected_tab_rect = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for row in rows {
                 let id = row.id;
@@ -164,18 +167,8 @@ impl ListenerApp {
                 // Each box gets its own id scope so widget ids don't collide between
                 // channels (that collision was why the 2nd channel couldn't be
                 // selected, #4).
-                ui.push_id(id, |ui| {
-                    let visuals = ui.visuals();
-                    let mut frame = egui::Frame::group(ui.style())
-                        .inner_margin(8.0)
-                        .corner_radius(egui::CornerRadius::same(6))
-                        .stroke(egui::Stroke::new(1.5_f32, theme::box_stroke()));
-                    if selected {
-                        frame.fill = visuals.selection.bg_fill;
-                        frame.stroke = egui::Stroke::new(1.5_f32, visuals.selection.stroke.color);
-                    }
-                    let inner = frame.show(ui, |ui| {
-                        ui.set_width(ui.available_width());
+                let visible_selected_rect = ui.push_id(id, |ui| {
+                    let inner = selection::channel_card(ui, selected, |ui| {
                         // Line 1: status glyph + name.
                         let mut line1 = egui::text::LayoutJob::default();
                         let (glyph, scale) = status_glyph(row.status);
@@ -263,10 +256,15 @@ impl ListenerApp {
                         // A box click that wasn't the ✕ selects the channel (#8).
                         self.selected = Some(id);
                     }
+                    (selected && ui.is_rect_visible(box_resp.rect)).then_some(box_resp.rect)
                 });
+                if visible_selected_rect.inner.is_some() {
+                    selected_tab_rect = visible_selected_rect.inner;
+                }
                 ui.add_space(6.0);
             }
         });
+        selected_tab_rect
     }
 
     /// Save to the current profile path silently; if none is set yet, fall through to

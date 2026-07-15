@@ -10,10 +10,12 @@ use std::time::Instant;
 
 use anyhow::Context as _;
 use egui::{Align, Layout, ScrollArea};
+use wiredata_ui::selection;
 
 use crate::core::{
-    channel::{ChannelConfig, ChannelId},
+    channel::{ChannelConfig, ChannelId, InterfaceConfig},
     logging::{LogEvent, LogLevel, LogLevelHandle, LoggingConfig},
+    message::MessageConfig,
     profile::Profile,
     runner,
     scheduler::Schedule,
@@ -166,6 +168,64 @@ fn drafts_to_channels(
     } else {
         Err(problems)
     }
+}
+
+/// A fully built replacement run. Constructing this value is pure draft
+/// preflight: it performs no I/O and does not mutate supervisor state, so a
+/// failure cannot disturb an already-running channel.
+#[derive(Debug)]
+struct PreparedChannelRun {
+    interface: InterfaceConfig,
+    messages: Vec<MessageConfig>,
+    schedule: Schedule,
+}
+
+fn prepare_channel_run(
+    conn: &ConnDraft,
+    drafts: &[ScheduleDraft],
+    start: Instant,
+) -> anyhow::Result<PreparedChannelRun> {
+    let interface = conn
+        .to_config()
+        .context("interface configuration is incomplete or invalid")?;
+    anyhow::ensure!(!drafts.is_empty(), "channel has no messages");
+    let messages = drafts
+        .iter()
+        .enumerate()
+        .map(|(i, draft)| {
+            draft.to_message_config().with_context(|| {
+                format!("message {} is incomplete or has an invalid interval", i + 1)
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let schedule = Schedule::compile(&messages, start)?;
+    Ok(PreparedChannelRun {
+        interface,
+        messages,
+        schedule,
+    })
+}
+
+/// Replace one supervisor slot only after its complete candidate run has
+/// compiled. This ordering is the safety boundary: every error return occurs
+/// before [`TalkerSupervisor::start`] can stop or reset the existing runner.
+fn replace_channel_run(
+    supervisor: &mut TalkerSupervisor,
+    index: usize,
+    label: String,
+    conn: &ConnDraft,
+    drafts: &[ScheduleDraft],
+    start: Instant,
+) -> anyhow::Result<()> {
+    let prepared = prepare_channel_run(conn, drafts, start)?;
+    supervisor.start(
+        index,
+        label,
+        prepared.interface,
+        prepared.messages,
+        prepared.schedule,
+    );
+    Ok(())
 }
 
 struct TalkerApp {
@@ -409,11 +469,16 @@ impl TalkerApp {
     }
 
     fn can_start_connection(&self, i: usize) -> bool {
-        !self.is_connection_running(i)
-            && self
-                .conn_drafts
-                .get(i)
-                .is_some_and(|d| d.to_config().is_some())
+        !self.is_connection_running(i) && self.drafts_are_startable(i)
+    }
+
+    /// Whether the current drafts form a complete, compilable candidate run.
+    /// Unlike [`Self::can_start_connection`], this deliberately ignores the
+    /// current lifecycle so it can also gate a running channel's replacement.
+    fn drafts_are_startable(&self, i: usize) -> bool {
+        self.conn_drafts
+            .get(i)
+            .is_some_and(|d| d.to_config().is_some())
             && self.sched_drafts.get(i).is_some_and(|s| {
                 // EVERY message must convert (a filter_map here once let an
                 // unconvertible draft silently vanish from the started
@@ -652,10 +717,6 @@ impl TalkerApp {
     // ── Talker thread lifecycle ────────────────────────────────────────────────
 
     fn start_connection(&mut self, i: usize) {
-        // Park any currently-running runner as a predecessor; the interface
-        // is opened on the new runner thread, never on the UI thread.
-        self.stop_connection(i);
-
         // Starting (or attempting to start) is an explicit commit —
         // flip the active UDP destination into strict validation so
         // missing / malformed fields surface as red immediately.
@@ -676,34 +737,37 @@ impl TalkerApp {
         let label = self.channel_label(i);
         let cid = self.sup.channel_id(i).map_or(0, |id| id.as_u64());
 
-        let Some(cfg) = self.conn_drafts.get(i).and_then(|d| d.to_config()) else {
-            tracing::warn!(channel = cid, "channel {label} config invalid");
-            return;
-        };
-
-        // Straight from this channel's drafts, strictly (all messages must
-        // convert). The old path flushed drafts into the profile and read
-        // `profile.channels[i]` back — an invalid *other* channel compressed
-        // the indices and this channel could start with someone else's
-        // messages.
-        let Some(messages) = self.sched_drafts.get(i).and_then(|ds| {
-            ds.iter()
-                .map(|d| d.to_message_config())
-                .collect::<Option<Vec<_>>>()
-        }) else {
-            tracing::warn!(
+        let Some(conn) = self.conn_drafts.get(i) else {
+            tracing::error!(
                 channel = cid,
-                "channel {label} has an invalid message (bad interval?) — fix or remove it"
+                "channel {label} start preflight failed: missing draft"
             );
             return;
         };
-        let schedule = match Schedule::compile(&messages, Instant::now()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(channel = cid, "channel {label} schedule error: {e:#}");
-                return;
-            }
+        let Some(drafts) = self.sched_drafts.get(i) else {
+            tracing::error!(
+                channel = cid,
+                "channel {label} start preflight failed: missing message drafts"
+            );
+            return;
         };
+        // Build the complete candidate before touching the supervisor, then
+        // replace through the one ordering boundary shared with the regression
+        // test. A malformed edit leaves the healthy run untouched.
+        if let Err(e) = replace_channel_run(
+            &mut self.sup,
+            i,
+            label.clone(),
+            conn,
+            drafts,
+            Instant::now(),
+        ) {
+            tracing::error!(
+                channel = cid,
+                "channel {label} start preflight failed; runtime unchanged: {e:#}"
+            );
+            return;
+        }
 
         // Lifecycle, telemetry reset, predecessor joining, and the runner
         // spawn all live in the supervisor (ADR-019); the GUI resets only
@@ -717,7 +781,6 @@ impl TalkerApp {
         if let Some(display) = self.displays.get_mut(i) {
             display.reset_run_state();
         }
-        self.sup.start(i, label, cfg, messages, schedule);
     }
 
     /// Stop channel `i` without blocking the UI (the supervisor parks the
@@ -908,17 +971,22 @@ impl eframe::App for TalkerApp {
                 // Master–detail (spec §3.2): the channel list on the left
                 // (or its collapsed status strip), the selected channel's
                 // detail pane in the centre.
-                if self.channels_collapsed {
+                let channel_panel = if self.channels_collapsed {
                     egui::Panel::left("channel_strip")
                         .resizable(false)
-                        .show_inside(ui, |ui| self.show_channel_strip(ui));
+                        .show_inside(ui, |ui| self.show_channel_strip(ui))
                 } else {
                     egui::Panel::left("channel_list")
                         .resizable(true)
                         .default_size(280.0)
-                        .show_inside(ui, |ui| self.show_channel_list(ui));
-                }
+                        .show_inside(ui, |ui| self.show_channel_list(ui))
+                };
                 egui::CentralPanel::default().show_inside(ui, |ui| self.show_detail(ui));
+                selection::connect_tab_to_page(
+                    ui,
+                    channel_panel.response.rect,
+                    channel_panel.inner,
+                );
             });
         self.show_remove_confirm(ui.ctx());
         // Apply user-requested mutations AFTER the layout closes — never
@@ -1372,6 +1440,91 @@ mod tests {
         let mut d = ScheduleDraft::from(&MessageConfig::new(PayloadConfig::raw_hex("AB"), 100));
         d.interval_ms = interval.to_string();
         d
+    }
+
+    #[test]
+    fn replacement_preflight_reports_the_exact_one_based_message_error() {
+        let conn = serial_draft("active");
+        let message = ScheduleDraft {
+            payload_kind: draft::PayloadKind::Ascii,
+            ascii_text: "broken‹marker".to_string(),
+            ..ScheduleDraft::default()
+        };
+
+        let err = prepare_channel_run(&conn, &[message], Instant::now())
+            .expect_err("malformed marker must fail preflight");
+        let text = format!("{err:#}");
+        assert!(text.contains("compiling message 1"), "error was: {text}");
+        assert!(
+            text.contains("complete ‹XX› byte marker"),
+            "error was: {text}"
+        );
+    }
+
+    #[test]
+    fn replacement_preflight_builds_the_complete_candidate_run() {
+        let conn = serial_draft("active");
+        let prepared = prepare_channel_run(&conn, &[message_draft("100")], Instant::now())
+            .expect("valid candidate");
+
+        assert_eq!(prepared.messages.len(), 1);
+        assert_eq!(prepared.schedule.len(), 1);
+        assert_eq!(prepared.interface, conn.to_config().unwrap());
+    }
+
+    #[test]
+    fn malformed_replacement_leaves_the_active_run_unchanged() {
+        use std::time::Duration;
+
+        use crate::core::channel::UdpConfig;
+
+        let interface =
+            InterfaceConfig::Udp(UdpConfig::unicast("127.0.0.1:49152".parse().unwrap()));
+        let conn = ConnDraft::from(&interface);
+        let valid = vec![message_draft("1000")];
+        let mut supervisor = TalkerSupervisor::new(runner::ObserverPolicy::sampled());
+        supervisor.push_slot();
+        replace_channel_run(
+            &mut supervisor,
+            0,
+            "active".to_string(),
+            &conn,
+            &valid,
+            Instant::now(),
+        )
+        .expect("initial run starts");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while supervisor.applied_run_config(0).is_none() && Instant::now() < deadline {
+            supervisor.poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let applied = supervisor
+            .applied_run_config(0)
+            .cloned()
+            .expect("initial interface opens");
+
+        let malformed = ScheduleDraft {
+            payload_kind: draft::PayloadKind::Ascii,
+            ascii_text: "broken‹marker".to_string(),
+            ..ScheduleDraft::default()
+        };
+        let error = replace_channel_run(
+            &mut supervisor,
+            0,
+            "replacement".to_string(),
+            &conn,
+            &[malformed],
+            Instant::now(),
+        )
+        .expect_err("malformed replacement must fail before restart");
+
+        assert!(format!("{error:#}").contains("complete ‹XX› byte marker"));
+        assert!(supervisor.is_running(0));
+        assert_eq!(supervisor.applied_run_config(0), Some(&applied));
+
+        supervisor.stop_all();
+        supervisor.join_all();
     }
 
     /// The flush is all-or-none and index-preserving: one bad entry aborts

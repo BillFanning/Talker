@@ -92,10 +92,3 @@ pub(super) fn line_high_green() -> Color32 {
 pub(super) fn line_low_grey() -> Color32 {
     palette().line_low_grey
 }
-
-// ── Structure ────────────────────────────────────────────────────────────────
-
-/// The channel-card border (talker's connection-card color).
-pub(super) fn box_stroke() -> Color32 {
-    palette().box_stroke
-}

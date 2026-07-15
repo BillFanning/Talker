@@ -158,7 +158,12 @@ Cross off items as they are completed. Add new ones inline as they come up.
 - [x] **Bounded multiline message editors (ADR-024).** UTF-8, UTF-16, and
   ASCII editors show explicit line breaks, never soft-wrap, grow from three
   through eight visible rows, and provide horizontal and vertical scrolling
-  on overflow.
+  on overflow. Horizontal sizing reuses the editor's non-wrapping galley, and
+  unchanged marker-aware repaints do not copy the message repair snapshot.
+- [x] **Active-run replacement preflight (ADR-025).** A complete candidate
+  interface, message list, and schedule now compile before supervisor state is
+  touched. Invalid edits disable `Apply & Restart`, surface their exact
+  one-based message error, and leave the current runner and applied run intact.
 - [x] **Sample lane rotates across messages** — the lane skips a repeat of the
   last sampled index while due (never longer than one full cycle), so an
   aligned multi-message schedule no longer shows message 0 forever. Pinned by

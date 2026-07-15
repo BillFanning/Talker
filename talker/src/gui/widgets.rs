@@ -3,7 +3,10 @@
 //! here is either a stateless `fn(ui, …)` widget or a pure validation /
 //! formatting helper — app state stays in [`super::TalkerApp`].
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 
 use egui::{Align, Layout};
 
@@ -65,7 +68,7 @@ pub(super) fn lifecycle_indicator(
 /// - not running, no error → "Start Channel", enabled iff the draft is valid
 /// - not running, error → "Retry Channel" (the open/run failed), iff valid
 /// - running + pending edits (interface or messages) → "Apply & Restart",
-///   enabled — one coordinated stop + apply + start
+///   enabled iff the complete replacement draft is valid
 /// - running, no edits → "Start Channel", **disabled** (nothing to do)
 pub(super) fn start_button(
     running: bool,
@@ -74,7 +77,7 @@ pub(super) fn start_button(
     can_start: bool,
 ) -> (&'static str, bool) {
     match (running, drift) {
-        (true, true) => ("Apply & Restart", true),
+        (true, true) => ("Apply & Restart", can_start),
         (true, false) => ("Start Channel", false),
         (false, _) => (
             if has_error {
@@ -276,6 +279,18 @@ fn message_blockers(idx: usize, entry: &ScheduleDraft) -> Vec<String> {
         }
         // UTF-8 / UTF-16 / ASCII payloads accept any string at this layer.
         _ => {}
+    }
+    if out.is_empty() {
+        match entry.to_message_config() {
+            Some(config) => {
+                if let Err(error) = config.validate() {
+                    out.push(format!("Message {n}: {error:#}"));
+                }
+            }
+            None => out.push(format!(
+                "Message {n}: configuration is incomplete or invalid"
+            )),
+        }
     }
     out
 }
@@ -992,16 +1007,63 @@ fn append_code_page_run(
     );
 }
 
-/// Lay out a UTF-8/ASCII text field. Explicit newlines create rows and long
-/// lines never soft-wrap.
-fn marker_layouter(
+#[derive(Clone, Copy)]
+enum MessageEditorLayout {
+    MarkerAware(Option<CodePage>),
+    Plain,
+}
+
+fn plain_editor_layout_job(ui: &egui::Ui, text: &str) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::TextStyle::Body.resolve(ui.style()),
+            color: ui.visuals().text_color(),
+            ..Default::default()
+        },
+    );
+    job
+}
+
+/// Lay out one editor value without soft wrapping. The resulting galley is
+/// both the source of truth for horizontal extent and the layout TextEdit
+/// consumes, avoiding a separate glyph-by-glyph width traversal.
+fn message_editor_galley(
     ui: &egui::Ui,
-    buf: &dyn egui::TextBuffer,
-    code_page: Option<CodePage>,
-    _wrap_width: f32,
-) -> std::sync::Arc<egui::Galley> {
-    let job = marker_layout_job(ui, buf.as_str(), code_page);
-    ui.fonts_mut(|f| f.layout_job(job))
+    text: &str,
+    layout: MessageEditorLayout,
+) -> Arc<egui::Galley> {
+    let job = match layout {
+        MessageEditorLayout::MarkerAware(code_page) => marker_layout_job(ui, text, code_page),
+        MessageEditorLayout::Plain => plain_editor_layout_job(ui, text),
+    };
+    ui.fonts_mut(|fonts| fonts.layout_job(job))
+}
+
+/// Supplies the precomputed galley to TextEdit's first layout request. If an
+/// input event changes the text, TextEdit asks again and receives a fresh
+/// galley for the new value.
+struct MessageEditorLayouter {
+    layout: MessageEditorLayout,
+    initial: Option<Arc<egui::Galley>>,
+}
+
+impl MessageEditorLayouter {
+    fn new(layout: MessageEditorLayout, initial: Arc<egui::Galley>) -> Self {
+        Self {
+            layout,
+            initial: Some(initial),
+        }
+    }
+
+    fn layout(&mut self, ui: &egui::Ui, text: &str) -> Arc<egui::Galley> {
+        self.initial
+            .take()
+            .unwrap_or_else(|| message_editor_galley(ui, text, self.layout))
+    }
 }
 
 const MESSAGE_EDITOR_MIN_ROWS: usize = 3;
@@ -1013,33 +1075,31 @@ fn message_editor_visible_rows(text: &str) -> usize {
         .clamp(MESSAGE_EDITOR_MIN_ROWS, MESSAGE_EDITOR_MAX_ROWS)
 }
 
-fn message_editor_content_width(ui: &egui::Ui, text: &str, viewport_width: f32) -> f32 {
-    let font = egui::TextStyle::Body.resolve(ui.style());
-    let longest_line = ui.fonts_mut(|fonts| {
-        text.split('\n')
-            .map(|line| {
-                line.chars()
-                    .map(|c| {
-                        let width = fonts.glyph_width(&font, c);
-                        if width > 0.0 {
-                            width
-                        } else {
-                            // Headless tests and a temporarily unavailable fallback
-                            // font can report zero. Reserve one em so content is never
-                            // silently clipped merely because measurement failed.
-                            font.size
-                        }
-                    })
-                    .sum::<f32>()
-            })
-            .fold(0.0_f32, f32::max)
-    });
+fn message_editor_content_width(
+    ui: &egui::Ui,
+    text: &str,
+    galley: &egui::Galley,
+    viewport_width: f32,
+) -> f32 {
+    let natural_width = if galley.size().x > 0.0 {
+        galley.size().x
+    } else {
+        // Headless tests and a temporarily unavailable fallback font can
+        // report a zero-width galley. Use a conservative byte-count estimate
+        // only in that exceptional path; normal frames never rescan text.
+        let longest_line = text.split('\n').map(str::len).max().unwrap_or(0);
+        longest_line as f32 * egui::TextStyle::Body.resolve(ui.style()).size
+    };
     // TextEdit's horizontal frame margin needs a little room beyond glyphs.
-    (longest_line + 12.0).max(viewport_width)
+    (natural_width + 12.0).max(viewport_width)
 }
 
 pub(super) fn message_editor_max_height(ui: &egui::Ui, text: &str) -> f32 {
-    let rows = message_editor_visible_rows(text) as f32;
+    message_editor_height_for_rows(ui, message_editor_visible_rows(text))
+}
+
+fn message_editor_height_for_rows(ui: &egui::Ui, rows: usize) -> f32 {
+    let rows = rows as f32;
     let text_height = rows * ui.text_style_height(&egui::TextStyle::Body);
     // Frame margins plus room for a horizontal scrollbar when a line is long.
     text_height + 8.0 + ui.spacing().scroll.allocated_width()
@@ -1063,11 +1123,192 @@ fn message_editor_content<R>(
     .inner
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TextEditContextMenuState {
+    has_selection: bool,
+    has_text: bool,
+}
+
+impl TextEditContextMenuState {
+    fn new(text: &str, cursor_range: Option<egui::text::CCursorRange>) -> Self {
+        Self {
+            has_selection: cursor_range.is_some_and(|range| !range.is_empty()),
+            has_text: !text.is_empty(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextEditContextAction {
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
+impl TextEditContextAction {
+    fn viewport_command(self) -> Option<egui::ViewportCommand> {
+        match self {
+            Self::Cut => Some(egui::ViewportCommand::RequestCut),
+            Self::Copy => Some(egui::ViewportCommand::RequestCopy),
+            Self::Paste => Some(egui::ViewportCommand::RequestPaste),
+            Self::SelectAll => None,
+        }
+    }
+}
+
+fn text_edit_context_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    key: egui::Key,
+    enabled: bool,
+) -> egui::Response {
+    let shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key);
+    let shortcut_text = ui.ctx().format_shortcut(&shortcut);
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(label).shortcut_text(shortcut_text),
+    )
+}
+
+fn apply_text_edit_context_action(
+    ui: &mut egui::Ui,
+    output: &mut egui::text_edit::TextEditOutput,
+    action: TextEditContextAction,
+) {
+    let response = &output.response.response;
+    response.request_focus();
+
+    if let Some(command) = action.viewport_command() {
+        // Let TextEdit process the native clipboard event on the next frame.
+        // This preserves its undo history and marker-aware post-edit repair.
+        ui.ctx().send_viewport_cmd(command);
+        return;
+    }
+
+    let range = egui::text::CCursorRange::select_all(&output.galley);
+    output.cursor_range = Some(range);
+    output.state.cursor.set_char_range(Some(range));
+    output.state.clone().store(ui.ctx(), response.id);
+}
+
+fn show_text_edit_context_menu(
+    ui: &mut egui::Ui,
+    text: &str,
+    output: &mut egui::text_edit::TextEditOutput,
+) {
+    let state = TextEditContextMenuState::new(text, output.cursor_range);
+    let response = output.response.response.clone();
+    let mut action = None;
+
+    response.context_menu(|ui| {
+        if text_edit_context_button(ui, "Cut", egui::Key::X, state.has_selection).clicked() {
+            action = Some(TextEditContextAction::Cut);
+            ui.close();
+        }
+        if text_edit_context_button(ui, "Copy", egui::Key::C, state.has_selection).clicked() {
+            action = Some(TextEditContextAction::Copy);
+            ui.close();
+        }
+        if text_edit_context_button(ui, "Paste", egui::Key::V, true).clicked() {
+            action = Some(TextEditContextAction::Paste);
+            ui.close();
+        }
+        ui.separator();
+        if text_edit_context_button(ui, "Select All", egui::Key::A, state.has_text).clicked() {
+            action = Some(TextEditContextAction::SelectAll);
+            ui.close();
+        }
+    });
+
+    // A secondary click does not inherently focus TextEdit. Focus it when the
+    // menu opens and again when applying an action so Paste targets this field.
+    if response.secondary_clicked() {
+        response.request_focus();
+    }
+    if let Some(action) = action {
+        apply_text_edit_context_action(ui, output, action);
+    }
+}
+
+fn bounded_multiline_text_edit(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    salt: &'static str,
+    layout: MessageEditorLayout,
+    width: f32,
+    hint: &str,
+) -> egui::text_edit::TextEditOutput {
+    let viewport_width = (width - ui.spacing().scroll.allocated_width()).max(64.0);
+    let rows = message_editor_visible_rows(text);
+    let max_height = message_editor_height_for_rows(ui, rows);
+
+    // This is the layout TextEdit needs anyway. Read its natural width before
+    // constructing the scroll content, then reuse the same Arc on TextEdit's
+    // first layout request instead of walking every glyph a second time.
+    let initial_galley = message_editor_galley(ui, text, layout);
+    let content_width = message_editor_content_width(ui, text, &initial_galley, viewport_width);
+    let mut editor_layouter = MessageEditorLayouter::new(layout, initial_galley);
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| {
+        editor_layouter.layout(ui, buf.as_str())
+    };
+
+    let mut output = egui::ScrollArea::both()
+        .id_salt(("message_editor_scroll", salt))
+        .max_width(width)
+        .max_height(max_height)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            message_editor_content(ui, salt, content_width, |ui| {
+                egui::TextEdit::multiline(text)
+                    .id_salt(salt)
+                    .desired_width(content_width)
+                    .desired_rows(rows)
+                    .hint_text(hint)
+                    .layouter(&mut layouter)
+                    .show(ui)
+            })
+        })
+        .inner;
+
+    show_text_edit_context_menu(ui, text, &mut output);
+    output
+}
+
+#[derive(Clone, Default)]
+struct MarkerEditSnapshot {
+    text: Arc<str>,
+}
+
+impl MarkerEditSnapshot {
+    /// Synchronize programmatic changes (profile/channel switches and Insert
+    /// popup actions) before TextEdit can mutate the value. Returns whether a
+    /// copy was needed; an unchanged repaint only performs a byte comparison.
+    fn sync_external(&mut self, current: &str) -> bool {
+        if self.text.as_ref() == current {
+            false
+        } else {
+            self.text = Arc::from(current);
+            true
+        }
+    }
+
+    fn repair_and_commit(&mut self, current: &mut String, changed: bool) -> bool {
+        if changed {
+            repair_after_edit(&self.text, current);
+            self.text = Arc::from(current.as_str());
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Bounded multiline TextEdit for text that may contain `‹XX›` byte markers.
 ///
 /// Three marker-aware behaviours layered on a plain `TextEdit`:
 ///
-///  1. Coloured-marker highlighting via [`marker_layouter`].
+///  1. Coloured-marker highlighting via [`message_editor_galley`].
 ///  2. *Atomic* marker deletion via [`repair_after_edit`]: a single
 ///     keystroke that disturbs a complete marker removes the whole
 ///     4-character unit rather than leaving an orphan `‹` / `›`.
@@ -1094,43 +1335,30 @@ pub(super) fn marker_aware_text_edit(
     let shared_cursor_id = egui::Id::new("marker_target_cursor").with(salt);
     let shared_widget_id = egui::Id::new("marker_target_widget").with(salt);
 
-    let prev_text: String = ui
-        .memory(|m| m.data.get_temp::<String>(stash_prev_text))
-        .unwrap_or_else(|| text.clone());
+    // Cloning the snapshot clones only an Arc. Leave the stored value untouched
+    // on unchanged frames; actual or programmatic edits replace it below.
+    let mut snapshot = ui
+        .memory(|m| m.data.get_temp::<MarkerEditSnapshot>(stash_prev_text))
+        .unwrap_or_default();
+    let mut store_snapshot = snapshot.sync_external(text);
     let prev_cursor: Option<usize> = ui.memory(|m| m.data.get_temp(stash_prev_cursor));
 
-    let viewport_width = (width - ui.spacing().scroll.allocated_width()).max(64.0);
-    let content_width = message_editor_content_width(ui, text, viewport_width);
-    let max_height = message_editor_max_height(ui, text);
-    let rows = message_editor_visible_rows(text);
-    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-        marker_layouter(ui, buf, code_page, wrap_width)
-    };
-    let output = egui::ScrollArea::both()
-        .id_salt(("message_editor_scroll", salt))
-        .max_width(width)
-        .max_height(max_height)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            message_editor_content(ui, salt, content_width, |ui| {
-                egui::TextEdit::multiline(text)
-                    .id_salt(salt)
-                    .desired_width(content_width)
-                    .desired_rows(rows)
-                    .hint_text(hint)
-                    .layouter(&mut layouter)
-                    .show(ui)
-            })
-        })
-        .inner;
+    let output = bounded_multiline_text_edit(
+        ui,
+        text,
+        salt,
+        MessageEditorLayout::MarkerAware(code_page),
+        width,
+        hint,
+    );
 
     // TextEdit::show returns AtomLayoutResponse wrapping the actual
     // Response — unwrap once here so the rest reads naturally.
     let resp = output.response.response;
-    if resp.changed() {
-        repair_after_edit(&prev_text, text);
+    store_snapshot |= snapshot.repair_and_commit(text, resp.changed());
+    if store_snapshot {
+        ui.memory_mut(|m| m.data.insert_temp(stash_prev_text, snapshot));
     }
-    ui.memory_mut(|m| m.data.insert_temp(stash_prev_text, text.clone()));
 
     let widget_id = resp.id;
     ui.memory_mut(|m| m.data.insert_temp(shared_widget_id, widget_id));
@@ -1197,26 +1425,8 @@ pub(super) fn plain_text_edit_with_cursor(
 ) -> egui::Response {
     let shared_cursor_id = egui::Id::new("marker_target_cursor").with(salt);
     let shared_widget_id = egui::Id::new("marker_target_widget").with(salt);
-    let viewport_width = (width - ui.spacing().scroll.allocated_width()).max(64.0);
-    let content_width = message_editor_content_width(ui, text, viewport_width);
-    let max_height = message_editor_max_height(ui, text);
-    let rows = message_editor_visible_rows(text);
-    let output = egui::ScrollArea::both()
-        .id_salt(("message_editor_scroll", salt))
-        .max_width(width)
-        .max_height(max_height)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            message_editor_content(ui, salt, content_width, |ui| {
-                egui::TextEdit::multiline(text)
-                    .id_salt(salt)
-                    .desired_width(content_width)
-                    .desired_rows(rows)
-                    .hint_text(hint)
-                    .show(ui)
-            })
-        })
-        .inner;
+    let output =
+        bounded_multiline_text_edit(ui, text, salt, MessageEditorLayout::Plain, width, hint);
     let resp = output.response.response;
     ui.memory_mut(|m| m.data.insert_temp(shared_widget_id, resp.id));
     if let Some(range) = output.cursor_range {
@@ -1793,12 +2003,119 @@ mod tests {
     use super::*;
 
     #[test]
-    fn marker_layouter_preserves_newlines_without_soft_wrapping() {
+    fn editor_galleys_preserve_newlines_without_soft_wrapping() {
         egui::__run_test_ui(|ui| {
             let text = format!("{}\nsecond line", "long ‹0D› ".repeat(500));
-            let galley = marker_layouter(ui, &text, None, 100.0);
-            assert_eq!(galley.rows.len(), 2, "long lines must not soft-wrap");
+            for layout in [
+                MessageEditorLayout::MarkerAware(None),
+                MessageEditorLayout::Plain,
+            ] {
+                let galley = message_editor_galley(ui, &text, layout);
+                assert_eq!(galley.rows.len(), 2, "long lines must not soft-wrap");
+            }
         });
+    }
+
+    #[test]
+    fn editor_layouter_reuses_the_galley_that_supplied_its_width() {
+        egui::__run_test_ui(|ui| {
+            let text = "a long editor line";
+            let initial = message_editor_galley(ui, text, MessageEditorLayout::MarkerAware(None));
+            let mut layouter = MessageEditorLayouter::new(
+                MessageEditorLayout::MarkerAware(None),
+                Arc::clone(&initial),
+            );
+
+            let first = layouter.layout(ui, text);
+            assert!(
+                Arc::ptr_eq(&first, &initial),
+                "TextEdit's first request must reuse the width galley"
+            );
+            let second = layouter.layout(ui, "changed");
+            assert_eq!(second.text(), "changed");
+        });
+    }
+
+    #[test]
+    fn text_edit_context_menu_enables_actions_from_editor_state() {
+        let caret = egui::text::CCursorRange::one(egui::text::CCursor::new(2));
+        let selection =
+            egui::text::CCursorRange::two(egui::text::CCursor::new(1), egui::text::CCursor::new(3));
+
+        assert_eq!(
+            TextEditContextMenuState::new("", None),
+            TextEditContextMenuState {
+                has_selection: false,
+                has_text: false,
+            }
+        );
+        assert_eq!(
+            TextEditContextMenuState::new("text", Some(caret)),
+            TextEditContextMenuState {
+                has_selection: false,
+                has_text: true,
+            }
+        );
+        assert_eq!(
+            TextEditContextMenuState::new("text", Some(selection)),
+            TextEditContextMenuState {
+                has_selection: true,
+                has_text: true,
+            }
+        );
+    }
+
+    #[test]
+    fn text_edit_clipboard_actions_use_native_viewport_requests() {
+        assert_eq!(
+            TextEditContextAction::Cut.viewport_command(),
+            Some(egui::ViewportCommand::RequestCut)
+        );
+        assert_eq!(
+            TextEditContextAction::Copy.viewport_command(),
+            Some(egui::ViewportCommand::RequestCopy)
+        );
+        assert_eq!(
+            TextEditContextAction::Paste.viewport_command(),
+            Some(egui::ViewportCommand::RequestPaste)
+        );
+        assert_eq!(TextEditContextAction::SelectAll.viewport_command(), None);
+    }
+
+    #[test]
+    fn text_edit_select_all_uses_and_persists_galley_character_bounds() {
+        egui::__run_test_ui(|ui| {
+            let mut text = "Aé‹1B›\nZ".to_owned();
+            let mut output = egui::TextEdit::multiline(&mut text).show(ui);
+            let widget_id = output.response.response.id;
+            let expected = egui::text::CCursorRange::select_all(&output.galley);
+
+            apply_text_edit_context_action(ui, &mut output, TextEditContextAction::SelectAll);
+
+            assert_eq!(output.cursor_range, Some(expected));
+            let stored = egui::TextEdit::load_state(ui.ctx(), widget_id)
+                .expect("Select All must persist the TextEdit cursor state");
+            assert_eq!(stored.cursor.char_range(), Some(expected));
+            assert!(ui.memory(|memory| memory.has_focus(widget_id)));
+        });
+    }
+
+    #[test]
+    fn marker_snapshot_copies_only_when_text_changes() {
+        let mut snapshot = MarkerEditSnapshot::default();
+        assert!(snapshot.sync_external("A‹1B›B"));
+        let unchanged = Arc::clone(&snapshot.text);
+
+        assert!(!snapshot.sync_external("A‹1B›B"));
+        assert!(Arc::ptr_eq(&snapshot.text, &unchanged));
+
+        let mut edited = "A‹X1B›B".to_string();
+        assert!(snapshot.repair_and_commit(&mut edited, true));
+        assert_eq!(edited, "AB");
+        assert_eq!(snapshot.text.as_ref(), "AB");
+
+        assert!(snapshot.sync_external("profile replacement"));
+        assert!(!snapshot.sync_external("profile replacement"));
     }
 
     #[test]
@@ -1863,7 +2180,8 @@ mod tests {
             let mut text = format!("{}\n{}", "wide ".repeat(500), "line\n".repeat(20));
             let before = ui.min_rect().bottom();
             let max_height = message_editor_max_height(ui, &text);
-            let content_width = message_editor_content_width(ui, &text, 300.0);
+            let galley = message_editor_galley(ui, &text, MessageEditorLayout::MarkerAware(None));
+            let content_width = message_editor_content_width(ui, &text, &galley, 300.0);
             let response =
                 marker_aware_text_edit(ui, &mut text, "bounded_editor_test", None, 300.0, "text");
             let consumed = ui.min_rect().bottom() - before;
@@ -2095,20 +2413,34 @@ mod tests {
             start_button(false, false, true, true),
             ("Start Channel", true)
         );
-        // Running with pending edits → the coordinated restart.
+        // Running with valid pending edits → the coordinated restart.
         assert_eq!(
-            start_button(true, false, true, false),
+            start_button(true, false, true, true),
             ("Apply & Restart", true)
         );
-        // Running with errors and edits still restarts (that's the recovery).
+        // An invalid replacement must not interrupt the active run.
         assert_eq!(
             start_button(true, true, true, false),
-            ("Apply & Restart", true)
+            ("Apply & Restart", false)
         );
         // Running, nothing to apply → disabled Start.
         assert_eq!(
             start_button(true, false, false, false),
             ("Start Channel", false)
         );
+    }
+
+    #[test]
+    fn malformed_ascii_marker_is_an_exact_message_blocker() {
+        let draft = ScheduleDraft {
+            payload_kind: PayloadKind::Ascii,
+            ascii_text: "active‹replacement".to_string(),
+            ..ScheduleDraft::default()
+        };
+
+        let blockers = message_blockers(0, &draft);
+        assert_eq!(blockers.len(), 1, "blockers: {blockers:?}");
+        assert!(blockers[0].starts_with("Message 1:"));
+        assert!(blockers[0].contains("complete ‹XX› byte marker"));
     }
 }

@@ -7,6 +7,7 @@ mod stream_view;
 
 use crate::core::{ChannelId, RecordingState};
 use crate::diagnostics::DiagnosticSeverity;
+use wiredata_ui::selection;
 
 use super::bridge::{self, UiCommand};
 use super::fonts::bold;
@@ -40,9 +41,15 @@ impl ListenerApp {
             return;
         };
         self.sync_edit_draft(id);
-        let Some((details, status, bytes_total, bps, last_error, recording)) =
-            self.state.channel(id).map(|v| {
+        let Some((position, name, details, status, bytes_total, bps, last_error, recording)) = self
+            .state
+            .channels()
+            .enumerate()
+            .find(|(_, view)| view.id == id)
+            .map(|(index, v)| {
                 (
+                    index + 1,
+                    v.name.clone(),
                     v.details.clone(),
                     v.status,
                     v.bytes_total,
@@ -55,6 +62,9 @@ impl ListenerApp {
             ui.label("That channel is no longer present.");
             return;
         };
+        let title = selection::channel_title(position, &name);
+        Self::show_channel_identity(ui, &title, status, &details);
+        ui.add_space(4.0);
 
         // Does the edit draft differ from the committed config in a way that needs a
         // restart? Drives the Start button's "Apply & Restart" label. Live-applied
@@ -83,7 +93,6 @@ impl ListenerApp {
                     id,
                     status,
                     config_changed,
-                    &details,
                     bytes_total,
                     bps,
                 );
@@ -167,6 +176,25 @@ impl ListenerApp {
         self.show_diagnostics(ui, id);
         ui.separator();
         self.show_stream_view(ui, id);
+    }
+
+    /// Persistent identity for the selected channel. Listener's stream and
+    /// diagnostics have their own scroll areas, so this matching band remains
+    /// visible while their contents move beneath it.
+    fn show_channel_identity(ui: &mut egui::Ui, title: &str, status: ChannelStatus, details: &str) {
+        selection::detail_identity(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (glyph, scale) = status_glyph(status);
+                paint_glyph(ui, glyph, scale, status_color(status));
+                let size = egui::TextStyle::Body.resolve(ui.style()).size * 1.15;
+                ui.label(egui::RichText::new(title).strong().size(size));
+            });
+            ui.horizontal(|ui| {
+                ui.label(status_label(status));
+                ui.label("·");
+                ui.label(egui::RichText::new(details).weak());
+            });
+        });
     }
 
     /// Diagnostics for the selected channel (snapshot-driven): a color-coded
@@ -319,28 +347,20 @@ impl ListenerApp {
         }
     }
 
-    /// The channel block (left column): name (live rename), status·details, byte
-    /// stats, and the [Start / Apply & Restart / Retry] [Stop] lifecycle row. Both
-    /// buttons always present; Stop disabled unless stoppable; the Start side's
-    /// label/enabled is the pure `start_button` decision.
-    #[allow(clippy::too_many_arguments)]
+    /// The channel block below the persistent identity: live rename, byte
+    /// stats, and the [Start / Apply & Restart / Retry] [Stop] lifecycle row.
+    /// Both buttons are always present; Stop is disabled unless stoppable.
     fn show_channel_controls(
         &mut self,
         ui: &mut egui::Ui,
         id: ChannelId,
         status: ChannelStatus,
         config_changed: bool,
-        details: &str,
         bytes_total: u64,
         bps: f64,
     ) {
-        // Name row: status glyph + editable name (renames live, §6).
+        // Editable name. Identity and lifecycle stay in the fixed band above.
         ui.horizontal(|ui| {
-            // Painted into a fixed cell so the glyph never drives the row height (the
-            // name line stayed put across status changes only once this stopped using a
-            // sized label).
-            let (glyph, scale) = status_glyph(status);
-            paint_glyph(ui, glyph, scale, status_color(status));
             const NAME_HINT: &str = "This channel's display name. When file rotation is \
                 on, it's also the base name of the rotated files (<channel>_<time \
                 period>), so keep it filesystem-safe.";
@@ -385,11 +405,6 @@ impl ListenerApp {
                         .color(theme::warning_amber()),
                 );
             }
-        });
-        ui.horizontal(|ui| {
-            ui.label(status_label(status));
-            ui.label("·");
-            ui.label(egui::RichText::new(details).weak());
         });
         // Byte-based liveness (§18): total received + rolling throughput.
         ui.label(format!(

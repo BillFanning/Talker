@@ -522,14 +522,14 @@ exclusive resources. These contradicted both ADR-021's runtime-truth rule and sp
 
 **Decision:**
 - `TalkerSupervisor` retains the requested interface **and messages** as a pending
-  start. `InterfaceOpened` atomically promotes them to one `AppliedRunConfig`; an
-  open failure promotes nothing. GUI drift compares drafts with this confirmed whole
-  run while live and with the profile only while stopped.
-- If a live runner exits unexpectedly after accepting commands, `poll` converts every
-  remaining pending id into a scoped failed completion. An explicit stop likewise
-  fails any result that has not yet been observed and clears the applied-run state.
-  `Enqueued` therefore always reaches either `Applied` or `Failed`, including the
-  initial-open race.
+  start. `InterfaceOpened` promotes them together in one all-or-nothing supervisor
+  state transition; an open failure promotes neither. GUI drift compares drafts with
+  this confirmed whole run while live and with the profile only while stopped.
+- While the supervisor remains active and its poll loop continues, an `Enqueued`
+  command is not silently discarded: execution reports `Applied` or `Failed`, and
+  `poll` converts unresolved pending ids to `Failed` when a runner exits or an explicit
+  stop tears it down, including the initial-open race. Application teardown may
+  abandon unobserved results because no observer remains.
 - `Interface::reconfigure` handles resources that cannot be double-opened. Same-port
   serial settings are applied to the owned serial handle with rollback to the prior
   settings on error. UDP changes retaining the same local bind update socket options
@@ -596,13 +596,45 @@ line feed in the compiled payload. They never soft-wrap. Each editor grows from 
 visible rows up to eight as explicit lines are added, then scrolls vertically. A line
 wider than the viewport scrolls horizontally. Both scrollbars appear only when their
 axis overflows, and the outer editor width remains bounded so adjacent controls keep
-their space.
+their space. Horizontal extent comes from the same non-wrapping egui galley that the
+`TextEdit` consumes; the editor reuses that precomputed galley for its first layout
+request instead of separately summing every glyph on every repaint. Marker-aware
+editors retain their repair snapshot as `Arc<str>` and replace it only when the text
+changes, avoiding an additional full text copy on unchanged repaints.
 
 **Consequences:** Users can see and edit line-oriented messages without allowing a
 large paste to take over the detail pane. Exact Unicode requires UTF-8 or UTF-16;
 legacy code pages retain ADR-023's visible `?` substitution. Tests pin explicit line
 feed encoding, no-soft-wrap layout, horizontal overflow, vertical growth, and the
-eight-row viewport cap for both editor variants.
+eight-row viewport cap for both editor variants. They also pin reuse of the galley
+that supplied the width and change-only replacement of marker repair snapshots.
+
+## ADR-025 — Preflight replacements before interrupting an active channel
+
+**Status:** Accepted 2026-07-14 (active-run safety fix).
+
+**Context:** A running channel with edited drafts always enabled `Apply & Restart`,
+even when the replacement message could not compile. The GUI then stopped the healthy
+runner before compiling its replacement. A transient edit such as an incomplete
+`‹XX›` byte marker therefore took an active channel offline and reported the problem
+only afterward as a zero-based `message 0` schedule error. The Wire preview reduced
+the same useful error to `(message is incomplete)`.
+
+**Decision:** A replacement follows a prepare-then-replace boundary. The candidate
+interface, complete message list, and compiled schedule are built before
+`TalkerSupervisor::start` performs the first runtime mutation. Any preflight failure
+leaves the existing runner, applied configuration, telemetry, and Output state
+unchanged. `Apply & Restart` uses complete draft validation and is disabled when that
+candidate is invalid; its disabled tooltip and the message's Wire preview expose the
+specific compile error. User-facing schedule diagnostics number messages from one.
+Malformed byte-marker syntax remains an error rather than silently changing wire
+bytes.
+
+**Consequences:** Editing cannot interrupt transmission until a complete replacement
+is ready. The supervisor still owns the valid restart and predecessor handoff, while
+the GUI owns only draft preparation and presentation. Tests pin the disabled invalid
+replacement state, exact one-based marker diagnostics, successful complete preflight,
+and preservation of a real active UDP run across a rejected replacement.
 
 ---
 
