@@ -81,7 +81,7 @@ fn unselected_card_stroke(ui: &egui::Ui) -> egui::Stroke {
             neutral.b(),
             110,
         ));
-    egui::Stroke::new(1.5, faint)
+    egui::Stroke::new(1.5_f32, faint)
 }
 
 fn channel_card_frame(ui: &egui::Ui, selected: bool) -> egui::Frame {
@@ -96,7 +96,7 @@ fn channel_card_frame(ui: &egui::Ui, selected: bool) -> egui::Frame {
         // The complete selected outline is painted later as one path by
         // `connect_tab_to_page`. Preserve the frame's stroke reservation so
         // selection cannot change row height, but make it fully transparent.
-        frame.stroke = egui::Stroke::new(1.5, egui::Color32::TRANSPARENT);
+        frame.stroke = egui::Stroke::new(1.5_f32, egui::Color32::TRANSPARENT);
         frame.corner_radius = egui::CornerRadius {
             nw: 6,
             ne: 0,
