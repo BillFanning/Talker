@@ -224,6 +224,11 @@ Channel types:
 - TCP Listener Channel
 - TCP Connection Channel
 
+For user-created Serial, UDP, and TCP Listener Channels, the `+ Add` template chooses
+the transport kind. Configure Connection edits that kind's parameters but does not
+replace it with another transport. TCP Connection Channels remain runtime-created
+children of a TCP Listener Channel.
+
 ### 4.2 Byte Stream
 
 A Byte Stream is an ordered sequence of received bytes.
@@ -2782,6 +2787,7 @@ Backpressure tests shall verify:
 A user shall be able to:
 
 - Create Serial, UDP, and TCP Listener Channels from templates.
+- Configure the parameters of the transport selected when each Channel was created.
 - Start and Stop Channels independently.
 - Run multiple Channels simultaneously.
 - View Channel status.

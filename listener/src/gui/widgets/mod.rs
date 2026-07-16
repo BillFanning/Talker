@@ -25,12 +25,24 @@ use crate::transport::udp::UdpMode;
 
 use super::fonts::bold;
 
-/// Which interface a new channel uses, in the add-channel form.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// Which interface a new channel uses, in the Add menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum AddKind {
     Udp,
     Tcp,
     Serial,
+}
+
+impl AddKind {
+    pub const ADD_MENU: [Self; 3] = [Self::Udp, Self::Tcp, Self::Serial];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Udp => "UDP",
+            Self::Tcp => "TCP",
+            Self::Serial => "Serial",
+        }
+    }
 }
 
 /// A simple preset color scheme for the message view (#6 — simpler than a picker).
@@ -446,6 +458,14 @@ pub(super) fn config_needs_restart(draft: &ChannelConfig, committed: &ChannelCon
 mod tests {
     use super::super::state::ChannelStatus;
     use super::*;
+
+    #[test]
+    fn add_menu_defines_the_shared_transport_order() {
+        assert_eq!(
+            AddKind::ADD_MENU.map(AddKind::label),
+            ["UDP", "TCP", "Serial"]
+        );
+    }
 
     #[test]
     fn config_incomplete_flags_missing_port_or_serial_device() {

@@ -18,8 +18,9 @@ struct ScheduledMessage {
     compiled: CompiledMessage,
     /// Send interval. Zero means the message is dormant.
     interval: Duration,
-    /// When this message should next fire (only meaningful while active).
-    next_fire: Instant,
+    /// When this message should next fire. `None` while the compiled schedule is
+    /// unarmed or this message is dormant.
+    next_fire: Option<Instant>,
 }
 
 impl ScheduledMessage {
@@ -47,6 +48,9 @@ pub struct Schedule {
     /// fire) under the stall policy — see [`Schedule::poll`]. A growing value
     /// means the send loop couldn't keep to the configured intervals.
     missed_sends: u64,
+    /// Compilation is pure preflight; the runner arms cadence only after its
+    /// interface is ready, so setup time can never count as missed sends.
+    armed: bool,
 }
 
 impl Schedule {
@@ -56,6 +60,15 @@ impl Schedule {
     /// fire at `start` (i.e. immediately). Returns an error if `messages` is
     /// empty or a payload fails to compile.
     pub fn compile(messages: &[MessageConfig], start: Instant) -> anyhow::Result<Self> {
+        let mut schedule = Self::compile_unarmed(messages)?;
+        schedule.arm(start);
+        Ok(schedule)
+    }
+
+    /// Compile payloads and intervals without establishing any deadlines.
+    /// Production preflight uses this form; [`Schedule::arm`] belongs at the
+    /// runner boundary after predecessor cleanup and interface opening.
+    pub fn compile_unarmed(messages: &[MessageConfig]) -> anyhow::Result<Self> {
         anyhow::ensure!(!messages.is_empty(), "channel has no messages");
         let messages = messages
             .iter()
@@ -67,14 +80,25 @@ impl Schedule {
                 Ok(ScheduledMessage {
                     compiled,
                     interval: Duration::from_millis(m.interval_ms),
-                    next_fire: start,
+                    next_fire: None,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Self {
             messages,
             missed_sends: 0,
+            armed: false,
         })
+    }
+
+    /// Establish a fresh cadence grid. Every active message is due immediately
+    /// at `start`; dormant messages remain unscheduled.
+    pub fn arm(&mut self, start: Instant) {
+        for message in &mut self.messages {
+            message.next_fire = message.is_active().then_some(start);
+        }
+        self.missed_sends = 0;
+        self.armed = true;
     }
 
     /// Number of messages in the schedule (active and dormant).
@@ -95,8 +119,8 @@ impl Schedule {
         self.messages
             .iter()
             .enumerate()
-            .filter(|(_, m)| m.is_active())
-            .min_by_key(|(i, m)| (m.next_fire, *i))
+            .filter_map(|(i, message)| message.next_fire.map(|next| (i, next)))
+            .min_by_key(|(i, next)| (*next, *i))
             .map(|(i, _)| i)
     }
 
@@ -113,33 +137,43 @@ impl Schedule {
     /// in the future. Talker generates test traffic — a receiver cares about
     /// cadence, not about conservation of message count.
     pub fn poll(&mut self, now: Instant) -> Tick {
+        // Defensive convenience for direct core users. The production runner
+        // arms explicitly after interface open, but an unarmed schedule still
+        // starts from its first actual poll rather than aging from compile time.
+        if !self.armed {
+            self.arm(now);
+        }
         let Some(index) = self.earliest() else {
             return Tick::Idle;
         };
         let msg = &mut self.messages[index];
-        if msg.next_fire <= now {
-            msg.next_fire += msg.interval;
+        let Some(next_fire) = msg.next_fire else {
+            return Tick::Idle;
+        };
+        if next_fire <= now {
+            let mut following = next_fire + msg.interval;
             let mut skipped = 0u64;
-            if msg.next_fire <= now {
+            if following <= now {
                 // More than one interval behind: skip the missed grid
                 // points. Integer math, not a loop — a long sleep with a
                 // short interval could mean millions of missed points.
                 // (`interval` is non-zero: `earliest` only yields active
                 // messages.)
-                let late = now.duration_since(msg.next_fire).as_nanos();
+                let late = now.duration_since(following).as_nanos();
                 let interval = msg.interval.as_nanos();
                 // Grid points in (old next_fire, now] that will never fire:
                 // the one at `next_fire` plus one per full interval of
                 // additional lateness.
                 skipped = (late / interval + 1) as u64;
                 let rem = late % interval;
-                msg.next_fire = now - Duration::from_nanos(rem as u64) + msg.interval;
+                following = now - Duration::from_nanos(rem as u64) + msg.interval;
             }
+            msg.next_fire = Some(following);
             let payload = msg.compiled.render();
             self.missed_sends = self.missed_sends.saturating_add(skipped);
             Tick::Send { index, payload }
         } else {
-            Tick::Wait(msg.next_fire)
+            Tick::Wait(next_fire)
         }
     }
 
@@ -178,11 +212,10 @@ impl Schedule {
     /// (re)schedules it to fire at `now + interval`. An out-of-range index is
     /// rejected (`false`).
     pub fn set_interval(&mut self, index: usize, interval_ms: u64, now: Instant) -> bool {
+        let armed = self.armed;
         if let Some(msg) = self.messages.get_mut(index) {
             msg.interval = Duration::from_millis(interval_ms);
-            if msg.is_active() {
-                msg.next_fire = now + msg.interval;
-            }
+            msg.next_fire = (armed && msg.is_active()).then_some(now + msg.interval);
             true
         } else {
             false
@@ -214,6 +247,17 @@ mod tests {
     fn compile_bad_payload_returns_error_with_context() {
         let err = Schedule::compile(&[msg("XYZ", 100)], Instant::now()).unwrap_err();
         assert!(err.to_string().contains("message 1"));
+    }
+
+    #[test]
+    fn unarmed_preflight_starts_at_first_poll_without_false_misses() {
+        let compiled_at = Instant::now();
+        let first_poll = compiled_at + ms(10_000);
+        let mut schedule = Schedule::compile_unarmed(&[msg("AB", 100)]).unwrap();
+
+        assert!(matches!(schedule.poll(first_poll), Tick::Send { .. }));
+        assert_eq!(schedule.missed_sends(), 0);
+        assert_eq!(schedule.poll(first_poll), Tick::Wait(first_poll + ms(100)));
     }
 
     // ── poll ──────────────────────────────────────────────────────────────────

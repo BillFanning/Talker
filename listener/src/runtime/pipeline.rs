@@ -12,7 +12,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -188,6 +188,10 @@ impl PipelineDisplayView {
 /// [`ChannelPipeline::ingest`]; [`run_channel`] is the async loop around it.
 pub struct ChannelPipeline {
     channel_id: ChannelId,
+    /// Opaque identity for this pipeline run. Stream offsets restart at zero for
+    /// every fresh pipeline, so the GUI needs an identity alongside the offset to
+    /// reject stale deltas without confusing them with a restart.
+    stream_generation: u64,
     /// Display Views (§48): a Channel may have several, each independently
     /// paused (§11). The first is the default view created by `new`.
     display_views: Vec<PipelineDisplayView>,
@@ -294,11 +298,13 @@ pub struct DisplayRecordingSettings {
 
 /// Bound on the retained recent-match log (§165) — generous but constant (§124).
 const RECENT_MATCHES_CAP: usize = 256;
+static NEXT_STREAM_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 impl ChannelPipeline {
     pub fn new(channel_id: ChannelId, caps: PipelineCapacities) -> Self {
         Self {
             channel_id,
+            stream_generation: NEXT_STREAM_GENERATION.fetch_add(1, Ordering::Relaxed),
             display_views: vec![PipelineDisplayView::new()],
             diagnostics: DiagnosticLog::new(
                 caps.event_retention,
@@ -1384,6 +1390,7 @@ impl ChannelPipeline {
         }
         let bytes: Arc<[u8]> = out.into();
         StreamDelta {
+            generation: self.stream_generation,
             base_offset: from,
             bytes,
             end_offset: end,

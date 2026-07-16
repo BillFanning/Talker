@@ -27,7 +27,10 @@ struct ChannelRow {
 }
 
 impl ListenerApp {
-    pub(super) fn show_channel_list(&mut self, ui: &mut egui::Ui) -> Option<egui::Rect> {
+    pub(super) fn show_channel_list(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Option<selection::SelectedTab> {
         // Heading + the "Add" menu (the only place channels are created now), plus
         // bulk Start all / Stop all (#5).
         ui.horizontal(|ui| {
@@ -58,17 +61,11 @@ impl ListenerApp {
                 theme::set_dark_active(self.dark_mode);
             }
             ui.menu_button("+ Add", |ui| {
-                if ui.button("UDP").clicked() {
-                    self.add_channel(AddKind::Udp);
-                    ui.close();
-                }
-                if ui.button("TCP").clicked() {
-                    self.add_channel(AddKind::Tcp);
-                    ui.close();
-                }
-                if ui.button("Serial").clicked() {
-                    self.add_channel(AddKind::Serial);
-                    ui.close();
+                for kind in AddKind::ADD_MENU {
+                    if ui.button(kind.label()).clicked() {
+                        self.add_channel(kind);
+                        ui.close();
+                    }
                 }
             });
             ui.menu_button("Profile", |ui| {
@@ -160,7 +157,8 @@ impl ListenerApp {
 
         let base = egui::TextStyle::Body.resolve(ui.style()).size;
         let mut selected_tab_rect = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        let scroll = egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(selection::TAB_JOIN_MARGIN);
             for row in rows {
                 let id = row.id;
                 let selected = self.selected == Some(id);
@@ -170,6 +168,7 @@ impl ListenerApp {
                 let visible_selected_rect = ui.push_id(id, |ui| {
                     let inner = selection::channel_card(ui, selected, |ui| {
                         // Line 1: status glyph + name.
+                        let emphasis = selection::channel_row_emphasis(ui, selected);
                         let mut line1 = egui::text::LayoutJob::default();
                         let (glyph, scale) = status_glyph(row.status);
                         line1.append(
@@ -187,7 +186,7 @@ impl ListenerApp {
                             0.0,
                             egui::TextFormat {
                                 font_id: egui::FontId::proportional(base * 1.1),
-                                color: ui.visuals().text_color(),
+                                color: emphasis.name,
                                 valign: egui::Align::Center,
                                 ..Default::default()
                             },
@@ -209,15 +208,15 @@ impl ListenerApp {
                             ui.label(
                                 egui::RichText::new(format!("{} info", row.info))
                                     .weak()
-                                    .color(theme::count_info_grey()),
+                                    .color(emphasis.info),
                             );
                             ui.label(
                                 egui::RichText::new(format!("{} warn", row.warnings))
-                                    .color(theme::warning_amber()),
+                                    .color(emphasis.warning),
                             );
                             ui.label(
                                 egui::RichText::new(format!("{} err", row.errors))
-                                    .color(theme::fault_red()),
+                                    .color(emphasis.error),
                             );
                         });
                         // Line 5: the last error (e.g. a recording fault), so a fault on
@@ -256,15 +255,15 @@ impl ListenerApp {
                         // A box click that wasn't the ✕ selects the channel (#8).
                         self.selected = Some(id);
                     }
-                    (selected && ui.is_rect_visible(box_resp.rect)).then_some(box_resp.rect)
+                    selected.then_some(box_resp.rect)
                 });
                 if visible_selected_rect.inner.is_some() {
                     selected_tab_rect = visible_selected_rect.inner;
                 }
-                ui.add_space(6.0);
+                ui.add_space(selection::TAB_JOIN_MARGIN);
             }
         });
-        selected_tab_rect
+        selected_tab_rect.map(|rect| selection::SelectedTab::new(rect, scroll.inner_rect))
     }
 
     /// Save to the current profile path silently; if none is set yet, fall through to

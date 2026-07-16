@@ -121,6 +121,13 @@ pub struct ChannelView {
     /// Next absolute stream offset to request — the cursor handed to
     /// `Listener::stream_delta`. Advances as deltas are folded.
     pub stream_cursor: u64,
+    /// Absolute offset of `stream_bytes[0]`. Keeping the window start explicit
+    /// avoids deriving it with subtraction after a discontinuity and makes the
+    /// contiguous-window invariant directly testable.
+    pub stream_base_offset: u64,
+    /// Opaque pipeline-run identity carried by stream deltas. Offsets restart at
+    /// zero on every run; this distinguishes that reset from stale same-run data.
+    stream_generation: Option<u64>,
     /// Per-channel stream-view presentation (mode, ctrl-chars, font, colors — §42).
     /// Each channel renders independently; seeded from the config's first display view
     /// on add/load and folded back on save (see [`super::view_prefs`]).
@@ -154,7 +161,17 @@ impl ChannelView {
             stream_bytes: std::collections::VecDeque::new(),
             marks: Vec::new(),
             stream_cursor: 0,
+            stream_base_offset: 0,
+            stream_generation: None,
         }
+    }
+
+    fn clear_stream_for_new_run(&mut self) {
+        self.stream_bytes.clear();
+        self.marks.clear();
+        self.stream_cursor = 0;
+        self.stream_base_offset = 0;
+        self.stream_generation = None;
     }
 
     /// Fold a snapshot's recent firings into the persistent mark list. The
@@ -200,13 +217,51 @@ impl ChannelView {
     /// Fold an incremental stream delta (§87, ADR-009) into the accumulated view
     /// bytes. Appends new bytes; if the runtime's window had evicted past our cursor
     /// (`base_offset` jumped ahead), reset to the returned window. Caps the buffer.
-    fn apply_stream_delta(&mut self, base_offset: u64, bytes: &[u8], end_offset: u64) {
-        // A base ahead of our cursor means our cursor was evicted: reset the view to
-        // the returned window rather than appending a gap.
-        if base_offset > self.stream_cursor {
-            self.stream_bytes.clear();
+    fn apply_stream_delta(
+        &mut self,
+        generation: u64,
+        base_offset: u64,
+        bytes: &[u8],
+        end_offset: u64,
+    ) {
+        // StreamDelta is an internal runtime contract. Refuse a malformed range
+        // defensively so bad metadata can never make the retained window incoherent.
+        if end_offset.checked_sub(base_offset) != Some(bytes.len() as u64) {
+            return;
         }
-        self.stream_bytes.extend(bytes.iter().copied());
+
+        if self.stream_generation != Some(generation) {
+            // A fresh pipeline reuses offsets from zero. The generation makes this
+            // reset reliable even if its advisory lifecycle event was dropped.
+            self.stream_bytes.clear();
+            self.marks.clear();
+            self.stream_base_offset = base_offset;
+            self.stream_cursor = base_offset;
+            self.stream_generation = Some(generation);
+        } else if end_offset <= self.stream_cursor {
+            // A duplicate or stale same-run delta contributes no new bytes. In
+            // particular, selecting a channel again may re-fetch an older window;
+            // never append it or move the cursor backward.
+            return;
+        } else if base_offset > self.stream_cursor {
+            // Our cursor was evicted and the runtime returned its current window.
+            // Replace rather than append across the gap.
+            self.stream_bytes.clear();
+            self.stream_base_offset = base_offset;
+            self.stream_cursor = base_offset;
+        }
+
+        // `base_offset <= cursor < end_offset`: append only the unseen suffix.
+        // This also reconciles an overlapping re-fetch after channel selection.
+        let Some(unseen) = self
+            .stream_cursor
+            .checked_sub(base_offset)
+            .and_then(|count| usize::try_from(count).ok())
+            .filter(|count| *count <= bytes.len())
+        else {
+            return;
+        };
+        self.stream_bytes.extend(bytes[unseen..].iter().copied());
         self.stream_cursor = end_offset;
         // Cap the GUI's accumulated copy at this channel's configured scroll buffer
         // (the same value the runtime retains — §87), so the viewer scrolls back
@@ -215,14 +270,21 @@ impl ChannelView {
         let overflow = self.stream_bytes.len().saturating_sub(cap);
         if overflow > 0 {
             self.stream_bytes.drain(..overflow);
+            self.stream_base_offset += overflow as u64;
         }
         // Marks live exactly as long as their annotated byte: drop those whose
         // offset slid off the front of the window (including after a reset).
-        let window_start = self.stream_cursor - self.stream_bytes.len() as u64;
-        let evicted = self.marks.partition_point(|s| s.offset < window_start);
+        let evicted = self
+            .marks
+            .partition_point(|s| s.offset < self.stream_base_offset);
         if evicted > 0 {
             self.marks.drain(..evicted);
         }
+        debug_assert_eq!(
+            self.stream_cursor.checked_sub(self.stream_base_offset),
+            Some(self.stream_bytes.len() as u64),
+            "stream byte window must remain contiguous"
+        );
     }
 
     /// The accumulated stream bytes as a contiguous slice for rendering.
@@ -398,7 +460,12 @@ impl AppState {
             }
             UiUpdate::StreamDelta(id, delta) => {
                 if let Some(view) = self.views.get_mut(&id) {
-                    view.apply_stream_delta(delta.base_offset, &delta.bytes, delta.end_offset);
+                    view.apply_stream_delta(
+                        delta.generation,
+                        delta.base_offset,
+                        &delta.bytes,
+                        delta.end_offset,
+                    );
                 }
             }
             UiUpdate::ProfileSaved(path) => {
@@ -435,9 +502,7 @@ impl AppState {
                     // A fresh Start resets the runtime's stream offset to 0, so drop
                     // any accumulated bytes/cursor/marks from a previous run to avoid
                     // mixing old and new streams (§8.5).
-                    view.stream_bytes.clear();
-                    view.marks.clear();
-                    view.stream_cursor = 0;
+                    view.clear_stream_for_new_run();
                     // Totals belong to a run (talker semantics): they survive
                     // Stop so an at-rest cross-check against the sender works,
                     // and zero the moment a new run begins — instantly, not on
@@ -466,7 +531,12 @@ impl AppState {
             RuntimeEvent::ChannelReconnecting(id, _) => {
                 self.set_status(id, ChannelStatus::Reconnecting)
             }
-            RuntimeEvent::ChannelReconnected(id) => self.set_status(id, ChannelStatus::Running),
+            RuntimeEvent::ChannelReconnected(id) => {
+                self.set_status(id, ChannelStatus::Running);
+                if let Some(view) = self.views.get_mut(&id) {
+                    view.clear_stream_for_new_run();
+                }
+            }
             RuntimeEvent::ChannelReconnectGaveUp(id) => self.set_status(id, ChannelStatus::Faulted),
             // A recording fault (e.g. a begin that couldn't open the file — Refuse over
             // an existing file) surfaces inline so "Record now" gives feedback instead
@@ -890,12 +960,22 @@ mod tests {
         assert_eq!(view.bytes_per_sec, 0.0);
     }
 
-    fn delta(base: u64, bytes: &[u8], end: u64) -> crate::runtime::StreamDelta {
+    fn generated_delta(
+        generation: u64,
+        base: u64,
+        bytes: &[u8],
+        end: u64,
+    ) -> crate::runtime::StreamDelta {
         crate::runtime::StreamDelta {
+            generation,
             base_offset: base,
             bytes: bytes.to_vec().into(),
             end_offset: end,
         }
+    }
+
+    fn delta(base: u64, bytes: &[u8], end: u64) -> crate::runtime::StreamDelta {
+        generated_delta(1, base, bytes, end)
     }
 
     #[test]
@@ -912,6 +992,75 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_delta_behind_the_cursor_does_not_underflow() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+
+        state.apply(UiUpdate::StreamDelta(
+            id,
+            Box::new(delta(0, b"0123456789", 10)),
+        ));
+        // This same-run delta is wholly behind the cursor. Appending it used to
+        // leave 12 bytes under cursor 7 and made offset subtraction panic.
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(5, b"XX", 7))));
+        let view = state.channel_mut(id).unwrap();
+        assert_eq!(view.stream_contiguous(), b"0123456789");
+        assert_eq!(view.stream_base_offset, 0);
+        assert_eq!(view.stream_cursor, 10);
+        assert_eq!(
+            view.stream_cursor - view.stream_base_offset,
+            view.stream_bytes.len() as u64
+        );
+    }
+
+    #[test]
+    fn malformed_delta_range_is_ignored_without_disturbing_the_window() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(0, b"live", 4))));
+
+        // Three bytes cannot describe the claimed two-byte range.
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(4, b"bad", 6))));
+        let view = state.channel_mut(id).unwrap();
+        assert_eq!(view.stream_contiguous(), b"live");
+        assert_eq!(view.stream_base_offset, 0);
+        assert_eq!(view.stream_cursor, 4);
+    }
+
+    #[test]
+    fn overlapping_delta_appends_only_its_unseen_suffix() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(0, b"abcde", 5))));
+
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(2, b"cdefgh", 8))));
+        let view = state.channel_mut(id).unwrap();
+        assert_eq!(view.stream_contiguous(), b"abcdefgh");
+        assert_eq!(view.stream_base_offset, 0);
+        assert_eq!(view.stream_cursor, 8);
+    }
+
+    #[test]
+    fn a_new_generation_replaces_old_bytes_even_without_a_lifecycle_event() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(0, b"old", 3))));
+
+        state.apply(UiUpdate::StreamDelta(
+            id,
+            Box::new(generated_delta(2, 0, b"new", 3)),
+        ));
+        let view = state.channel_mut(id).unwrap();
+        assert_eq!(view.stream_contiguous(), b"new");
+        assert_eq!(view.stream_base_offset, 0);
+        assert_eq!(view.stream_cursor, 3);
+    }
+
+    #[test]
     fn stream_delta_reset_on_eviction_replaces_rather_than_appends() {
         let mut state = AppState::default();
         let id = ChannelId::new();
@@ -923,6 +1072,7 @@ mod tests {
         state.apply(UiUpdate::StreamDelta(id, Box::new(delta(10, b"new", 13))));
         let view = state.channel_mut(id).unwrap();
         assert_eq!(view.stream_contiguous(), b"new");
+        assert_eq!(view.stream_base_offset, 10);
         assert_eq!(view.stream_cursor, 13);
     }
 

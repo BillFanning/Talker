@@ -48,7 +48,10 @@ impl TalkerApp {
         }
     }
 
-    pub(super) fn show_channel_list(&mut self, ui: &mut egui::Ui) -> Option<egui::Rect> {
+    pub(super) fn show_channel_list(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Option<selection::SelectedTab> {
         let pal = theme_palette(ui);
 
         // Header: collapse, title, + Add and Profile menus (listener's header
@@ -63,12 +66,8 @@ impl TalkerApp {
             }
             ui.heading("Channels");
             ui.menu_button("+ Add", |ui| {
-                for (kind, label) in [
-                    (ConnKind::Serial, "Serial"),
-                    (ConnKind::Udp, "UDP"),
-                    (ConnKind::Tcp, "TCP"),
-                ] {
-                    if ui.button(label).clicked() {
+                for kind in ConnKind::ADD_MENU {
+                    if ui.button(kind.label()).clicked() {
                         self.deferred.add_channel = Some(kind);
                         ui.close();
                     }
@@ -80,11 +79,12 @@ impl TalkerApp {
         // labels and an always-present Stop all, as in listener (stopping
         // with nothing running is a no-op).
         ui.horizontal(|ui| {
-            let start_all = ui.add_enabled(self.can_start_any(), egui::Button::new("Start all"));
+            let can_start_any = self.can_start_any();
+            let start_all = ui.add_enabled(can_start_any, egui::Button::new("Start all"));
             if start_all.clicked() {
                 self.deferred.start_all = true;
             }
-            if !self.can_start_any() {
+            if !can_start_any {
                 start_all.on_disabled_hover_text("Add at least one valid channel and one message");
             }
             if ui.button("Stop all").clicked() {
@@ -133,18 +133,20 @@ impl TalkerApp {
             .collect();
 
         let mut selected_tab_rect = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for (i, row) in rows.iter().enumerate() {
-                if let Some(rect) = self.show_channel_row(ui, i, row, pal) {
-                    selected_tab_rect = Some(rect);
-                }
-                ui.add_space(6.0);
-            }
+        let scroll = egui::ScrollArea::vertical().show(ui, |ui| {
             if rows.is_empty() {
                 ui.weak("No channels yet — “+ Add” above.");
+            } else {
+                ui.add_space(selection::TAB_JOIN_MARGIN);
+                for (i, row) in rows.iter().enumerate() {
+                    if let Some(rect) = self.show_channel_row(ui, i, row, pal) {
+                        selected_tab_rect = Some(rect);
+                    }
+                    ui.add_space(selection::TAB_JOIN_MARGIN);
+                }
             }
         });
-        selected_tab_rect
+        selected_tab_rect.map(|rect| selection::SelectedTab::new(rect, scroll.inner_rect))
     }
 
     /// The Profile menu (listener's structure): the Recent section, then
@@ -222,6 +224,7 @@ impl TalkerApp {
                     let base = egui::TextStyle::Body.resolve(ui.style()).size;
                     let (glyph, color, word) =
                         lifecycle_indicator(row.running, row.error.is_some(), pal);
+                    let emphasis = selection::channel_row_emphasis(ui, selected);
                     let mut line1 = egui::text::LayoutJob::default();
                     line1.append(
                         glyph,
@@ -238,7 +241,7 @@ impl TalkerApp {
                         0.0,
                         egui::TextFormat {
                             font_id: egui::FontId::proportional(base * 1.1),
-                            color: ui.visuals().text_color(),
+                            color: emphasis.name,
                             valign: egui::Align::Center,
                             ..Default::default()
                         },
@@ -260,22 +263,25 @@ impl TalkerApp {
                     // Line 4: per-severity log counts (since the channel's
                     // last start) — listener's row line: always shown, in
                     // info · warn · err order with the shared colors.
+                    // Historical counts recede on background tabs. The live
+                    // fault below remains saturated on every row.
                     ui.horizontal(|ui| {
                         let tip = "Log events attributed to this channel \
                                        since its last start";
                         ui.label(
                             egui::RichText::new(format!("{} info", row.info))
                                 .weak()
-                                .color(pal.count_info_grey),
+                                .color(emphasis.info),
                         )
                         .on_hover_text(tip);
                         ui.label(
                             egui::RichText::new(format!("{} warn", row.warnings))
-                                .color(pal.warning_amber),
+                                .color(emphasis.warning),
                         )
                         .on_hover_text(tip);
                         ui.label(
-                            egui::RichText::new(format!("{} err", row.errors)).color(pal.fault_red),
+                            egui::RichText::new(format!("{} err", row.errors))
+                                .color(emphasis.error),
                         )
                         .on_hover_text(tip);
                     });
@@ -313,8 +319,7 @@ impl TalkerApp {
                 (box_resp, remove_clicked)
             })
             .inner;
-        let selected_tab_rect =
-            (selected && ui.is_rect_visible(box_resp.rect)).then_some(box_resp.rect);
+        let selected_tab_rect = selected.then_some(box_resp.rect);
         // Removal confirms through the shared modal; a box click that
         // wasn't the ✕ selects the channel.
         if remove_clicked {
@@ -327,7 +332,10 @@ impl TalkerApp {
 
     /// The collapsed variant: a thin strip — an expand button plus one
     /// status dot per channel (click to select, name on hover).
-    pub(super) fn show_channel_strip(&mut self, ui: &mut egui::Ui) -> Option<egui::Rect> {
+    pub(super) fn show_channel_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Option<selection::SelectedTab> {
         let pal = theme_palette(ui);
         if ui
             .button("\u{25B6}")
@@ -337,6 +345,8 @@ impl TalkerApp {
             self.channels_collapsed = false;
         }
         ui.separator();
+        let clip_rect = ui.clip_rect();
+        ui.add_space(selection::TAB_JOIN_MARGIN);
         let base = egui::TextStyle::Body.resolve(ui.style()).size;
         let mut selected_tab_rect = None;
         for i in 0..self.conn_drafts.len() {
@@ -349,13 +359,14 @@ impl TalkerApp {
                 .size(base * glyphs::glyph_size(glyph));
             let title = selection::channel_title(i + 1, &self.conn_drafts[i].name);
             let response = selection::mini_tab(ui, selected, text).on_hover_text(title);
-            if selected && ui.is_rect_visible(response.rect) {
+            if selected {
                 selected_tab_rect = Some(response.rect);
             }
             if response.clicked() {
                 self.deferred.select = Some(i);
             }
+            ui.add_space(selection::TAB_JOIN_MARGIN);
         }
-        selected_tab_rect
+        selected_tab_rect.map(|rect| selection::SelectedTab::new(rect, clip_rect))
     }
 }

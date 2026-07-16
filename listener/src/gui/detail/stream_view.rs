@@ -413,6 +413,7 @@ impl ListenerApp {
             StreamRefresh {
                 channel: id,
                 window,
+                window_start: view.stream_base_offset,
                 cursor: view.stream_cursor,
                 marks: &view.marks,
                 view: renderer,
@@ -426,8 +427,10 @@ impl ListenerApp {
 struct StreamRefresh<'a> {
     channel: ChannelId,
     /// The accumulated byte window, contiguous. Its first byte sits at absolute
-    /// stream offset `cursor - window.len()`.
+    /// stream offset `window_start`.
     window: &'a [u8],
+    /// Absolute stream offset of `window[0]`, maintained alongside the byte deque.
+    window_start: u64,
     /// Absolute stream offset one past the window's last byte.
     cursor: u64,
     /// The channel's pinned inline-Mark timestamps (§50.2), **offset-sorted**
@@ -446,7 +449,7 @@ const MAX_ROW_BATCHES: usize = 512;
 /// Refresh `cache` from `p`: incremental append when only new bytes arrived,
 /// full rebuild when a setting / the mark history / the stream base changed.
 fn refresh_rows(cache: &mut Option<super::super::StreamRenderCache>, p: StreamRefresh) {
-    let window_start = p.cursor - p.window.len() as u64;
+    let window_start = p.window_start;
     let needs_rebuild = match cache.as_ref() {
         None => true,
         Some(c) => {
@@ -719,6 +722,7 @@ mod tests {
                 StreamRefresh {
                     channel: id,
                     window: &data[..end],
+                    window_start: 0,
                     cursor: end as u64,
                     marks,
                     view: v,
@@ -797,6 +801,7 @@ mod tests {
             StreamRefresh {
                 channel: id,
                 window: data,
+                window_start: 0,
                 cursor: data.len() as u64,
                 marks: &[],
                 view: &v,
@@ -815,6 +820,7 @@ mod tests {
             StreamRefresh {
                 channel: id,
                 window: data,
+                window_start: 0,
                 cursor: data.len() as u64,
                 marks: &marks,
                 view: &v,
@@ -845,6 +851,7 @@ mod tests {
                 StreamRefresh {
                     channel: id,
                     window: &all[start..],
+                    window_start: start as u64,
                     cursor: all.len() as u64,
                     marks: &[],
                     view: &v,
@@ -883,6 +890,7 @@ mod tests {
             StreamRefresh {
                 channel: id,
                 window: b"old data",
+                window_start: 0,
                 cursor: 8,
                 marks: &[],
                 view: &v,
@@ -894,6 +902,7 @@ mod tests {
             StreamRefresh {
                 channel: id,
                 window: b"new",
+                window_start: 0,
                 cursor: 3,
                 marks: &[],
                 view: &v,
@@ -915,6 +924,7 @@ mod tests {
                 StreamRefresh {
                     channel: id,
                     window: data,
+                    window_start: 0,
                     cursor: data.len() as u64,
                     marks: &[],
                     view: &v,
@@ -940,6 +950,7 @@ mod tests {
                 StreamRefresh {
                     channel: id,
                     window: &all,
+                    window_start: 0,
                     cursor: all.len() as u64,
                     marks: &[],
                     view: &v,

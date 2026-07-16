@@ -14,11 +14,25 @@ use crate::core::{
 
 // ── Channel interface ─────────────────────────────────────────────────────────
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ConnKind {
     Serial,
     Udp,
     Tcp,
+}
+
+impl ConnKind {
+    /// Match listener's Add menu: the transport is selected when the channel
+    /// is created and is not a routine field in the detail editor.
+    pub const ADD_MENU: [Self; 3] = [Self::Udp, Self::Tcp, Self::Serial];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Serial => "Serial",
+            Self::Udp => "UDP",
+            Self::Tcp => "TCP",
+        }
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -99,7 +113,10 @@ pub struct ConnDraft {
     /// `to_config()` (which builds only the interface); the profile writer
     /// carries it separately.
     pub name: String,
-    pub kind: ConnKind,
+    // Creation-time identity of the interface draft. Kept private so the GUI
+    // cannot accidentally reintroduce an in-place transport switch; Add or a
+    // loaded profile chooses it, while Configure edits only its parameters.
+    kind: ConnKind,
     // serial
     pub serial_port: String,
     pub baud_rate: u32,
@@ -255,6 +272,17 @@ impl From<&InterfaceConfig> for ConnDraft {
 }
 
 impl ConnDraft {
+    pub fn new(kind: ConnKind) -> Self {
+        Self {
+            kind,
+            ..Self::default()
+        }
+    }
+
+    pub const fn kind(&self) -> ConnKind {
+        self.kind
+    }
+
     pub fn to_config(&self) -> Option<InterfaceConfig> {
         // Empty local_port = "let the OS pick". Non-empty but unparseable
         // (e.g. "444444444" > u16::MAX) is a user mistake; fail the whole
@@ -340,6 +368,10 @@ pub enum PayloadKind {
 /// Editable state for one message. A text buffer is kept per format so
 /// switching the format selector does not discard what was typed.
 pub struct ScheduleDraft {
+    /// Monotonic content revision for cached compile/preview analysis. Only fields
+    /// that can affect the wire message increment this; popup filters, insertion
+    /// scratch text, and remove-confirmation chrome deliberately do not.
+    pub(super) revision: u64,
     pub payload_kind: PayloadKind,
     // hex
     pub hex_data: String,
@@ -393,6 +425,7 @@ pub struct ScheduleDraft {
 impl Default for ScheduleDraft {
     fn default() -> Self {
         Self {
+            revision: 0,
             payload_kind: PayloadKind::Hex,
             hex_data: String::new(),
             utf8_text: String::new(),
@@ -485,6 +518,14 @@ impl From<&MessageConfig> for ScheduleDraft {
 }
 
 impl ScheduleDraft {
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(super) fn mark_changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     pub fn to_message_config(&self) -> Option<MessageConfig> {
         let interval_ms: u64 = self.interval_ms.parse().ok()?;
         let payload = match self.payload_kind {
@@ -544,6 +585,17 @@ impl ScheduleDraft {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_menu_matches_listener_order_and_preserves_the_chosen_kind() {
+        assert_eq!(
+            ConnKind::ADD_MENU.map(ConnKind::label),
+            ["UDP", "TCP", "Serial"]
+        );
+        for kind in ConnKind::ADD_MENU {
+            assert_eq!(ConnDraft::new(kind).kind(), kind);
+        }
+    }
 
     // ── ConnDraft round-trips ─────────────────────────────────────────────────
     //

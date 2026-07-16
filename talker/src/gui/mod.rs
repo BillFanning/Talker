@@ -15,7 +15,7 @@ use wiredata_ui::selection;
 use crate::core::{
     channel::{ChannelConfig, ChannelId, InterfaceConfig},
     logging::{LogEvent, LogLevel, LogLevelHandle, LoggingConfig},
-    message::MessageConfig,
+    message::{code_page_replacements, CodePage, CodePageReplacementSummary, MessageConfig},
     profile::Profile,
     runner,
     scheduler::Schedule,
@@ -152,7 +152,10 @@ fn drafts_to_channels(
             .enumerate()
         {
             match d.to_message_config() {
-                Some(mc) => messages.push(mc),
+                Some(mc) => match mc.validate() {
+                    Ok(()) => messages.push(mc),
+                    Err(err) => problems.push(format!("{label}, message {}: {err:#}", m + 1)),
+                },
                 None => problems.push(format!(
                     "{label}, message {}: invalid interval — fix or remove it",
                     m + 1
@@ -170,6 +173,194 @@ fn drafts_to_channels(
     }
 }
 
+/// A loaded profile after every fallible read, parse, conversion, and payload
+/// validation has completed. Building this is side-effect free with respect to
+/// the active workspace, so the GUI can replace runners only after it exists.
+struct PreparedProfileLoad {
+    profile: Profile,
+    conn_drafts: Vec<ConnDraft>,
+    sched_drafts: Vec<Vec<ScheduleDraft>>,
+}
+
+enum MessagePreview {
+    Incomplete,
+    Invalid(String),
+    Text(String),
+    Hex(String),
+    Ascii {
+        bytes: Vec<u8>,
+        code_page: CodePage,
+        replacement_wire_offsets: Vec<usize>,
+    },
+}
+
+/// Everything derived from one message draft that was previously rebuilt in
+/// several widgets every repaint. One content revision performs one conversion,
+/// one compile, and one fixed-time preview render; all consumers borrow it.
+struct MessageDraftAnalysis {
+    config: Option<MessageConfig>,
+    validation_error: Option<String>,
+    replacements: Option<CodePageReplacementSummary>,
+    preview: MessagePreview,
+}
+
+impl MessageDraftAnalysis {
+    fn build(draft: &ScheduleDraft) -> Self {
+        use std::fmt::Write as _;
+
+        let replacements = (draft.payload_kind == draft::PayloadKind::Ascii)
+            .then(|| code_page_replacements(&draft.ascii_text, draft.ascii_code_page))
+            .flatten();
+        let Some(config) = draft.to_message_config() else {
+            return Self {
+                config: None,
+                validation_error: None,
+                replacements,
+                preview: MessagePreview::Incomplete,
+            };
+        };
+
+        let reference = chrono::DateTime::<chrono::Utc>::from_timestamp(1_704_110_400, 0)
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+        match config.compile() {
+            Ok(compiled) => {
+                let timestamp_len = config
+                    .timestamp
+                    .as_ref()
+                    .map(|timestamp| timestamp.format(reference).len())
+                    .unwrap_or(0);
+                let bytes = compiled.render_at(reference);
+                let preview = match draft.payload_kind {
+                    draft::PayloadKind::Ascii => MessagePreview::Ascii {
+                        replacement_wire_offsets: replacements
+                            .as_ref()
+                            .map(|summary| {
+                                summary
+                                    .payload_offsets
+                                    .iter()
+                                    .map(|offset| timestamp_len + offset)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        bytes,
+                        code_page: draft.ascii_code_page,
+                    },
+                    draft::PayloadKind::Utf8 | draft::PayloadKind::Nmea => {
+                        MessagePreview::Text(widgets::preview_text(&bytes))
+                    }
+                    draft::PayloadKind::Hex | draft::PayloadKind::Utf16 => {
+                        let mut text = String::with_capacity(bytes.len().saturating_mul(3));
+                        for (index, byte) in bytes.iter().enumerate() {
+                            if index > 0 {
+                                text.push(' ');
+                            }
+                            let _ = write!(text, "{byte:02X}");
+                        }
+                        MessagePreview::Hex(text)
+                    }
+                };
+                Self {
+                    config: Some(config),
+                    validation_error: None,
+                    replacements,
+                    preview,
+                }
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                Self {
+                    config: Some(config),
+                    validation_error: Some(error.clone()),
+                    replacements,
+                    preview: MessagePreview::Invalid(error),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct MessageAnalysisCache {
+    revision: Option<u64>,
+    analysis: Option<MessageDraftAnalysis>,
+    #[cfg(test)]
+    rebuilds: usize,
+}
+
+impl MessageAnalysisCache {
+    fn refresh(&mut self, draft: &ScheduleDraft) -> &MessageDraftAnalysis {
+        if self.revision != Some(draft.revision()) {
+            self.analysis = Some(MessageDraftAnalysis::build(draft));
+            self.revision = Some(draft.revision());
+            #[cfg(test)]
+            {
+                self.rebuilds += 1;
+            }
+        }
+        self.analysis
+            .get_or_insert_with(|| MessageDraftAnalysis::build(draft))
+    }
+}
+
+fn analyzed_messages_match(
+    analyses: Option<&[MessageAnalysisCache]>,
+    target: &[MessageConfig],
+) -> Option<bool> {
+    let analyses = analyses?;
+    if analyses.len() != target.len() {
+        return Some(false);
+    }
+    for (cached, target) in analyses.iter().zip(target) {
+        let config = cached.analysis.as_ref()?.config.as_ref()?;
+        if config != target {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+fn prepare_profile_load(path: &Path) -> anyhow::Result<PreparedProfileLoad> {
+    let mut profile = Profile::load(path)?;
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        profile.name = stem.to_string();
+    }
+    profile
+        .validate()
+        .with_context(|| format!("validating profile '{}'", profile.name))?;
+
+    let conn_drafts: Vec<_> = profile
+        .channels
+        .iter()
+        .map(|channel| {
+            let mut draft = ConnDraft::from(&channel.interface);
+            draft.name = channel.name.clone();
+            draft
+        })
+        .collect();
+    let sched_drafts: Vec<Vec<_>> = profile
+        .channels
+        .iter()
+        .map(|channel| channel.messages.iter().map(ScheduleDraft::from).collect())
+        .collect();
+
+    let rebuilt = drafts_to_channels(&conn_drafts, &sched_drafts).map_err(|problems| {
+        anyhow::anyhow!(
+            "loaded profile cannot be represented by the GUI:\n{}",
+            problems.join("\n")
+        )
+    })?;
+    anyhow::ensure!(
+        rebuilt == profile.channels,
+        "loaded profile cannot be represented by the GUI without changing it"
+    );
+
+    Ok(PreparedProfileLoad {
+        profile,
+        conn_drafts,
+        sched_drafts,
+    })
+}
+
 /// A fully built replacement run. Constructing this value is pure draft
 /// preflight: it performs no I/O and does not mutate supervisor state, so a
 /// failure cannot disturb an already-running channel.
@@ -183,7 +374,6 @@ struct PreparedChannelRun {
 fn prepare_channel_run(
     conn: &ConnDraft,
     drafts: &[ScheduleDraft],
-    start: Instant,
 ) -> anyhow::Result<PreparedChannelRun> {
     let interface = conn
         .to_config()
@@ -198,7 +388,7 @@ fn prepare_channel_run(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let schedule = Schedule::compile(&messages, start)?;
+    let schedule = Schedule::compile_unarmed(&messages)?;
     Ok(PreparedChannelRun {
         interface,
         messages,
@@ -215,9 +405,8 @@ fn replace_channel_run(
     label: String,
     conn: &ConnDraft,
     drafts: &[ScheduleDraft],
-    start: Instant,
 ) -> anyhow::Result<()> {
-    let prepared = prepare_channel_run(conn, drafts, start)?;
+    let prepared = prepare_channel_run(conn, drafts)?;
     supervisor.start(
         index,
         label,
@@ -239,6 +428,9 @@ struct TalkerApp {
     dirty: bool,
     conn_drafts: Vec<ConnDraft>,
     sched_drafts: Vec<Vec<ScheduleDraft>>,
+    /// Revision-keyed compile/validation/preview results, shape-matched to
+    /// `sched_drafts`. This keeps long message text off unchanged repaint paths.
+    message_analysis: Vec<Vec<MessageAnalysisCache>>,
     /// The channel collection (ADR-019): runner threads, command/status
     /// channels, draining buckets, and per-channel telemetry all live in
     /// core's supervisor — the GUI keeps only view-state and reads
@@ -401,6 +593,7 @@ impl TalkerApp {
             dirty: false,
             conn_drafts: Vec::new(),
             sched_drafts: Vec::new(),
+            message_analysis: Vec::new(),
             sup,
             log_rx,
             log_lines: Vec::new(),
@@ -472,22 +665,35 @@ impl TalkerApp {
         !self.is_connection_running(i) && self.drafts_are_startable(i)
     }
 
+    fn refresh_message_analysis(&mut self) {
+        self.message_analysis
+            .resize_with(self.sched_drafts.len(), Vec::new);
+        self.message_analysis.truncate(self.sched_drafts.len());
+        for (drafts, caches) in self
+            .sched_drafts
+            .iter()
+            .zip(self.message_analysis.iter_mut())
+        {
+            caches.resize_with(drafts.len(), MessageAnalysisCache::default);
+            caches.truncate(drafts.len());
+            for (draft, cache) in drafts.iter().zip(caches.iter_mut()) {
+                cache.refresh(draft);
+            }
+        }
+    }
+
     /// Whether the current drafts form a complete, compilable candidate run.
     /// Unlike [`Self::can_start_connection`], this deliberately ignores the
     /// current lifecycle so it can also gate a running channel's replacement.
     fn drafts_are_startable(&self, i: usize) -> bool {
-        self.conn_drafts
-            .get(i)
-            .is_some_and(|d| d.to_config().is_some())
-            && self.sched_drafts.get(i).is_some_and(|s| {
-                // EVERY message must convert (a filter_map here once let an
-                // unconvertible draft silently vanish from the started
-                // schedule), there must be at least one, and each must
-                // compile (`validate` is the shared core surface — e.g. bad
-                // hex, NMEA framing characters).
-                let msgs: Option<Vec<_>> = s.iter().map(|d| d.to_message_config()).collect();
-                msgs.is_some_and(|m| !m.is_empty() && m.iter().all(|mc| mc.validate().is_ok()))
-            })
+        let (Some(conn), Some(messages), Some(analyses)) = (
+            self.conn_drafts.get(i),
+            self.sched_drafts.get(i),
+            self.message_analysis.get(i),
+        ) else {
+            return false;
+        };
+        widgets::start_blockers_analyzed(conn, messages, analyses).is_empty()
     }
 
     fn can_start_any(&self) -> bool {
@@ -507,22 +713,26 @@ impl TalkerApp {
     ///   can't be hot-swapped today.
     fn detect_drift(&self, i: usize) -> (bool, bool) {
         let draft_interface = self.conn_drafts.get(i).and_then(ConnDraft::to_config);
-        let draft_messages: Option<Vec<_>> = self
-            .sched_drafts
-            .get(i)
-            .map(|s| s.iter().map(ScheduleDraft::to_message_config).collect())
-            .unwrap_or_default();
+        let analyses = self.message_analysis.get(i).map(Vec::as_slice);
+        let messages_complete = analyses.is_some_and(|analyses| {
+            analyses.iter().all(|cached| {
+                cached
+                    .analysis
+                    .as_ref()
+                    .is_some_and(|analysis| analysis.config.is_some())
+            })
+        });
 
         if self.sup.is_running(i) {
             // Interface and schedule are one runner-confirmed fact. Until open
             // succeeds there is no applied baseline, so valid drafts remain
             // visibly pending instead of being inferred from spawn intent.
             let Some(applied) = self.sup.applied_run_config(i) else {
-                return (draft_interface.is_some(), draft_messages.is_some());
+                return (draft_interface.is_some(), messages_complete);
             };
             return (
                 draft_interface.as_ref() != Some(&applied.interface),
-                draft_messages.as_ref() != Some(&applied.messages),
+                !analyzed_messages_match(analyses, &applied.messages).unwrap_or(false),
             );
         }
 
@@ -531,7 +741,7 @@ impl TalkerApp {
         };
         (
             draft_interface.as_ref() != Some(&profile.interface),
-            draft_messages.as_ref() != Some(&profile.messages),
+            !analyzed_messages_match(analyses, &profile.messages).unwrap_or(false),
         )
     }
 
@@ -554,31 +764,23 @@ impl TalkerApp {
     // ── Profile actions ───────────────────────────────────────────────────────
 
     fn load_profile_from_path(&mut self, path: &Path) {
-        self.stop_all();
-        match Profile::load(path) {
-            Ok(mut p) => {
-                // The file root is the profile's name (`name` isn't
-                // serialized — see `Profile::name`). Always overlay
-                // from the path so renaming the file on disk is the
-                // way to rename the profile.
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    p.name = stem.to_string();
-                }
-                let n = p.channels.len();
-                self.conn_drafts = p
-                    .channels
-                    .iter()
-                    .map(|ch| {
-                        let mut d = ConnDraft::from(&ch.interface);
-                        d.name = ch.name.clone();
-                        d
-                    })
-                    .collect();
-                self.sched_drafts = p
-                    .channels
-                    .iter()
-                    .map(|ch| ch.messages.iter().map(ScheduleDraft::from).collect())
-                    .collect();
+        // Complete every fallible operation before touching the active workspace.
+        // A missing, malformed, or unrepresentable profile leaves healthy runners
+        // and all current drafts exactly as they were.
+        match prepare_profile_load(path) {
+            Ok(prepared) => {
+                let PreparedProfileLoad {
+                    profile,
+                    conn_drafts,
+                    sched_drafts,
+                } = prepared;
+                let n = profile.channels.len();
+
+                self.stop_all();
+                self.conn_drafts = conn_drafts;
+                self.sched_drafts = sched_drafts;
+                self.message_analysis.clear();
+                self.refresh_message_analysis();
                 self.sup.resize_slots(0); // orphan any old runners, then size fresh
                 self.sup.resize_slots(n);
                 self.displays = (0..n).map(|_| ChannelDisplay::default()).collect();
@@ -587,12 +789,7 @@ impl TalkerApp {
                 // — clear rather than leak them.
                 self.log_counts.clear();
                 self.selected = if n > 0 { Some(0) } else { None };
-                // Preflight the whole profile so any payload that won't
-                // compile is surfaced now, not silently at the first Start.
-                if let Err(e) = p.validate() {
-                    tracing::warn!("profile '{}' has an invalid message: {e:#}", p.name);
-                }
-                self.profile = p;
+                self.profile = profile;
                 self.profile_path = Some(path.to_path_buf());
                 self.push_recent(path);
                 self.dirty = false;
@@ -622,6 +819,7 @@ impl TalkerApp {
         self.dirty = true;
         self.conn_drafts.clear();
         self.sched_drafts.clear();
+        self.message_analysis.clear();
         self.sup.resize_slots(0);
         self.displays.clear();
         self.rates.clear();
@@ -721,7 +919,7 @@ impl TalkerApp {
         // flip the active UDP destination into strict validation so
         // missing / malformed fields surface as red immediately.
         if let Some(draft) = self.conn_drafts.get_mut(i) {
-            if matches!(draft.kind, ConnKind::Udp) {
+            if matches!(draft.kind(), ConnKind::Udp) {
                 let pair = match draft.udp_mode {
                     UdpModeDraft::Unicast => &mut draft.udp_unicast,
                     UdpModeDraft::Broadcast => &mut draft.udp_broadcast,
@@ -754,14 +952,7 @@ impl TalkerApp {
         // Build the complete candidate before touching the supervisor, then
         // replace through the one ordering boundary shared with the regression
         // test. A malformed edit leaves the healthy run untouched.
-        if let Err(e) = replace_channel_run(
-            &mut self.sup,
-            i,
-            label.clone(),
-            conn,
-            drafts,
-            Instant::now(),
-        ) {
+        if let Err(e) = replace_channel_run(&mut self.sup, i, label.clone(), conn, drafts) {
             tracing::error!(
                 channel = cid,
                 "channel {label} start preflight failed; runtime unchanged: {e:#}"
@@ -957,6 +1148,7 @@ impl eframe::App for TalkerApp {
         // fresh wake — never lost.
         self.repaint.frame_started();
         self.poll_channels(ui.ctx());
+        self.refresh_message_analysis();
         self.handle_tab_keys(ui.ctx());
         egui::Frame::new()
             .inner_margin(4.0)
@@ -971,14 +1163,17 @@ impl eframe::App for TalkerApp {
                 // Master–detail (spec §3.2): the channel list on the left
                 // (or its collapsed status strip), the selected channel's
                 // detail pane in the centre.
-                let channel_panel = if self.channels_collapsed {
+                let channels_collapsed = self.channels_collapsed;
+                let channel_panel = if channels_collapsed {
                     egui::Panel::left("channel_strip")
                         .resizable(false)
+                        .show_separator_line(false)
                         .show_inside(ui, |ui| self.show_channel_strip(ui))
                 } else {
                     egui::Panel::left("channel_list")
                         .resizable(true)
                         .default_size(280.0)
+                        .show_separator_line(false)
                         .show_inside(ui, |ui| self.show_channel_list(ui))
                 };
                 egui::CentralPanel::default().show_inside(ui, |ui| self.show_detail(ui));
@@ -986,6 +1181,7 @@ impl eframe::App for TalkerApp {
                     ui,
                     channel_panel.response.rect,
                     channel_panel.inner,
+                    (!channels_collapsed).then(|| egui::Id::new("channel_list")),
                 );
             });
         self.show_remove_confirm(ui.ctx());
@@ -1293,8 +1489,8 @@ impl TalkerApp {
     /// egui's two-pass layout.
     fn process_deferred(&mut self) {
         let mut d = std::mem::take(&mut self.deferred);
-        // Dedup applies — multiple radio-clicks in one frame on the same
-        // channel are pointless to apply twice.
+        // Dedup applies: multiple committed field edits in one frame on the
+        // same channel are pointless to apply twice.
         d.apply.sort_unstable();
         d.apply.dedup();
         for i in d.apply {
@@ -1328,6 +1524,7 @@ impl TalkerApp {
             self.sup.remove_slot(i);
             self.conn_drafts.remove(i);
             self.sched_drafts.remove(i);
+            self.message_analysis.remove(i);
             self.displays.remove(i);
             if i < self.rates.len() {
                 self.rates.remove(i);
@@ -1352,11 +1549,9 @@ impl TalkerApp {
             self.dirty = true;
         }
         if let Some(kind) = d.add_channel {
-            self.conn_drafts.push(ConnDraft {
-                kind,
-                ..ConnDraft::default()
-            });
+            self.conn_drafts.push(ConnDraft::new(kind));
             self.sched_drafts.push(Vec::new());
+            self.message_analysis.push(Vec::new());
             self.sup.push_slot();
             self.displays.push(ChannelDisplay::default());
             self.rates.push(RateTracker::new());
@@ -1427,12 +1622,10 @@ mod tests {
     }
 
     fn serial_draft(name: &str) -> ConnDraft {
-        ConnDraft {
-            name: name.to_string(),
-            kind: ConnKind::Serial,
-            serial_port: "COM9".to_string(),
-            ..ConnDraft::default()
-        }
+        let mut draft = ConnDraft::new(ConnKind::Serial);
+        draft.name = name.to_string();
+        draft.serial_port = "COM9".to_string();
+        draft
     }
 
     fn message_draft(interval: &str) -> ScheduleDraft {
@@ -1440,6 +1633,77 @@ mod tests {
         let mut d = ScheduleDraft::from(&MessageConfig::new(PayloadConfig::raw_hex("AB"), 100));
         d.interval_ms = interval.to_string();
         d
+    }
+
+    #[test]
+    fn message_analysis_reuses_unchanged_revisions_and_rebuilds_after_an_edit() {
+        let mut draft = message_draft("100");
+        let mut cache = MessageAnalysisCache::default();
+
+        cache.refresh(&draft);
+        cache.refresh(&draft);
+        assert_eq!(cache.rebuilds, 1, "unchanged repaint reused analysis");
+
+        draft.hex_data.push_str("CD");
+        draft.mark_changed();
+        cache.refresh(&draft);
+        assert_eq!(cache.rebuilds, 2, "wire edit invalidated analysis");
+    }
+
+    fn temp_profile_path(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "talker_gui_{label}_{}_{nonce}.toml",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn profile_load_preparation_rejects_bad_payloads_before_workspace_replacement() {
+        use crate::core::message::{MessageConfig, PayloadConfig};
+
+        let path = temp_profile_path("bad_payload");
+        let mut profile = Profile::new("bad_payload");
+        profile.channels.push(ChannelConfig::new(
+            serial_draft("active").to_config().unwrap(),
+            vec![MessageConfig::new(
+                PayloadConfig::Ascii {
+                    text: "broken‹marker".to_string(),
+                    code_page: Default::default(),
+                },
+                100,
+            )],
+        ));
+        profile.save(&path).unwrap();
+
+        let error = match prepare_profile_load(&path) {
+            Ok(_) => panic!("bad payload must not be prepared"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("complete ‹XX› byte marker"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn profile_load_preparation_is_complete_before_it_returns_success() {
+        let path = temp_profile_path("valid");
+        let mut profile = Profile::new("valid");
+        let mut channel = ChannelConfig::new(
+            serial_draft("A").to_config().unwrap(),
+            vec![message_draft("250").to_message_config().unwrap()],
+        );
+        channel.name = "A".to_string();
+        profile.channels.push(channel);
+        profile.save(&path).unwrap();
+
+        let prepared = prepare_profile_load(&path).expect("valid candidate");
+        assert_eq!(prepared.profile.channels.len(), 1);
+        assert_eq!(prepared.conn_drafts[0].name, "A");
+        assert_eq!(prepared.sched_drafts[0][0].interval_ms, "250");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -1451,7 +1715,7 @@ mod tests {
             ..ScheduleDraft::default()
         };
 
-        let err = prepare_channel_run(&conn, &[message], Instant::now())
+        let err = prepare_channel_run(&conn, &[message])
             .expect_err("malformed marker must fail preflight");
         let text = format!("{err:#}");
         assert!(text.contains("compiling message 1"), "error was: {text}");
@@ -1464,8 +1728,8 @@ mod tests {
     #[test]
     fn replacement_preflight_builds_the_complete_candidate_run() {
         let conn = serial_draft("active");
-        let prepared = prepare_channel_run(&conn, &[message_draft("100")], Instant::now())
-            .expect("valid candidate");
+        let prepared =
+            prepare_channel_run(&conn, &[message_draft("100")]).expect("valid candidate");
 
         assert_eq!(prepared.messages.len(), 1);
         assert_eq!(prepared.schedule.len(), 1);
@@ -1484,15 +1748,8 @@ mod tests {
         let valid = vec![message_draft("1000")];
         let mut supervisor = TalkerSupervisor::new(runner::ObserverPolicy::sampled());
         supervisor.push_slot();
-        replace_channel_run(
-            &mut supervisor,
-            0,
-            "active".to_string(),
-            &conn,
-            &valid,
-            Instant::now(),
-        )
-        .expect("initial run starts");
+        replace_channel_run(&mut supervisor, 0, "active".to_string(), &conn, &valid)
+            .expect("initial run starts");
 
         let deadline = Instant::now() + Duration::from_secs(1);
         while supervisor.applied_run_config(0).is_none() && Instant::now() < deadline {
@@ -1515,7 +1772,6 @@ mod tests {
             "replacement".to_string(),
             &conn,
             &[malformed],
-            Instant::now(),
         )
         .expect_err("malformed replacement must fail before restart");
 
@@ -1553,6 +1809,17 @@ mod tests {
         let sched = vec![vec![message_draft("100")], vec![message_draft("100")]];
         let problems = drafts_to_channels(&conn, &sched).unwrap_err();
         assert!(problems[0].contains("Channel 2"));
+
+        // Conversion alone is not enough: Save and profile replacement must also
+        // reject payloads that core compilation cannot represent safely.
+        let malformed = ScheduleDraft {
+            payload_kind: draft::PayloadKind::Ascii,
+            ascii_text: "broken‹marker".to_string(),
+            ..ScheduleDraft::default()
+        };
+        let problems = drafts_to_channels(&[serial_draft("A")], &[vec![malformed]])
+            .expect_err("malformed payload must block the whole conversion");
+        assert!(problems[0].contains("complete ‹XX› byte marker"));
     }
 
     #[test]

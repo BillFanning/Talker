@@ -17,6 +17,7 @@ use crate::core::message::{
 
 use super::display::{ChannelDisplay, ControlStyle, DisplayMode};
 use super::draft::{ConnDraft, ConnKind, PayloadKind, PortHold, ScheduleDraft, UdpModeDraft};
+use super::{MessageAnalysisCache, MessageDraftAnalysis};
 
 /// The shared wiredata palette matching the active theme (ADR-016).
 pub(super) fn theme_palette(ui: &egui::Ui) -> &'static wiredata_ui::palette::Palette {
@@ -157,7 +158,7 @@ pub(super) fn interface_summary(conn: &ConnDraft) -> String {
     } else {
         format!(" (local {})", conn.local_port)
     };
-    match conn.kind {
+    match conn.kind() {
         ConnKind::Serial => {
             let data = conn.data_bits;
             let parity = match conn.parity {
@@ -201,16 +202,38 @@ pub(super) fn interface_summary(conn: &ConnDraft) -> String {
 /// channel — one human-readable line per problem. Returned in the same
 /// order they appear in the editor (channel fields first, then per-message
 /// issues from top to bottom).
-pub(super) fn start_blockers(conn: &ConnDraft, messages: &[ScheduleDraft]) -> Vec<String> {
+pub(super) fn start_blockers_analyzed(
+    conn: &ConnDraft,
+    messages: &[ScheduleDraft],
+    analyses: &[MessageAnalysisCache],
+) -> Vec<String> {
+    start_blockers_with(conn, messages, |index| {
+        analyses
+            .get(index)
+            .and_then(|cached| cached.analysis.as_ref())
+    })
+}
+
+fn start_blockers_with<'a>(
+    conn: &ConnDraft,
+    messages: &[ScheduleDraft],
+    analysis_at: impl Fn(usize) -> Option<&'a MessageDraftAnalysis>,
+) -> Vec<String> {
     let mut out = Vec::new();
     out.extend(channel_blockers(conn));
     if messages.is_empty() {
         out.push("No messages defined — add at least one".to_string());
     } else {
-        for (i, m) in messages.iter().enumerate() {
-            out.extend(message_blockers(i, m));
+        let mut any_complete = false;
+        for (i, message) in messages.iter().enumerate() {
+            let Some(analysis) = analysis_at(i) else {
+                out.push("Message analysis is not ready".to_string());
+                return out;
+            };
+            any_complete |= analysis.config.is_some();
+            out.extend(message_blockers(i, message, analysis));
         }
-        if !messages.iter().any(|m| m.to_message_config().is_some()) {
+        if !any_complete {
             out.push("No message is fully filled in".to_string());
         }
     }
@@ -219,7 +242,7 @@ pub(super) fn start_blockers(conn: &ConnDraft, messages: &[ScheduleDraft]) -> Ve
 
 fn channel_blockers(conn: &ConnDraft) -> Vec<String> {
     let mut out = Vec::new();
-    match conn.kind {
+    match conn.kind() {
         ConnKind::Serial => {
             if conn.serial_port.is_empty() {
                 out.push("Channel: select a serial port".to_string());
@@ -257,7 +280,11 @@ fn channel_blockers(conn: &ConnDraft) -> Vec<String> {
     out
 }
 
-fn message_blockers(idx: usize, entry: &ScheduleDraft) -> Vec<String> {
+fn message_blockers(
+    idx: usize,
+    entry: &ScheduleDraft,
+    analysis: &MessageDraftAnalysis,
+) -> Vec<String> {
     let mut out = Vec::new();
     let n = idx + 1;
     if entry.interval_ms.is_empty() {
@@ -281,13 +308,10 @@ fn message_blockers(idx: usize, entry: &ScheduleDraft) -> Vec<String> {
         _ => {}
     }
     if out.is_empty() {
-        match entry.to_message_config() {
-            Some(config) => {
-                if let Err(error) = config.validate() {
-                    out.push(format!("Message {n}: {error:#}"));
-                }
-            }
-            None => out.push(format!(
+        match (&analysis.config, &analysis.validation_error) {
+            (Some(_), Some(error)) => out.push(format!("Message {n}: {error}")),
+            (Some(_), None) => {}
+            (None, _) => out.push(format!(
                 "Message {n}: configuration is incomplete or invalid"
             )),
         }
@@ -1551,7 +1575,7 @@ pub(super) fn show_insert_byte_button(
     text: &mut String,
     hex: &mut String,
     target_salt: &'static str,
-) {
+) -> bool {
     show_insert_popup(
         ui,
         text,
@@ -1563,7 +1587,7 @@ pub(super) fn show_insert_byte_button(
             hint: "1B  or  1B 0D 0A",
         },
         |s| Ok(bytes_to_markers(&parse_hex_bytes(s)?)),
-    );
+    )
 }
 
 /// "Insert Code Unit" button — UTF-16 variant. Each unit is 4 hex
@@ -1581,7 +1605,7 @@ pub(super) fn show_insert_unit_button(
     target_salt: &'static str,
     big_endian: bool,
     allow_raw_bytes: bool,
-) {
+) -> bool {
     show_insert_popup(
         ui,
         text,
@@ -1615,7 +1639,7 @@ pub(super) fn show_insert_unit_button(
                 })
             }
         },
-    );
+    )
 }
 
 /// Wrap each byte in a `‹XX›` marker (uppercase hex). The string is
@@ -1645,7 +1669,8 @@ fn show_insert_popup<F>(
     target_salt: &'static str,
     chrome: InsertChrome,
     parse: F,
-) where
+) -> bool
+where
     F: Fn(&str) -> Result<String, String>,
 {
     let shared_cursor_id = egui::Id::new("marker_target_cursor").with(target_salt);
@@ -1656,6 +1681,7 @@ fn show_insert_popup<F>(
     // TextEdit (which has to be clicked to gain focus). Switch to
     // `CloseOnClickOutside` so the popup stays open while the user
     // types the hex value.
+    let mut changed = false;
     egui::containers::menu::MenuButton::new(chrome.button_label)
         .config(
             egui::containers::menu::MenuConfig::new()
@@ -1707,6 +1733,7 @@ fn show_insert_popup<F>(
                                 .map(|c| char_to_byte(text, c))
                                 .unwrap_or(text.len());
                             text.insert_str(insert_byte, insertion);
+                            changed = true;
                             // New cursor sits right after the inserted
                             // text. Update both the shared stash (so a
                             // subsequent Insert lands in the right place
@@ -1735,6 +1762,7 @@ fn show_insert_popup<F>(
                 },
             );
         });
+    changed
 }
 
 // ── Display pane ──────────────────────────────────────────────────────────────
@@ -2438,7 +2466,8 @@ mod tests {
             ..ScheduleDraft::default()
         };
 
-        let blockers = message_blockers(0, &draft);
+        let analysis = MessageDraftAnalysis::build(&draft);
+        let blockers = message_blockers(0, &draft, &analysis);
         assert_eq!(blockers.len(), 1, "blockers: {blockers:?}");
         assert!(blockers[0].starts_with("Message 1:"));
         assert!(blockers[0].contains("complete ‹XX› byte marker"));

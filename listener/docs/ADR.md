@@ -487,9 +487,9 @@ Stream-view pause and optional byte/line gutters.
 
 **Decision.** Split the pull surface so nothing is O(buffer) in steady state:
 - The **snapshot carries only the small, bounded observable state** — diagnostics, recent match firings, view pause, recording state, liveness, and the stream's `stream_end_offset` (a cursor target). It no longer carries the scrollback bytes.
-- The scrollback is read **incrementally** through a new `PipelineRequest::StreamDelta { since }` → `StreamDelta { base_offset, bytes, end_offset }`: only the bytes at/after the consumer's absolute cursor. A cursor behind the (bounded) retained window returns the whole window with `base_offset > since` — a **reset** signal, not an append. The pipeline tracks `stream_dropped` (bytes evicted from the front) so an absolute offset locates a byte in (or past) the ring in O(returned bytes).
-- The **driver** holds a per-selected-channel cursor, polls `stream_delta` alongside the snapshot, pushes only non-empty deltas (a "caught up" empty delta is a no-op, so the UI isn't woken for nothing), and resets the cursor to 0 on `Select` and on `ChannelStarted`/`ChannelReconnected` (a (re)start resets the runtime's stream offset to 0).
-- The **GUI** accumulates delta bytes per channel (capped, with eviction/restart reset), memoizes the line-split render keyed on the cursor + view mode, and **virtualizes the layout** with `ScrollArea::show_rows` so only visible rows are laid out.
+- The scrollback is read **incrementally** through a new `PipelineRequest::StreamDelta { since }` → `StreamDelta { generation, base_offset, bytes, end_offset }`: only the bytes at/after the consumer's absolute cursor. A cursor behind the (bounded) retained window returns the whole window with `base_offset > since` — a **reset** signal, not an append. The pipeline tracks `stream_dropped` (bytes evicted from the front) so an absolute offset locates a byte in (or past) the ring in O(returned bytes). `generation` is a process-unique identity minted for each pipeline run because offsets legitimately restart at zero.
+- The **driver** retains a `(generation, offset)` cursor per channel across selection changes, so revisiting a tab does not re-ship its retained window. It advances a non-empty delta only after the bounded UI update channel accepts it; a dropped update is fetched again rather than becoming a permanent display gap. Caught-up empty deltas remain no-ops, except that the first empty delta from a new generation is forwarded so a restart clears old bytes before new data arrives. Start/reconnect lifecycle events eagerly forget the cursor, but generation remains the correctness boundary if such an advisory event is delayed or dropped.
+- The **GUI** stores the explicit absolute offset of `stream_bytes[0]` as well as the end cursor. It validates each delta range, resets on generation change or a forward gap, ignores wholly stale/duplicate same-run deltas, and appends only the unseen suffix of an overlap. Front eviction advances the explicit base. The invariant is always `cursor - base == retained length`; no offset is reconstructed as `cursor - length` after folding an untrusted or stale delta. Rendering remains memoized by cursor + view mode and **virtualized** with `ScrollArea::show_rows` so only visible rows are laid out.
 
 End to end the steady-state cost is now: ingest O(chunk), snapshot O(small bounded state), stream delta O(new bytes), GUI render/layout O(new bytes)/O(visible rows). Nothing re-touches the whole buffer.
 
@@ -501,9 +501,9 @@ End to end the steady-state cost is now: ingest O(chunk), snapshot O(small bound
 **Consequences.**
 - `ChannelSnapshot.stream_tail` is removed; `stream_end_offset` replaces it. Tests that asserted verbatim bytes now fetch via `stream_delta` (a `#[cfg(test)]` `stream_tail()` accessor remains on the pipeline for unit tests).
 - A new `UiUpdate::StreamDelta` rides beside `Snapshot`/`Stats`; the App folds it into per-channel accumulated bytes.
-- The reset-on-eviction contract (`base_offset > since`) is the consumer's signal to re-seed rather than append; restart is handled by resetting the cursor (offsets restart at 0).
+- The reset-on-eviction contract (`base_offset > since`) is the consumer's signal to re-seed rather than append; restart is identified independently by generation, so reused offsets cannot be mistaken for stale same-run data.
 - This refines ADR-006's pull surface exactly along the "push rich incremental state" axis that ADR-006 left open; no actor/event-loop rewrite was needed.
-- Pinned by tests: `pipeline` (`stream_delta_serves_only_new_bytes_since_a_cursor`, `stream_delta_resets_when_the_cursor_was_evicted`), `gui::state` (`stream_deltas_accumulate_incrementally`, `stream_delta_reset_on_eviction_replaces_rather_than_appends`, `restart_clears_accumulated_stream`).
+- Pinned by tests: `pipeline` (`stream_delta_serves_only_new_bytes_since_a_cursor`, `stream_delta_resets_when_the_cursor_was_evicted`), `gui::state` (`stream_deltas_accumulate_incrementally`, `stream_delta_reset_on_eviction_replaces_rather_than_appends`, `overlapping_delta_behind_the_cursor_does_not_underflow`, `malformed_delta_range_is_ignored_without_disturbing_the_window`, `overlapping_delta_appends_only_its_unseen_suffix`, `a_new_generation_replaces_old_bytes_even_without_a_lifecycle_event`, `restart_clears_accumulated_stream`), plus the bridge's empty-new-generation forwarding assertion.
 
 ## ADR-012 — The command surface is the `Listener` method API; no `RuntimeCommand` enum
 
@@ -670,6 +670,16 @@ The live viewer was rebasing `TriggeredMatch.byte_offset` (stream space) onto it
 - Anything app-specific stays put: view-models, widgets with runtime knowledge, the stream-view `ColorScheme` (user-chosen content colors are not chrome).
 - A change to the shared look lands in both apps by construction — the drift risk that motivated the crate is gone.
 
+**Follow-up (selected-channel continuity).** `wiredata-ui::selection` now owns the
+selected/full and compact channel tabs, shared row emphasis, and the complete
+tab-to-page edge. The apps supply the selected card rectangle and
+its real scroll viewport. The shared painter mirrors egui's resizer hover/drag stroke
+and detours around a tab only when the whole card and both rounded turns are visible;
+a clipped selection gets a straight page divider. Historical warning/error counts
+recede identically on background tabs, while app-owned lifecycle glyphs and live
+faults remain saturated. This is chrome, not channel state, so both apps use one
+implementation and one set of geometry tests.
+
 ## ADR-020 — Terminal transport fault causes use lossless post-reception delivery
 
 **Status:** Accepted 2026-07-12. **Context:** spec §94/§95/§101, ADR-006
@@ -696,6 +706,21 @@ finalization but cannot erase its reason; a pipeline that has already been forci
 removed simply closes the receiver and releases the send. Pinned by
 `terminal_fault_waits_for_space_in_a_full_notice_queue` plus the end-to-end
 `spontaneous_transport_fault_emits_channel_faulted` diagnostic assertion.
+
+## ADR-021 — Channel transport is chosen at creation
+
+**Status:** Accepted 2026-07-15. **Context:** the existing Add-template GUI model and
+its adoption by talker in talker ADR-027.
+
+**Decision:** Keep transport kind structural in the GUI. `+ Add` chooses the UDP, TCP,
+or Serial template, in that shared order. Configure Connection edits the selected
+template's parameters and never replaces its `InterfaceConfig` variant. Runtime-created
+TCP Connection Channels remain governed by their TCP Listener parent.
+
+**Consequences:** This records existing listener behavior rather than adding a new
+runtime path. Both apps now present one ordinary transport choice and the same Add-menu
+order. Reconfiguration, profiles, and the schema are unchanged. A focused GUI test
+pins the menu labels and order.
 
 ## Open questions
 

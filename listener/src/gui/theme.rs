@@ -76,11 +76,6 @@ pub(super) fn event_grey() -> Color32 {
     palette().event_grey
 }
 
-/// The per-tab "info" count in the channel list (lighter, secondary).
-pub(super) fn count_info_grey() -> Color32 {
-    palette().count_info_grey
-}
-
 // ── Serial control lines (§161) ──────────────────────────────────────────────
 
 /// A high (asserted) serial control/status line.

@@ -325,10 +325,14 @@ pub fn run(
     who: RunnerIdentity,
     interface: Box<dyn Interface>,
     current_config: Option<InterfaceConfig>,
-    schedule: Schedule,
+    mut schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
     observer: RunnerObserver,
 ) {
+    // Cadence starts only now: any profile preflight, predecessor join, TCP
+    // connect, or serial open happened before this runner boundary and must not
+    // inflate missed-send telemetry or shift the first-fire grid.
+    schedule.arm(Instant::now());
     tracing::info!(
         channel = who.id.as_u64(),
         "channel {} running ({}-message schedule)",

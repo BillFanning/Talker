@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use anyhow::Context;
 use clap::{Args as ClapArgs, ValueEnum};
@@ -197,18 +196,26 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     tracing::info!("profile {:?} loaded", profile.name);
     anyhow::ensure!(!profile.channels.is_empty(), "profile has no channels");
 
-    // Open every channel's interface and compile its schedule up front, so a
-    // failure aborts cleanly before any talker thread is spawned. Each channel
-    // gets its stable id here (ADR-020); the CLI never removes channels, but
-    // the statuses carry ids now, so the echo funnel maps id → position.
+    // Compile every schedule before opening any interface. Preparation is inert,
+    // so a bad message cannot briefly claim a serial port or socket; an open
+    // failure still drops any earlier prepared handles before a thread is spawned.
+    // Each channel gets its stable id here (ADR-020); the CLI never removes
+    // channels, but statuses carry ids, so the echo funnel maps id → position.
+    let channels = profile.channels;
+    let schedules = channels
+        .iter()
+        .enumerate()
+        .map(|(i, channel)| {
+            Schedule::compile_unarmed(&channel.messages)
+                .with_context(|| format!("compiling channel {i} schedule"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let mut prepared: Vec<(runner::RunnerIdentity, Box<dyn Interface>, Schedule)> = Vec::new();
-    for (i, channel) in profile.channels.into_iter().enumerate() {
+    for ((i, channel), schedule) in channels.into_iter().enumerate().zip(schedules) {
         let interface = channel
             .interface
             .open()
             .with_context(|| format!("opening channel {i}"))?;
-        let schedule = Schedule::compile(&channel.messages, Instant::now())
-            .with_context(|| format!("compiling channel {i} schedule"))?;
         let label = if channel.name.is_empty() {
             (i + 1).to_string()
         } else {

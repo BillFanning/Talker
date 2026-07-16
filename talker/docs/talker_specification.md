@@ -19,6 +19,9 @@ Revision v2.1 (master–detail GUI, named channels, shared chrome):
 - **§3.2 GUI state** — window geometry is **not** persisted anymore (the window opens
   at its default size; restoring geometry after the window is shown caused a visible
   double-flash). Zoom, theme, and the last profile path still persist.
+- **§2.4 / §4.3 channel transport** — the `+ Add` menu chooses a channel's transport
+  from the same UDP / TCP / Serial templates as listener. The transport is structural;
+  the detail pane configures that transport's parameters but does not change its kind.
 
 Revision v2.0.1 (corrections to match the implementation and its dependencies):
 
@@ -138,17 +141,19 @@ The GUI uses a **master–detail** layout:
   channel showing a status glyph (running / fault / stopped), the channel's display
   name (or the positional "Channel N" fallback), a one-line interface summary with
   unfilled fields flagged, the running send count with a msgs/s estimate, and the most
-  recent error. The list header holds `+ Add` (per interface kind: Serial / UDP / TCP)
+  recent error. The list header holds `+ Add` (per interface kind: UDP / TCP / Serial)
   and Start all / Stop all.
 - **Detail pane** (centre): everything about the **selected** channel — a header with
-  the editable name, interface-kind selector, summary, drift badge, and per-channel
-  actions (start / stop / restart / remove); the Connection editor; the Messages
-  editor (one or more messages, each independently configured); and the real-time
-  outbound display pane (configurable view — see Section 5.7).
+  the editable name, interface summary, drift badge, and per-channel actions (start /
+  stop / restart / remove); the Connection editor for the transport selected at
+  creation; the Messages editor (one or more messages, each independently configured);
+  and the real-time outbound display pane (configurable view — see Section 5.7).
 
-Channels can be added, renamed, changed, removed, started, and stopped independently
-at runtime. Channel names are cosmetic (channels are positional); empty names fall
-back to "Channel N", and duplicate names are allowed but flagged inline.
+Channels can be added, renamed, reconfigured, removed, started, and stopped
+independently at runtime. `+ Add` chooses a channel's transport kind; normal
+configuration edits only that kind's parameters, matching listener's model. Channel
+names are cosmetic (channels are positional); empty names fall back to "Channel N",
+and duplicate names are allowed but flagged inline.
 
 #### Communication
 
@@ -263,6 +268,10 @@ Interface parameters (port, baud rate, UDP port, host address, etc.) are adjusta
 - The user is notified visibly in the GUI (status indicator)
 - The interface is automatically closed, reconfigured, and reopened
 - Output resumes without user action
+
+The transport kind itself is selected when the channel is created and is not an
+in-place interface parameter. A different transport is represented by a newly added
+channel, as in listener.
 
 ### 4.4 Per-Channel Monitoring
 

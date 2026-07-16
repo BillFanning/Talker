@@ -11,7 +11,7 @@
 //! coupling to the UI is an opaque `repaint` callback the driver invokes after
 //! pushing an update (the App passes `egui::Context::request_repaint`).
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -30,6 +30,12 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(200);
 /// Auto-reconnect cadence (§162): the orchestrator has no background loop, so the
 /// driver ticks it, exactly as the CLI does.
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StreamPollCursor {
+    generation: Option<u64>,
+    offset: u64,
+}
 
 /// A command from the GUI to the runtime — the GUI's on-the-wire command form, which
 /// the driver translates into [`Listener`] calls (the command surface; ADR-012). There
@@ -212,10 +218,10 @@ pub struct Driver {
     /// The channel currently on screen; only this one gets a snapshot + stream delta
     /// polled (the rest get cheap stats).
     selected: Option<ChannelId>,
-    /// The live stream cursor for the selected channel (§87, ADR-009): the next
-    /// absolute offset to fetch via `stream_delta`. Reset to 0 when the selection
-    /// changes (the new channel's bytes are fetched from its current window).
-    stream_cursor: u64,
+    /// Per-channel live stream cursors (§87, ADR-009). Preserving these across
+    /// selection changes avoids re-shipping the retained window whenever the user
+    /// revisits a tab. Generation changes still force a reliable run reset.
+    stream_cursors: HashMap<ChannelId, StreamPollCursor>,
 }
 
 impl Driver {
@@ -236,7 +242,7 @@ impl Driver {
             repaint,
             channels: Vec::new(),
             selected: None,
-            stream_cursor: 0,
+            stream_cursors: HashMap::new(),
         }
     }
 
@@ -275,12 +281,11 @@ impl Driver {
     /// Forward one runtime event to the GUI, applying the stream-cursor reset a
     /// (re)start needs (§87). Shared by the `select!` loop and `drain_events`.
     fn forward_event(&mut self, ev: RuntimeEvent) {
-        // A (re)start resets the channel's stream offset to 0; reset our cursor so the
-        // new stream's first bytes aren't skipped (§87).
+        // A (re)start resets the channel's stream offset to 0. Forget the old run's
+        // cursor even if this advisory event cannot be forwarded; StreamDelta's
+        // generation remains the fallback when the runtime event itself is dropped.
         if let RuntimeEvent::ChannelStarted(id) | RuntimeEvent::ChannelReconnected(id) = ev {
-            if Some(id) == self.selected {
-                self.stream_cursor = 0;
-            }
+            self.stream_cursors.remove(&id);
         }
         self.push(UiUpdate::Event(ev));
     }
@@ -375,6 +380,7 @@ impl Driver {
             UiCommand::RemoveChannel(id) => {
                 let _ = self.listener.remove_channel(id).await;
                 self.channels.retain(|c| *c != id);
+                self.stream_cursors.remove(&id);
                 self.push(UiUpdate::ChannelRemoved(id));
             }
             UiCommand::Rename(id, name) => {
@@ -434,10 +440,9 @@ impl Driver {
                 self.listener.set_view_config(id, *display, *retention);
             }
             UiCommand::Select(id) => {
-                // New selection: restart the live stream cursor so the new channel's
-                // scrollback is fetched from its current window (§87).
+                // Each channel retains its own cursor, so revisiting a tab fetches only
+                // bytes that arrived while it was off-screen.
                 self.selected = id;
-                self.stream_cursor = 0;
             }
             UiCommand::SaveProfile(path) => self.save_profile(path),
             UiCommand::LoadProfile(path) => self.load_profile(path).await,
@@ -486,7 +491,7 @@ impl Driver {
             self.push(UiUpdate::ChannelRemoved(id));
         }
         self.selected = None;
-        self.stream_cursor = 0;
+        self.stream_cursors.clear();
         // Validate before registering (§71, ADR-014): a hand-edited profile can carry an
         // invalid channel (e.g. a duplicate name) — skip those and load the rest, like
         // the CLI. Validation is workspace-level (`Profile::validate`), so duplicate
@@ -540,12 +545,25 @@ impl Driver {
                 // cursor so the next poll re-fetches those bytes instead of skipping
                 // them. (Previously the cursor advanced unconditionally, so a dropped
                 // delta was lost forever and the view froze while bytes kept counting.)
-                if let Some(delta) = self.listener.stream_delta(id, self.stream_cursor).await {
+                let cursor = self.stream_cursors.get(&id).copied().unwrap_or_default();
+                if let Some(delta) = self.listener.stream_delta(id, cursor.offset).await {
                     let end = delta.end_offset;
-                    let advance = delta.bytes.is_empty()
-                        || self.push(UiUpdate::StreamDelta(id, Box::new(delta)));
+                    let generation = delta.generation;
+                    // Empty caught-up deltas normally stay off the UI channel. A new
+                    // generation is different: forward even an empty window so a
+                    // restart clears stale bytes when no new data has arrived yet.
+                    let needs_update =
+                        Some(generation) != cursor.generation || !delta.bytes.is_empty();
+                    let advance =
+                        !needs_update || self.push(UiUpdate::StreamDelta(id, Box::new(delta)));
                     if advance {
-                        self.stream_cursor = end;
+                        self.stream_cursors.insert(
+                            id,
+                            StreamPollCursor {
+                                generation: Some(generation),
+                                offset: end,
+                            },
+                        );
                     }
                 }
             } else if let Some(stats) = self.listener.channel_stats(id).await {
@@ -735,11 +753,9 @@ mod tests {
                 Ok(Some(UiUpdate::Snapshot(sid, _))) if sid == id => got_snapshot = true,
                 // The scrollback bytes ride the incremental delta, not the snapshot.
                 Ok(Some(UiUpdate::StreamDelta(sid, delta))) if sid == id => {
-                    assert!(
-                        !delta.bytes.is_empty(),
-                        "a non-empty delta carries the bytes"
-                    );
-                    got_stream = true;
+                    // A new generation is forwarded even before its first byte so
+                    // the GUI can clear stale data from a previous run promptly.
+                    got_stream |= !delta.bytes.is_empty();
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => panic!("update stream closed early"),

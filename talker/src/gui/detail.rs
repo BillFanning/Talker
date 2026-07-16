@@ -1,23 +1,23 @@
 //! The detail pane: everything about the **selected** channel — header
-//! (name, kind, summary, actions), the Connection editor, the Messages
+//! (name, summary, actions), the Connection editor, the Messages
 //! editor, and the Output display pane. One channel on screen at a time;
 //! the channel list in [`super::channels`] picks which.
 
 use egui::{Align, Layout};
 
-use crate::core::message::{code_page_replacements, NmeaChecksumMode};
+use crate::core::message::NmeaChecksumMode;
 
-use wiredata_ui::{fonts::bold, format::human_bytes, glyphs, selection};
+use wiredata_ui::{fonts::bold, format::human_bytes, glyphs};
 
 use super::draft::{ConnKind, PayloadKind, ScheduleDraft};
 use super::widgets::{
     checksum_label, code_page_label, hex_valid, invalid_parse, lifecycle_indicator,
     marker_aware_text_edit, message_editor_max_height, plain_text_edit_with_cursor,
-    preview_ascii_layout_job, preview_text, red_bordered, show_display_pane,
-    show_insert_byte_button, show_insert_unit_button, show_interface_summary, show_serial_fields,
-    show_tcp_fields, show_udp_fields, start_blockers, start_button, theme_palette, UppercaseHex,
+    preview_ascii_layout_job, red_bordered, show_display_pane, show_insert_byte_button,
+    show_insert_unit_button, show_interface_summary, show_serial_fields, show_tcp_fields,
+    show_udp_fields, start_button, theme_palette, UppercaseHex,
 };
-use super::TalkerApp;
+use super::{MessageAnalysisCache, MessageDraftAnalysis, MessagePreview, TalkerApp};
 
 impl TalkerApp {
     /// Render the central detail pane for the selected channel (or a hint
@@ -33,11 +33,9 @@ impl TalkerApp {
             });
             return;
         };
-        let running = self.is_connection_running(i);
-        self.show_channel_identity(ui, i, running);
-        ui.add_space(4.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.push_id(i, |ui| {
+                let running = self.is_connection_running(i);
                 self.show_channel_header(ui, i, running);
                 ui.separator();
                 self.show_channel_body(ui, i, running);
@@ -49,48 +47,26 @@ impl TalkerApp {
         });
     }
 
-    /// Persistent identity for the selected channel. The title, status glyph,
-    /// and interface summary stay visible while the channel's editors and
-    /// Output pane scroll beneath it.
-    fn show_channel_identity(&self, ui: &mut egui::Ui, i: usize, running: bool) {
-        let pal = theme_palette(ui);
-        let error = self.sup.telemetry(i).banner_error().is_some();
-        let (glyph, glyph_color, status_word) = lifecycle_indicator(running, error, pal);
-        let title = selection::channel_title(i + 1, &self.conn_drafts[i].name);
-
-        selection::detail_identity(ui, |ui| {
-            ui.horizontal(|ui| {
-                glyphs::paint_glyph(ui, glyph, glyphs::glyph_size(glyph), glyph_color);
-                let size = egui::TextStyle::Body.resolve(ui.style()).size * 1.15;
-                ui.label(egui::RichText::new(title).strong().size(size));
-            });
-            ui.horizontal(|ui| {
-                ui.label(status_word);
-                ui.label("·");
-                ui.push_id("selected_iface_summary", |ui| {
-                    show_interface_summary(ui, &self.conn_drafts[i]);
-                });
-            });
-        });
-    }
-
-    /// Editable channel controls and live readouts below the persistent
-    /// identity band: name and kind, sent/unsent totals, throughput, high-rate
-    /// health, and the lifecycle button pair. Channel removal lives on the
-    /// channel-list rows (the ✕ overlay), as in listener.
+    /// The detail header, laid out like listener's channel block so the two
+    /// apps read as one product: name row (status glyph · name · label), a
+    /// `status · interface` row, sent/unsent totals, throughput, the
+    /// performance readouts for high-rate health, and the lifecycle button
+    /// pair. Channel removal lives on the channel-list rows (the ✕ overlay),
+    /// as in listener.
     fn show_channel_header(&mut self, ui: &mut egui::Ui, i: usize, running: bool) {
         let pal = theme_palette(ui);
         // Owned snapshot of the channel's telemetry (ADR-019): the readouts
         // are rendered across several `&mut self` widget closures.
         let telemetry = self.sup.telemetry(i);
         let error: Option<String> = telemetry.banner_error().map(str::to_owned);
+        let (glyph, glyph_color, status_word) = lifecycle_indicator(running, error.is_some(), pal);
         let (iface_drift, msg_drift) = self.detect_drift(i);
 
-        // Name row: editable display name followed by the interface kind.
-        // Identity and lifecycle stay in the fixed band above this scroll.
+        // Name row: status glyph (listener's symbol set/colors, painted into
+        // a fixed cell so status changes never shift the row) + editable
+        // name + label.
         ui.horizontal(|ui| {
-            ui.label(bold("Name"))
-                .on_hover_text("This channel's display name, shown in the channel list.");
+            glyphs::paint_glyph(ui, glyph, glyphs::glyph_size(glyph), glyph_color);
             // Editable display name (cosmetic — channels are positional).
             // The hint shows the positional fallback the list uses when the
             // name is empty.
@@ -104,6 +80,8 @@ impl TalkerApp {
             if name_r.changed() {
                 self.dirty = true;
             }
+            ui.label(bold("Name"))
+                .on_hover_text("This channel's display name, shown in the channel list.");
             // Duplicate names are allowed (nothing is keyed by them) but
             // worth a nudge — two identical rows in the list are confusing.
             let name = &self.conn_drafts[i].name;
@@ -123,15 +101,17 @@ impl TalkerApp {
                     .on_hover_text("Another channel has the same name — allowed, but confusing.");
                 }
             });
+        });
 
-            ui.separator();
-            let before_kind = self.conn_drafts[i].kind;
-            ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Serial, "Serial");
-            ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Udp, "UDP");
-            ui.radio_value(&mut self.conn_drafts[i].kind, ConnKind::Tcp, "TCP");
-            if self.conn_drafts[i].kind != before_kind {
-                self.deferred.apply.push(i);
-            }
+        // Status · interface row (listener's `running · details` line).
+        // A stable id scopes the summary, whose red `?` pills may come and go
+        // between egui's two layout passes.
+        ui.horizontal(|ui| {
+            ui.label(status_word);
+            ui.label("·");
+            ui.push_id("iface_summary", |ui| {
+                show_interface_summary(ui, &self.conn_drafts[i]);
+            });
         });
 
         // One weak readout line per signal (listener's queue-readout pattern),
@@ -246,7 +226,11 @@ impl TalkerApp {
         let blockers = if running && !drift {
             Vec::new()
         } else {
-            start_blockers(&self.conn_drafts[i], &self.sched_drafts[i])
+            super::widgets::start_blockers_analyzed(
+                &self.conn_drafts[i],
+                &self.sched_drafts[i],
+                &self.message_analysis[i],
+            )
         };
         let can_start = blockers.is_empty();
         let (label, enabled) = start_button(running, has_error, drift, can_start);
@@ -292,7 +276,7 @@ impl TalkerApp {
             .id_salt(("conn_section", i))
             .default_open(true)
             .show(ui, |ui| {
-                match self.conn_drafts[i].kind {
+                match self.conn_drafts[i].kind() {
                     // Each kind gets its own push_id namespace so the very
                     // different widget trees produced by Serial / UDP / TCP can't
                     // shift each other's auto-ids across egui's two layout passes.
@@ -330,6 +314,7 @@ impl TalkerApp {
         let interval_changes = show_schedule_section(
             ui,
             &mut self.sched_drafts[i],
+            &mut self.message_analysis[i],
             &mut self.dirty,
             &per_message_counts,
             running,
@@ -348,6 +333,7 @@ impl TalkerApp {
 fn show_schedule_section(
     ui: &mut egui::Ui,
     entries: &mut Vec<ScheduleDraft>,
+    analyses: &mut Vec<MessageAnalysisCache>,
     dirty: &mut bool,
     per_message_counts: &[u64],
     channel_running: bool,
@@ -363,6 +349,8 @@ fn show_schedule_section(
     // (The old stacked-card layout auto-collapsed this section on
     // Start; in the detail pane there's room, so the section just
     // honours whatever the user last chose.)
+    analyses.resize_with(entries.len(), MessageAnalysisCache::default);
+    analyses.truncate(entries.len());
     let n = entries.len();
     let header = if n == 0 {
         "Configure messages — (none)".to_string()
@@ -377,16 +365,20 @@ fn show_schedule_section(
         .default_open(true)
         .show(ui, |ui| {
             for (i, entry) in entries.iter_mut().enumerate() {
+                let analysis_cache = &mut analyses[i];
                 ui.push_id(i, |ui| {
                     ui.group(|ui| {
+                        let mut content_changed = false;
                         ui.horizontal(|ui| {
                             ui.strong(format!("Message {}", i + 1));
                             ui.separator();
+                            let before_kind = entry.payload_kind;
                             ui.radio_value(&mut entry.payload_kind, PayloadKind::Nmea, "NMEA");
                             ui.radio_value(&mut entry.payload_kind, PayloadKind::Ascii, "ASCII");
                             ui.radio_value(&mut entry.payload_kind, PayloadKind::Utf8, "UTF-8");
                             ui.radio_value(&mut entry.payload_kind, PayloadKind::Utf16, "UTF-16");
                             ui.radio_value(&mut entry.payload_kind, PayloadKind::Hex, "Hex");
+                            content_changed |= entry.payload_kind != before_kind;
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if entry.pending_remove {
                                     // Confirm step: ✓ commits, ✕ cancels. The
@@ -444,7 +436,11 @@ fn show_schedule_section(
                             .num_columns(2)
                             .spacing([8.0, 4.0])
                             .show(ui, |ui| {
-                                show_payload_fields(ui, entry);
+                                content_changed |= show_payload_fields(
+                                    ui,
+                                    entry,
+                                    analysis_cache.analysis.as_ref(),
+                                );
 
                                 let bad_interval = invalid_parse::<u64>(&entry.interval_ms);
                                 ui.label("Interval (ms)");
@@ -460,6 +456,7 @@ fn show_schedule_section(
                                         )
                                     },
                                 );
+                                content_changed |= interval_resp.changed();
                                 ui.end_row();
                                 if interval_resp.lost_focus() {
                                     if let Ok(ms) = entry.interval_ms.parse::<u64>() {
@@ -469,12 +466,17 @@ fn show_schedule_section(
                             });
 
                         ui.horizontal(|ui| {
-                            show_timestamp_editor(ui, entry);
+                            content_changed |= show_timestamp_editor(ui, entry);
                             ui.separator();
-                            show_checksum_editor(ui, entry);
+                            content_changed |= show_checksum_editor(ui, entry);
                         });
 
-                        show_message_preview(ui, entry);
+                        if content_changed {
+                            entry.mark_changed();
+                            *dirty = true;
+                        }
+                        let analysis = analysis_cache.refresh(entry);
+                        show_message_preview(ui, analysis);
 
                         let sent = per_message_counts.get(i).copied().unwrap_or(0);
                         show_message_status(ui, channel_running, sent);
@@ -489,10 +491,12 @@ fn show_schedule_section(
 
     if let Some(i) = to_remove {
         entries.remove(i);
+        analyses.remove(i);
         *dirty = true;
     }
     if add_one {
         entries.push(ScheduleDraft::default());
+        analyses.push(MessageAnalysisCache::default());
         *dirty = true;
     }
 
@@ -501,12 +505,16 @@ fn show_schedule_section(
 
 /// Render the payload-format fields for one message into the surrounding grid.
 /// Each `PayloadKind` arm has its own renderer below.
-fn show_payload_fields(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+fn show_payload_fields(
+    ui: &mut egui::Ui,
+    entry: &mut ScheduleDraft,
+    analysis: Option<&MessageDraftAnalysis>,
+) -> bool {
     match entry.payload_kind {
         PayloadKind::Hex => show_hex_payload(ui, entry),
         PayloadKind::Utf8 => show_utf8_payload(ui, entry),
         PayloadKind::Utf16 => show_utf16_payload(ui, entry),
-        PayloadKind::Ascii => show_ascii_payload(ui, entry),
+        PayloadKind::Ascii => show_ascii_payload(ui, entry, analysis),
         PayloadKind::Nmea => show_nmea_payload(ui, entry),
     }
 }
@@ -529,10 +537,10 @@ fn top_aligned_grid_cell<R>(
     .inner
 }
 
-fn show_hex_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+fn show_hex_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
     let bad_hex = !entry.hex_data.is_empty() && !hex_valid(&entry.hex_data);
     ui.label("Data (hex)");
-    let _ = red_bordered(
+    let response = red_bordered(
         ui,
         bad_hex,
         "invalid hex — use byte pairs like DE AD BE EF",
@@ -546,34 +554,38 @@ fn show_hex_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
         },
     );
     ui.end_row();
+    response.changed()
 }
 
-fn show_utf8_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+fn show_utf8_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
     let row_height = message_editor_max_height(ui, &entry.utf8_text);
     top_aligned_grid_cell(ui, row_height, |ui| ui.label("Text"));
-    top_aligned_grid_cell(ui, row_height, |ui| {
-        marker_aware_text_edit(
+    let changed = top_aligned_grid_cell(ui, row_height, |ui| {
+        let edited = marker_aware_text_edit(
             ui,
             &mut entry.utf8_text,
             "payload_utf8",
             None,
             300.0,
             "Unicode text",
-        );
-        show_insert_byte_button(
+        )
+        .changed();
+        let inserted = show_insert_byte_button(
             ui,
             &mut entry.utf8_text,
             &mut entry.insert_byte_hex,
             "payload_utf8",
         );
+        edited || inserted
     });
     ui.end_row();
+    changed
 }
 
-fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
     let row_height = message_editor_max_height(ui, &entry.utf16_text);
     top_aligned_grid_cell(ui, row_height, |ui| ui.label("Text"));
-    top_aligned_grid_cell(ui, row_height, |ui| {
+    let text_changed = top_aligned_grid_cell(ui, row_height, |ui| {
         // Two editor modes, chosen by `Allow raw bytes`:
         //   off — plain Unicode editor (what you see is what gets
         //         encoded). Insert Code Unit inserts the decoded
@@ -581,21 +593,23 @@ fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
         //   on  — marker-aware editor + Insert Byte button. Insert
         //         Code Unit inserts marker pairs with byte order
         //         applied.
-        if entry.utf16_allow_raw_bytes {
-            marker_aware_text_edit(
+        let mut changed = if entry.utf16_allow_raw_bytes {
+            let edited = marker_aware_text_edit(
                 ui,
                 &mut entry.utf16_text,
                 "payload_utf16",
                 None,
                 300.0,
                 "Unicode text",
-            );
-            show_insert_byte_button(
+            )
+            .changed();
+            let inserted = show_insert_byte_button(
                 ui,
                 &mut entry.utf16_text,
                 &mut entry.insert_byte_hex,
                 "payload_utf16",
             );
+            edited || inserted
         } else {
             plain_text_edit_with_cursor(
                 ui,
@@ -603,9 +617,10 @@ fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                 "payload_utf16",
                 300.0,
                 "Unicode text",
-            );
-        }
-        show_insert_unit_button(
+            )
+            .changed()
+        };
+        changed |= show_insert_unit_button(
             ui,
             &mut entry.utf16_text,
             &mut entry.insert_byte_hex,
@@ -613,8 +628,14 @@ fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             entry.utf16_big_endian,
             entry.utf16_allow_raw_bytes,
         );
+        changed
     });
     ui.end_row();
+    let before_options = (
+        entry.utf16_big_endian,
+        entry.utf16_bom,
+        entry.utf16_allow_raw_bytes,
+    );
     ui.label("Byte order");
     ui.horizontal(|ui| {
         ui.radio_value(&mut entry.utf16_big_endian, true, "Big-endian");
@@ -629,28 +650,42 @@ fn show_utf16_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             );
     });
     ui.end_row();
+    text_changed
+        || before_options
+            != (
+                entry.utf16_big_endian,
+                entry.utf16_bom,
+                entry.utf16_allow_raw_bytes,
+            )
 }
 
-fn show_ascii_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+fn show_ascii_payload(
+    ui: &mut egui::Ui,
+    entry: &mut ScheduleDraft,
+    analysis: Option<&MessageDraftAnalysis>,
+) -> bool {
     let row_height = message_editor_max_height(ui, &entry.ascii_text);
     top_aligned_grid_cell(ui, row_height, |ui| ui.label("Text"));
-    top_aligned_grid_cell(ui, row_height, |ui| {
-        marker_aware_text_edit(
+    let text_changed = top_aligned_grid_cell(ui, row_height, |ui| {
+        let edited = marker_aware_text_edit(
             ui,
             &mut entry.ascii_text,
             "payload_ascii",
             Some(entry.ascii_code_page),
             300.0,
             "text",
-        );
-        show_insert_byte_button(
+        )
+        .changed();
+        let inserted = show_insert_byte_button(
             ui,
             &mut entry.ascii_text,
             &mut entry.insert_byte_hex,
             "payload_ascii",
         );
+        edited || inserted
     });
     ui.end_row();
+    let code_page_before = entry.ascii_code_page;
     ui.label("Code page");
     ui.horizontal(|ui| {
         egui::ComboBox::from_id_salt("code_page")
@@ -665,7 +700,7 @@ fn show_ascii_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
                     ui.selectable_value(&mut entry.ascii_code_page, cp, code_page_label(cp));
                 }
             });
-        if let Some(summary) = code_page_replacements(&entry.ascii_text, entry.ascii_code_page) {
+        if let Some(summary) = analysis.and_then(|analysis| analysis.replacements.as_ref()) {
             let characters = summary
                 .characters
                 .iter()
@@ -685,9 +720,11 @@ fn show_ascii_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
         }
     });
     ui.end_row();
+    text_changed || entry.ascii_code_page != code_page_before
 }
 
-fn show_nmea_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+fn show_nmea_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
+    let mut changed = false;
     ui.label("Talker / Sentence");
     ui.horizontal(|ui| {
         let r = ui.add(
@@ -698,9 +735,10 @@ fn show_nmea_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
         );
         if r.changed() {
             entry.nmea_talker = entry.nmea_talker.to_ascii_uppercase();
+            changed = true;
         }
         ui.menu_button("v", |ui| {
-            show_filtered_picker(
+            changed |= show_filtered_picker(
                 ui,
                 "filter by code or description",
                 &mut entry.nmea_talker_filter,
@@ -718,20 +756,20 @@ fn show_nmea_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
         if r.changed() {
             entry.nmea_sentence_type = entry.nmea_sentence_type.to_ascii_uppercase();
             prefill_nmea_fields(entry);
+            changed = true;
         }
-        let sentence_before = entry.nmea_sentence_type.clone();
         ui.menu_button("v", |ui| {
-            show_filtered_picker(
+            if show_filtered_picker(
                 ui,
                 "filter by code or description",
                 &mut entry.nmea_sentence_filter,
                 nmea0183::sentence_type::ALL_WITH_DESC,
                 &mut entry.nmea_sentence_type,
-            );
+            ) {
+                prefill_nmea_fields(entry);
+                changed = true;
+            }
         });
-        if entry.nmea_sentence_type != sentence_before {
-            prefill_nmea_fields(entry);
-        }
         ui.separator();
         ui.label("NMEA checksum:").on_hover_text(
             "The protocol-internal `*XX` byte at the end of an NMEA \
@@ -739,6 +777,7 @@ fn show_nmea_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
              which is an outer checksum wrapped around the complete \
              rendered message (timestamp + payload + NMEA `*XX`).",
         );
+        let checksum_before = entry.nmea_checksum_mode;
         ui.radio_value(
             &mut entry.nmea_checksum_mode,
             NmeaChecksumMode::Correct,
@@ -754,6 +793,7 @@ fn show_nmea_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             NmeaChecksumMode::Wrong,
             "wrong",
         );
+        changed |= entry.nmea_checksum_mode != checksum_before;
     });
     ui.end_row();
 
@@ -768,8 +808,10 @@ fn show_nmea_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
         // User edited by hand — protect Fields from being overwritten
         // by future auto-fills on sentence-type changes.
         entry.nmea_fields_autofilled = false;
+        changed = true;
     }
     ui.end_row();
+    changed
 }
 
 /// Example comma-separated field values for common NMEA sentence types.
@@ -858,7 +900,7 @@ fn show_filtered_picker(
     filter: &mut String,
     options: &[(&'static str, &'static str)],
     selected: &mut String,
-) {
+) -> bool {
     // Pin the popup so the Talker and Sentence pickers look the same and
     // so the (often long) descriptions don't keep widening it.
     ui.set_min_width(360.0);
@@ -869,6 +911,7 @@ fn show_filtered_picker(
     );
     r.request_focus();
     let needle = filter.to_ascii_lowercase();
+    let mut changed = false;
     egui::ScrollArea::vertical()
         .min_scrolled_height(300.0)
         .max_height(300.0)
@@ -885,6 +928,7 @@ fn show_filtered_picker(
             {
                 selected.clear();
                 filter.clear();
+                changed = true;
                 ui.close();
             }
             for (code, desc) in options {
@@ -894,27 +938,25 @@ fn show_filtered_picker(
                 if matches && ui.button(format!("{code}  —  {desc}")).clicked() {
                     *selected = (*code).to_string();
                     filter.clear();
+                    changed = true;
                     ui.close();
                 }
             }
         });
+    changed
 }
 
 /// Render the read-only "this is what would be sent" preview row.
 ///
-/// Compiles the draft each frame and renders the wire bytes with a fixed
-/// reference timestamp — never `chrono::Utc::now()` — so the value does
-/// not change between repaints (which can be triggered by mouse motion,
-/// not just edits). The actual send still uses the wall clock; this
-/// preview shows the format and structure, not a live tick.
+/// The revision-keyed [`MessageDraftAnalysis`] owns conversion, compilation,
+/// and fixed-time rendering. This widget only applies theme-dependent styling,
+/// so unchanged long messages do no wire-format work during repaints.
 ///
 /// Bytes are shown as text (lossy UTF-8) for payload types that are text
 /// at heart (Utf8 / Ascii / NMEA) and as space-separated hex for the
 /// binary types (Hex / Utf16), to avoid the U+FFFD-tofu we'd otherwise
 /// get for non-UTF-8 bytes.
-fn show_message_preview(ui: &mut egui::Ui, entry: &ScheduleDraft) {
-    // 2024-01-01T12:00:00.000Z — a fixed, recognisable sample instant.
-    let reference = chrono::DateTime::<chrono::Utc>::from_timestamp(1_704_110_400, 0).unwrap();
+fn show_message_preview(ui: &mut egui::Ui, analysis: &MessageDraftAnalysis) {
     ui.horizontal(|ui| {
         ui.label("Wire bytes:").on_hover_text(
             "Literal bytes that would be sent on the wire, rendered \
@@ -922,61 +964,20 @@ fn show_message_preview(ui: &mut egui::Ui, entry: &ScheduleDraft) {
                  reference instant so the value doesn't tick — the \
                  actual send uses the wall clock.",
         );
-        let preview: egui::WidgetText = match entry.to_message_config() {
-            Some(config) => match config.compile() {
-                Ok(compiled) => {
-                    let timestamp_len = config
-                        .timestamp
-                        .as_ref()
-                        .map(|timestamp| timestamp.format(reference).len())
-                        .unwrap_or(0);
-                    let bytes = compiled.render_at(reference);
-                    match entry.payload_kind {
-                        // ASCII previews through the message's code page,
-                        // so the user sees what a receiver decoding via
-                        // the same code page would render: byte `0xE9` is
-                        // `é` in ISO-8859-1, `Θ` in CP437, `È` in Mac
-                        // Roman, etc. Only lossy fallback bytes receive
-                        // warning backgrounds; literal `?` bytes do not.
-                        PayloadKind::Ascii => {
-                            let replacement_offsets =
-                                code_page_replacements(&entry.ascii_text, entry.ascii_code_page)
-                                    .map(|summary| {
-                                        summary
-                                            .payload_offsets
-                                            .into_iter()
-                                            .map(|offset| timestamp_len + offset)
-                                            .collect::<Vec<_>>()
-                                    })
-                                    .unwrap_or_default();
-                            preview_ascii_layout_job(
-                                ui,
-                                &bytes,
-                                entry.ascii_code_page,
-                                &replacement_offsets,
-                            )
-                            .into()
-                        }
-                        PayloadKind::Utf8 | PayloadKind::Nmea => {
-                            egui::RichText::new(preview_text(&bytes)).monospace().into()
-                        }
-                        PayloadKind::Hex | PayloadKind::Utf16 => egui::RichText::new(
-                            bytes
-                                .iter()
-                                .map(|b| format!("{b:02X}"))
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                        )
-                        .monospace()
-                        .into(),
-                    }
-                }
-                Err(error) => egui::RichText::new(format!("Invalid: {error:#}"))
-                    .color(theme_palette(ui).fault_red)
-                    .monospace()
-                    .into(),
-            },
-            None => egui::RichText::new("(message is incomplete)")
+        let preview: egui::WidgetText = match &analysis.preview {
+            MessagePreview::Ascii {
+                bytes,
+                code_page,
+                replacement_wire_offsets,
+            } => preview_ascii_layout_job(ui, bytes, *code_page, replacement_wire_offsets).into(),
+            MessagePreview::Text(text) | MessagePreview::Hex(text) => {
+                egui::RichText::new(text).monospace().into()
+            }
+            MessagePreview::Invalid(error) => egui::RichText::new(format!("Invalid: {error}"))
+                .color(theme_palette(ui).fault_red)
+                .monospace()
+                .into(),
+            MessagePreview::Incomplete => egui::RichText::new("(message is incomplete)")
                 .monospace()
                 .into(),
         };
@@ -1043,7 +1044,13 @@ fn show_message_status(ui: &mut egui::Ui, channel_running: bool, sent: u64) {
 /// only `ui.separator()` at this nesting level is the one *between* the
 /// timestamp group and the message-checksum group, so the hierarchy reads
 /// "groups are separated; within a group is just spacing".
-fn show_timestamp_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+fn show_timestamp_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
+    let before = (
+        entry.timestamp_enabled,
+        entry.ts_date,
+        entry.ts_millis,
+        entry.ts_timezone,
+    );
     ui.horizontal(|ui| {
         ui.checkbox(&mut entry.timestamp_enabled, "Timestamp");
         if entry.timestamp_enabled {
@@ -1052,12 +1059,24 @@ fn show_timestamp_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             ui.checkbox(&mut entry.ts_timezone, "Z (UTC)");
         }
     });
+    before
+        != (
+            entry.timestamp_enabled,
+            entry.ts_date,
+            entry.ts_millis,
+            entry.ts_timezone,
+        )
 }
 
 /// Render the per-message checksum controls. See [`show_timestamp_editor`]
 /// for the separator hierarchy rationale.
-fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
+fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
     use crate::core::message::ChecksumAlgorithm;
+    let before = (
+        entry.checksum_enabled,
+        entry.checksum_algorithm,
+        entry.checksum_wrong,
+    );
     ui.horizontal(|ui| {
         ui.checkbox(&mut entry.checksum_enabled, "Message checksum")
             .on_hover_text(
@@ -1086,6 +1105,12 @@ fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) {
             ui.checkbox(&mut entry.checksum_wrong, "Intentionally wrong");
         }
     });
+    before
+        != (
+            entry.checksum_enabled,
+            entry.checksum_algorithm,
+            entry.checksum_wrong,
+        )
 }
 
 #[cfg(test)]

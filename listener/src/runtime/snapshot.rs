@@ -72,6 +72,10 @@ pub enum PipelineRequest {
 /// positions (bytes received since Start, modulo display pause).
 #[derive(Clone, Debug)]
 pub struct StreamDelta {
+    /// Opaque identity of the pipeline run that owns these offsets. Absolute
+    /// offsets restart at zero for each run, so consumers use this to distinguish
+    /// a genuine restart from a delayed, duplicate, or overlapping read.
+    pub generation: u64,
     /// Absolute stream offset of `bytes[0]`. Normally equals the requested `since`;
     /// it is **greater** when the requester's cursor had already been evicted from
     /// the front of the bounded scrollback — a signal to the consumer to reset its

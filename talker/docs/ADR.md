@@ -303,10 +303,21 @@ The version number increments only on breaking schema changes that `serde(defaul
 
 **Consequences:**
 - The font assets moved from `listener/assets/fonts/` to `wiredata-ui/assets/fonts/` (one copy; talker's private subset — including the Cascadia control-pictures subset font — was deleted, since the full Cascadia face in the shared stack covers U+2400–U+243F).
-- Talker's local visuals/font installers were replaced by `wiredata_ui::{fonts::install_fonts, style::install_visuals, style::apply_style_tweaks}`. Talker's light theme is now listener's grey-backdrop look; talker's original dark values seeded the shared dark theme. The dark/light **toggle** remains talker-only until listener grows one.
+- Talker's local visuals/font installers were replaced by `wiredata_ui::{fonts::install_fonts, style::install_visuals, style::apply_style_tweaks}`. Talker's light theme is now listener's grey-backdrop look; talker's original dark values seeded the shared dark theme. Both apps now expose and persist the same dark/light toggle.
 - Talker also adopts listener's window-startup lessons: `persist_window: false` (no post-show geometry jump) and a minimum window size.
 - Listener's `gui/{fonts,theme}.rs` and `widgets/format.rs` became thin re-exports, so its call sites are unchanged.
 - The crate has no `docs/` folder; its decisions live in the two app ADR series (this entry and listener ADR-019).
+
+**Follow-up (selected-channel continuity).** The shared crate also owns the purely
+presentational selected-channel card, compact tab, row text and historical-count
+emphasis, and the card-to-page connector. Each app supplies only a
+selected card rectangle, its actual scroll viewport, and (for an expanded list) the
+panel id. One shared painter owns the complete page-edge stroke and mirrors egui's
+resize hover/drag stroke; it draws the tab detour only when the card and both turns
+fit inside the viewport, otherwise it draws an ordinary straight divider. This
+prevents partial off-screen connectors and keeps both apps' selection hierarchy and
+resizer feedback identical. Lifecycle glyphs and live faults remain app-owned because
+they carry runtime meaning rather than chrome.
 
 ---
 
@@ -602,12 +613,22 @@ request instead of separately summing every glyph on every repaint. Marker-aware
 editors retain their repair snapshot as `Arc<str>` and replace it only when the text
 changes, avoiding an additional full text copy on unchanged repaints.
 
+All other message-derived GUI state is likewise revision-memoized. Every
+wire-affecting editor change advances its `ScheduleDraft` revision; one
+`MessageDraftAnalysis` build then converts and validates the message, computes ASCII
+replacement provenance, and compiles/renders the Wire preview. Start eligibility,
+drift detection, replacement warnings, and the preview consume that same analysis
+until the revision changes. Hex preview formatting writes once into a pre-sized
+string. Unchanged repaints therefore do no payload clone, compile, replacement scan,
+or per-byte temporary-string allocation.
+
 **Consequences:** Users can see and edit line-oriented messages without allowing a
 large paste to take over the detail pane. Exact Unicode requires UTF-8 or UTF-16;
 legacy code pages retain ADR-023's visible `?` substitution. Tests pin explicit line
 feed encoding, no-soft-wrap layout, horizontal overflow, vertical growth, and the
 eight-row viewport cap for both editor variants. They also pin reuse of the galley
-that supplied the width and change-only replacement of marker repair snapshots.
+that supplied the width, change-only replacement of marker repair snapshots, and
+one analysis rebuild per changed revision rather than per repaint or consumer.
 
 ## ADR-025 — Preflight replacements before interrupting an active channel
 
@@ -635,6 +656,64 @@ is ready. The supervisor still owns the valid restart and predecessor handoff, w
 the GUI owns only draft preparation and presentation. Tests pin the disabled invalid
 replacement state, exact one-based marker diagnostics, successful complete preflight,
 and preservation of a real active UDP run across a rejected replacement.
+
+## ADR-026 — Preparation has no live-time side effects
+
+**Status:** Accepted 2026-07-15 (profile reliability and schedule timing follow-up).
+
+**Context:** ADR-025 protected one active-channel replacement, but two neighboring
+paths still crossed the commit boundary too early. GUI profile loading stopped every
+runner before discovering that a hand-edited message could not compile or be
+represented by the draft model. Schedule compilation also assigned `Instant`
+deadlines during preflight, so time spent joining a predecessor or opening an
+interface appeared as missed sends when the new runner finally began.
+
+**Decision:** Preparation constructs inert candidates only. A profile load parses the
+file, validates the complete profile, materializes every connection and message draft,
+and round-trips those drafts through validated `ChannelConfig` construction. The same
+draft-to-core conversions feed Save and Start. Only a successful
+`PreparedProfileLoad` may stop runners and replace the workspace. Draft conversion
+validates each `MessageConfig`, so malformed marker syntax cannot be saved or flushed
+through another GUI path either.
+
+`Schedule::compile_unarmed` compiles wire data and intervals without assigning clock
+deadlines. Production entry points use that form; the runner calls `arm(now)` only
+after it owns an open interface and immediately before entering the send loop. Arming
+makes every active message due at that boundary and starts missed-send accounting
+there. The timestamp-taking `Schedule::compile` remains a convenience for deterministic
+scheduler tests and is implemented as compile-unarmed plus arm.
+
+**Consequences:** A bad profile leaves the current workspace and active transmissions
+untouched. Valid loads remain all-or-nothing at the UI commit point. Slow interface
+opens and predecessor handoffs no longer age a candidate schedule, create false missed
+sends, or move its first-fire grid. Tests pin complete profile preparation, rejection
+before replacement, validation at draft conversion, and a deliberately delayed
+unarmed schedule whose first poll sends immediately with zero misses.
+
+## ADR-027 — Channel transport is chosen at creation
+
+**Status:** Accepted 2026-07-15. **Context:** listener's established Add-template
+model and the cross-app GUI harmonization following ADR-016 / listener ADR-019.
+
+**Problem:** Talker's `+ Add` menu already chose Serial, UDP, or TCP, but the selected
+channel header repeated those choices as three radio buttons. The second control was
+not just visual duplication: changing a radio mutated the existing draft and queued
+an immediate interface apply. A valid retained target configuration could therefore
+replace a running channel's transport after one casual click. Listener instead treats
+transport as structural: Add chooses a template and Configure edits its parameters.
+
+**Decision:** Both GUIs use listener's model and one Add-menu order: UDP, TCP, Serial.
+For talker, `ConnDraft`'s kind is creation-only and private outside its draft module;
+it is set by `ConnDraft::new` or by materializing a profile interface. The detail pane
+has no transport selector. Configure Connection renders and edits only the fields for
+the existing kind. Runtime parameter reconfiguration remains unchanged.
+
+**Consequences:** The normal workflow has one transport choice, and a running channel
+cannot switch transport through an incidental header click. A different transport is
+a different channel created through `+ Add`; messages are not silently transferred.
+Profiles and the CLI still select a kind while constructing channels. There is no
+profile-schema or runtime-protocol change. Focused tests pin the common menu order and
+creation-time kind.
 
 ---
 
