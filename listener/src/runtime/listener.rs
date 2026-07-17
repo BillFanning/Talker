@@ -398,8 +398,9 @@ impl Listener {
     }
 
     /// Incremental stream bytes since the consumer's cursor (§87, ADR-009): only
-    /// what is new, so a live viewer never re-ships the whole ~1 MB scrollback each
-    /// poll. `None` when unknown, not running, or a TCP listener.
+    /// what is new, so a live viewer never re-ships the whole retained scrollback
+    /// (up to the 256 KB cap) each poll. `None` when unknown, not running, or a
+    /// TCP listener.
     pub async fn stream_delta(&self, id: ChannelId, since: u64) -> Option<StreamDelta> {
         match self.channels.get(&id)?.handle.as_ref()? {
             ChannelHandle::Data(tasks) => tasks.stream_delta(since).await,
@@ -1094,8 +1095,10 @@ impl Listener {
                 ));
                 Ok((handle, None))
             }
-            // The TCP listener supervises per-connection faults itself; a
-            // listener-acceptor fault isn't reconciled through this flag (v1).
+            // Per-connection faults stay supervised inside the listener task;
+            // a spontaneous *acceptor* fault sets `faulted` like any other
+            // transport, so polled state reads Faulted and reconnect can
+            // engage (§162).
             InterfaceConfig::TcpListener(tcp) => {
                 let bound = build_tcp_listener(id, tcp)?
                     .bind()
@@ -1103,9 +1106,11 @@ impl Listener {
                     .map_err(OrchestratorError::Bind)?;
                 // Per-connection recording is deferred (§59).
                 let handle = start_tcp_listener(
+                    bound.channel_id(),
                     bound,
                     self.channel_caps(config),
                     tcp.max_connections,
+                    faulted,
                     self.events_tx.clone(),
                 );
                 Ok((ChannelHandle::TcpListener(handle), None))

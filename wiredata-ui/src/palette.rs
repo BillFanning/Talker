@@ -3,14 +3,24 @@
 //! from `listener/src/gui/theme.rs` (talker ADR-016 / listener ADR-019).
 //!
 //! Two const instances: [`LIGHT`] (the shipped listener look) and [`DARK`]
-//! (initial seeds for the dark theme — several light values are unreadable on
-//! a dark backdrop, so each gets an explicit counterpart; expect tuning when
-//! the dark theme ships in both apps).
+//! (several light values are unreadable on a dark backdrop, so each gets an
+//! explicit counterpart).
 //!
 //! Stream/display *content* colors are deliberately **not** here — those are
 //! user-chosen per view.
 
 use egui::Color32;
+
+/// The palette matching the `Ui`'s active theme. The single accessor both
+/// apps and the shared chrome use, so every call site recolors live when the
+/// user toggles themes.
+pub fn active(ui: &egui::Ui) -> &'static Palette {
+    if ui.visuals().dark_mode {
+        &DARK
+    } else {
+        &LIGHT
+    }
+}
 
 /// The chrome colors, grouped by meaning rather than by widget.
 pub struct Palette {
@@ -66,7 +76,7 @@ pub const LIGHT: Palette = Palette {
 
 /// The dark-theme palette. Brighter accents and lighter greys so every value
 /// stays readable on a dark backdrop (the light `warning_amber`/`info_grey`
-/// would all but vanish). Initial seeds — tuned when dark ships in both apps.
+/// would all but vanish). Tune values here as the dark look evolves.
 pub const DARK: Palette = Palette {
     fault_red: Color32::from_rgb(235, 90, 90),
     running_green: Color32::from_rgb(0, 210, 150),

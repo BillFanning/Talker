@@ -5,6 +5,7 @@
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
+    ops::ControlFlow,
     sync::Arc,
 };
 
@@ -19,21 +20,15 @@ use super::display::{ChannelDisplay, ControlStyle, DisplayMode};
 use super::draft::{ConnDraft, ConnKind, PayloadKind, PortHold, ScheduleDraft, UdpModeDraft};
 use super::{MessageAnalysisCache, MessageDraftAnalysis};
 
-/// The shared wiredata palette matching the active theme (ADR-016).
-pub(super) fn theme_palette(ui: &egui::Ui) -> &'static wiredata_ui::palette::Palette {
-    if ui.visuals().dark_mode {
-        &wiredata_ui::palette::DARK
-    } else {
-        &wiredata_ui::palette::LIGHT
-    }
-}
-
 /// Foreground/background pair for a lossy code-page substitution. The shared
 /// palette's amber is a readable foreground in light mode but too dark behind
 /// black text, so the light theme uses a pale amber field with dark-brown text.
 fn replacement_highlight_colors(ui: &egui::Ui) -> (egui::Color32, egui::Color32) {
     if ui.visuals().dark_mode {
-        (egui::Color32::BLACK, theme_palette(ui).warning_amber)
+        (
+            egui::Color32::BLACK,
+            wiredata_ui::palette::active(ui).warning_amber,
+        )
     } else {
         (
             egui::Color32::from_rgb(45, 30, 0),
@@ -198,6 +193,11 @@ pub(super) fn interface_summary(conn: &ConnDraft) -> String {
     }
 }
 
+/// A start-blocker sink: receives each blocker as a **lazy** formatter (so a
+/// caller that only asks "is there any?" never formats or allocates) and can
+/// stop the walk early by returning `Break`.
+type BlockerSink<'s> = dyn FnMut(&dyn Fn() -> String) -> ControlFlow<()> + 's;
+
 /// Enumerate the specific reasons the Start button is disabled for a
 /// channel — one human-readable line per problem. Returned in the same
 /// order they appear in the editor (channel fields first, then per-message
@@ -207,50 +207,62 @@ pub(super) fn start_blockers_analyzed(
     messages: &[ScheduleDraft],
     analyses: &[MessageAnalysisCache],
 ) -> Vec<String> {
-    start_blockers_with(conn, messages, |index| {
-        analyses
-            .get(index)
-            .and_then(|cached| cached.analysis.as_ref())
-    })
-}
-
-fn start_blockers_with<'a>(
-    conn: &ConnDraft,
-    messages: &[ScheduleDraft],
-    analysis_at: impl Fn(usize) -> Option<&'a MessageDraftAnalysis>,
-) -> Vec<String> {
     let mut out = Vec::new();
-    out.extend(channel_blockers(conn));
-    if messages.is_empty() {
-        out.push("No messages defined — add at least one".to_string());
-    } else {
-        let mut any_complete = false;
-        for (i, message) in messages.iter().enumerate() {
-            let Some(analysis) = analysis_at(i) else {
-                out.push("Message analysis is not ready".to_string());
-                return out;
-            };
-            any_complete |= analysis.config.is_some();
-            out.extend(message_blockers(i, message, analysis));
-        }
-        if !any_complete {
-            out.push("No message is fully filled in".to_string());
-        }
-    }
+    let _ = visit_start_blockers(conn, messages, analyses, &mut |blocker| {
+        out.push(blocker());
+        ControlFlow::Continue(())
+    });
     out
 }
 
-fn channel_blockers(conn: &ConnDraft) -> Vec<String> {
-    let mut out = Vec::new();
+/// Whether any start blocker exists — [`start_blockers_analyzed`]'s predicate
+/// without its strings. This runs for **every** channel on every frame (the
+/// Start-all gate); the walk stops at the first blocker and, because blockers
+/// reach the sink lazily, formats nothing.
+pub(super) fn any_start_blocker_analyzed(
+    conn: &ConnDraft,
+    messages: &[ScheduleDraft],
+    analyses: &[MessageAnalysisCache],
+) -> bool {
+    visit_start_blockers(conn, messages, analyses, &mut |_| ControlFlow::Break(())).is_break()
+}
+
+/// The single source of truth both frontends walk.
+fn visit_start_blockers(
+    conn: &ConnDraft,
+    messages: &[ScheduleDraft],
+    analyses: &[MessageAnalysisCache],
+    sink: &mut BlockerSink,
+) -> ControlFlow<()> {
+    channel_blockers(conn, sink)?;
+    if messages.is_empty() {
+        sink(&|| "No messages defined — add at least one".to_string())?;
+    } else {
+        let mut any_complete = false;
+        for (i, message) in messages.iter().enumerate() {
+            let Some(analysis) = analyses.get(i).and_then(|cached| cached.analysis.as_ref()) else {
+                return sink(&|| "Message analysis is not ready".to_string());
+            };
+            any_complete |= analysis.config.is_some();
+            message_blockers(i, message, analysis, sink)?;
+        }
+        if !any_complete {
+            sink(&|| "No message is fully filled in".to_string())?;
+        }
+    }
+    ControlFlow::Continue(())
+}
+
+fn channel_blockers(conn: &ConnDraft, sink: &mut BlockerSink) -> ControlFlow<()> {
     match conn.kind() {
         ConnKind::Serial => {
             if conn.serial_port.is_empty() {
-                out.push("Channel: select a serial port".to_string());
+                sink(&|| "Channel: select a serial port".to_string())?;
             }
             if !conn.baud_custom.is_empty()
                 && conn.baud_custom.parse::<u32>().map_or(true, |b| b == 0)
             {
-                out.push("Channel: baud rate must be a positive number".to_string());
+                sink(&|| "Channel: baud rate must be a positive number".to_string())?;
             }
         }
         ConnKind::Udp => {
@@ -260,63 +272,69 @@ fn channel_blockers(conn: &ConnDraft) -> Vec<String> {
                 UdpModeDraft::Multicast => ("multicast", &conn.udp_multicast, "group"),
             };
             if pair.addr.is_empty() || pair.addr.parse::<Ipv4Addr>().is_err() {
-                out.push(format!("Channel: {mode_label} {addr_label} must be IPv4"));
+                sink(&|| format!("Channel: {mode_label} {addr_label} must be IPv4"))?;
             }
             if pair.port.is_empty() || pair.port.parse::<u16>().is_err() {
-                out.push(format!("Channel: {mode_label} port must be 1–65535"));
+                sink(&|| format!("Channel: {mode_label} port must be 1–65535"))?;
             }
             if invalid_parse::<u16>(&conn.local_port) {
-                out.push("Channel: local port must be 1–65535".to_string());
+                sink(&|| "Channel: local port must be 1–65535".to_string())?;
             }
         }
         ConnKind::Tcp => {
             if conn.tcp_addr.is_empty() {
-                out.push("Channel: address is empty".to_string());
+                sink(&|| "Channel: address is empty".to_string())?;
             } else if conn.tcp_addr.parse::<SocketAddr>().is_err() {
-                out.push("Channel: address must be host:port".to_string());
+                sink(&|| "Channel: address must be host:port".to_string())?;
             }
         }
     }
-    out
+    ControlFlow::Continue(())
 }
 
 fn message_blockers(
     idx: usize,
     entry: &ScheduleDraft,
     analysis: &MessageDraftAnalysis,
-) -> Vec<String> {
-    let mut out = Vec::new();
+    sink: &mut BlockerSink,
+) -> ControlFlow<()> {
     let n = idx + 1;
+    // Track whether this message reported a field-level blocker: the
+    // analysis-level fallbacks below only apply to messages whose fields
+    // all individually pass (same precedence the Vec-building code had).
+    let mut any = false;
+    let mut emit = |blocker: &dyn Fn() -> String| -> ControlFlow<()> {
+        any = true;
+        sink(blocker)
+    };
     if entry.interval_ms.is_empty() {
-        out.push(format!("Message {n}: interval is empty"));
+        emit(&|| format!("Message {n}: interval is empty"))?;
     } else if entry.interval_ms.parse::<u64>().is_err() {
-        out.push(format!("Message {n}: interval must be a whole number"));
+        emit(&|| format!("Message {n}: interval must be a whole number"))?;
     }
     match entry.payload_kind {
         PayloadKind::Hex if !hex_valid(&entry.hex_data) => {
-            out.push(format!("Message {n}: hex is empty or invalid"));
+            emit(&|| format!("Message {n}: hex is empty or invalid"))?;
         }
         PayloadKind::Nmea => {
             if entry.nmea_talker.is_empty() {
-                out.push(format!("Message {n}: NMEA talker is empty"));
+                emit(&|| format!("Message {n}: NMEA talker is empty"))?;
             }
             if entry.nmea_sentence_type.is_empty() {
-                out.push(format!("Message {n}: NMEA sentence type is empty"));
+                emit(&|| format!("Message {n}: NMEA sentence type is empty"))?;
             }
         }
         // UTF-8 / UTF-16 / ASCII payloads accept any string at this layer.
         _ => {}
     }
-    if out.is_empty() {
+    if !any {
         match (&analysis.config, &analysis.validation_error) {
-            (Some(_), Some(error)) => out.push(format!("Message {n}: {error}")),
+            (Some(_), Some(error)) => sink(&|| format!("Message {n}: {error}"))?,
             (Some(_), None) => {}
-            (None, _) => out.push(format!(
-                "Message {n}: configuration is incomplete or invalid"
-            )),
+            (None, _) => sink(&|| format!("Message {n}: configuration is incomplete or invalid"))?,
         }
     }
-    out
+    ControlFlow::Continue(())
 }
 
 // ── Interface field editors (Serial / UDP / TCP) ─────────────────────────────
@@ -1830,7 +1848,7 @@ pub(super) fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay,
                 .sample_interval
                 .as_secs_f32();
         if let Some(rate) = display.sampling_badge(send_rate > sample_hz, send_rate) {
-            let pal = theme_palette(ui);
+            let pal = wiredata_ui::palette::active(ui);
             ui.label(
                 egui::RichText::new(format!(
                     "sampled · showing ~{sample_hz:.0}/s of ~{rate:.0}/s"
@@ -2467,9 +2485,55 @@ mod tests {
         };
 
         let analysis = MessageDraftAnalysis::build(&draft);
-        let blockers = message_blockers(0, &draft, &analysis);
+        let mut blockers = Vec::new();
+        let _ = message_blockers(0, &draft, &analysis, &mut |blocker| {
+            blockers.push(blocker());
+            ControlFlow::Continue(())
+        });
         assert_eq!(blockers.len(), 1, "blockers: {blockers:?}");
         assert!(blockers[0].starts_with("Message 1:"));
         assert!(blockers[0].contains("complete ‹XX› byte marker"));
+    }
+
+    #[test]
+    fn blocker_predicate_agrees_with_the_collected_list() {
+        // The bool fast path (`any_start_blocker_analyzed`) and the
+        // string-collecting path walk the same visitor; pin that they can't
+        // drift apart across a few representative draft states.
+        let valid_conn = || {
+            let mut conn = ConnDraft::new(ConnKind::Tcp);
+            conn.tcp_addr = "127.0.0.1:9000".to_string();
+            conn
+        };
+        let invalid_conn = || ConnDraft::new(ConnKind::Tcp); // empty address
+        let msg = |interval: &str| ScheduleDraft {
+            payload_kind: PayloadKind::Utf8,
+            utf8_text: "hello".to_string(),
+            interval_ms: interval.to_string(),
+            ..ScheduleDraft::default()
+        };
+        for (conn, msgs) in [
+            (valid_conn(), vec![msg("100")]),
+            (valid_conn(), vec![msg("not-a-number")]),
+            (invalid_conn(), vec![msg("100")]),
+            (valid_conn(), vec![]),
+            (valid_conn(), vec![msg("100"), msg("not-a-number")]),
+        ] {
+            let conn = &conn;
+            let analyses: Vec<MessageAnalysisCache> = msgs
+                .iter()
+                .map(|d| {
+                    let mut cache = MessageAnalysisCache::default();
+                    cache.refresh(d);
+                    cache
+                })
+                .collect();
+            let listed = start_blockers_analyzed(conn, &msgs, &analyses);
+            assert_eq!(
+                any_start_blocker_analyzed(conn, &msgs, &analyses),
+                !listed.is_empty(),
+                "predicate disagrees with list {listed:?}"
+            );
+        }
     }
 }

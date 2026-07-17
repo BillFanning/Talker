@@ -12,7 +12,7 @@
 /// state (not flat labels) — filled face + visible border + a little rounding,
 /// brightening on hover and darkening on press. Disabled buttons use
 /// `noninteractive` (flat/dim), so the enabled↔disabled distinction survives.
-pub fn light_visuals() -> egui::Visuals {
+fn light_visuals() -> egui::Visuals {
     let mut light = egui::Visuals::light();
     light.override_text_color = Some(egui::Color32::from_gray(20));
     light.panel_fill = egui::Color32::from_gray(220);
@@ -40,7 +40,7 @@ pub fn light_visuals() -> egui::Visuals {
 
 /// The dark counterpart: talker's original dark values (light text, visible
 /// separators) with the same raised-button treatment as the light theme.
-pub fn dark_visuals() -> egui::Visuals {
+fn dark_visuals() -> egui::Visuals {
     let fg = egui::Color32::from_gray(230);
     let mut dark = egui::Visuals::dark();
     dark.override_text_color = Some(fg);
@@ -71,6 +71,32 @@ pub fn dark_visuals() -> egui::Visuals {
 pub fn install_visuals(ctx: &egui::Context) {
     ctx.set_visuals_of(egui::Theme::Light, light_visuals());
     ctx.set_visuals_of(egui::Theme::Dark, dark_visuals());
+}
+
+/// The theme-toggle button both apps put in their header: half-circle glyphs
+/// from the Geometric Shapes block (U+25D0/U+25D1) — the same block as the
+/// ■ ▶ • glyphs the apps already render, so coverage is guaranteed in the
+/// base font (the Misc-Symbols ☀/☾ dingbats are not). The half-lit circle
+/// reads as a light/dark duality icon; the tooltip states the action.
+///
+/// Flips `dark` and installs the matching theme preference on click. Returns
+/// `true` when toggled, for any app-side state that mirrors the theme.
+pub fn theme_toggle_button(ui: &mut egui::Ui, dark: &mut bool) -> bool {
+    let (glyph, tip) = if *dark {
+        ("\u{25D1}", "Switch to light theme") // ◑
+    } else {
+        ("\u{25D0}", "Switch to dark theme") // ◐
+    };
+    let toggled = ui.small_button(glyph).on_hover_text(tip).clicked();
+    if toggled {
+        *dark = !*dark;
+        ui.ctx().set_theme(if *dark {
+            egui::ThemePreference::Dark
+        } else {
+            egui::ThemePreference::Light
+        });
+    }
+    toggled
 }
 
 /// The non-visual style tweaks both apps share, applied to every theme:

@@ -4,18 +4,17 @@
 //! the parent module call into these. Grouped by responsibility into submodules,
 //! re-exported flat so callers keep using `widgets::<name>`.
 
-mod format;
 mod match_rule_editor;
 mod recording_editor;
 mod status;
 
-pub(super) use format::human_bytes;
 pub(super) use match_rule_editor::edit_mark_rules;
 pub(super) use recording_editor::{edit_display_recording, edit_raw_recording};
 pub(super) use status::{
     line_indicator, line_toggle, paint_glyph, recording_glyph_size, recording_indicator,
     start_button, status_color, status_glyph, status_label, stop_enabled,
 };
+pub(super) use wiredata_ui::format::human_bytes;
 
 use crate::config::{
     templates, ChannelConfig, DataBits, FlowControl, InterfaceConfig, Parity, StopBits,
@@ -23,7 +22,7 @@ use crate::config::{
 use crate::core::ChannelId;
 use crate::transport::udp::UdpMode;
 
-use super::fonts::bold;
+use wiredata_ui::fonts::bold;
 
 /// Which interface a new channel uses, in the Add menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -530,16 +529,20 @@ mod tests {
     #[test]
     fn recording_indicator_maps_state_to_label() {
         use crate::core::RecordingState;
+        let pal = &wiredata_ui::palette::LIGHT;
         assert_eq!(
-            recording_indicator(Some(RecordingState::Enabled)).2,
+            recording_indicator(Some(RecordingState::Enabled), pal).2,
             "recording"
         );
         assert_eq!(
-            recording_indicator(Some(RecordingState::Faulted)).2,
+            recording_indicator(Some(RecordingState::Faulted), pal).2,
             "faulted"
         );
-        assert_eq!(recording_indicator(Some(RecordingState::Disabled)).2, "off");
-        assert_eq!(recording_indicator(None).2, "off");
+        assert_eq!(
+            recording_indicator(Some(RecordingState::Disabled), pal).2,
+            "off"
+        );
+        assert_eq!(recording_indicator(None, pal).2, "off");
     }
 
     #[test]

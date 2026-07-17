@@ -4,7 +4,7 @@
 //! parent's test module); only the line/glyph painters touch egui.
 
 use super::super::state::ChannelStatus;
-use super::super::theme;
+use wiredata_ui::palette::Palette;
 
 /// The Start/Apply/Retry button's label and enabled state, from the channel status
 /// and whether the edit draft has pending changes (§8.5). Pure decision, unit-tested;
@@ -43,15 +43,16 @@ pub(crate) fn stop_enabled(status: ChannelStatus) -> bool {
 /// renders it as a colored label sized via [`recording_glyph_size`].
 pub(crate) fn recording_indicator(
     recording: Option<crate::core::RecordingState>,
+    pal: &Palette,
 ) -> (&'static str, egui::Color32, &'static str) {
     use crate::core::RecordingState;
     // Same colors as channel status (`status_color`): the active ● is RUNNING_GREEN
     // (like a Running channel), faulted ⚠ is FAULT_RED, off ■ is IDLE_GREY.
     use wiredata_ui::glyphs;
     match recording {
-        Some(RecordingState::Enabled) => (glyphs::RUNNING, theme::running_green(), "recording"),
-        Some(RecordingState::Faulted) => (glyphs::FAULT, theme::fault_red(), "faulted"),
-        Some(RecordingState::Disabled) | None => (glyphs::STOPPED, theme::idle_grey(), "off"),
+        Some(RecordingState::Enabled) => (glyphs::RUNNING, pal.running_green, "recording"),
+        Some(RecordingState::Faulted) => (glyphs::FAULT, pal.fault_red, "faulted"),
+        Some(RecordingState::Disabled) | None => (glyphs::STOPPED, pal.idle_grey, "off"),
     }
 }
 
@@ -68,10 +69,11 @@ pub(crate) fn status_label(status: ChannelStatus) -> &'static str {
 /// A serial control-line indicator (§161): the line name colored green when the
 /// line is high (asserted), grey when low, with a hover tooltip.
 pub(crate) fn line_indicator(ui: &mut egui::Ui, name: &str, high: bool) {
+    let pal = wiredata_ui::palette::active(ui);
     let color = if high {
-        theme::line_high_green()
+        pal.line_high_green
     } else {
-        theme::line_low_grey()
+        pal.line_low_grey
     };
     ui.colored_label(color, name)
         .on_hover_text(if high { "high" } else { "low" });
@@ -82,7 +84,7 @@ pub(crate) fn line_indicator(ui: &mut egui::Ui, name: &str, high: bool) {
 /// response so the caller can send the matching Set command.
 pub(crate) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Response {
     let color = if high {
-        theme::line_high_green()
+        wiredata_ui::palette::active(ui).line_high_green
     } else {
         ui.visuals().weak_text_color()
     };
@@ -97,13 +99,14 @@ pub(crate) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Re
 /// The color for a status glyph. Running is a bright blue-green and Reconnecting a
 /// yellower amber, both chosen to read distinctly from the red fault for red-green
 /// color blindness (the distinct glyphs ●/■/⚠ are the primary signal; color reinforces).
-/// All values live in [`super::super::theme`].
-pub(crate) fn status_color(status: ChannelStatus) -> egui::Color32 {
+/// Pure — callers pass the active theme's palette (`wiredata_ui::palette::active`),
+/// the same pattern as talker's `lifecycle_indicator`.
+pub(crate) fn status_color(status: ChannelStatus, pal: &Palette) -> egui::Color32 {
     match status {
-        ChannelStatus::Running => theme::running_green(),
-        ChannelStatus::Stopped => theme::idle_grey(),
-        ChannelStatus::Faulted => theme::fault_red(),
-        ChannelStatus::Reconnecting => theme::reconnecting_amber(),
+        ChannelStatus::Running => pal.running_green,
+        ChannelStatus::Stopped => pal.idle_grey,
+        ChannelStatus::Faulted => pal.fault_red,
+        ChannelStatus::Reconnecting => pal.reconnecting_amber,
     }
 }
 

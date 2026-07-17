@@ -11,9 +11,8 @@
 pub mod bridge;
 mod channels;
 mod detail;
-mod fonts;
+
 pub mod state;
-mod theme;
 mod view_prefs;
 mod widgets;
 
@@ -25,7 +24,7 @@ use crate::core::ChannelId;
 use crate::display::{CharacterRendering, DisplayMode, StreamRenderer};
 
 use bridge::{BridgeHandle, UiCommand};
-use fonts::install_fonts;
+
 use state::{AppState, ChannelStatus};
 use widgets::{
     config_incomplete, list_serial_ports, status_color, status_glyph, template_for, AddKind,
@@ -121,18 +120,16 @@ pub fn run() -> anyhow::Result<()> {
 /// and darker/heavier text, and a nudged text size — no custom UI scale (the OS DPI
 /// drives scaling, see below), and no 3-D / outline / button-sizing overrides.
 fn apply_style(ctx: &egui::Context) {
-    install_fonts(ctx);
     // No custom UI scale: the OS DPI setting drives sizing. (We deliberately do not
     // call `set_pixels_per_point` / `set_zoom_factor` — overriding the scale here both
     // ignores the user's system setting and gets persisted into eframe storage, where
     // a stale value then sticks across launches. Text size is nudged by the shared
     // style tweaks instead.)
 
-    // The shared wiredata look (ADR-019): visuals for both themes come from
-    // `wiredata-ui` so talker and listener read as one product. Which theme is
-    // *active* is restored from storage in `ListenerApp::new` (light default).
-    wiredata_ui::style::install_visuals(ctx);
-    wiredata_ui::style::apply_style_tweaks(ctx);
+    // The shared wiredata look (ADR-019): fonts, both themes' visuals, and the
+    // style tweaks come from `wiredata-ui` so talker and listener read as one
+    // product. Which theme is *active* is restored in `ListenerApp::new`.
+    wiredata_ui::install_chrome(ctx);
 }
 
 /// The eframe application root: the runtime bridge, the folded view-model, the
@@ -166,9 +163,9 @@ struct ListenerApp {
     /// Whether the channel-list (tabs) column is collapsed to a thin strip (#1).
     channels_collapsed: bool,
     /// `true` = dark theme, `false` = light (the default). Persisted; toggled
-    /// from the ◐ button in the channel-list header. The shared visuals for
-    /// both themes come from `wiredata-ui` (ADR-019); the palette follows via
-    /// [`theme::set_dark_active`].
+    /// from the shared ◐ button in the channel-list header. The visuals for
+    /// both themes come from `wiredata-ui` (ADR-019); chrome colors follow the
+    /// active theme via `wiredata_ui::palette::active`.
     dark_mode: bool,
     /// Per-severity filters for the diagnostics log.
     show_info: bool,
@@ -178,7 +175,7 @@ struct ListenerApp {
     /// on demand via the ⟳ button.
     serial_ports: Vec<String>,
     /// Memoized stream-view rows for the detail pane. The scrollback can reach the
-    /// ~1 MB retention cap, so rendering + line-splitting it every frame (even at
+    /// 256 KB scroll cap, so rendering + line-splitting it every frame (even at
     /// 5 Hz) is wasteful and, with a non-virtualized layout, was stalling the UI
     /// (regression after the stream-only split). We recompute only when the inputs
     /// change; `show_rows` then lays out just the visible rows.
@@ -207,7 +204,7 @@ pub(super) const MAX_RECENT_PROFILES: usize = 8;
 /// stream bytes for the live viewer.
 ///
 /// The earlier cache re-rendered the **whole** retained window (up to the
-/// ~1 MB cap) and re-split every row each time the stream cursor advanced —
+/// 256 KB scroll cap) and re-split every row each time the stream cursor advanced —
 /// O(buffer) per accepted delta at up to the 5 Hz poll rate, a milder
 /// recurrence of the symptom ADR-011 removed. Now only the **new** bytes are
 /// rendered, through a persistent [`StreamRenderer`] (ADR-018 — the same
@@ -232,6 +229,10 @@ struct StreamRenderCache {
     /// byte, or front-pruning of the mark list — forces a rebuild; marks for
     /// not-yet-rendered bytes ride the incremental path.
     history_marks_sig: u64,
+    /// The channel's `marks_version` at the last refresh. The signature above
+    /// is recomputed only when this moved — an idle frame compares two u64s
+    /// instead of re-hashing the whole mark history.
+    marks_version: u64,
     /// Absolute stream offset rendered so far (== the view's `stream_cursor`
     /// at the last refresh).
     rendered_cursor: u64,
@@ -279,7 +280,6 @@ impl ListenerApp {
         } else {
             egui::ThemePreference::Light
         });
-        theme::set_dark_active(dark_mode);
         Self {
             bridge,
             repaint,
@@ -546,7 +546,7 @@ impl ListenerApp {
                         egui::Button::new(
                             egui::RichText::new("Remove").color(egui::Color32::WHITE),
                         )
-                        .fill(theme::fault_red()),
+                        .fill(wiredata_ui::palette::active(ui).fault_red),
                     )
                     .clicked()
                 {
@@ -625,7 +625,7 @@ impl eframe::App for ListenerApp {
                         let (glyph, scale) = status_glyph(status);
                         let dot = egui::RichText::new(glyph)
                             .size(base * scale)
-                            .color(status_color(status));
+                            .color(status_color(status, wiredata_ui::palette::active(ui)));
                         let response = selection::mini_tab(ui, selected, dot).on_hover_text(name);
                         if selected {
                             selected_tab_rect = Some(response.rect);

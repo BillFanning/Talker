@@ -14,8 +14,8 @@
 use crate::config::schema::DisplayViewConfig;
 use crate::display::{CharacterRendering, DisplayMode};
 
-use super::fonts::MonoFont;
 use super::widgets::ColorScheme;
+use wiredata_ui::fonts::MonoFont;
 
 /// The GUI default font size when a config carries none.
 pub(crate) const DEFAULT_FONT_SIZE: f32 = 13.0;

@@ -162,7 +162,8 @@ pub enum UiUpdate {
     ControlLines(ChannelId, SerialControlLines),
     /// Incremental stream scrollback for the *selected* channel (§87, ADR-009):
     /// only the bytes new since the GUI's cursor, so the driver never re-ships the
-    /// whole ~1 MB buffer each poll. The App appends them to its live view.
+    /// whole retained buffer (up to the 256 KB scroll cap) each poll. The App
+    /// appends them to its live view.
     StreamDelta(ChannelId, Box<StreamDelta>),
     /// The workspace was saved to a profile file (the path, for a confirmation).
     ProfileSaved(std::path::PathBuf),

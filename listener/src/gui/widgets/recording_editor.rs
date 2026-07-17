@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use crate::config::ChannelConfig;
 use crate::record::{effective_overwrite, FileRotationPolicy, OverwritePolicy};
 
-use super::super::theme;
+use wiredata_ui::palette::active as palette;
 
 /// The shared destination / overwrite / rotation controls for a recording (§55–§59),
 /// used by both the Raw and Display editors (their config structs carry the same
@@ -54,7 +54,7 @@ fn recording_file_fields(
     if destination.is_none() {
         ui.label(
             egui::RichText::new("⚠ set a destination — recording won't start without one")
-                .color(theme::warning_amber()),
+                .color(palette(ui).warning_amber),
         );
     }
     // With rotation on, each period gets a fresh file, so "Refuse" makes no

@@ -14,7 +14,7 @@ use crate::config::{
 };
 use crate::core::TimestampConfig;
 
-use super::super::fonts::bold;
+use wiredata_ui::fonts::bold;
 
 /// Is this rule one the Mark editor owns — a single `BytePattern` condition whose only
 /// action is a timestamped `Mark`? Other rules (Idle, Record, bare Mark, multi-action)

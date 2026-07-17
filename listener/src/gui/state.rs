@@ -42,8 +42,10 @@ pub struct StreamMark {
 /// bounds memory if a dense rule marks nearly every byte of a large window.
 const MAX_STREAM_MARKS: usize = 4096;
 
-/// A Channel's lifecycle as the GUI understands it, derived from the event stream
-/// (the authoritative push surface, ADR-006).
+/// A Channel's lifecycle as the GUI understands it. Events are the *advisory*
+/// push surface (a wake-up); the folded state is reconciled against the polled
+/// snapshots/stats, which are authoritative (ADR-006, review round 2's polled
+/// lifecycle truth).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ChannelStatus {
     #[default]
@@ -118,6 +120,11 @@ pub struct ChannelView {
     /// cleared on restart. See [`StreamMark`] for why this outlives the
     /// snapshot's bounded `matches` window.
     pub marks: Vec<StreamMark>,
+    /// Bumped on every change to `marks` (merge, trim, clear). The stream-view
+    /// row cache compares this before hashing the mark history, so an idle
+    /// frame doesn't re-hash up to `MAX_STREAM_MARKS` entries just to conclude
+    /// nothing moved.
+    pub marks_version: u64,
     /// Next absolute stream offset to request — the cursor handed to
     /// `Listener::stream_delta`. Advances as deltas are folded.
     pub stream_cursor: u64,
@@ -160,6 +167,7 @@ impl ChannelView {
             raw_recording_queue: None,
             stream_bytes: std::collections::VecDeque::new(),
             marks: Vec::new(),
+            marks_version: 0,
             stream_cursor: 0,
             stream_base_offset: 0,
             stream_generation: None,
@@ -168,7 +176,10 @@ impl ChannelView {
 
     fn clear_stream_for_new_run(&mut self) {
         self.stream_bytes.clear();
-        self.marks.clear();
+        if !self.marks.is_empty() {
+            self.marks.clear();
+            self.marks_version += 1;
+        }
         self.stream_cursor = 0;
         self.stream_base_offset = 0;
         self.stream_generation = None;
@@ -181,6 +192,7 @@ impl ChannelView {
     /// take its on-screen timestamp with it). Firings without a mark or without
     /// a view position (paused-view bytes, idle rules) contribute nothing.
     fn merge_marks(&mut self, matches: &[TriggeredMatch]) {
+        let mut changed = false;
         for m in matches {
             let (Some(offset), Some(mark)) = (m.view_offset, m.mark.as_ref()) else {
                 continue;
@@ -207,10 +219,15 @@ impl ChannelView {
                     text: mark.text.clone(),
                 },
             );
+            changed = true;
         }
         if self.marks.len() > MAX_STREAM_MARKS {
             let excess = self.marks.len() - MAX_STREAM_MARKS;
             self.marks.drain(..excess); // oldest (lowest offsets) first
+            changed = true;
+        }
+        if changed {
+            self.marks_version += 1;
         }
     }
 
@@ -234,7 +251,10 @@ impl ChannelView {
             // A fresh pipeline reuses offsets from zero. The generation makes this
             // reset reliable even if its advisory lifecycle event was dropped.
             self.stream_bytes.clear();
-            self.marks.clear();
+            if !self.marks.is_empty() {
+                self.marks.clear();
+                self.marks_version += 1;
+            }
             self.stream_base_offset = base_offset;
             self.stream_cursor = base_offset;
             self.stream_generation = Some(generation);
@@ -279,6 +299,7 @@ impl ChannelView {
             .partition_point(|s| s.offset < self.stream_base_offset);
         if evicted > 0 {
             self.marks.drain(..evicted);
+            self.marks_version += 1;
         }
         debug_assert_eq!(
             self.stream_cursor.checked_sub(self.stream_base_offset),
@@ -1125,6 +1146,43 @@ mod tests {
         let view = state.channel(id).unwrap();
         assert_eq!(view.marks.len(), 1, "the mark outlives the rolling window");
         assert_eq!(view.marks[0].offset, 2);
+    }
+
+    #[test]
+    fn marks_version_moves_with_the_mark_list_not_the_bytes() {
+        // The stream-view cache trusts `marks_version` to decide whether the
+        // mark history could have changed, so it must bump on every mark
+        // mutation (merge / trim / clear) and stay put on plain byte appends.
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(0, b"abcdef", 6))));
+        let v0 = state.channel(id).unwrap().marks_version;
+
+        // A byte append with no mark activity: version unchanged.
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(6, b"gh", 8))));
+        assert_eq!(state.channel(id).unwrap().marks_version, v0);
+
+        // A merged mark bumps; re-delivering the same firing (no-op merge) doesn't.
+        let rule = MatchRuleId::new();
+        let mut snap = snapshot_with(id, 8, 0.0, 0);
+        snap.matches = vec![mark_match(rule, 2, "[t]")];
+        state.apply(UiUpdate::Snapshot(id, Box::new(snap)));
+        let v1 = state.channel(id).unwrap().marks_version;
+        assert_ne!(v1, v0, "merge bumps");
+        let mut again = snapshot_with(id, 8, 0.0, 0);
+        again.matches = vec![mark_match(rule, 2, "[t]")];
+        state.apply(UiUpdate::Snapshot(id, Box::new(again)));
+        assert_eq!(
+            state.channel(id).unwrap().marks_version,
+            v1,
+            "idempotent re-merge does not bump"
+        );
+
+        // An eviction reset drops the mark with its byte: version bumps.
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(20, b"xyz", 23))));
+        assert!(state.channel(id).unwrap().marks.is_empty());
+        assert_ne!(state.channel(id).unwrap().marks_version, v1, "trim bumps");
     }
 
     #[test]

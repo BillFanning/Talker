@@ -9,15 +9,15 @@ use crate::core::{ChannelId, RecordingState};
 use crate::diagnostics::DiagnosticSeverity;
 
 use super::bridge::{self, UiCommand};
-use super::fonts::bold;
 use super::state::ChannelStatus;
-use super::theme;
 use super::widgets::{
     config_needs_restart, edit_display_recording, edit_interface, edit_raw_recording, human_bytes,
     line_indicator, line_toggle, paint_glyph, recording_glyph_size, recording_indicator,
     start_button, status_color, status_glyph, status_label, stop_enabled,
 };
 use super::ListenerApp;
+use wiredata_ui::fonts::bold;
+use wiredata_ui::palette::active as palette;
 
 /// Uniform size for the lifecycle / recording control buttons. Text wider than the
 /// min grows the button (so "Apply & Restart" doesn't clip).
@@ -91,7 +91,7 @@ impl ListenerApp {
             });
         });
         if let Some(err) = &last_error {
-            ui.colored_label(theme::fault_red(), format!("⚠ {err}"));
+            ui.colored_label(palette(ui).fault_red, format!("⚠ {err}"));
             // The port/bind recourse only applies to a *start* fault (channel Faulted) —
             // not a recording fault, which leaves the channel Running and whose error
             // already names its own recourse (check the destination / on-exists).
@@ -216,13 +216,13 @@ impl ListenerApp {
         let (headline_level, headline, headline_color) = match entries.last() {
             Some(d) => {
                 let (level, color) = match d.severity {
-                    DiagnosticSeverity::Event => ("INFO", theme::event_grey()),
-                    DiagnosticSeverity::Warning => ("WARN", theme::warning_amber()),
-                    DiagnosticSeverity::Error => ("ERROR", theme::fault_red()),
+                    DiagnosticSeverity::Event => ("INFO", palette(ui).event_grey),
+                    DiagnosticSeverity::Warning => ("WARN", palette(ui).warning_amber),
+                    DiagnosticSeverity::Error => ("ERROR", palette(ui).fault_red),
                 };
                 (level, d.message.clone(), color)
             }
-            None => ("", "no diagnostics yet".to_string(), theme::idle_grey()),
+            None => ("", "no diagnostics yet".to_string(), palette(ui).idle_grey),
         };
         let dv = DiagView {
             headline_level,
@@ -283,13 +283,13 @@ impl ListenerApp {
                         for d in dv.entries.iter().rev() {
                             let (enabled, color, level) = match d.severity {
                                 DiagnosticSeverity::Event => {
-                                    (self.show_info, theme::info_grey(), "INFO ")
+                                    (self.show_info, palette(ui).info_grey, "INFO ")
                                 }
                                 DiagnosticSeverity::Warning => {
-                                    (self.show_warn, theme::warning_amber(), "WARN ")
+                                    (self.show_warn, palette(ui).warning_amber, "WARN ")
                                 }
                                 DiagnosticSeverity::Error => {
-                                    (self.show_error, theme::fault_red(), "ERROR")
+                                    (self.show_error, palette(ui).fault_red, "ERROR")
                                 }
                             };
                             if !enabled {
@@ -339,7 +339,7 @@ impl ListenerApp {
         ui.horizontal(|ui| {
             // Painted into a fixed cell so the glyph never drives the row height.
             let (glyph, scale) = status_glyph(status);
-            paint_glyph(ui, glyph, scale, status_color(status));
+            paint_glyph(ui, glyph, scale, status_color(status, palette(ui)));
             const NAME_HINT: &str = "This channel's display name. When file rotation is \
                 on, it's also the base name of the rotated files (<channel>_<time \
                 period>), so keep it filesystem-safe.";
@@ -381,7 +381,7 @@ impl ListenerApp {
             if self.name_duplicate {
                 ui.label(
                     egui::RichText::new("⚠ name already in use — names must be unique")
-                        .color(theme::warning_amber()),
+                        .color(palette(ui).warning_amber),
                 );
             }
         });
@@ -410,7 +410,7 @@ impl ListenerApp {
                 ))
                 .weak();
                 ui.label(if q.peak * 2 >= q.capacity.max(1) {
-                    text.color(theme::warning_amber())
+                    text.color(palette(ui).warning_amber)
                 } else {
                     text
                 });
@@ -475,7 +475,7 @@ impl ListenerApp {
             // Status glyph only (same symbol set/colors as channel status) — the word
             // ("recording"/"off"/"faulted") is dropped to keep the row compact; the glyph
             // ■/●/⚠ carries the state.
-            let (glyph, color, _text) = recording_indicator(recording);
+            let (glyph, color, _text) = recording_indicator(recording, palette(ui));
             paint_glyph(ui, glyph, recording_glyph_size(glyph), color);
             self.record_button(ui, id, status, recording, RecTap::Raw);
         });
@@ -500,7 +500,7 @@ impl ListenerApp {
         let display_recording = self.state.channel(id).and_then(|v| v.display_recording);
         ui.horizontal(|ui| {
             ui.label(bold("Record Display"));
-            let (glyph, color, _text) = recording_indicator(display_recording);
+            let (glyph, color, _text) = recording_indicator(display_recording, palette(ui));
             paint_glyph(ui, glyph, recording_glyph_size(glyph), color);
             self.record_button(ui, id, status, display_recording, RecTap::Display);
         });

@@ -16,13 +16,15 @@
 //! Connection channels are runtime-only and never persisted (§16.3).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, Sender};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::{ChannelId, RuntimeEvent};
-use crate::transport::tcp::{BoundTcpListenerTransport, TcpConnectionTransport};
+use crate::transport::tcp::TcpConnectionTransport;
 use crate::transport::{ConnectionAcceptorRunner, NewConnection, TransportOutcome};
 
 use super::channel::{
@@ -62,27 +64,33 @@ impl TcpListenerHandle {
 
 /// Start a TCP listener and supervise its connection channels (§16).
 ///
-/// All lifecycle events flow into `events`.
+/// All lifecycle events flow into `events`. A spontaneous acceptor fault sets
+/// `faulted` (the channel's polled-state flag, ADR-006) and emits
+/// `ChannelFaulted(listener_id)` — the listener is then Faulted like any other
+/// transport, so auto-reconnect can engage (§162). Existing connection
+/// channels live on either way.
 ///
 /// Per-connection **recording** is not wired: each connection would need a
 /// distinct destination file, which depends on filename templating (§59,
 /// deferred). Accepted connections are therefore unrecorded for now.
 pub fn start_tcp_listener(
-    bound: BoundTcpListenerTransport,
+    listener_id: ChannelId,
+    acceptor: impl ConnectionAcceptorRunner,
     caps: PipelineCapacities,
     max_connections: Option<u32>,
+    faulted: Arc<AtomicBool>,
     events: Sender<RuntimeEvent>,
 ) -> TcpListenerHandle {
-    let listener_id = bound.channel_id();
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
 
-    let task = tokio::spawn(async move {
-        // Listener acceptor → supervisor queue of NewConnection.
-        let (conn_tx, mut conn_rx) = mpsc::channel::<NewConnection>(caps.ingest);
-        let listener_cancel = CancellationToken::new();
-        let listener_handle = bound.run(conn_tx, listener_cancel.clone());
+    // Listener acceptor → supervisor queue of NewConnection. Run before the
+    // spawn so the acceptor type itself never crosses into the task.
+    let (conn_tx, mut conn_rx) = mpsc::channel::<NewConnection>(caps.ingest);
+    let listener_cancel = CancellationToken::new();
+    let mut listener_handle = Some(acceptor.run(conn_tx, listener_cancel.clone()));
 
+    let task = tokio::spawn(async move {
         let mut connections: HashMap<ChannelId, Connection> = HashMap::new();
         // Each entry awaits a connection's transport completion and yields its id.
         let mut monitors: JoinSet<(ChannelId, TransportOutcome)> = JoinSet::new();
@@ -154,7 +162,20 @@ pub fn start_tcp_listener(
                         );
                         let _ = events.try_send(RuntimeEvent::TcpClientConnected(conn_id));
                     }
-                    None => listener_open = false, // acceptor ended; existing connections live on
+                    None => {
+                        // Acceptor ended on its own (not our shutdown cancel);
+                        // existing connections live on, but the listener no
+                        // longer accepts — surface a fault as any transport
+                        // would (§162), instead of sitting silently "running".
+                        listener_open = false;
+                        if let Some(handle) = listener_handle.take() {
+                            if let TransportOutcome::Faulted(cause) = handle.join().await {
+                                tracing::error!("TCP listener acceptor faulted: {cause}");
+                                faulted.store(true, Ordering::Relaxed);
+                                let _ = events.try_send(RuntimeEvent::ChannelFaulted(listener_id));
+                            }
+                        }
+                    }
                 },
 
                 Some(joined) = monitors.join_next(), if !monitors.is_empty() => {
@@ -187,7 +208,9 @@ pub fn start_tcp_listener(
 
         // Shutdown (§110, §13): stop accepting, then stop every connection.
         listener_cancel.cancel();
-        let _ = listener_handle.join().await;
+        if let Some(handle) = listener_handle.take() {
+            let _ = handle.join().await;
+        }
         for (conn_id, conn) in connections.drain() {
             let Connection {
                 transport_cancel,
@@ -214,7 +237,8 @@ pub fn start_tcp_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::tcp::TcpListenerTransport;
+    use crate::transport::tcp::{BoundTcpListenerTransport, TcpListenerTransport};
+    use crate::transport::TransportJoinHandle;
     use std::collections::HashSet;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
@@ -226,6 +250,23 @@ mod tests {
             .unwrap()
     }
 
+    fn start(
+        bound: BoundTcpListenerTransport,
+        max_connections: Option<u32>,
+        events: Sender<RuntimeEvent>,
+    ) -> (TcpListenerHandle, Arc<AtomicBool>) {
+        let faulted = Arc::new(AtomicBool::new(false));
+        let handle = start_tcp_listener(
+            bound.channel_id(),
+            bound,
+            PipelineCapacities::default(),
+            max_connections,
+            faulted.clone(),
+            events,
+        );
+        (handle, faulted)
+    }
+
     #[tokio::test]
     async fn connection_lifecycle_emits_connected_and_disconnected() {
         let bound = bound_listener().await;
@@ -233,7 +274,7 @@ mod tests {
         let listener_id = bound.channel_id();
         let (ev_tx, mut ev_rx) = mpsc::channel(64);
 
-        let handle = start_tcp_listener(bound, PipelineCapacities::default(), None, ev_tx);
+        let (handle, _faulted) = start(bound, None, ev_tx);
 
         let mut client = TcpStream::connect(addr).await.unwrap();
 
@@ -266,7 +307,7 @@ mod tests {
         let listener_id = bound.channel_id();
         let (ev_tx, mut ev_rx) = mpsc::channel(64);
 
-        let handle = start_tcp_listener(bound, PipelineCapacities::default(), Some(1), ev_tx);
+        let (handle, _faulted) = start(bound, Some(1), ev_tx);
 
         // First client accepted.
         let _c1 = TcpStream::connect(addr).await.unwrap();
@@ -285,13 +326,61 @@ mod tests {
         handle.stop().await;
     }
 
+    /// An acceptor that fails immediately, without touching a socket —
+    /// injected in place of the bound listener to exercise the fault path.
+    struct FailingAcceptor {
+        cause: &'static str,
+    }
+
+    impl ConnectionAcceptorRunner for FailingAcceptor {
+        fn run(
+            self,
+            out: mpsc::Sender<NewConnection>,
+            _cancel: CancellationToken,
+        ) -> TransportJoinHandle {
+            let cause = self.cause;
+            TransportJoinHandle::Task(tokio::spawn(async move {
+                drop(out); // acceptor gone → the supervisor's queue closes
+                TransportOutcome::Faulted(cause.to_string())
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn acceptor_fault_sets_faulted_and_emits_channel_faulted() {
+        // Regression (§162): a spontaneously dying acceptor used to only flip
+        // an internal flag — the listener kept reading as Running, accepted
+        // nothing, and auto-reconnect never engaged.
+        let listener_id = ChannelId::new();
+        let (ev_tx, mut ev_rx) = mpsc::channel(16);
+        let faulted = Arc::new(AtomicBool::new(false));
+        let handle = start_tcp_listener(
+            listener_id,
+            FailingAcceptor {
+                cause: "injected accept failure",
+            },
+            PipelineCapacities::default(),
+            None,
+            faulted.clone(),
+            ev_tx,
+        );
+
+        match ev_rx.recv().await.unwrap() {
+            RuntimeEvent::ChannelFaulted(id) => assert_eq!(id, listener_id),
+            other => panic!("expected ChannelFaulted, got {other:?}"),
+        }
+        assert!(faulted.load(Ordering::Relaxed), "polled-state flag set");
+
+        handle.stop().await;
+    }
+
     #[tokio::test]
     async fn connections_are_independent_channels() {
         let bound = bound_listener().await;
         let addr = bound.local_addr().unwrap();
         let (ev_tx, mut ev_rx) = mpsc::channel(128);
 
-        let handle = start_tcp_listener(bound, PipelineCapacities::default(), None, ev_tx);
+        let (handle, _faulted) = start(bound, None, ev_tx);
 
         let mut c1 = TcpStream::connect(addr).await.unwrap();
         let mut c2 = TcpStream::connect(addr).await.unwrap();

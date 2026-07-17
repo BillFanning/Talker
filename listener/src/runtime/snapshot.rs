@@ -7,7 +7,8 @@
 //! point-in-time, owned copy of the *small* observable state (diagnostics, matches,
 //! liveness, view pause, the stream's end offset); the scrollback bytes themselves
 //! are fetched separately and incrementally via [`StreamDelta`] so a high-throughput
-//! viewer never re-ships the whole ~1 MB buffer (§87, ADR-009).
+//! viewer never re-ships the whole retained buffer (up to the 256 KB scroll cap —
+//! §87, ADR-009).
 //!
 //! This is the *pull* half of the observability surface. The *push* half is the
 //! [`RuntimeEvent`](crate::core::RuntimeEvent) stream, which stays authoritative

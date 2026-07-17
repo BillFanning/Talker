@@ -23,7 +23,7 @@ pub const FAULT: &str = "\u{26A0}";
 /// square (`■`) is the reference at this size; the dot and triangle are
 /// enlarged by the optical correction in [`glyph_size`] to match the
 /// square's apparent size.
-pub const STATUS_GLYPH_SCALE: f32 = 1.5;
+const STATUS_GLYPH_SCALE: f32 = 1.5;
 
 /// Per-glyph optical correction: `●`/`■`/`⚠` have different bounding boxes,
 /// so at one font size they look different sizes. The square is the

@@ -5,8 +5,9 @@
 use wiredata_ui::{glyphs, palette::Palette, selection};
 
 use super::draft::ConnKind;
-use super::widgets::{interface_summary, lifecycle_indicator, theme_palette};
+use super::widgets::{interface_summary, lifecycle_indicator};
 use super::TalkerApp;
+use wiredata_ui::palette::active as theme_palette;
 
 /// One channel's row data, snapshotted before rendering.
 struct ChannelRow {
@@ -110,7 +111,9 @@ impl TalkerApp {
         // `selected` (via deferred), which must not alias the borrow.
         let rows: Vec<ChannelRow> = (0..self.conn_drafts.len())
             .map(|i| {
-                let telemetry = self.sup.telemetry(i);
+                // Borrowed telemetry: rows read two fields, so don't clone
+                // the whole struct per channel per frame.
+                let telemetry = self.sup.telemetry_ref(i);
                 // Row → tally via the slot's stable id (ADR-020): the id
                 // travels with the slot, so this stays right after removals.
                 let counts = self
@@ -122,8 +125,8 @@ impl TalkerApp {
                     name: selection::channel_title(i + 1, &self.conn_drafts[i].name),
                     summary: interface_summary(&self.conn_drafts[i]),
                     running: self.is_connection_running(i),
-                    error: telemetry.banner_error().map(str::to_owned),
-                    sent: telemetry.total_count,
+                    error: telemetry.and_then(|t| t.banner_error()).map(str::to_owned),
+                    sent: telemetry.map(|t| t.total_count).unwrap_or_default(),
                     per_sec: self.rates.get(i).map(|r| r.per_sec).unwrap_or(0.0),
                     info: counts.info,
                     warnings: counts.warn,
@@ -261,41 +264,22 @@ impl TalkerApp {
                         ui.label(egui::RichText::new(format!("Sent: {}{rate}", row.sent)).weak());
                     }
                     // Line 4: per-severity log counts (since the channel's
-                    // last start) — listener's row line: always shown, in
-                    // info · warn · err order with the shared colors.
-                    // Historical counts recede on background tabs. The live
-                    // fault below remains saturated on every row.
-                    ui.horizontal(|ui| {
-                        let tip = "Log events attributed to this channel \
-                                       since its last start";
-                        ui.label(
-                            egui::RichText::new(format!("{} info", row.info))
-                                .weak()
-                                .color(emphasis.info),
-                        )
-                        .on_hover_text(tip);
-                        ui.label(
-                            egui::RichText::new(format!("{} warn", row.warnings))
-                                .color(emphasis.warning),
-                        )
-                        .on_hover_text(tip);
-                        ui.label(
-                            egui::RichText::new(format!("{} err", row.errors))
-                                .color(emphasis.error),
-                        )
-                        .on_hover_text(tip);
-                    });
-                    // Line 5: the last error, wrapped like listener's so
-                    // the full text reads on the row itself.
+                    // last start) — the shared row line (info · warn · err;
+                    // historical counts recede on background tabs).
+                    selection::severity_counts_line(
+                        ui,
+                        row.info.into(),
+                        row.warnings.into(),
+                        row.errors.into(),
+                        &emphasis,
+                        Some(
+                            "Log events attributed to this channel \
+                             since its last start",
+                        ),
+                    );
+                    // Line 5: the live fault — saturated on every row.
                     if let Some(err) = &row.error {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("\u{26A0} {err}"))
-                                    .small()
-                                    .color(pal.fault_red),
-                            )
-                            .wrap(),
-                        );
+                        selection::last_error_line(ui, err);
                     }
                 });
                 // Box-select: sense a click on the whole box first.
@@ -351,7 +335,10 @@ impl TalkerApp {
         let mut selected_tab_rect = None;
         for i in 0..self.conn_drafts.len() {
             let running = self.is_connection_running(i);
-            let error = self.sup.telemetry(i).banner_error().is_some();
+            let error = self
+                .sup
+                .telemetry_ref(i)
+                .is_some_and(|t| t.banner_error().is_some());
             let (glyph, color, _) = lifecycle_indicator(running, error, pal);
             let selected = self.selected == Some(i);
             let text = egui::RichText::new(glyph)

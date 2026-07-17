@@ -15,9 +15,10 @@ use super::widgets::{
     marker_aware_text_edit, message_editor_max_height, plain_text_edit_with_cursor,
     preview_ascii_layout_job, red_bordered, show_display_pane, show_insert_byte_button,
     show_insert_unit_button, show_interface_summary, show_serial_fields, show_tcp_fields,
-    show_udp_fields, start_button, theme_palette, UppercaseHex,
+    show_udp_fields, start_button, UppercaseHex,
 };
 use super::{MessageAnalysisCache, MessageDraftAnalysis, MessagePreview, TalkerApp};
+use wiredata_ui::palette::active as theme_palette;
 
 impl TalkerApp {
     /// Render the central detail pane for the selected channel (or a hint
@@ -310,7 +311,13 @@ impl TalkerApp {
         }
 
         ui.separator();
-        let per_message_counts = self.sup.telemetry(i).per_message_counts;
+        // Owned (the schedule section takes `&mut self` state alongside it),
+        // but clone only the counts Vec, not the whole telemetry struct.
+        let per_message_counts = self
+            .sup
+            .telemetry_ref(i)
+            .map(|t| t.per_message_counts.clone())
+            .unwrap_or_default();
         let interval_changes = show_schedule_section(
             ui,
             &mut self.sched_drafts[i],
@@ -350,7 +357,6 @@ fn show_schedule_section(
     // Start; in the detail pane there's room, so the section just
     // honours whatever the user last chose.)
     analyses.resize_with(entries.len(), MessageAnalysisCache::default);
-    analyses.truncate(entries.len());
     let n = entries.len();
     let header = if n == 0 {
         "Configure messages — (none)".to_string()

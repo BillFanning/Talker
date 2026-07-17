@@ -11,13 +11,13 @@ use crate::display::{
 };
 
 use super::super::bridge::UiCommand;
-use super::super::fonts::{bold, MonoFont};
 use super::super::view_prefs::{
     scroll_buffer_label, ViewPrefs, MAX_SCROLL_BUFFER_BYTES, MIN_SCROLL_BUFFER_BYTES,
     SCROLL_BUFFER_PRESETS_KB,
 };
 use super::super::widgets::{edit_mark_rules, human_bytes, ColorScheme, MSG_FONT_SIZES};
 use super::super::ListenerApp;
+use wiredata_ui::fonts::{bold, MonoFont};
 
 impl ListenerApp {
     /// The stream viewer (§41): the toolbar (Pause/Resume, View mode, ctrl-chars,
@@ -133,12 +133,13 @@ impl ListenerApp {
         // data — Rendered honors real CR/LF (§44), Raw shows control pictures, Hex
         // is a byte run. Serial and UDP render identically (no reframing).
         //
-        // Performance (§100): the scrollback can reach the ~1 MB cap. The bytes
-        // arrive incrementally (StreamDelta) so the driver never re-ships the whole
-        // buffer; here we (a) memoize the split rows, re-rendering only when data
-        // arrives or the view mode changes — keyed on the stream cursor — and (b)
-        // virtualize the layout with `show_rows`, laying out only visible rows. Both
-        // matter: a non-virtualized selectable Label over ~1 MB stalled the UI.
+        // Performance (§100): the scrollback can reach the 256 KB scroll cap. The
+        // bytes arrive incrementally (StreamDelta) so the driver never re-ships the
+        // whole buffer; here we (a) memoize the split rows, re-rendering only when
+        // data arrives or the view mode changes — keyed on the stream cursor — and
+        // (b) virtualize the layout with `show_rows`, laying out only visible rows.
+        // Both matter: a non-virtualized selectable Label over the full buffer
+        // stalled the UI.
         let font = egui::FontId::new(font_size, mono_family.clone());
         // Monospace metrics: row height and the width of one glyph ('0' as a stand-in),
         // so we can convert the available pixel width into a column count for wrapping.
@@ -416,6 +417,7 @@ impl ListenerApp {
                 window_start: view.stream_base_offset,
                 cursor: view.stream_cursor,
                 marks: &view.marks,
+                marks_version: view.marks_version,
                 view: renderer,
                 wrap_cols,
             },
@@ -436,15 +438,29 @@ struct StreamRefresh<'a> {
     /// The channel's pinned inline-Mark timestamps (§50.2), **offset-sorted**
     /// (view space) — the renderer's forward-only walker requires sorted input.
     marks: &'a [crate::gui::state::StreamMark],
+    /// The channel's mark-list change counter (see `ChannelView::marks_version`);
+    /// gates the history-signature hash to frames where marks actually changed.
+    marks_version: u64,
     view: &'a DisplayView,
     wrap_cols: usize,
 }
 
-/// Cap on trim-accounting batches: beyond this the two oldest merge, so a
-/// slow-trickle channel (many small deltas, no eviction yet) can't grow the
-/// bookkeeping without bound. Coarser batches only make front-trimming
-/// slightly lazier, never wrong.
+/// Hard cap on trim-accounting batches — a backstop only. The real bound
+/// comes from byte-quantum coalescing in `append_text`: batches absorb
+/// appends until they span [`row_batch_quantum`] bytes and then their end
+/// offset **freezes**, so the advancing window inevitably passes every batch
+/// and `trim_evicted` reclaims it. (Merging on *count* alone was a leak: each
+/// merge advanced the oldest batch's end in lockstep with the window start,
+/// so with more than this many deltas per retained window the front batch
+/// never became evictable and rows grew for the channel's lifetime.)
 const MAX_ROW_BATCHES: usize = 512;
+
+/// Byte span a trim-accounting batch grows to before its end freezes: the
+/// row cache lags eviction by at most this many bytes' worth of rows, and
+/// the batch count stays ≤ window/quantum + O(1) (≈128, under the backstop).
+fn row_batch_quantum(window_len: usize) -> u64 {
+    (window_len as u64 / 128).max(256)
+}
 
 /// Refresh `cache` from `p`: incremental append when only new bytes arrived,
 /// full rebuild when a setting / the mark history / the stream base changed.
@@ -460,9 +476,13 @@ fn refresh_rows(cache: &mut Option<super::super::StreamRenderCache>, p: StreamRe
                 // The stream restarted / reset behind us…
                 || p.cursor < c.rendered_cursor
                 // …or eviction ran past the rendered point (a gap we can't append over).
+                // A mark appeared for (or was pruned from) an already-rendered
+                // offset. The version gate keeps the common idle frame from
+                // re-hashing the whole mark history: the signature is only
+                // recomputed when the channel's mark list actually changed.
                 || window_start > c.rendered_cursor
-                // A mark appeared for (or was pruned from) an already-rendered offset.
-                || marks_signature_below(p.marks, c.rendered_cursor) != c.history_marks_sig
+                || (c.marks_version != p.marks_version
+                    && marks_signature_below(p.marks, c.rendered_cursor) != c.history_marks_sig)
         }
     };
     if needs_rebuild {
@@ -470,6 +490,10 @@ fn refresh_rows(cache: &mut Option<super::super::StreamRenderCache>, p: StreamRe
         return;
     }
     let c = cache.as_mut().expect("checked Some above");
+    // The version moved but the history signature didn't (the change was at or
+    // past the rendered cursor — it rides the incremental path): adopt the new
+    // version so later idle frames skip the hash again.
+    c.marks_version = p.marks_version;
     if p.cursor == c.rendered_cursor {
         return; // nothing new — the common per-frame case
     }
@@ -480,7 +504,7 @@ fn refresh_rows(cache: &mut Option<super::super::StreamRenderCache>, p: StreamRe
     let delta = &p.window[from..];
     let annotations = delta_annotations(p.marks, c.rendered_cursor, delta.len());
     let text = c.renderer.render_chunk(delta, &annotations);
-    c.append_text(&text, p.cursor);
+    c.append_text(&text, p.cursor, row_batch_quantum(p.window.len()));
     c.rendered_cursor = p.cursor;
     c.history_marks_sig = marks_signature_below(p.marks, p.cursor);
     c.trim_evicted(window_start);
@@ -521,6 +545,7 @@ fn rebuild_rows(p: &StreamRefresh, window_start: u64) -> super::super::StreamRen
         chars: p.view.character_rendering,
         wrap_cols: p.wrap_cols,
         history_marks_sig: marks_signature_below(p.marks, p.cursor),
+        marks_version: p.marks_version,
         rendered_cursor: p.cursor,
         renderer,
         rows,
@@ -566,7 +591,7 @@ impl super::super::StreamRenderCache {
     /// multiples of the column count — so popping the open row and
     /// re-splitting `open + new` yields exactly what a one-shot split of the
     /// whole text would.
-    fn append_text(&mut self, text: &str, end_offset: u64) {
+    fn append_text(&mut self, text: &str, end_offset: u64, quantum: u64) {
         let seed = match self.rows.pop() {
             Some(open) => {
                 // The open row was owned by the previous batch — debit it so
@@ -583,10 +608,29 @@ impl super::super::StreamRenderCache {
         let before = self.rows.len();
         self.rows
             .extend(split_stream_rows(&combined, self.wrap_cols));
-        self.row_batches
-            .push_back((end_offset, self.rows.len() - before));
-        // Bound the bookkeeping: merge the two oldest batches (older rows,
-        // newer end offset) once the queue is full.
+        let added = self.rows.len() - before;
+        // Coalesce into the back batch while it spans under `quantum` bytes;
+        // at the quantum its end freezes, which is what guarantees eviction
+        // eventually reclaims it (see `MAX_ROW_BATCHES`). Batches are
+        // contiguous, so the back batch's start is its predecessor's end; a
+        // lone batch (fresh rebuild) has no known start — freeze it.
+        let back_span_under_quantum = match self.row_batches.len() {
+            0 | 1 => false,
+            len => {
+                let prev_end = self.row_batches[len - 2].0;
+                self.row_batches[len - 1].0.saturating_sub(prev_end) < quantum
+            }
+        };
+        if back_span_under_quantum {
+            let back = self.row_batches.back_mut().expect("len ≥ 2 above");
+            back.0 = end_offset;
+            back.1 += added;
+        } else {
+            self.row_batches.push_back((end_offset, added));
+        }
+        // Backstop only — unreachable with quantum coalescing (≈128 batches
+        // per window), kept so a logic slip degrades to lazy trimming
+        // instead of unbounded bookkeeping.
         while self.row_batches.len() > MAX_ROW_BATCHES {
             let (_, n1) = self.row_batches.pop_front().expect("len checked");
             let (e2, n2) = self.row_batches.pop_front().expect("len > 1");
@@ -725,6 +769,7 @@ mod tests {
                     window_start: 0,
                     cursor: end as u64,
                     marks,
+                    marks_version: 0,
                     view: v,
                     wrap_cols: cols,
                 },
@@ -804,6 +849,7 @@ mod tests {
                 window_start: 0,
                 cursor: data.len() as u64,
                 marks: &[],
+                marks_version: 0,
                 view: &v,
                 wrap_cols: 80,
             },
@@ -812,8 +858,10 @@ mod tests {
             cache.as_ref().unwrap().rows,
             vec!["hello world".to_string()]
         );
-        // The mark targets offset 0 - long since rendered. The history
-        // signature changes, so the cache rebuilds with the splice.
+        // The mark targets offset 0 - long since rendered. The state bumps
+        // `marks_version` whenever the mark list changes, which admits the
+        // history-signature check; the signature differs, so the cache
+        // rebuilds with the splice.
         let marks = vec![mark(0, true, "[LATE]")];
         refresh_rows(
             &mut cache,
@@ -823,10 +871,53 @@ mod tests {
                 window_start: 0,
                 cursor: data.len() as u64,
                 marks: &marks,
+                marks_version: 1,
                 view: &v,
                 wrap_cols: 80,
             },
         );
+        assert_eq!(
+            cache.as_ref().unwrap().rows,
+            vec!["[LATE]hello world".to_string()]
+        );
+    }
+
+    #[test]
+    fn unchanged_marks_version_skips_the_history_signature_check() {
+        // The version gate is the contract: with an unchanged `marks_version`
+        // the cache never re-hashes the mark history, so a mark list that
+        // mutated *without* a bump goes unnoticed. The state upholds its half
+        // (`marks_version_moves_with_the_mark_list_not_the_bytes`); this pins
+        // the cache's half — the idle-frame fast path.
+        let id = ChannelId::new();
+        let v = view(DisplayMode::Rendered);
+        let mut cache = None;
+        let data = b"hello world";
+        let refresh = |cache: &mut _, marks: &[StreamMark], version: u64| {
+            refresh_rows(
+                cache,
+                StreamRefresh {
+                    channel: id,
+                    window: data,
+                    window_start: 0,
+                    cursor: data.len() as u64,
+                    marks,
+                    marks_version: version,
+                    view: &v,
+                    wrap_cols: 80,
+                },
+            );
+        };
+        refresh(&mut cache, &[], 0);
+        // Same version: the changed mark history is (by contract) not noticed.
+        let marks = vec![mark(0, true, "[LATE]")];
+        refresh(&mut cache, &marks, 0);
+        assert_eq!(
+            cache.as_ref().unwrap().rows,
+            vec!["hello world".to_string()]
+        );
+        // Bumped version: noticed, rebuilt with the splice.
+        refresh(&mut cache, &marks, 1);
         assert_eq!(
             cache.as_ref().unwrap().rows,
             vec!["[LATE]hello world".to_string()]
@@ -854,6 +945,7 @@ mod tests {
                     window_start: start as u64,
                     cursor: all.len() as u64,
                     marks: &[],
+                    marks_version: 0,
                     view: &v,
                     wrap_cols: 80,
                 },
@@ -893,6 +985,7 @@ mod tests {
                 window_start: 0,
                 cursor: 8,
                 marks: &[],
+                marks_version: 0,
                 view: &v,
                 wrap_cols: 80,
             },
@@ -905,6 +998,7 @@ mod tests {
                 window_start: 0,
                 cursor: 3,
                 marks: &[],
+                marks_version: 0,
                 view: &v,
                 wrap_cols: 80,
             },
@@ -927,12 +1021,68 @@ mod tests {
                     window_start: 0,
                     cursor: data.len() as u64,
                     marks: &[],
+                    marks_version: 0,
                     view: &v,
                     wrap_cols: cols,
                 },
             );
         }
         assert_eq!(cache.unwrap().rows, vec!["abcdefghijklmnop".to_string()]);
+    }
+
+    #[test]
+    fn tiny_deltas_with_a_sliding_window_keep_rows_bounded() {
+        // Regression: with more deltas per retained window than the batch cap
+        // (tiny reads on a capped scrollback — the weeks-long-logging shape),
+        // the old count-triggered merge advanced the front batch's end in
+        // lockstep with the window start, so no batch ever became evictable
+        // and `rows` grew for the channel's lifetime. Quantum coalescing
+        // freezes batch ends, so rows must track the window, not the total
+        // bytes ever received.
+        let id = ChannelId::new();
+        let v = view(DisplayMode::Rendered);
+        let mut cache = None;
+        let cap = 2048usize; // window spans ~2048 one-byte deltas >> MAX_ROW_BATCHES
+        let mut all: Vec<u8> = Vec::new();
+        for i in 0..6000 {
+            all.push(if i % 8 == 7 { b'\n' } else { b'x' });
+            let start = all.len().saturating_sub(cap);
+            refresh_rows(
+                &mut cache,
+                StreamRefresh {
+                    channel: id,
+                    window: &all[start..],
+                    window_start: start as u64,
+                    cursor: all.len() as u64,
+                    marks: &[],
+                    marks_version: 0,
+                    view: &v,
+                    wrap_cols: 80,
+                },
+            );
+        }
+        let c = cache.unwrap();
+        // The window holds 2048 bytes ≈ 256 nine-byte lines; the cache may
+        // lag by roughly a quantum's worth of rows, never by the stream's
+        // full 6000-byte history (the old code retained ~660 rows here and
+        // kept growing with every further delta).
+        assert!(
+            c.rows.len() <= 320,
+            "rows not bounded by the window: {} rows",
+            c.rows.len()
+        );
+        assert!(c.row_batches.len() <= MAX_ROW_BATCHES);
+        // Ownership accounting still covers every row exactly.
+        let owned: usize = c.row_batches.iter().map(|&(_, n)| n).sum();
+        assert_eq!(owned, c.rows.len());
+        // And the tail still equals a one-shot render of the window.
+        let want = batch_rows(&all[all.len() - cap..], &[], &v, 80);
+        let tail = 3;
+        assert_eq!(
+            &c.rows[c.rows.len() - tail..],
+            &want[want.len() - tail..],
+            "tail rows diverged from one-shot render"
+        );
     }
 
     #[test]
@@ -953,6 +1103,7 @@ mod tests {
                     window_start: 0,
                     cursor: all.len() as u64,
                     marks: &[],
+                    marks_version: 0,
                     view: &v,
                     wrap_cols: 80,
                 },

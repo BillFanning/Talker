@@ -376,6 +376,14 @@ impl TalkerSupervisor {
             .unwrap_or_default()
     }
 
+    /// Borrowed view of this slot's telemetry, for per-frame reads that touch
+    /// a field or two — cloning the whole struct there drags
+    /// `per_message_counts` and the command-failure map along for every
+    /// channel on every repaint. `None` for an out-of-range index.
+    pub fn telemetry_ref(&self, i: usize) -> Option<&ChannelTelemetry> {
+        self.slots.get(i).map(|s| &s.telemetry)
+    }
+
     /// Start (or restart) channel `i` with an interface config and a compiled
     /// schedule. `label` is the human name for log text (frozen for the run —
     /// ADR-020; attribution itself rides the slot's stable id). Telemetry
@@ -685,6 +693,13 @@ impl TalkerSupervisor {
         }
         self.orphans.retain_mut(|d| {
             for _ in d.control_rx.try_iter() {}
+            // Discard status too (an orphan's slot is gone, so its telemetry
+            // has no home). Draining is still required: the runner's final
+            // Counters send blocks on a full queue (runner exit path), and a
+            // never-drained orphan would wedge that thread — holding its
+            // serial port / socket until exit (`join_all` is the only other
+            // place that would unblock it).
+            for _ in d.status_rx.try_iter() {}
             !d.thread.is_finished()
         });
         self.command_completions.extend(command_completions);
@@ -1010,6 +1025,60 @@ mod tests {
         // every_send policy: one sample per send reached the display lane.
         assert_eq!(samples.len() as u64, wire);
         assert!(samples.iter().all(|s| s.slot == 0));
+    }
+
+    #[test]
+    fn removal_with_a_saturated_status_queue_still_reaps_the_orphan() {
+        // Regression: the runner's final Counters send blocks on a full
+        // status queue (deliberate — "exact at rest"), relying on the owner
+        // draining the receiver until the thread exits. Orphans' status lanes
+        // were never drained in `poll`, so removing a channel whose queue
+        // filled while the UI wasn't polling wedged the runner forever and
+        // leaked its interface until process exit.
+        let mut sup = TalkerSupervisor::new(ObserverPolicy::every_send());
+        sup.push_slot();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        start_with_interface(
+            &mut sup,
+            0,
+            Box::new(CountingInterface {
+                sent: Arc::clone(&sent),
+            }),
+            schedule(&[msg("AB", 1)]),
+        );
+        // No polls while the 1 ms every-send cadence overfills the
+        // STATUS_QUEUE_CAP lane (256 + margin sends).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sent.lock().unwrap().len() <= STATUS_QUEUE_CAP + 16 {
+            assert!(Instant::now() < deadline, "interface never saturated");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Remove: stops the runner (its exit path now hits the blocking
+        // final send against a full queue) and orphans the thread.
+        sup.remove_slot(0);
+        assert_eq!(sup.len(), 0);
+        // Poll must unblock and reap the orphan — before the fix this timed
+        // out with the orphan (and its interface) held forever.
+        let mut samples = Vec::new();
+        poll_until(&mut sup, &mut samples, |s| !s.any_draining());
+    }
+
+    #[test]
+    fn telemetry_ref_matches_telemetry_and_is_none_out_of_range() {
+        let mut sup = TalkerSupervisor::new(ObserverPolicy::sampled());
+        sup.push_slot();
+        // Out of range: the clone accessor zeroes, the borrow accessor is None.
+        assert_eq!(sup.telemetry(7).total_count, 0);
+        assert!(sup.telemetry_ref(7).is_none());
+        // In range, both views read the same slot state.
+        assert_eq!(
+            sup.set_interval(0, 0, 50).outcome,
+            CommandOutcome::NotRunning
+        );
+        let owned = sup.telemetry(0);
+        let borrowed = sup.telemetry_ref(0).expect("slot 0 exists");
+        assert_eq!(borrowed.errors_total, owned.errors_total);
+        assert_eq!(borrowed.banner_error(), owned.banner_error());
     }
 
     #[test]

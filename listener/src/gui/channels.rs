@@ -5,7 +5,6 @@ use wiredata_ui::selection;
 
 use super::bridge::UiCommand;
 use super::state::ChannelStatus;
-use super::theme;
 use super::widgets::{human_bytes, status_color, status_glyph, AddKind};
 use super::ListenerApp;
 
@@ -42,24 +41,10 @@ impl ListenerApp {
                 self.channels_collapsed = true;
             }
             ui.heading("Channels");
-            // Theme toggle — same glyphs and storage key as talker, so the
-            // two apps read and behave identically. Both themes' visuals are
-            // pre-installed (ADR-019); this flips the preference and the
-            // palette mirror.
-            let (glyph, tip) = if self.dark_mode {
-                ("\u{25D1}", "Switch to light theme") // ◑
-            } else {
-                ("\u{25D0}", "Switch to dark theme") // ◐
-            };
-            if ui.small_button(glyph).on_hover_text(tip).clicked() {
-                self.dark_mode = !self.dark_mode;
-                ui.ctx().set_theme(if self.dark_mode {
-                    egui::ThemePreference::Dark
-                } else {
-                    egui::ThemePreference::Light
-                });
-                theme::set_dark_active(self.dark_mode);
-            }
+            // Theme toggle — the shared button (same storage key as talker,
+            // so the two apps read and behave identically). Both themes'
+            // visuals are pre-installed (ADR-019).
+            wiredata_ui::style::theme_toggle_button(ui, &mut self.dark_mode);
             ui.menu_button("+ Add", |ui| {
                 for kind in AddKind::ADD_MENU {
                     if ui.button(kind.label()).clicked() {
@@ -176,7 +161,7 @@ impl ListenerApp {
                             0.0,
                             egui::TextFormat {
                                 font_id: egui::FontId::proportional(base * scale),
-                                color: status_color(row.status),
+                                color: status_color(row.status, wiredata_ui::palette::active(ui)),
                                 valign: egui::Align::Center,
                                 ..Default::default()
                             },
@@ -203,33 +188,20 @@ impl ListenerApp {
                             ))
                             .weak(),
                         );
-                        // Line 4: per-severity diagnostic counts, color-coded (#8).
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{} info", row.info))
-                                    .weak()
-                                    .color(emphasis.info),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!("{} warn", row.warnings))
-                                    .color(emphasis.warning),
-                            );
-                            ui.label(
-                                egui::RichText::new(format!("{} err", row.errors))
-                                    .color(emphasis.error),
-                            );
-                        });
+                        // Line 4: per-severity diagnostic counts, color-coded
+                        // (#8) — the shared row line.
+                        selection::severity_counts_line(
+                            ui,
+                            row.info as u64,
+                            row.warnings as u64,
+                            row.errors as u64,
+                            &emphasis,
+                            None,
+                        );
                         // Line 5: the last error (e.g. a recording fault), so a fault on
                         // this channel is visible on its tab even when it isn't selected.
                         if let Some(err) = &row.last_error {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(format!("⚠ {err}"))
-                                        .small()
-                                        .color(theme::fault_red()),
-                                )
-                                .wrap(),
-                            );
+                            selection::last_error_line(ui, err);
                         }
                     });
                     // Box-select: sense a click on the whole box first.

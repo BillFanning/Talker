@@ -298,25 +298,26 @@ impl MessageAnalysisCache {
             }
         }
         self.analysis
-            .get_or_insert_with(|| MessageDraftAnalysis::build(draft))
+            .as_ref()
+            .expect("assigned above whenever the revision was recorded")
     }
 }
 
 fn analyzed_messages_match(
     analyses: Option<&[MessageAnalysisCache]>,
     target: &[MessageConfig],
-) -> Option<bool> {
-    let analyses = analyses?;
-    if analyses.len() != target.len() {
-        return Some(false);
-    }
-    for (cached, target) in analyses.iter().zip(target) {
-        let config = cached.analysis.as_ref()?.config.as_ref()?;
-        if config != target {
-            return Some(false);
-        }
-    }
-    Some(true)
+) -> bool {
+    let Some(analyses) = analyses else {
+        return false;
+    };
+    analyses.len() == target.len()
+        && analyses.iter().zip(target).all(|(cached, target)| {
+            cached
+                .analysis
+                .as_ref()
+                .and_then(|a| a.config.as_ref())
+                .is_some_and(|config| config == target)
+        })
 }
 
 fn prepare_profile_load(path: &Path) -> anyhow::Result<PreparedProfileLoad> {
@@ -574,9 +575,7 @@ impl TalkerApp {
         // visuals, and the style tweaks come from `wiredata-ui`, so talker
         // and listener read as one product. Talker keeps its dark/light
         // toggle; `apply_theme` just picks which installed theme is active.
-        wiredata_ui::fonts::install_fonts(ctx);
-        wiredata_ui::style::install_visuals(ctx);
-        wiredata_ui::style::apply_style_tweaks(ctx);
+        wiredata_ui::install_chrome(ctx);
         apply_theme(ctx, dark_mode);
         let repaint = wiredata_ui::repaint::RepaintCoalescer::for_ctx(ctx.clone());
         // Sampled lanes (ADR-018): the GUI's display cost stays constant
@@ -668,14 +667,12 @@ impl TalkerApp {
     fn refresh_message_analysis(&mut self) {
         self.message_analysis
             .resize_with(self.sched_drafts.len(), Vec::new);
-        self.message_analysis.truncate(self.sched_drafts.len());
         for (drafts, caches) in self
             .sched_drafts
             .iter()
             .zip(self.message_analysis.iter_mut())
         {
             caches.resize_with(drafts.len(), MessageAnalysisCache::default);
-            caches.truncate(drafts.len());
             for (draft, cache) in drafts.iter().zip(caches.iter_mut()) {
                 cache.refresh(draft);
             }
@@ -693,7 +690,9 @@ impl TalkerApp {
         ) else {
             return false;
         };
-        widgets::start_blockers_analyzed(conn, messages, analyses).is_empty()
+        // The lazy predicate: stops at the first blocker, formats nothing —
+        // this runs for every channel on every frame via `can_start_any`.
+        !widgets::any_start_blocker_analyzed(conn, messages, analyses)
     }
 
     fn can_start_any(&self) -> bool {
@@ -732,7 +731,7 @@ impl TalkerApp {
             };
             return (
                 draft_interface.as_ref() != Some(&applied.interface),
-                !analyzed_messages_match(analyses, &applied.messages).unwrap_or(false),
+                !analyzed_messages_match(analyses, &applied.messages),
             );
         }
 
@@ -741,7 +740,7 @@ impl TalkerApp {
         };
         (
             draft_interface.as_ref() != Some(&profile.interface),
-            !analyzed_messages_match(analyses, &profile.messages).unwrap_or(false),
+            !analyzed_messages_match(analyses, &profile.messages),
         )
     }
 
@@ -1117,8 +1116,12 @@ impl TalkerApp {
         // Refresh the per-channel send-rate samples (~1 s window).
         let now = Instant::now();
         for i in 0..self.rates.len() {
-            let t = self.sup.telemetry(i);
-            self.rates[i].sample(now, t.total_count, t.total_bytes, self.sup.is_running(i));
+            let (count, bytes) = self
+                .sup
+                .telemetry_ref(i)
+                .map(|t| (t.total_count, t.total_bytes))
+                .unwrap_or_default();
+            self.rates[i].sample(now, count, bytes, self.sup.is_running(i));
         }
 
         if self.sup.any_running() || self.sup.any_draining() {
@@ -1278,22 +1281,9 @@ impl TalkerApp {
                 }
 
                 ui.separator();
-                // Theme toggle. Uses half-circle glyphs from the
-                // Geometric Shapes block (U+25D0/U+25D1) — the same
-                // block as the ■ ▶ • glyphs the app already renders,
-                // so coverage is guaranteed in the base font (the
-                // Misc-Symbols ☀/☾ dingbats are not). The half-lit
-                // circle reads as a light/dark duality icon; the
-                // tooltip states the action.
-                let (glyph, tip) = if self.dark_mode {
-                    ("\u{25D1}", "Switch to light theme") // ◑
-                } else {
-                    ("\u{25D0}", "Switch to dark theme") // ◐
-                };
-                if ui.small_button(glyph).on_hover_text(tip).clicked() {
-                    self.dark_mode = !self.dark_mode;
-                    apply_theme(ui.ctx(), self.dark_mode);
-                }
+                // Theme toggle — the shared button (same storage key as
+                // listener, so the two apps read and behave identically).
+                wiredata_ui::style::theme_toggle_button(ui, &mut self.dark_mode);
             });
             ui.add_space(4.0);
         });
@@ -1320,11 +1310,10 @@ impl TalkerApp {
                 ui.colored_label(color, label);
                 ui.separator();
                 let (total_sent, errors) = (0..self.sup.len())
-                    .map(|i| {
-                        let t = self.sup.telemetry(i);
-                        (t.total_count, t.errors_total)
-                    })
-                    .fold((0u64, 0u64), |(s, e), (ts, te)| (s + ts, e + te));
+                    .filter_map(|i| self.sup.telemetry_ref(i))
+                    .fold((0u64, 0u64), |(s, e), t| {
+                        (s + t.total_count, e + t.errors_total)
+                    });
                 ui.label(format!("Sent: {total_sent}"));
                 ui.separator();
                 // Per-run errors: each channel's tally resets when it starts,

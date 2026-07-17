@@ -1,6 +1,6 @@
 //! Shared selected-channel chrome (talker ADR-016 / listener ADR-019).
 
-use crate::palette::{Palette, DARK, LIGHT};
+use crate::palette::active as active_palette;
 
 const TAB_BRIDGE_OVERLAP: f32 = 2.0;
 const TAB_JOIN_RADIUS: f32 = 6.0;
@@ -11,14 +11,6 @@ const TAB_CLIP_TOLERANCE: f32 = 0.5;
 /// first or last card out of connector eligibility.
 pub const TAB_JOIN_MARGIN: f32 = TAB_JOIN_RADIUS + 2.0;
 const TAB_ARC_STEPS: usize = 24;
-
-fn active_palette(ui: &egui::Ui) -> &'static Palette {
-    if ui.visuals().dark_mode {
-        &DARK
-    } else {
-        &LIGHT
-    }
-}
 
 /// Stable channel identity used in full and compact channel-list rows.
 /// `position` is one-based. A fallback name is not repeated.
@@ -62,6 +54,55 @@ pub fn channel_row_emphasis(ui: &egui::Ui, selected: bool) -> ChannelRowEmphasis
             palette.count_info_grey
         },
     }
+}
+
+/// A channel row's per-severity counts line, in info · warn · err order with
+/// the row's [`ChannelRowEmphasis`] colors (historical counts recede on
+/// background tabs). An optional hover tip applies to all three labels.
+pub fn severity_counts_line(
+    ui: &mut egui::Ui,
+    info: u64,
+    warnings: u64,
+    errors: u64,
+    emphasis: &ChannelRowEmphasis,
+    hover: Option<&str>,
+) {
+    ui.horizontal(|ui| {
+        let show = |ui: &mut egui::Ui, text: egui::RichText| {
+            let response = ui.label(text);
+            if let Some(tip) = hover {
+                response.on_hover_text(tip);
+            }
+        };
+        show(
+            ui,
+            egui::RichText::new(format!("{info} info"))
+                .weak()
+                .color(emphasis.info),
+        );
+        show(
+            ui,
+            egui::RichText::new(format!("{warnings} warn")).color(emphasis.warning),
+        );
+        show(
+            ui,
+            egui::RichText::new(format!("{errors} err")).color(emphasis.error),
+        );
+    });
+}
+
+/// A channel row's live-fault line: small, saturated fault red on **every**
+/// row (selection never dims an active fault), wrapped so the full text reads
+/// on the row itself.
+pub fn last_error_line(ui: &mut egui::Ui, error: &str) {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(format!("\u{26A0} {error}"))
+                .small()
+                .color(active_palette(ui).fault_red),
+        )
+        .wrap(),
+    );
 }
 
 /// The receded border for an unselected card: the app's **neutral** divider
@@ -226,6 +267,12 @@ fn tab_join_geometry(panel_rect: egui::Rect, tab_rect: egui::Rect) -> Option<Tab
 }
 
 fn tab_outline_stroke(ui: &egui::Ui, resizable_panel_id: Option<egui::Id>) -> egui::Stroke {
+    // `"__resize"` mirrors egui's INTERNAL id for a SidePanel's resize
+    // interaction (egui::containers::panel — not public API). If an egui
+    // upgrade renames it, `read_response` returns None and this degrades
+    // gracefully to the noninteractive stroke — the connector stays correct
+    // but stops brightening on resize hover/drag. Re-check this string on
+    // every egui bump (upgrade checklist).
     let resize =
         resizable_panel_id.and_then(|panel_id| ui.ctx().read_response(panel_id.with("__resize")));
     if resize.as_ref().is_some_and(egui::Response::dragged) {

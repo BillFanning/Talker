@@ -44,8 +44,8 @@ pub enum FileRotationPolicy {
 /// What to do when the destination file already exists (§80.1). Enforced when
 /// recording is enabled (§55, §121); `Refuse` is the default and never clobbers.
 ///
-/// Defined here (record owns file lifecycle, §128); the profile schema will
-/// reference this type when the config module lands.
+/// Defined here (record owns file lifecycle, §128); referenced by the profile
+/// schema (`config::schema`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum OverwritePolicy {
     #[default]

@@ -14,3 +14,12 @@ pub mod palette;
 pub mod repaint;
 pub mod selection;
 pub mod style;
+
+/// One-call chrome install both apps run at creation, in the required order:
+/// fonts, both themes' widget visuals, then the shared style tweaks. The
+/// caller still picks the startup theme with `ctx.set_theme(...)`.
+pub fn install_chrome(ctx: &egui::Context) {
+    fonts::install_fonts(ctx);
+    style::install_visuals(ctx);
+    style::apply_style_tweaks(ctx);
+}

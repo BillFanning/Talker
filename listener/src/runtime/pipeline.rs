@@ -20,6 +20,7 @@ use super::matchrule::{FiredRule, MatchRuleSet};
 use super::snapshot::{MarkRender, TriggeredMatch};
 
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::activity::ActivityMeter;
@@ -184,6 +185,11 @@ impl PipelineDisplayView {
     }
 }
 
+/// A detached recorder stop's outcome: the arguments
+/// [`ChannelPipeline::note_recording_stop`] needs to report it honestly —
+/// `(tap, fault_already_reported, terminal_fault, announce_clean)`.
+type RetiredRecording = (RecordingTap, bool, Option<String>, bool);
+
 /// One Channel's stream pipeline (§102). Driven synchronously via
 /// [`ChannelPipeline::ingest`]; [`run_channel`] is the async loop around it.
 pub struct ChannelPipeline {
@@ -192,8 +198,10 @@ pub struct ChannelPipeline {
     /// every fresh pipeline, so the GUI needs an identity alongside the offset to
     /// reject stale deltas without confusing them with a restart.
     stream_generation: u64,
-    /// Display Views (§48): a Channel may have several, each independently
-    /// paused (§11). The first is the default view created by `new`.
+    /// Display Views (§48): v2.1 is one logical view per Channel (ADR-023) —
+    /// the first entry, created by `new`, is *the* view. The `Vec` shape is
+    /// retained latitude for the deferred multi-view feature (Appendix A);
+    /// entries beyond the first are ignored by pause gating and the GUI.
     display_views: Vec<PipelineDisplayView>,
     /// Retained diagnostics, count-limited per type (§88).
     diagnostics: DiagnosticLog,
@@ -230,6 +238,14 @@ pub struct ChannelPipeline {
     /// `Record` actions queued by rule evaluation, applied asynchronously by
     /// [`apply_pending_records`](Self::apply_pending_records) (file I/O is async).
     pending_record_controls: Vec<PendingRecord>,
+    /// Recorder stops detached from the acquisition loop (§56, and §142's
+    /// never-block-the-producer rule): each task drains its recorder's
+    /// accepted backlog and finalizes off the pipeline task, yielding the
+    /// arguments for [`note_recording_stop`](Self::note_recording_stop).
+    /// `run_channel` reaps completions between reads; `begin_*` and `finish`
+    /// drain first, so a new file never opens while its predecessor is still
+    /// closing and a channel stop still reports every outcome (§56.1).
+    retiring: JoinSet<RetiredRecording>,
     /// The Raw recording settings used to build the recording on demand (§50.2,
     /// lazy-create: nothing on disk until a `Begin` fires). `None` = no destination
     /// set, so a `Begin` can't record.
@@ -324,6 +340,7 @@ impl ChannelPipeline {
             match_rules: MatchRuleSet::compile(&[]),
             recent_matches: DropOldestQueue::with_capacity(RECENT_MATCHES_CAP),
             pending_record_controls: Vec::new(),
+            retiring: JoinSet::new(),
             recording_settings: None,
             auto_begin_recording: false,
             created_at: Instant::now(),
@@ -812,6 +829,9 @@ impl ChannelPipeline {
     /// existing file under a Refuse policy) reports the reason without faulting the
     /// Channel (§55).
     async fn begin_recording(&mut self) {
+        // A predecessor's detached stop must fully land first: a begin to the
+        // same destination would otherwise race the closing file.
+        self.drain_retiring().await;
         match self.raw_recorder.as_ref().map(|r| r.state()) {
             // Already recording — `Begin` is idempotent.
             Some(state) if state != RecordingState::Faulted => return,
@@ -901,15 +921,61 @@ impl ChannelPipeline {
         }
     }
 
-    /// Stop and finalize the Raw recording on a `Record { Stop }` (§50.2, §56): a
-    /// clean finalize, reception continues. A no-op if none is active. Also clears a
-    /// prior begin-fault so the state reads "off" again, not ⚠.
+    /// Stop the Raw recording on a `Record { Stop }` (§50.2, §56): the recorder
+    /// retires **detached** — draining its accepted backlog and closing the file
+    /// must not stall reception (§142's never-block-the-producer rule; a slow
+    /// disk here used to back the bounded ingest queue up into the transport).
+    /// The stop outcome is reported when the retirement completes. A no-op if
+    /// none is active. Also clears a prior begin-fault so the state reads
+    /// "off" again, not ⚠.
     async fn stop_recording(&mut self) {
         self.begin_faulted = false;
         if let Some(recorder) = self.raw_recorder.take() {
             let already_reported = self.recording_fault_reported;
-            let fault = recorder.finalize(RecordingStopReason::Disabled).await;
-            self.note_recording_stop(RecordingTap::Raw, already_reported, fault, true);
+            self.retiring.spawn(async move {
+                let fault = recorder.finalize(RecordingStopReason::Disabled).await;
+                (RecordingTap::Raw, already_reported, fault, true)
+            });
+        }
+    }
+
+    /// Report one detached retirement's outcome (see `retiring`).
+    fn note_retired_recording(
+        &mut self,
+        retired: Result<RetiredRecording, tokio::task::JoinError>,
+    ) {
+        match retired {
+            Ok((tap, already_reported, fault, announce_clean)) => {
+                self.note_recording_stop(tap, already_reported, fault, announce_clean);
+            }
+            // A panicked finalize task cannot report which tap it served;
+            // don't let it pass as a clean stop silently (§56.1).
+            Err(err) => {
+                self.diagnostics.record(Diagnostic::error(format!(
+                    "a recording finalize task failed: {err} — the file's tail may be lost"
+                )));
+            }
+        }
+    }
+
+    /// Non-blockingly reap every **completed** detached retirement and report
+    /// its outcome. `run_channel` calls this each loop pass — the idle tick
+    /// guarantees a pass even on a quiet stream, so an outcome's note lands
+    /// within one tick without reception ever waiting on a file close.
+    pub fn reap_retired_recordings(&mut self) {
+        while let Some(retired) = self.retiring.try_join_next() {
+            self.note_retired_recording(retired);
+        }
+    }
+
+    /// Await every in-flight retirement and report each outcome. Runs before a
+    /// `begin_*` (a new file must never open while its predecessor is still
+    /// closing — same-destination restarts would collide on the open file) and
+    /// in `finish` (a channel stop reports every outcome before returning,
+    /// §56.1).
+    async fn drain_retiring(&mut self) {
+        while let Some(retired) = self.retiring.join_next().await {
+            self.note_retired_recording(retired);
         }
     }
 
@@ -978,6 +1044,9 @@ impl ChannelPipeline {
     /// is already active; no destination reports a fault rather than a silent
     /// no-op; an open failure reports the reason without faulting the Channel.
     async fn begin_display_recording(&mut self) {
+        // Same rule as the Raw begin: land any detached predecessor stop
+        // before opening a file it might still hold.
+        self.drain_retiring().await;
         match self
             .display_views
             .first()
@@ -1062,9 +1131,10 @@ impl ChannelPipeline {
         }
     }
 
-    /// Stop and finalize the Display recording (§54): a clean finalize; reception
-    /// and the Raw recording continue. A no-op if none is active. Clears a prior
-    /// begin-fault so the state reads "off" again, not ⚠.
+    /// Stop the Display recording (§54): retires **detached**, like the Raw
+    /// sibling — reception and the Raw recording continue, and the acquisition
+    /// loop never waits on the drain. A no-op if none is active. Clears a
+    /// prior begin-fault so the state reads "off" again, not ⚠.
     async fn stop_display_recording(&mut self) {
         self.display_begin_faulted = false;
         let taken = self
@@ -1073,9 +1143,12 @@ impl ChannelPipeline {
             .and_then(|v| v.recorder.take());
         if let Some(rec) = taken {
             let already_reported = self.display_fault_reported;
-            let fault =
-                finalize_view_recorder(self.channel_id, rec, RecordingStopReason::Disabled).await;
-            self.note_recording_stop(RecordingTap::Display, already_reported, fault, true);
+            let channel_id = self.channel_id;
+            self.retiring.spawn(async move {
+                let fault =
+                    finalize_view_recorder(channel_id, rec, RecordingStopReason::Disabled).await;
+                (RecordingTap::Display, already_reported, fault, true)
+            });
         }
     }
 
@@ -1126,8 +1199,21 @@ impl ChannelPipeline {
         if self.raw_recorder.is_none() && !self.display_views.iter().any(|v| v.recorder.is_some()) {
             return;
         }
-        let (Ok(free), Ok(total)) = (fs4::available_space(&path), fs4::total_space(&path)) else {
-            return; // cannot determine free space; do not act
+        // Filesystem space queries are synchronous syscalls — off the
+        // acquisition task (a hung network share would otherwise stall
+        // reception), and bounded so even the blocking pool handoff can't
+        // wedge the loop for more than a beat.
+        let query_path = path.clone();
+        let query = tokio::task::spawn_blocking(move || {
+            (
+                fs4::available_space(&query_path),
+                fs4::total_space(&query_path),
+            )
+        });
+        let Ok(Ok((Ok(free), Ok(total)))) =
+            tokio::time::timeout(Duration::from_secs(2), query).await
+        else {
+            return; // cannot determine free space (or the query hung); do not act
         };
         if !disk_is_low(free, total, guard.min_free) {
             self.disk_low_reported = false;
@@ -1152,26 +1238,28 @@ impl ChannelPipeline {
         }
     }
 
-    /// Finalize and drop every recording on this Channel (§56). Reception,
-    /// display, and the scrollback are unaffected (§96).
+    /// Stop and drop every recording on this Channel (§56), each retiring
+    /// detached (this runs from the disk guard on the acquisition task — the
+    /// low-disk stop must not itself stall reception, §96).
     async fn stop_all_recording(&mut self) {
         if let Some(recorder) = self.raw_recorder.take() {
             let already = self.recording_fault_reported;
-            let fault = recorder.finalize(RecordingStopReason::Disabled).await;
-            self.note_recording_stop(RecordingTap::Raw, already, fault, false);
+            self.retiring.spawn(async move {
+                let fault = recorder.finalize(RecordingStopReason::Disabled).await;
+                (RecordingTap::Raw, already, fault, false)
+            });
         }
-        let mut display_faults = Vec::new();
         for view in &mut self.display_views {
             if let Some(rec) = view.recorder.take() {
-                display_faults.push(
-                    finalize_view_recorder(self.channel_id, rec, RecordingStopReason::Disabled)
-                        .await,
-                );
+                let already = self.display_fault_reported;
+                let channel_id = self.channel_id;
+                self.retiring.spawn(async move {
+                    let fault =
+                        finalize_view_recorder(channel_id, rec, RecordingStopReason::Disabled)
+                            .await;
+                    (RecordingTap::Display, already, fault, false)
+                });
             }
-        }
-        for fault in display_faults {
-            let already = self.display_fault_reported;
-            self.note_recording_stop(RecordingTap::Display, already, fault, false);
         }
     }
 
@@ -1185,6 +1273,9 @@ impl ChannelPipeline {
     /// stop-time INFO notes recorded here reach the GUI because the orchestrator takes
     /// one final snapshot of the returned pipeline after this runs (see `drain_handle`).
     pub async fn finish(&mut self) {
+        // Land any detached stops first: a channel stop reports every
+        // recording outcome before the final snapshot is taken (§56.1).
+        self.drain_retiring().await;
         if let Some(recorder) = self.raw_recorder.take() {
             let already = self.recording_fault_reported;
             let fault = recorder.finalize(RecordingStopReason::ChannelStopped).await;
@@ -1475,6 +1566,10 @@ pub async fn run_channel(
         pipeline.begin_recording().await;
     }
     loop {
+        // Detached recorder stops (§56.1): report any outcome that landed
+        // since the last pass. Non-blocking — reception never waits on a
+        // file close; the idle tick guarantees a pass on a quiet stream.
+        pipeline.reap_retired_recordings();
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
@@ -2608,6 +2703,58 @@ mod tests {
 
         let written = tokio::fs::read(&path).await.unwrap();
         assert_eq!(written, b"capturedmore");
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn recorder_stop_retires_detached_and_still_reports_the_outcome() {
+        // §142's never-block-the-producer rule: a live Stop must not make the
+        // acquisition loop wait for the recorder's backlog drain + file close.
+        // The stop detaches; state reads "off" immediately, ingest continues,
+        // and the honest outcome note (§56.1) lands via the loop's
+        // non-blocking reap — not synchronously inside the stop.
+        let cid = ChannelId::new();
+        let path = temp_path("detached-stop");
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_recording_settings(
+            RawRecordingSettings {
+                destination: path.clone(),
+                channel_name: "detached".to_string(),
+                overwrite: OverwritePolicy::Refuse,
+                timestamps: false,
+                file_rotation: FileRotationPolicy::None,
+                capacity: 64,
+            },
+        );
+        p.set_recording(true, None).await;
+        p.ingest(bytes_chunk(cid, b"data"));
+        p.set_recording(false, None).await;
+
+        // The stop returned with the retirement possibly still in flight:
+        // the recording already reads off, and ingest keeps flowing.
+        assert!(p.raw_recording_state().is_none());
+        p.ingest(bytes_chunk(cid, b"while closing"));
+
+        // The outcome is reported through the reap path.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            p.reap_retired_recordings();
+            let noted = p
+                .snapshot()
+                .diagnostics
+                .events
+                .iter()
+                .any(|d| d.message.contains("Raw recording stopped"));
+            if noted {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "detached stop outcome never reported"
+            );
+            tokio::task::yield_now().await;
+        }
+        let written = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(written, b"data", "capture ends exactly at the stop");
         let _ = tokio::fs::remove_file(&path).await;
     }
 
