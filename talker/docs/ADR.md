@@ -319,6 +319,17 @@ prevents partial off-screen connectors and keeps both apps' selection hierarchy 
 resizer feedback identical. Lifecycle glyphs and live faults remain app-owned because
 they carry runtime meaning rather than chrome.
 
+**Follow-up (2026-07-16, chrome dedup).** The remaining duplicated accessors merged
+into the crate: `palette::active(ui)` is the one theme-aware palette accessor
+(replacing talker's `theme_palette`, `selection`'s private copy, and listener's
+`gui/theme.rs` process-global mirror — listener's pure helpers now take `&Palette`
+like talker's `lifecycle_indicator`), `style::theme_toggle_button` owns the shared
+◐/◑ header toggle, `selection::{severity_counts_line, last_error_line}` own the two
+value-only channel-row lines, and `install_chrome(ctx)` bundles the three-call
+chrome install. Listener's re-export shims (`gui/fonts.rs`, `widgets/format.rs`,
+`gui/theme.rs`) were deleted in favor of direct `wiredata_ui` paths — the shims
+predated the merge settling and had become pure indirection.
+
 ---
 
 ## ADR-017 — High-resolution OS timer scope for high-rate schedules
@@ -363,8 +374,8 @@ owner picks the payload policy via a named `ObserverPolicy` passed to the runner
    (edge-triggered per ADR-017's sibling backoff work) are never rate-limited.
 
 `Sent` is **removed**, replaced by lanes 1+2. CLI `--echo` passes
-`ObserverPolicy::every()` (every send emits a `SendSample`) — the one consumer that
-genuinely wants every payload keeps it, explicitly.
+`ObserverPolicy::every_send()` (every send emits a `SendSample`) — the one consumer
+that genuinely wants every payload keeps it, explicitly.
 
 **Consequences:**
 - Per-send cost at any rate is a counter bump; allocations for observers happen at

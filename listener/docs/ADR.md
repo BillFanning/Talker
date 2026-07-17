@@ -663,12 +663,20 @@ The live viewer was rebasing `TriggeredMatch.byte_offset` (stream space) onto it
 
 **Status:** Accepted. **Context:** the GUI merge — talker adopts listener's look and feel, and both apps will eventually offer the same light/dark themes. Counterpart of talker ADR-016, which holds the full rationale and the scope rule.
 
-**Decision.** Listener's GUI **chrome** — the bundled font stack (`gui/fonts.rs`), the named color palette (`gui/theme.rs`), the base widget visuals and style tweaks (the body of `apply_style`), and `widgets::format::human_bytes` — moved verbatim into the new internal workspace crate **`wiredata-ui`** (egui-only, `publish = false`). The listener modules remain as thin re-exports, so every call site is unchanged. The palette carries both `LIGHT` and `DARK` instances — several light values (e.g. `WARNING_AMBER`, `INFO_GREY`) are unreadable on a dark backdrop. *(Follow-up, same series:)* listener since gained the theme toggle: `gui/theme.rs` became theme-aware — same names as small functions that read a UI-thread-written mirror of the active egui theme (set at startup restore and by the ◐ header button; persisted under the same `dark_mode` storage key talker uses), picking `LIGHT` or `DARK` live. The pure color helpers (`status_color` etc.) stay argument-free that way. Stream-view content colors remain user-chosen per view (`ColorScheme` offers both light and dark schemes) — deliberately not coupled to the chrome theme.
+**Decision.** Listener's GUI **chrome** — the bundled font stack (`gui/fonts.rs`), the named color palette (`gui/theme.rs`), the base widget visuals and style tweaks (the body of `apply_style`), and `widgets::format::human_bytes` — moved verbatim into the new internal workspace crate **`wiredata-ui`** (egui-only, `publish = false`). The listener modules remain as thin re-exports, so every call site is unchanged. The palette carries both `LIGHT` and `DARK` instances — several light values (e.g. the then-named `WARNING_AMBER`/`INFO_GREY` consts, now `Palette` fields `warning_amber`/`info_grey`) are unreadable on a dark backdrop. *(Follow-up, same series:)* listener since gained the theme toggle: `gui/theme.rs` became theme-aware — same names as small functions that read a UI-thread-written mirror of the active egui theme (set at startup restore and by the ◐ header button; persisted under the same `dark_mode` storage key talker uses), picking `LIGHT` or `DARK` live. The pure color helpers (`status_color` etc.) stay argument-free that way. Stream-view content colors remain user-chosen per view (`ColorScheme` offers both light and dark schemes) — deliberately not coupled to the chrome theme.
 
 **Consequences.**
 - `listener/assets/fonts/` moved to `wiredata-ui/assets/fonts/` (README and licenses included); the font rationale doc lives there now.
 - Anything app-specific stays put: view-models, widgets with runtime knowledge, the stream-view `ColorScheme` (user-chosen content colors are not chrome).
 - A change to the shared look lands in both apps by construction — the drift risk that motivated the crate is gone.
+
+**Follow-up (2026-07-16, chrome dedup — counterpart of the talker ADR-016 follow-up).**
+The transitional re-export shims (`gui/fonts.rs`, `gui/widgets/format.rs`) and the
+`gui/theme.rs` global theme mirror were retired: call sites import `wiredata_ui`
+paths directly, `wiredata_ui::palette::active(ui)` replaces the atomic mirror (the
+pure helpers `status_color` / `recording_indicator` now take `&Palette`, keeping
+them unit-testable without a `Ui`), and the header theme toggle is the shared
+`wiredata_ui::style::theme_toggle_button`.
 
 **Follow-up (selected-channel continuity).** `wiredata-ui::selection` now owns the
 selected/full and compact channel tabs, shared row emphasis, and the complete
@@ -721,6 +729,78 @@ TCP Connection Channels remain governed by their TCP Listener parent.
 runtime path. Both apps now present one ordinary transport choice and the same Add-menu
 order. Reconfiguration, profiles, and the schema are unchanged. A focused GUI test
 pins the menu labels and order.
+
+## ADR-022 — Recorder stops retire detached from the acquisition loop
+
+**Status:** Accepted 2026-07-16. **Context:** spec §142 requires recorder
+implementations to never block the producer, and §96 keeps reception running when
+recording stops. Yet a live Stop (`set_recording(false)`, a rule's `Record { Stop }`,
+or the disk guard's `StopRecording` action) awaited `Recording::finalize` — a full
+accepted-backlog drain plus file close — **on the pipeline task**, inside the same
+select loop that drains ingest. On a slow disk this backed the bounded ingest queue
+up into the transport. The disk guard also ran synchronous filesystem space queries
+on the pipeline task, where a hung network share could stall reception indefinitely.
+
+**Decision:** Recorder stops retire **detached**. The pipeline moves the taken
+recorder into a `JoinSet` task that drains and finalizes off-loop and yields the
+arguments for `note_recording_stop`; the run loop reaps completed retirements
+non-blockingly each pass (the idle tick bounds the note's latency on a quiet
+stream). Ordering rules preserve the previous guarantees: `begin_*` drains in-flight
+retirements first (a new file must never open while its predecessor is closing —
+same-destination restarts), and `finish` drains before the final snapshot so a
+channel stop still reports every outcome (§56.1 honesty — a stop that lost data
+never reads clean; a panicked finalize task is reported as a fault, not silence).
+Disk-guard space queries move to `spawn_blocking` under a 2 s timeout.
+
+**Consequences:** The recording state reads "off" the moment a stop is requested,
+while the flush completes in the background and its outcome note (clean or faulted)
+lands within one idle tick. Asynchronous **begin** is unchanged (still awaited
+inline): detaching it would need a defined `Starting` recording state or prebuffer —
+deferred until something needs it. Pinned by
+`recorder_stop_retires_detached_and_still_reports_the_outcome`.
+
+## ADR-023 — One Display View per Channel
+
+**Status:** Accepted 2026-07-16 (spec v2.1). **Context:** spec §48 promised multiple
+simultaneous Display Views per Channel, but the runtime and GUI have only ever used
+the first view: scrollback pause gating keyed on `display_views.first()`, and the
+detail pane surfaced one view. A non-primary view could be *marked* paused but had no
+per-view stream state to freeze — the abstraction cost complexity (a `Vec` of views
+threaded through the pipeline, snapshots, and config) without delivering the feature.
+
+**Decision:** v2.1 makes one **logical** Display View per Channel normative, with
+Raw / Rendered / Hex as that view's switchable modes — matching talker's single
+Output pane, so the two apps present the same display model. The profile schema's
+`views` list stays (additive forward-compatibility); entries beyond the first are
+ignored. Multiple simultaneous views are deferred to Appendix A: reviving them
+requires per-view render/pause state, not just config plumbing.
+
+**Consequences:** "The view is paused" and "the Channel's display is paused" are the
+same statement, closing the pause ambiguity. Internal `Vec` shapes may simplify
+opportunistically; no behavior changes now (the code already lived this way).
+
+## ADR-024 — TCP Connection-Channel surfacing is deferred scope
+
+**Status:** Accepted 2026-07-16 (spec v2.1; parked by user decision 2026-07-11).
+**Context:** every accepted TCP connection runs a full pipeline (Model A, §16.4),
+but the supervisor drops its request handle — so connections surface only
+connect/disconnect lifecycle events: no per-connection snapshot, stream view,
+recording (blocked on §59 filename templating), or match rules, and
+`recv_buffer_bytes` is not applied to accepted sockets. The spec read as if the
+full per-connection surface existed.
+
+**Decision:** Record the shipped boundary as normative v2.1 scope. §16.2's
+independence requirements remain the architecture; their user-facing surfacing is
+Appendix-A deferred until a real TCP-inspection need promotes it (UC1 today is
+serial/UDP). When promoted, the design direction stays what the TODO records: the
+supervisor retains per-connection handles in a registry keyed by the minted
+`ChannelId`, `Listener::snapshot`/`stream_delta` route through it, and the GUI
+decides between sub-tabs and dynamic top-level channels.
+
+**Consequences:** The spec no longer promises an inspection surface the runtime
+doesn't expose. The full-pipeline-per-connection cost is acknowledged as paying for
+recording-readiness and §16.2 independence, not for visibility; a lighter
+per-connection pipeline is an option if promotion is far off.
 
 ## Open questions
 

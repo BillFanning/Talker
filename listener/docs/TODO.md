@@ -101,7 +101,7 @@ Message-model removal). Everything below this block is verified done:
       a_profile` + `a_profile_without_hex_grouping_loads_with_the_default`.
 - [ ] Consume `hex_grouping` in the Hex renderer: `hex_bytes_per_line` is hardcoded to
       16 in both `build_display_view` (`build.rs`) and the GUI stream renderer
-      (`detail.rs`); map the config `HexGrouping` onto `hex_bytes_per_line`/
+      (`gui/detail/stream_view.rs`); map the config `HexGrouping` onto `hex_bytes_per_line`/
       `hex_separator` at both sites so the persisted grouping drives the Hex view
       (with a GUI control).
 - [x] Live `Record` begin/stop without a restart (ADR-012). `Listener::set_recording`
@@ -155,30 +155,29 @@ Message-model removal). Everything below this block is verified done:
 ## Carried over (still valid under v2)
 
 - [ ] Disk-guard GUI exposure (§56.2)
-- [ ] **TCP connection channels are currently unobservable** — PARKED by user
-      decision 2026-07-11 (stays deferred until a real TCP-inspection need
-      shows up; UC1 today is serial/UDP). Design when promoted: (bigger than the
-      recording gap below): each accepted connection runs a full pipeline, but the
-      supervisor drops its `PipelineRequest` sender (`runtime/tcp.rs`), so there is
-      no per-connection snapshot, stream delta, display, or match evaluation — the
-      feature surfaces only connect/disconnect events while paying full pipeline
-      cost per connection. UC1 troubleshooting of a TCP feed is impossible today.
-      Needs: the supervisor retains per-connection handles (shared registry keyed
-      by the minted `ChannelId`), `Listener::snapshot`/`stream_delta` route to
-      them, and a GUI decision on how connections appear (sub-tabs under the
-      listener channel vs. dynamic top-level channels).
+- [ ] **TCP connection channels are currently unobservable** — now NORMATIVE
+      deferred scope (spec v2.1 §16.2 / ADR-024, 2026-07-16; parked by user
+      decision 2026-07-11 — stays deferred until a real TCP-inspection need
+      shows up; UC1 today is serial/UDP). Design when promoted lives in ADR-024:
+      per-connection handle registry keyed by the minted `ChannelId`,
+      `Listener::snapshot`/`stream_delta` routed through it, and a GUI decision
+      (sub-tabs vs. dynamic top-level channels).
 - [ ] Per-connection recording for TCP connection channels (§16.2, deferred §59 naming)
 - [ ] RS-422/485 phases (§14.4)
 - [ ] CLI parity with GUI for the v2 surface
-- [ ] TCP `recv_buffer_bytes` is persisted + specified (§76) but **ignored at runtime**.
-      UDP maps it (`build_udp` → `with_recv_buffer`, `build.rs`); `build_tcp_listener`
-      passes only the address and `TcpListenerTransport` stores no buffer, so SO_RCVBUF
-      is never applied to accepted connections. Wire it through accept (socket2), like UDP.
-- [ ] Multi-view pause is only real for the **first** view. There is one shared stream
-      buffer; scrollback retention gates on `display_views.first()`'s pause
-      (`pipeline.rs`) and the GUI only surfaces the first snapshot view (`detail.rs`).
-      A non-primary view can be marked paused but has no per-view stream state to freeze.
-      Needs a decision: per-view render state, or document pause as stream-wide (one view).
+- [ ] TCP `recv_buffer_bytes` is persisted + specified (§76) but **ignored at runtime**
+      — now normatively deferred with the rest of the connection-channel surfacing
+      (spec v2.1 §16.2 / ADR-024 / Appendix A). UDP maps it (`build_udp` →
+      `with_recv_buffer`, `build.rs`); `build_tcp_listener` passes only the address and
+      `TcpListenerTransport` stores no buffer, so SO_RCVBUF is never applied to accepted
+      connections. When promoted: wire it through accept (socket2), like UDP.
+- [x] Multi-view pause ambiguity — DECIDED (spec v2.1 §48 / ADR-023,
+      2026-07-16): one logical Display View per Channel is normative, with
+      Raw/Rendered/Hex as its modes; pause is that view's pause, full stop.
+      Multiple simultaneous views moved to Appendix A (reviving them needs
+      per-view render/pause state). The schema's `views` list stays; entries
+      beyond the first are ignored. Internal `Vec<PipelineDisplayView>` may be
+      simplified opportunistically.
 - [x] `.disp` per-chunk rendering garbled a multi-byte character split across two
       reads, and injected a newline per read chunk — both fixed by the streaming
       renderer (ADR-018): the `.disp` is now the exact rendered stream (no hard

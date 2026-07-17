@@ -20,26 +20,17 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 ## Docs
 
-- [ ] **Spec §8.1 wording tighten (next spec pass, no bump alone).** The v2.1
-  intro says the priority queue is the conceptual model (the implementation is a
-  linear next-fire scan), but the first "Queue model" bullet still reads "maintains
-  a priority queue sorted by next-fire-time" — tighten to "tracks each message's
-  next-fire-time (conceptually a priority queue)". Fold into whichever spec revision
-  lands next; not worth a version bump alone. (External review, 2026-07-10.)
-- [ ] **Spec §3.2 detail-header readouts (next spec pass, no bump alone).** The
-  detail header now mirrors listener's channel block (GUI-merge harmonization,
-  2026-07-10): status glyph + name row, `status · interface` row, sent totals +
-  throughput (byte- and message-based), and performance readouts (`Status queue`
-  occupancy/peak vs `core::supervisor::STATUS_QUEUE_CAP`, `Display updates dropped` from
-  `TalkerStatus::Sent::dropped_statuses`, `Missed sends` from
-  `Schedule::missed_sends`). Also from the same harmonization pass: the
-  lifecycle buttons are listener's labeled pair (`start_button` decision), the
-  Profile menu moved to the channel-list header (the top-bar name field is
-  gone; renaming = Save As…), channel removal is the list rows' ✕ overlay, and
-  the detail sections are titled "Configure connection" / "Configure messages"
-  (listener's Configure section was renamed to "Configure connection" to
-  match). Fold the layout and the two new `Sent` fields (`total_bytes`,
-  `missed_sends`) into the next spec revision.
+- [x] **Spec §8.1 wording tighten** — folded into spec v2.1.1 (2026-07-16): the
+  "Queue model" bullet now reads "tracks each message's next-fire-time
+  (conceptually a priority queue)". (External review, 2026-07-10.)
+- [x] **Spec §3.2 detail-header readouts** — folded into spec v2.1.1
+  (2026-07-16): §3.2 now describes the shipped master–detail pane (wire-facts /
+  throughput / observer-health readout grouping post-ADR-018, lifecycle button
+  pair, list-row contents, Profile menu in the list header, ✕ removal,
+  "Configure connection" / "Configure messages" titles). The original item's
+  `TalkerStatus::Sent` field references had gone stale (ADR-018 replaced `Sent`
+  with counters + samples); the spec text was written from the current
+  `show_channel_header`. (GUI-merge harmonization, 2026-07-10.)
 
 ## Robustness & performance (external review, 2026-07-11)
 
@@ -216,6 +207,52 @@ Cross off items as they are completed. Add new ones inline as they come up.
   Raw/Rendered/Hex stream machinery could move to an egui-free shared crate so
   talker reuses listener's incremental rendering. Standalone extraction is
   speculative crate surface — don't do it first.
+
+## Week-in-review cleanup (2026-07-16)
+
+- [ ] **Split `talker/src/gui/widgets.rs`** (~2.5 k lines after the GUI-merge
+  week) into a `widgets/` directory of focused modules mirroring listener's
+  shape (`status`, `summary`/blockers, the field editors, text-edit helpers).
+  Mechanical move, re-exported flat so call sites keep `widgets::<name>` — do
+  it as a standalone commit (blame churn), not bundled with feature work.
+- [x] **Per-frame telemetry clone removed** — `TalkerSupervisor::telemetry_ref`
+  borrows for the row snapshot / rate sampler / status bar; the owning
+  `telemetry()` clone remains for the detail header.
+- [x] **Start blockers no longer format per frame** —
+  `widgets::any_start_blocker_analyzed` (lazy `visit_start_blockers` sink)
+  gates Start-all; strings only materialize for the disabled tooltip via
+  `start_blockers_analyzed`.
+- [x] **Listener mark-history hash gated** — `ChannelView::marks_version`
+  bumps on every mark mutation; `StreamRenderCache` compares versions and
+  only re-hashes (`marks_signature_below`) when marks actually changed.
+- [x] **Chrome dedup into `wiredata-ui`** — `palette::active(ui)` (replaces
+  talker's `theme_palette`, listener's `gui/theme.rs` global mirror, and
+  selection's private copy), `style::theme_toggle_button`,
+  `selection::{severity_counts_line, last_error_line}`, `install_chrome`;
+  listener's `gui/fonts.rs` + `widgets/format.rs` re-export shims deleted.
+
+### External review fixes (2026-07-16)
+
+- [x] **Listener row-cache unbounded growth** — count-triggered batch merging
+  advanced the front batch's end in lockstep with the window start, so with
+  more deltas per retained window than `MAX_ROW_BATCHES` no batch ever became
+  evictable and `rows` grew for the channel's lifetime. Fixed by byte-quantum
+  coalescing (`row_batch_quantum`, batch ends freeze); pinned by
+  `tiny_deltas_with_a_sliding_window_keep_rows_bounded`.
+- [x] **Orphaned talker runner wedge** — `poll` never drained an orphan's
+  status lane, so the runner's blocking final-Counters send could wedge on a
+  full queue and hold the interface until exit. Orphans now drain-and-discard
+  status; pinned by `removal_with_a_saturated_status_queue_still_reaps_the_orphan`.
+- [x] **TCP acceptor faults surfaced (§162)** — a spontaneously ending
+  acceptor now sets the channel's `faulted` flag and emits `ChannelFaulted`
+  (was: silent `listener_open = false`); pinned by
+  `acceptor_fault_sets_faulted_and_emits_channel_faulted`.
+- [x] **Recorder stops off the acquisition loop** — listener ADR-022; pinned
+  by `recorder_stop_retires_detached_and_still_reports_the_outcome`.
+- [ ] **Acceptor fault CAUSE into the listener channel's retained
+  diagnostics** — the fault flag + event land (§162), but the cause string
+  only reaches the log via `tracing`; route it into `retained_diagnostics`
+  like start faults (needs a supervisor→orchestrator path).
 
 ## macOS target (planned, 2026-07-10)
 
