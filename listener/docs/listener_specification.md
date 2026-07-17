@@ -1,9 +1,31 @@
-# Listener Specification v2.0.7
+# Listener Specification v2.1
 
 Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
+
+Revision v2.1 (scope amendments — one display view per channel; TCP connection-channel
+visibility deferred; a §155 correction):
+
+- **§48 one Display View per Channel (ADR-023).** v2.1 narrows §48 from "multiple
+  simultaneous Display Views" to exactly **one logical Display View per Channel**,
+  with Raw / Rendered / Hex as that view's switchable *modes*. This documents shipped
+  reality (pause gating and the GUI have only ever used the first view) and matches
+  talker's one-Output-pane model. The profile schema's `views` list is unchanged
+  (additive forward-compatibility); entries beyond the first are ignored. Multiple
+  simultaneous views move to Appendix A.
+- **§16 TCP Connection-Channel visibility is deferred (ADR-024; parked by user
+  decision 2026-07-11).** Accepted connections run full pipelines and emit
+  connect/disconnect lifecycle events, but are not individually inspectable (no
+  per-connection snapshot, stream view, recording, or match rules), and
+  `recv_buffer_bytes` is not yet applied to accepted sockets. §16.2's independence
+  requirements remain the architecture; their user-facing surfacing moves to
+  Appendix A until a real TCP-inspection need promotes it.
+- **§155 correction** — the BytePattern acceptance criterion said matches are
+  "highlighted in the stream"; on-screen highlighting was removed in v2.0
+  (ADR-015). The criterion now names the shipped observables: the rule-firing
+  log and inline `Mark` splices.
 
 Revision v2.0.7 (inline Mark timestamps; remove two abandoned timestamp pieces):
 
@@ -720,6 +742,13 @@ Each TCP Connection Channel shall have:
 
 Data from different TCP clients shall not be merged into a common Byte Stream.
 
+_Scope (v2.1, ADR-024; parked by user decision 2026-07-11):_ these independence
+requirements are architectural — each accepted connection runs its own full
+pipeline today. Their **user-facing surfacing is deferred** (Appendix A): v2.1
+exposes connection channels through connect/disconnect lifecycle events only,
+with no per-connection snapshot, stream view, recording, or match rules, and
+`recv_buffer_bytes` (§76) is not yet applied to accepted sockets.
+
 ### 16.3 TCP Connection Persistence
 
 TCP Connection Channels are runtime objects.
@@ -876,7 +905,7 @@ Display functions shall not modify:
 
 ## 41. Display Source
 
-A Display View operates on the received **byte stream** — the verbatim sequence of bytes as received (§17–18). There is a single source; the former per-view Stream/Messages source selector is removed in v2.0. Multiple views may render the same stream in different modes (§48).
+A Display View operates on the received **byte stream** — the verbatim sequence of bytes as received (§17–18). There is a single source; the former per-view Stream/Messages source selector is removed in v2.0. The Channel's one view renders that stream in its selected mode, switchable at any time (§42, §48).
 
 ## 42. Display Modes
 
@@ -955,17 +984,19 @@ Display View configuration may include:
 - Wrapping Mode
 - Character Rendering
 
-## 48. Multi-View Display
+## 48. Display View
 
-A Channel may have multiple simultaneous Display Views.
+_Amended in v2.1 (ADR-023): one logical Display View per Channel._
 
-Examples:
+Each Channel has exactly **one** Display View. Raw, Rendered, and Hex are that
+view's switchable **modes** (§42), not separate simultaneous views; the per-view
+settings of §46–§47 and the pause of §50 apply to this single view, so "the view
+is paused" and "the Channel's display is paused" mean the same thing.
 
-- Raw + Hex
-- Rendered + Hex
-- Raw + Rendered + Hex
-
-Each Display View may maintain independent display settings where practical.
+The profile schema's `views` list (§78) is retained for forward compatibility;
+v2.1 reads exactly one entry and ignores the rest. Multiple simultaneous views
+(e.g. Raw + Hex side by side, each independently paused) are deferred —
+Appendix A.
 
 ## 49. Metadata Display
 
@@ -2805,7 +2836,10 @@ A TCP Listener shall:
 
 A user shall be able to:
 
-- Define a `BytePattern` find rule and see matches highlighted in the stream (§50.2).
+- Define a `BytePattern` find rule and observe its matches fire: the rule's firings
+  appear in the recent-matches log (snapshot `matches`, §165) and a `Mark` action
+  splices its marker/timestamp inline at the matched offset (§50.2). (On-screen
+  byte-range highlighting was removed in v2.0 — ADR-015.)
 - Define an `Idle` rule and have it fire after the configured quiet time.
 - Attach `Record` / `Notify` / `Mark` actions to a rule and observe them fire.
 
@@ -2924,6 +2958,15 @@ space, and rotation countdown (§56.2).
 ---
 
 # Appendix A — Deferred Features
+
+Deferred in v2.1:
+
+- Multiple simultaneous Display Views per Channel (§48 — one view with switchable
+  modes ships; per-view render state would be required for independent pause)
+- TCP Connection-Channel user-facing surfacing (§16.2/ADR-024): per-connection
+  snapshots/stream view, per-connection recording (needs §59 filename
+  templating), per-connection match rules, and `recv_buffer_bytes` on accepted
+  sockets
 
 Deferred from Version 1:
 

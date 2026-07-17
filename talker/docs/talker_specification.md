@@ -1,7 +1,22 @@
 # Talker — Program Specification
-**Version:** 2.1
+**Version:** 2.1.1
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
+
+Revision v2.1.1 (corrections and doc-alignment; no behavior change):
+
+- **§8.1 scheduling** — the "Queue model" bullet no longer claims the scheduler
+  "maintains a priority queue"; it tracks each message's next-fire-time
+  (conceptually a priority queue — the v2.0.1/v2.1 clarification, now applied to
+  the bullet itself). Implementation unchanged.
+- **§5.1 / §5.2 ASCII payloads** — ASCII text is not "restricted" to the selected
+  code page: characters the code page cannot encode compile to a visible `?`
+  (`0x3F`) fallback byte, flagged in the editor and preview (ADR-023). The format
+  table and §5.2 now state the shipped fallback behavior.
+- **§3.2 GUI** — describes the master–detail detail pane as shipped after the
+  GUI-merge harmonization and the ADR-018 telemetry split: the detail header's
+  wire-facts and performance readouts, the lifecycle button pair, list-row
+  contents, and the Profile menu's home in the channel-list header.
 
 Revision v2.1 (master–detail GUI, named channels, shared chrome):
 
@@ -220,6 +235,36 @@ The GUI is built with egui/eframe and supports:
 - Real-time status display (channel state, data sent, errors)
 - Profile save/load/switch
 
+#### Master–detail layout
+
+One channel is on screen at a time. The collapsible **channel list** (left) shows
+per-row: status glyph + name, the one-line interface summary (unfilled fields as
+red `?` pills), `Sent: N · msg/s` while running, per-severity log counts
+(info · warn · err, since the channel's last start), and the last error. Rows carry
+a ✕ remove overlay; `+ Add` (per transport kind), Start all / Stop all, and the
+**Profile menu** (Recent / Save / Save As… / Load… / New; renaming = Save As…) live
+in the list header. Collapsed, the list becomes a mini-strip of status glyphs.
+
+The **detail pane** (right) shows the selected channel:
+
+- **Header** — status glyph + editable name (duplicates allowed but hinted);
+  a `status · interface summary` row; then the readouts, grouped by subsystem:
+  - *Wire facts:* `Sent: <bytes> · <msgs> msgs`, and
+    `Unsent: <n> (<x>% of <scheduled>)` — amber when nonzero; its tooltip
+    decomposes the total into failed sends, backoff-suppressed fires, and
+    stall-skipped cadence points (§8.1). Sent + Unsent = scheduled, always.
+  - *Throughput:* rolling `kB/s · msg/s` from cumulative successful sends.
+  - *Observer health:* `Display backlog: <len>/<cap> (peak <p>, <d> dropped)` —
+    the runner→UI status-queue gauge (ADR-018/ADR-019); amber when the peak
+    nears the cap or anything was dropped. Pressure here never delays a send;
+    counters are cumulative, so tallies stay exact across drops.
+- **Lifecycle buttons** — the labeled pair (shared with listener):
+  [Start Channel / Apply & Restart / Retry Channel] + [Stop Channel]; the Start
+  side's label and enabled state derive from run state, drift, and draft
+  validity (a disabled Start's tooltip lists the exact blockers).
+- **Configure connection** / **Configure messages** sections (the editors), and
+  the **Output** display pane (sampled at high rates, with a sub-sampling badge).
+
 #### GUI State Persistence
 
 GUI state and profile data are stored separately and serve different purposes:
@@ -295,7 +340,7 @@ Each channel has one or more messages. Messages within a channel share the same 
 | Hex | Arbitrary byte sequence entered as hexadecimal pairs; spaces and hyphens allowed as separators |
 | UTF-8 | Unicode text encoded as UTF-8 |
 | UTF-16 | Unicode text encoded as UTF-16; byte order (LE or BE) and optional BOM are user-configurable |
-| ASCII | Text restricted to the ASCII range or a selected extended code page (see 5.2) |
+| ASCII | Text encoded through a selected code page (see 5.2); characters the code page cannot encode compile to a visible `?` fallback byte (ADR-023) |
 | NMEA 0183 | Handled by the `nmea0183` crate (see Section 6) |
 
 All format selections are saved as part of a profile.
@@ -312,6 +357,8 @@ When the message format is ASCII, the user selects a code page. This determines 
 | ISO-8859-1 | Latin-1; standard on Linux/Unix systems |
 
 All four code pages are available regardless of the host operating system. This allows `talker` running on any platform to generate byte streams matching the expectations of a device or system built for a specific OS.
+
+The editor accepts any Unicode text; a character the selected code page cannot encode is **not** an error. Each such character compiles to a single ASCII `?` (`0x3F`) replacement byte (ADR-023). The GUI surfaces the lossiness rather than hiding it: an amber count and a UTF-8 recommendation appear beside the code-page selector, and the wire preview / Output pane give the resulting `?` bytes a contrast-aware amber background (literal question marks are unmarked). Valid `‹XX›` byte markers (§5.3) still emit exact bytes; malformed marker syntax remains an error.
 
 ### 5.3 Character Entry
 
@@ -559,7 +606,8 @@ Each channel runs a **priority-queue scheduler**. Each message within the channe
 
 **Queue model:**
 
-- The scheduler maintains a priority queue sorted by next-fire-time.
+- The scheduler tracks each message's next-fire-time (conceptually a priority
+  queue; see the model note above).
 - When a channel starts, all enabled messages (interval > 0) are inserted into the queue with next-fire-time = now (all fire immediately at t=0).
 - The scheduler picks the message with the earliest next-fire-time, waits until that time, sends the message, then re-inserts it with next-fire-time = previous-fire-time + interval.
 - When two messages are due at the same time, they fire in list order (the order in which they appear in the message list for that channel).
