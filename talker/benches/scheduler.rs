@@ -88,6 +88,20 @@ fn bench_poll_due_send_rendered(c: &mut Criterion) {
             black_box(schedule.poll(now))
         })
     });
+
+    let fields = "typed,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,"
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    let message = MessageConfig::new(PayloadConfig::nmea_live("GP", "GGA", fields, true), 1);
+    let mut schedule = Schedule::compile(&[message], start).unwrap();
+    let mut now = start;
+    c.bench_function("schedule/poll-due-send/live-nmea-gga", |b| {
+        b.iter(|| {
+            now += Duration::from_millis(1);
+            black_box(schedule.poll(now))
+        })
+    });
 }
 
 fn bench_min_active_interval(c: &mut Criterion) {

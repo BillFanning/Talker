@@ -1,6 +1,6 @@
 //! A minimal in-app editor for **Mark timestamp** rules (§50.2): create a
 //! `BytePattern → Mark(+timestamp)` rule so a matched pattern gets an inline local
-//! arrival timestamp in the display and Display Recording. This is deliberately small
+//! time or NMEA ZDA annotation in the display and Display Recording. This is deliberately small
 //! — it edits only single-pattern Mark rules; the general match-rule editor
 //! (Idle/Record/Notify/PauseDisplay, compound conditions) is a separate TODO. Rules
 //! it doesn't understand are listed read-only and never modified.
@@ -10,9 +10,10 @@
 //! which rebuilds the pipeline with the new rules (no dedicated runtime command).
 
 use crate::config::{
-    ChannelConfig, MarkPosition, MarkTimestamp, MatchAction, MatchCondition, MatchRule,
+    ChannelConfig, MarkPosition, MarkTimestamp, MarkTimestampStyle, MatchAction, MatchCondition,
+    MatchRule,
 };
-use crate::core::TimestampConfig;
+use crate::core::{validate_zda_talker_id, TimestampConfig, MAX_ZDA_TALKER_ID_BYTES};
 
 use wiredata_ui::fonts::bold;
 
@@ -33,8 +34,8 @@ fn is_mark_timestamp_rule(rule: &MatchRule) -> bool {
 /// Apply & Restart path picks them up.
 pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
     ui.label(bold("Timestamp marks")).on_hover_text(
-        "Insert a local arrival timestamp before/after a byte pattern, inline in \
-             the view and the .disp recording (never .raw). Applying restarts the channel.",
+        "Insert local arrival time or an NMEA ZDA sentence before/after a byte pattern, \
+             inline in the view and .disp recording (never .raw). Applying restarts the channel.",
     );
 
     // Edit existing editor-owned rules in place; collect indices to delete afterwards
@@ -65,8 +66,7 @@ pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
             );
             mark_pattern_field(ui, pattern);
             mark_position_selector(ui, &mut ts.position);
-            mark_format_toggles(ui, &mut ts.format);
-            mark_separator_field(ui, &mut ts.separator);
+            mark_style_selector(ui, &mut ts.style);
             if ui
                 .button("🗑")
                 .on_hover_text("Delete this mark rule")
@@ -74,6 +74,19 @@ pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
             {
                 delete = Some(i);
             }
+        });
+        ui.indent(("mark_options", i), |ui| {
+            ui.horizontal(|ui| {
+                match &mut ts.style {
+                    MarkTimestampStyle::Plain => mark_format_toggles(ui, &mut ts.format),
+                    MarkTimestampStyle::NmeaZda { talker } => {
+                        mark_zda_talker_field(ui, talker);
+                        ui.checkbox(&mut ts.format.include_millis, "ms")
+                            .on_hover_text("Include milliseconds in the ZDA UTC time field.");
+                    }
+                }
+                mark_separator_field(ui, &mut ts.separator);
+            });
         });
     }
     if let Some(i) = delete {
@@ -101,6 +114,7 @@ pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
             actions: vec![MatchAction::Mark {
                 timestamp: Some(MarkTimestamp {
                     position: MarkPosition::Before,
+                    style: Default::default(),
                     format: TimestampConfig::default(),
                     separator: String::new(),
                 }),
@@ -211,6 +225,45 @@ fn mark_position_selector(ui: &mut egui::Ui, position: &mut MarkPosition) {
         });
 }
 
+fn mark_style_selector(ui: &mut egui::Ui, style: &mut MarkTimestampStyle) {
+    let mut zda = matches!(style, MarkTimestampStyle::NmeaZda { .. });
+    egui::ComboBox::from_id_salt(("mark_style", ui.next_auto_id()))
+        .selected_text(if zda { "NMEA ZDA" } else { "Time" })
+        .width(82.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut zda, false, "Time");
+            ui.selectable_value(&mut zda, true, "NMEA ZDA");
+        });
+    if zda && matches!(style, MarkTimestampStyle::Plain) {
+        *style = MarkTimestampStyle::NmeaZda {
+            talker: "GP".to_string(),
+        };
+    } else if !zda && matches!(style, MarkTimestampStyle::NmeaZda { .. }) {
+        *style = MarkTimestampStyle::Plain;
+    }
+}
+
+fn mark_zda_talker_field(ui: &mut egui::Ui, talker: &mut String) {
+    ui.label("talker");
+    let response = ui.add(
+        egui::TextEdit::singleline(talker)
+            .desired_width(112.0)
+            .char_limit(MAX_ZDA_TALKER_ID_BYTES)
+            .hint_text("GP"),
+    );
+    if response.changed() {
+        *talker = talker.to_ascii_uppercase();
+    }
+    response.on_hover_text(
+        "One to 32 printable ASCII characters. Two characters form a standard NMEA talker ID; \
+         longer values are custom IDs. Whitespace and $ ! , * are not allowed.",
+    );
+    if let Err(error) = validate_zda_talker_id(talker) {
+        ui.colored_label(ui.visuals().error_fg_color, "invalid talker")
+            .on_hover_text(error.to_string());
+    }
+}
+
 /// Free-text separator appended right after the timestamp — a space, `", "`, or
 /// a control byte as a `<XX>` hex escape (`<0A>` puts the data on a new line) —
 /// so the time stands apart from the adjacent data in the view and `.disp`.
@@ -261,6 +314,7 @@ mod tests {
             actions: vec![MatchAction::Mark {
                 timestamp: Some(MarkTimestamp {
                     position: MarkPosition::Before,
+                    style: Default::default(),
                     format: TimestampConfig::default(),
                     separator: String::new(),
                 }),

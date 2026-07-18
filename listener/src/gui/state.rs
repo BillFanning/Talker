@@ -114,7 +114,7 @@ pub struct ChannelView {
     /// re-ships the whole buffer each poll. Capped (oldest dropped) at this channel's
     /// `view_prefs.scroll_buffer_bytes` — the same value the runtime retains.
     pub stream_bytes: std::collections::VecDeque<u8>,
-    /// Inline Mark timestamps pinned to the accumulated bytes (§50.2), sorted by
+    /// Inline Mark annotations pinned to the accumulated bytes (§50.2), sorted by
     /// `offset` (the renderer needs ascending annotations). Folded from snapshot
     /// firings by [`merge_marks`](Self::merge_marks); trimmed with the window;
     /// cleared on restart. See [`StreamMark`] for why this outlives the
@@ -194,7 +194,10 @@ impl ChannelView {
     fn merge_marks(&mut self, matches: &[TriggeredMatch]) {
         let mut changed = false;
         for m in matches {
-            let (Some(offset), Some(mark)) = (m.view_offset, m.mark.as_ref()) else {
+            let Some(mark) = m.mark.as_ref() else {
+                continue;
+            };
+            let Some(offset) = mark.view_offset else {
                 continue;
             };
             // Sorted by offset: binary-search the equal-offset run for the dedup
@@ -448,7 +451,7 @@ impl AppState {
                     view.display_recording = snapshot.display_recording;
                     view.ingest_queue = snapshot.ingest_queue;
                     view.raw_recording_queue = snapshot.raw_recording_queue;
-                    // Pin this window's Mark timestamps before the snapshot is
+                    // Pin this window's Mark annotations before the snapshot is
                     // replaced — the snapshot's matches roll over, the pins stay.
                     view.merge_marks(&snapshot.matches);
                     // Flatten+sort once per poll; the detail pane reads per frame.
@@ -1105,6 +1108,7 @@ mod tests {
             mark: Some(crate::runtime::snapshot::MarkRender {
                 text: text.into(),
                 before: true,
+                view_offset: Some(view_offset),
             }),
         }
     }
@@ -1146,6 +1150,22 @@ mod tests {
         let view = state.channel(id).unwrap();
         assert_eq!(view.marks.len(), 1, "the mark outlives the rolling window");
         assert_eq!(view.marks[0].offset, 2);
+    }
+
+    #[test]
+    fn mark_merge_uses_the_annotation_anchor_not_the_match_start() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+        state.apply(UiUpdate::StreamDelta(id, Box::new(delta(0, b"xABCy", 5))));
+
+        let mut matched = mark_match(MatchRuleId::new(), 1, "[after]");
+        matched.mark.as_mut().unwrap().view_offset = Some(3);
+        let mut snapshot = snapshot_with(id, 5, 0.0, 0);
+        snapshot.matches = vec![matched];
+        state.apply(UiUpdate::Snapshot(id, Box::new(snapshot)));
+
+        assert_eq!(state.channel(id).unwrap().marks[0].offset, 3);
     }
 
     #[test]

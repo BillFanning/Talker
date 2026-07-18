@@ -167,10 +167,10 @@ impl MessageConfig {
         }
     }
 
-    /// Compile the static parts of this message. The payload is encoded once;
-    /// the timestamp and checksum settings are kept for per-send rendering.
+    /// Compile and validate this message. Static payloads are encoded once;
+    /// live NMEA keeps only its immutable template for per-send rendering.
     pub fn compile(&self) -> anyhow::Result<CompiledMessage> {
-        let payload = self.payload.compile()?;
+        let payload = self.payload.compile_payload()?;
         let timestamp_len = self.timestamp.map_or(0, |timestamp| timestamp.wire_len());
         let replacement_wire_offsets = match &self.payload {
             PayloadConfig::Ascii { text, code_page } => code_page_replacements(text, *code_page)
@@ -203,10 +203,10 @@ impl MessageConfig {
     }
 }
 
-/// A message with its payload encoded, ready to render wire bytes per send.
+/// A validated message ready to render wire bytes per send.
 #[derive(Debug, Clone)]
 pub struct CompiledMessage {
-    payload: Vec<u8>,
+    payload: CompiledPayload,
     timestamp: Option<TimestampConfig>,
     checksum: Option<ChecksumConfig>,
     /// Positions of lossy code-page fallback bytes in the final wire message.
@@ -218,8 +218,8 @@ pub struct CompiledMessage {
 impl CompiledMessage {
     /// Produce the wire bytes for one send: `[timestamp][payload][checksum]`.
     ///
-    /// The timestamp is generated at the current instant; the checksum is
-    /// computed over the timestamp and payload together.
+    /// The timestamp and any live NMEA fields use the same current instant;
+    /// the outer checksum is computed over timestamp and payload together.
     pub fn render(&self) -> Vec<u8> {
         self.render_at(chrono::Utc::now())
     }
@@ -230,15 +230,15 @@ impl CompiledMessage {
         &self.replacement_wire_offsets
     }
 
-    /// Like [`Self::render`], but uses `now` as the timestamp instant
-    /// instead of reading the wall clock. Useful for previews where the
-    /// output should not advance every frame.
+    /// Like [`Self::render`], but uses `now` for the prepended timestamp and
+    /// live NMEA fields instead of reading the wall clock. Useful for stable
+    /// previews and deterministic tests.
     pub fn render_at(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.payload.len() + 16);
+        let mut out = Vec::with_capacity(self.payload.wire_len_hint() + 16);
         if let Some(ts) = &self.timestamp {
             out.extend_from_slice(ts.format(now).as_bytes());
         }
-        out.extend_from_slice(&self.payload);
+        self.payload.append_at(now, &mut out);
         if let Some(cs) = &self.checksum {
             let sum = cs.compute(&out);
             out.extend_from_slice(&sum);
@@ -249,7 +249,8 @@ impl CompiledMessage {
 
 /// The payload source for one message.
 ///
-/// `compile()` converts this to the static wire bytes for the payload.
+/// `compile()` converts this to wire bytes; a compiled message retains live
+/// NMEA templates so their known UTC fields can advance on every send.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -301,6 +302,14 @@ pub enum PayloadConfig {
         /// without this field deserialize to that default.
         #[serde(default)]
         nmea_checksum: NmeaChecksumMode,
+        /// Replace the sentence type's known UTC time/date fields at each
+        /// send. Unsupported sentence types fail message validation instead
+        /// of silently retaining stale typed values.
+        #[serde(default)]
+        live_time: bool,
+        /// Include three fractional-second digits in a live UTC time field.
+        #[serde(default)]
+        live_time_millis: bool,
     },
 }
 
@@ -319,28 +328,183 @@ impl PayloadConfig {
             sentence_type: sentence_type.into(),
             fields,
             nmea_checksum: NmeaChecksumMode::Correct,
+            live_time: false,
+            live_time_millis: false,
         }
     }
 
-    /// Encode this payload to its static wire bytes.
+    /// Build an NMEA payload whose known UTC fields are refreshed per send.
+    pub fn nmea_live(
+        talker: impl Into<String>,
+        sentence_type: impl Into<String>,
+        fields: Vec<String>,
+        include_millis: bool,
+    ) -> Self {
+        Self::Nmea {
+            talker: talker.into(),
+            sentence_type: sentence_type.into(),
+            fields,
+            nmea_checksum: NmeaChecksumMode::Correct,
+            live_time: true,
+            live_time_millis: include_millis,
+        }
+    }
+
+    /// Encode this payload to wire bytes. Live NMEA fields use the current UTC
+    /// instant; compiled messages render them again for every send.
     pub fn compile(&self) -> anyhow::Result<Vec<u8>> {
+        match self.compile_payload()? {
+            CompiledPayload::Static(bytes) => Ok(bytes),
+            CompiledPayload::NmeaLive(template) => Ok(template.render_at(chrono::Utc::now())),
+        }
+    }
+
+    fn compile_payload(&self) -> anyhow::Result<CompiledPayload> {
         match self {
-            Self::RawHex { data } => compile_hex(data),
-            Self::Utf8 { text } => Ok(compile_utf8(text)),
+            Self::RawHex { data } => compile_hex(data).map(CompiledPayload::Static),
+            Self::Utf8 { text } => Ok(CompiledPayload::Static(compile_utf8(text))),
             Self::Utf16 {
                 text,
                 byte_order,
                 bom,
                 allow_raw_bytes,
-            } => Ok(encode_utf16(text, *byte_order, *bom, *allow_raw_bytes)),
-            Self::Ascii { text, code_page } => compile_ascii(text, *code_page),
+            } => Ok(CompiledPayload::Static(encode_utf16(
+                text,
+                *byte_order,
+                *bom,
+                *allow_raw_bytes,
+            ))),
+            Self::Ascii { text, code_page } => {
+                compile_ascii(text, *code_page).map(CompiledPayload::Static)
+            }
             Self::Nmea {
                 talker,
                 sentence_type,
                 fields,
                 nmea_checksum,
-            } => compile_nmea(talker, sentence_type, fields, *nmea_checksum),
+                live_time,
+                live_time_millis,
+            } => {
+                if *live_time {
+                    let (talker_id, parsed_type) = parse_nmea_identity(talker, sentence_type)?;
+                    anyhow::ensure!(
+                        !parsed_type.time_fields().is_empty(),
+                        "NMEA sentence type {sentence_type:?} has no defined live UTC fields"
+                    );
+                    Ok(CompiledPayload::NmeaLive(NmeaLiveTemplate::new(
+                        talker_id,
+                        parsed_type,
+                        fields.clone(),
+                        *nmea_checksum,
+                        *live_time_millis,
+                    )))
+                } else {
+                    compile_nmea(talker, sentence_type, fields, *nmea_checksum)
+                        .map(CompiledPayload::Static)
+                }
+            }
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CompiledPayload {
+    Static(Vec<u8>),
+    NmeaLive(NmeaLiveTemplate),
+}
+
+impl CompiledPayload {
+    fn wire_len_hint(&self) -> usize {
+        match self {
+            Self::Static(bytes) => bytes.len(),
+            Self::NmeaLive(template) => template.wire_len_hint(),
+        }
+    }
+
+    fn append_at(&self, now: chrono::DateTime<chrono::Utc>, out: &mut Vec<u8>) {
+        match self {
+            Self::Static(bytes) => out.extend_from_slice(bytes),
+            Self::NmeaLive(template) => template.append_at(now, out),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NmeaLiveTemplate {
+    talker: nmea0183::TalkerId,
+    sentence_type: nmea0183::SentenceType,
+    fields: Vec<String>,
+    nmea_checksum: NmeaChecksumMode,
+    include_millis: bool,
+    wire_len_hint: usize,
+}
+
+impl NmeaLiveTemplate {
+    fn new(
+        talker: nmea0183::TalkerId,
+        sentence_type: nmea0183::SentenceType,
+        fields: Vec<String>,
+        nmea_checksum: NmeaChecksumMode,
+        include_millis: bool,
+    ) -> Self {
+        let mut template = Self {
+            talker,
+            sentence_type,
+            fields,
+            nmea_checksum,
+            include_millis,
+            wire_len_hint: 0,
+        };
+        // All substituted fields are fixed width. Render once at compile time
+        // so the send path does not stringify IDs or rescan fields for capacity.
+        template.wire_len_hint = template.render_at(chrono::Utc::now()).len();
+        template
+    }
+
+    fn wire_len_hint(&self) -> usize {
+        self.wire_len_hint
+    }
+
+    fn render_at(&self, now: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.wire_len_hint());
+        self.append_at(now, &mut out);
+        out
+    }
+
+    fn append_at(&self, now: chrono::DateTime<chrono::Utc>, out: &mut Vec<u8>) {
+        use chrono::{Datelike, Timelike};
+        use nmea0183::{NmeaSentence, TimeFieldKind};
+
+        let time_fields = self.sentence_type.time_fields();
+        let required_len = time_fields.last().map_or(self.fields.len(), |(index, _)| {
+            self.fields.len().max(index + 1)
+        });
+        let mut fields = self.fields.clone();
+        fields.resize(required_len, String::new());
+
+        for &(index, kind) in time_fields {
+            fields[index] = match kind {
+                TimeFieldKind::UtcTime if self.include_millis => format!(
+                    "{:02}{:02}{:02}.{:03}",
+                    now.hour(),
+                    now.minute(),
+                    now.second(),
+                    now.timestamp_subsec_millis()
+                ),
+                TimeFieldKind::UtcTime => {
+                    format!("{:02}{:02}{:02}", now.hour(), now.minute(), now.second())
+                }
+                TimeFieldKind::DateDdmmyy => {
+                    format!("{:02}{:02}{:02}", now.day(), now.month(), now.year() % 100)
+                }
+                TimeFieldKind::Day => format!("{:02}", now.day()),
+                TimeFieldKind::Month => format!("{:02}", now.month()),
+                TimeFieldKind::Year => format!("{:04}", now.year()),
+            };
+        }
+
+        let sentence = NmeaSentence::new(self.talker.clone(), self.sentence_type.clone(), fields);
+        out.extend_from_slice(sentence.to_wire_with(self.nmea_checksum.into()).as_bytes());
     }
 }
 
@@ -453,7 +617,21 @@ fn compile_nmea(
     fields: &[String],
     nmea_checksum: NmeaChecksumMode,
 ) -> anyhow::Result<Vec<u8>> {
-    use nmea0183::{NmeaSentence, SentenceType, TalkerId};
+    let (talker_id, parsed_type) = parse_nmea_identity(talker, sentence_type)?;
+    Ok(compile_parsed_nmea(
+        talker_id,
+        parsed_type,
+        fields,
+        nmea_checksum,
+    ))
+}
+
+fn parse_nmea_identity(
+    talker: &str,
+    sentence_type: &str,
+) -> anyhow::Result<(nmea0183::TalkerId, nmea0183::SentenceType)> {
+    use nmea0183::{SentenceType, TalkerId};
+
     // Arbitrary (non-standard) talker IDs and sentence types are a feature —
     // unknown strings parse into the enums' `Custom` variants. But characters
     // with structural meaning in NMEA framing would corrupt the sentence
@@ -472,13 +650,48 @@ fn compile_nmea(
     let st: SentenceType = sentence_type
         .parse()
         .expect("SentenceType parse is infallible");
-    let sentence = NmeaSentence::new(talker_id, st, fields.to_vec());
-    Ok(sentence.to_wire_with(nmea_checksum.into()).into_bytes())
+    Ok((talker_id, st))
+}
+
+fn compile_parsed_nmea(
+    talker: nmea0183::TalkerId,
+    sentence_type: nmea0183::SentenceType,
+    fields: &[String],
+    nmea_checksum: NmeaChecksumMode,
+) -> Vec<u8> {
+    nmea0183::NmeaSentence::new(talker, sentence_type, fields.to_vec())
+        .to_wire_with(nmea_checksum.into())
+        .into_bytes()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Timelike};
+
+    fn utc_at(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+        second: u32,
+        millis: u32,
+    ) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc
+            .with_ymd_and_hms(year, month, day, hour, minute, second)
+            .unwrap()
+            .with_nanosecond(millis * 1_000_000)
+            .unwrap()
+    }
+
+    fn parse_rendered_nmea(
+        message: &CompiledMessage,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> nmea0183::NmeaSentence {
+        let wire = String::from_utf8(message.render_at(at)).unwrap();
+        nmea0183::NmeaSentence::parse(&wire).unwrap()
+    }
 
     // ── RawHex ────────────────────────────────────────────────────────────────
 
@@ -771,6 +984,125 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_rmc_replaces_only_known_fields_on_each_render() {
+        let typed = vec![
+            "typed-time",
+            "A",
+            "4916.45",
+            "N",
+            "12311.12",
+            "W",
+            "0.5",
+            "54.7",
+            "typed-date",
+            "",
+            "A",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let message = MessageConfig::new(
+            PayloadConfig::nmea_live("GP", "RMC", typed.clone(), false),
+            1000,
+        )
+        .compile()
+        .unwrap();
+
+        let first = parse_rendered_nmea(&message, utc_at(2026, 7, 17, 12, 34, 56, 789));
+        let second = parse_rendered_nmea(&message, utc_at(2026, 7, 18, 1, 2, 3, 4));
+
+        let mut expected_first = typed.clone();
+        expected_first[0] = "123456".to_string();
+        expected_first[8] = "170726".to_string();
+        assert_eq!(first.fields, expected_first);
+
+        let mut expected_second = typed;
+        expected_second[0] = "010203".to_string();
+        expected_second[8] = "180726".to_string();
+        assert_eq!(second.fields, expected_second);
+    }
+
+    #[test]
+    fn live_time_milliseconds_are_opt_in() {
+        let without =
+            MessageConfig::new(PayloadConfig::nmea_live("GP", "GGA", vec![], false), 1000)
+                .compile()
+                .unwrap();
+        let with = MessageConfig::new(PayloadConfig::nmea_live("GP", "GGA", vec![], true), 1000)
+            .compile()
+            .unwrap();
+        let at = utc_at(2026, 7, 17, 1, 2, 3, 45);
+
+        assert_eq!(parse_rendered_nmea(&without, at).field(0), Some("010203"));
+        assert_eq!(parse_rendered_nmea(&with, at).field(0), Some("010203.045"));
+    }
+
+    #[test]
+    fn prepended_timestamp_and_live_nmea_use_the_same_instant() {
+        let message = MessageConfig {
+            payload: PayloadConfig::nmea_live("GP", "GGA", vec![], true),
+            interval_ms: 1000,
+            timestamp: Some(TimestampConfig {
+                include_millis: true,
+                ..Default::default()
+            }),
+            checksum: None,
+        }
+        .compile()
+        .unwrap();
+        let wire = String::from_utf8(message.render_at(utc_at(2026, 7, 17, 1, 2, 3, 45))).unwrap();
+
+        assert!(
+            wire.starts_with("01:02:03.045$GPGGA,010203.045*"),
+            "wire was {wire:?}"
+        );
+    }
+
+    #[test]
+    fn live_rmc_extends_short_field_list_through_date() {
+        let message =
+            MessageConfig::new(PayloadConfig::nmea_live("GN", "RMC", vec![], false), 1000)
+                .compile()
+                .unwrap();
+        let sentence = parse_rendered_nmea(&message, utc_at(2026, 12, 3, 4, 5, 6, 0));
+
+        assert_eq!(sentence.fields.len(), 9);
+        assert_eq!(sentence.field(0), Some("040506"));
+        assert!(sentence.fields[1..8].iter().all(String::is_empty));
+        assert_eq!(sentence.field(8), Some("031226"));
+    }
+
+    #[test]
+    fn bare_live_zda_emits_complete_utc_date_and_time() {
+        let message = MessageConfig::new(PayloadConfig::nmea_live("GP", "ZDA", vec![], true), 1000)
+            .compile()
+            .unwrap();
+        let sentence = parse_rendered_nmea(&message, utc_at(2026, 7, 9, 1, 2, 3, 7));
+
+        assert_eq!(sentence.fields, ["010203.007", "09", "07", "2026"]);
+    }
+
+    #[test]
+    fn unsupported_live_time_sentence_fails_preflight() {
+        for sentence_type in ["HDT", "CUSTOM"] {
+            let message = MessageConfig::new(
+                PayloadConfig::nmea_live("GP", sentence_type, vec![], false),
+                1000,
+            );
+            let error = format!("{:#}", message.compile().unwrap_err());
+            assert!(error.contains("no defined live UTC fields"), "{error}");
+            assert!(error.contains(sentence_type), "{error}");
+        }
+    }
+
+    #[test]
+    fn old_nmea_profile_defaults_live_time_flags_off() {
+        let json = r#"{"type":"nmea","talker":"GP","sentence_type":"GGA","fields":[]}"#;
+        let payload: PayloadConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(payload, PayloadConfig::nmea("GP", "GGA", vec![]));
+    }
+
     // ── MessageConfig / CompiledMessage ───────────────────────────────────────
 
     #[test]
@@ -905,6 +1237,7 @@ mod tests {
                 code_page: CodePage::Windows1252,
             },
             PayloadConfig::nmea("GP", "GGA", vec!["f".to_string()]),
+            PayloadConfig::nmea_live("GN", "RMC", vec![], true),
         ] {
             let json = serde_json::to_string(&p).unwrap();
             let back: PayloadConfig = serde_json::from_str(&json).unwrap();

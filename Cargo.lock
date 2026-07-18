@@ -2040,6 +2040,7 @@ dependencies = [
  "eframe",
  "egui",
  "fs4",
+ "nmea0183",
  "rfd",
  "serde",
  "serialport",

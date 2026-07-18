@@ -207,6 +207,50 @@ pub enum SentenceType {
     Custom(String),
 }
 
+/// A date/time value carried by one field of a standard NMEA sentence.
+///
+/// Field positions returned by [`SentenceType::time_fields`] are zero-based
+/// indices into [`NmeaSentence::fields`](crate::NmeaSentence::fields): the
+/// talker ID and sentence mnemonic are not fields.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimeFieldKind {
+    /// UTC time of day as `hhmmss` with an optional fractional suffix.
+    UtcTime,
+    /// UTC calendar date as `ddmmyy`.
+    DateDdmmyy,
+    /// UTC day of month as `dd`.
+    Day,
+    /// UTC month as `mm`.
+    Month,
+    /// Four-digit UTC year as `yyyy`.
+    Year,
+}
+
+impl TimeFieldKind {
+    /// Short user-facing description suitable for a field-substitution hint.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::UtcTime => "UTC time",
+            Self::DateDdmmyy => "UTC date (ddmmyy)",
+            Self::Day => "UTC day",
+            Self::Month => "UTC month",
+            Self::Year => "UTC year",
+        }
+    }
+}
+
+const TIME_AT_0: &[(usize, TimeFieldKind)] = &[(0, TimeFieldKind::UtcTime)];
+const GLL_TIME_FIELDS: &[(usize, TimeFieldKind)] = &[(4, TimeFieldKind::UtcTime)];
+const RMC_TIME_FIELDS: &[(usize, TimeFieldKind)] =
+    &[(0, TimeFieldKind::UtcTime), (8, TimeFieldKind::DateDdmmyy)];
+const ZDA_TIME_FIELDS: &[(usize, TimeFieldKind)] = &[
+    (0, TimeFieldKind::UtcTime),
+    (1, TimeFieldKind::Day),
+    (2, TimeFieldKind::Month),
+    (3, TimeFieldKind::Year),
+];
+
 /// All standard sentence-type mnemonics in this enum, in declaration order.
 /// Intended for UIs that want to present every option (e.g. a filterable
 /// dropdown). Does not include the `Custom(String)` variant.
@@ -335,6 +379,32 @@ pub const ALL_WITH_DESC: &[(&str, &str)] = &[
 ];
 
 impl SentenceType {
+    /// Date/time fields whose typed values may be replaced by a caller's live
+    /// UTC instant. The table follows the stable field positions published for
+    /// these sentence types; an empty slice means no live-time substitution is
+    /// defined, not that the sentence can never contain a time-like value.
+    pub const fn time_fields(&self) -> &'static [(usize, TimeFieldKind)] {
+        match self {
+            // First data field is UTC. ASHR is the known `$PASHR` construction;
+            // GRS, ZFO, and ZTG are included explicitly rather than inferred
+            // from their names so additions remain reviewable.
+            Self::ASHR
+            | Self::BWC
+            | Self::BWR
+            | Self::GBS
+            | Self::GGA
+            | Self::GNS
+            | Self::GRS
+            | Self::GST
+            | Self::ZFO
+            | Self::ZTG => TIME_AT_0,
+            Self::GLL => GLL_TIME_FIELDS,
+            Self::RMC => RMC_TIME_FIELDS,
+            Self::ZDA => ZDA_TIME_FIELDS,
+            _ => &[],
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         match self {
             Self::AAM => "AAM",
@@ -693,5 +763,47 @@ mod tests {
         let t: SentenceType = "FOO".parse().unwrap();
         assert_eq!(t, SentenceType::Custom("FOO".to_string()));
         assert_eq!(t.to_string(), "FOO");
+    }
+
+    #[test]
+    fn live_time_field_map_is_explicit_and_complete_for_supported_types() {
+        use TimeFieldKind::{DateDdmmyy, Day, Month, UtcTime, Year};
+
+        let cases: &[(SentenceType, &[(usize, TimeFieldKind)])] = &[
+            (SentenceType::ASHR, &[(0, UtcTime)]),
+            (SentenceType::BWC, &[(0, UtcTime)]),
+            (SentenceType::BWR, &[(0, UtcTime)]),
+            (SentenceType::GBS, &[(0, UtcTime)]),
+            (SentenceType::GGA, &[(0, UtcTime)]),
+            (SentenceType::GLL, &[(4, UtcTime)]),
+            (SentenceType::GNS, &[(0, UtcTime)]),
+            (SentenceType::GRS, &[(0, UtcTime)]),
+            (SentenceType::GST, &[(0, UtcTime)]),
+            (SentenceType::RMC, &[(0, UtcTime), (8, DateDdmmyy)]),
+            (
+                SentenceType::ZDA,
+                &[(0, UtcTime), (1, Day), (2, Month), (3, Year)],
+            ),
+            (SentenceType::ZFO, &[(0, UtcTime)]),
+            (SentenceType::ZTG, &[(0, UtcTime)]),
+        ];
+
+        for (sentence, expected) in cases {
+            assert_eq!(sentence.time_fields(), *expected, "{sentence}");
+        }
+        assert!(SentenceType::Custom("ZZZ".into()).time_fields().is_empty());
+        assert!(SentenceType::HDT.time_fields().is_empty());
+    }
+
+    #[test]
+    fn every_time_field_map_is_sorted_and_has_unique_positions() {
+        for code in ALL {
+            let sentence: SentenceType = code.parse().unwrap();
+            let fields = sentence.time_fields();
+            assert!(
+                fields.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "{code} time-field positions are not strictly increasing: {fields:?}"
+            );
+        }
     }
 }

@@ -802,6 +802,44 @@ doesn't expose. The full-pipeline-per-connection cost is acknowledged as paying 
 recording-readiness and §16.2 independence, not for visibility; a lighter
 per-connection pipeline is an option if promotion is far off.
 
+## ADR-025 — NMEA construction returns for presentation-only ZDA Marks
+
+**Status:** Accepted 2026-07-17 (spec v2.2).
+
+**Context:** ADR-010 removed protocol decoding and Listener's `nmea0183` dependency,
+correctly preserving a byte-stream-only receive path. Timestamped Marks now need an
+optional interoperable ZDA form, while user-configured separators may contain CR/LF.
+The existing renderer treated annotation text as column-neutral, and `After` anchored
+at the first match byte, so a multiline or multi-byte-match annotation could corrupt
+layout or split the match.
+
+**Decision:** `MarkTimestamp` gains an additive style: `Plain` keeps compact local
+time; `NmeaZda { talker }` constructs
+`$<talker>ZDA,<UTC time>,<dd>,<mm>,<yyyy>,<local-zone-hours>,<minutes>*XX` through
+`nmea0183`, strips only its trailing CRLF, then appends the configured separator
+verbatim. Milliseconds are optional. Two-character talkers are standard; custom IDs
+of 1–32 printable ASCII characters are allowed, while whitespace/control characters
+and `$ ! , *` are rejected before Start. IDs longer than two are explicitly custom
+ZDA-shaped output.
+
+Listener depends on `nmea0183` for construction only. It never parses, validates,
+frames, or interprets received bytes as NMEA. ZDA UTC fields use chunk arrival wall
+time; zone fields carry the local offset when representable by the conventional ZDA
+range, otherwise remain empty. No CR/LF is injected by the style itself; separators
+remain the user's line-layout control.
+
+All display renderers now consume explicit CR/LF in annotation text and reset their
+wrap, tab-column, or Hex-cell continuation state. A `Before` annotation anchors on the
+match's first byte and `After` on its final byte; diagnostic offsets continue to name
+the first byte. `.raw` is never changed.
+
+**Consequences:** Existing profiles default to `Plain` with no schema-version bump.
+ZDA output is checksum-bearing and identical in the live view and `.disp`, including
+newline separators. Construction happens only when a configured Mark fires, not for
+ordinary chunks. Tests pin long custom IDs, unsafe-ID validation, UTC/date and zone
+formatting, checksum validity, multiline renderer state, complete-match anchoring,
+profile round trips, and byte-exact Raw recording.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

@@ -29,12 +29,13 @@ use super::snapshot::{
     QueueDepth, StreamDelta,
 };
 use crate::config::{
-    DiskGuard, DiskThreshold, LowDiskAction, MarkPosition, MatchAction, MatchRule, RecordControl,
-    RecordTarget,
+    DiskGuard, DiskThreshold, LowDiskAction, MarkPosition, MarkTimestampStyle, MatchAction,
+    MatchRule, RecordControl, RecordTarget,
 };
 
 use crate::core::{
-    ChannelId, ChunkTime, DisplayViewId, MatchRuleId, RecordingState, RecordingTap, RuntimeEvent,
+    zda_sentence, ChannelId, ChunkTime, DisplayViewId, MatchRuleId, RecordingState, RecordingTap,
+    RuntimeEvent,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticLog};
 use crate::display::{
@@ -49,11 +50,11 @@ use crate::transport::{ReceivedData, TransportNotice};
 
 use super::queue::DropOldestQueue;
 
-/// An inline Mark timestamp produced by a firing this chunk (§50.2): the **absolute**
-/// stream offset of the matched byte, whether the timestamp goes before it, and the
-/// already-formatted local text. The pipeline rebases the offset onto the current
-/// chunk for the `.disp` render and ships the same text to the snapshot for the live
-/// view.
+/// An inline Mark annotation produced by a firing this chunk (§50.2): the
+/// **absolute** stream-space anchor (first match byte for `Before`, final byte for
+/// `After`), its placement around that byte, and already-formatted text. The
+/// pipeline rebases the anchor onto the current chunk for `.disp` and ships the
+/// same text to the snapshot for the live view.
 #[derive(Clone, Debug)]
 struct MarkAnnotation {
     offset: u64,
@@ -62,10 +63,10 @@ struct MarkAnnotation {
 }
 
 /// Rebase this chunk's Mark annotations (absolute offsets) onto within-chunk byte
-/// offsets for the `.disp` render. An annotation whose match began in a *prior* chunk
-/// (a boundary split — absolute offset < `chunk_offset`) cannot be spliced into this
-/// chunk's already-anchored render and is dropped from `.disp`; it still reaches the
-/// snapshot/live view via `TriggeredMatch`. Offsets past the chunk are ignored.
+/// offsets for the `.disp` render. An anchor in a *prior* chunk (for example a
+/// `Before` annotation on a boundary-split match) cannot be spliced into this
+/// chunk's already-recorded text and is dropped from `.disp`; an `After` anchor on
+/// the completing byte still lands. Offsets past the chunk are ignored.
 fn render_annotations_for_chunk(
     marks: &[MarkAnnotation],
     chunk_offset: u64,
@@ -606,7 +607,7 @@ impl ChannelPipeline {
     /// (`None` for an idle firing); a boundary-split firing also records the
     /// where/why measurement diagnostic.
     ///
-    /// Returns the inline **Mark timestamp annotations** produced this chunk (absolute
+    /// Returns the inline **Mark annotations** produced this chunk (absolute
     /// stream offsets), which the caller splices into the `.disp` render. `arrival` is
     /// the chunk's arrival time — the source of a Mark timestamp (§50.2).
     /// `view_base`/`chunk_offset` translate each firing's stream offset into view
@@ -622,7 +623,7 @@ impl ChannelPipeline {
         let mut annotations = Vec::new();
         for rule in fired {
             let byte_offset = rule.match_offset;
-            // The matched byte's position in view space (§50): stream offsets count
+            // The match-start byte's position in view space (§50): stream offsets count
             // every received byte, but the view skips bytes that arrived while
             // paused, so the spaces diverge after any pause — translate here so the
             // live viewer's Mark splice stays aligned. A boundary-split match can
@@ -661,25 +662,57 @@ impl ChannelPipeline {
                             format!("match rule fired on channel {}{where_}", self.channel_id),
                         ));
                     }
-                    // A timestamped Mark splices the inline local arrival time; a bare
-                    // Mark writes the `‹MARK …›` marker line (§50.2). Both only ever
-                    // touch the display and `.disp`, never `.raw` (§5.6/§49).
+                    // A timestamped Mark splices either compact local time or a ZDA
+                    // annotation; a bare Mark writes the `‹MARK …›` marker line
+                    // (§50.2). Both only ever touch display and `.disp`, never `.raw`.
                     MatchAction::Mark {
                         timestamp: Some(ts),
                     } => {
                         if let Some(offset) = byte_offset {
                             let before = matches!(ts.position, MarkPosition::Before);
-                            // The separator trails the timestamp in both positions
-                            // (`[ts][sep]match…` / `…match[ts][sep]`), keeping the
-                            // time visually apart from the adjacent data (§50.2).
-                            let text =
-                                format!("{}{}", ts.format.format(arrival.wall_clock), ts.separator);
-                            annotations.push(MarkAnnotation {
-                                offset,
-                                before,
-                                text: text.clone(),
-                            });
-                            mark_render = Some(MarkRender { text, before });
+                            let anchor_offset = if before {
+                                Some(offset)
+                            } else {
+                                offset.checked_add(rule.match_len.saturating_sub(1) as u64)
+                            };
+                            let rendered = match &ts.style {
+                                MarkTimestampStyle::Plain => ts.format.format(arrival.wall_clock),
+                                MarkTimestampStyle::NmeaZda { talker } => {
+                                    match zda_sentence(
+                                        talker,
+                                        arrival.wall_clock,
+                                        ts.format.include_millis,
+                                    ) {
+                                        Ok(text) => text,
+                                        Err(error) => {
+                                            self.diagnostics.record(Diagnostic::error(format!(
+                                                "could not render NMEA ZDA Mark on channel {}: {error}",
+                                                self.channel_id
+                                            )));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            };
+                            // The configured separator is verbatim and may include
+                            // line breaks; StreamRenderer updates its row/column state
+                            // while splicing it into every display mode.
+                            let text = format!("{rendered}{}", ts.separator);
+                            if let Some(anchor_offset) = anchor_offset {
+                                let anchor_view_offset = view_base.and_then(|base| {
+                                    (base + anchor_offset).checked_sub(chunk_offset)
+                                });
+                                annotations.push(MarkAnnotation {
+                                    offset: anchor_offset,
+                                    before,
+                                    text: text.clone(),
+                                });
+                                mark_render = Some(MarkRender {
+                                    text,
+                                    before,
+                                    view_offset: anchor_view_offset,
+                                });
+                            }
                         }
                     }
                     MatchAction::Mark { timestamp: None } => self.write_mark(rule.id, byte_offset),
@@ -2322,6 +2355,7 @@ mod tests {
         let mark = MatchAction::Mark {
             timestamp: Some(MarkTimestamp {
                 position: MarkPosition::Before,
+                style: Default::default(),
                 format: TimestampConfig::default(), // HH:MM:SS
                 separator: String::new(),
             }),
@@ -2365,6 +2399,7 @@ mod tests {
         let mark = MatchAction::Mark {
             timestamp: Some(MarkTimestamp {
                 position: MarkPosition::Before,
+                style: Default::default(),
                 format: TimestampConfig::default(), // HH:MM:SS
                 separator: ", ".to_string(),
             }),
@@ -2775,6 +2810,7 @@ mod tests {
         let mark = |sep: &str| MatchAction::Mark {
             timestamp: Some(MarkTimestamp {
                 position: MarkPosition::Before,
+                style: Default::default(),
                 format: TimestampConfig::default(), // HH:MM:SS
                 separator: sep.to_string(),
             }),
@@ -2796,6 +2832,94 @@ mod tests {
             "the lower-offset rule's timestamp splices too: {disp_written:?}"
         );
         assert!(disp_written.contains("|z|ZZ"), "{disp_written:?}");
+        let _ = tokio::fs::remove_file(&disp_path).await;
+    }
+
+    #[tokio::test]
+    async fn after_mark_splices_after_the_complete_multibyte_match() {
+        use crate::config::{MarkPosition, MarkTimestamp};
+        use crate::core::TimestampConfig;
+        use crate::record::{start_display_recording, DisplayFileRecorder};
+
+        let cid = ChannelId::new();
+        let disp_path = temp_path("after-complete-match");
+        let disp = DisplayFileRecorder::create(&disp_path, OverwritePolicy::Refuse)
+            .await
+            .unwrap();
+        let mark = MatchAction::Mark {
+            timestamp: Some(MarkTimestamp {
+                position: MarkPosition::After,
+                style: Default::default(),
+                format: TimestampConfig::default(),
+                separator: "|".to_string(),
+            }),
+        };
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&[byte_rule(
+            "abc",
+            b"ABC",
+            vec![mark],
+        )]);
+        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+
+        p.ingest(bytes_chunk(cid, b"xABCy"));
+        let snapshot = p.snapshot();
+        p.finish().await;
+
+        let mark = snapshot.matches[0].mark.as_ref().unwrap();
+        assert_eq!(snapshot.matches[0].byte_offset, Some(1));
+        assert_eq!(snapshot.matches[0].view_offset, Some(1));
+        assert_eq!(mark.view_offset, Some(3));
+        let written = tokio::fs::read_to_string(&disp_path).await.unwrap();
+        assert!(
+            written.starts_with("xABC"),
+            "after mark split the match: {written:?}"
+        );
+        assert!(
+            written.contains('|'),
+            "timestamp separator missing: {written:?}"
+        );
+        let _ = tokio::fs::remove_file(&disp_path).await;
+    }
+
+    #[tokio::test]
+    async fn after_mark_on_a_boundary_split_lands_in_the_completing_chunk() {
+        use crate::config::{MarkPosition, MarkTimestamp};
+        use crate::core::TimestampConfig;
+        use crate::record::{start_display_recording, DisplayFileRecorder};
+
+        let cid = ChannelId::new();
+        let disp_path = temp_path("after-boundary-match");
+        let disp = DisplayFileRecorder::create(&disp_path, OverwritePolicy::Refuse)
+            .await
+            .unwrap();
+        let mark = MatchAction::Mark {
+            timestamp: Some(MarkTimestamp {
+                position: MarkPosition::After,
+                style: Default::default(),
+                format: TimestampConfig::default(),
+                separator: "|".to_string(),
+            }),
+        };
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&[byte_rule(
+            "abc",
+            b"ABC",
+            vec![mark],
+        )]);
+        p.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+
+        p.ingest(bytes_chunk(cid, b"xAB"));
+        p.ingest(bytes_chunk(cid, b"Cy"));
+        p.finish().await;
+
+        let written = tokio::fs::read_to_string(&disp_path).await.unwrap();
+        assert!(
+            written.starts_with("xABC"),
+            "split match was not kept whole: {written:?}"
+        );
+        assert!(
+            written.contains('|'),
+            "boundary mark was dropped: {written:?}"
+        );
         let _ = tokio::fs::remove_file(&disp_path).await;
     }
 
@@ -2939,6 +3063,7 @@ mod tests {
         let mark = MatchAction::Mark {
             timestamp: Some(MarkTimestamp {
                 position: MarkPosition::Before,
+                style: Default::default(),
                 format: TimestampConfig::default(), // HH:MM:SS
                 separator: String::new(),
             }),
@@ -2977,6 +3102,71 @@ mod tests {
             .expect("mark render in snapshot");
         assert!(mark.before);
         assert_eq!(mark.text, ts);
+
+        let _ = tokio::fs::remove_file(&raw_path).await;
+        let _ = tokio::fs::remove_file(&disp_path).await;
+    }
+
+    #[tokio::test]
+    async fn zda_mark_splices_valid_custom_sentence_and_newline_only_into_display() {
+        use crate::config::{MarkPosition, MarkTimestamp, MarkTimestampStyle};
+        use crate::core::{zda_sentence, TimestampConfig};
+        use crate::record::{start_display_recording, DisplayFileRecorder};
+
+        let cid = ChannelId::new();
+        let raw_path = temp_path("zda-mark-raw");
+        let disp_path = temp_path("zda-mark-disp");
+        let raw = RawFileRecorder::create(&raw_path, OverwritePolicy::Refuse, false)
+            .await
+            .unwrap();
+        let disp = DisplayFileRecorder::create(&disp_path, OverwritePolicy::Refuse)
+            .await
+            .unwrap();
+        let mark = MatchAction::Mark {
+            timestamp: Some(MarkTimestamp {
+                position: MarkPosition::Before,
+                style: MarkTimestampStyle::NmeaZda {
+                    talker: "RECEIVER_A".to_string(),
+                },
+                format: TimestampConfig {
+                    include_millis: true,
+                    ..Default::default()
+                },
+                separator: "\r\n".to_string(),
+            }),
+        };
+        let mut pipeline = pipeline(cid, PipelineCapacities::default())
+            .with_raw_recorder(start_raw_recording(raw, 64))
+            .with_match_rules(&[byte_rule("zda", b"$GP", vec![mark])]);
+        pipeline.set_display_recorder(DisplayView::default(), start_display_recording(disp, 64));
+        let arrival = ChunkTime {
+            monotonic: Instant::now(),
+            wall_clock: std::time::UNIX_EPOCH + Duration::from_millis(1_784_282_096_789),
+        };
+        pipeline.ingest(ReceivedData {
+            channel_id: cid,
+            payload: ReceivedPayload::Bytes(b"xx$GPGGA,1".to_vec()),
+            received_at: arrival,
+        });
+        let snapshot = pipeline.snapshot();
+        pipeline.finish().await;
+
+        assert_eq!(tokio::fs::read(&raw_path).await.unwrap(), b"xx$GPGGA,1");
+        let annotation = format!(
+            "{}\r\n",
+            zda_sentence("RECEIVER_A", arrival.wall_clock, true).unwrap()
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&disp_path).await.unwrap(),
+            format!("xx{annotation}$GPGGA,1")
+        );
+        let mark = snapshot
+            .matches
+            .iter()
+            .find_map(|matched| matched.mark.as_ref())
+            .expect("ZDA mark render in snapshot");
+        assert_eq!(mark.text, annotation);
+        nmea0183::NmeaSentence::parse(mark.text.trim_end_matches(['\r', '\n'])).unwrap();
 
         let _ = tokio::fs::remove_file(&raw_path).await;
         let _ = tokio::fs::remove_file(&disp_path).await;

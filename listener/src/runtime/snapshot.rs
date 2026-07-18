@@ -196,10 +196,9 @@ pub struct ChannelSnapshot {
 /// and of any rule's trigger; `Notify` also lands in diagnostics and every firing
 /// emits a `MatchTriggered` event.
 ///
-/// When the firing was a `Mark` carrying an inline timestamp, `mark` holds the
-/// formatted local arrival timestamp and where it goes relative to the match, so a
-/// live viewer can splice it into the rendered stream (§50.2) exactly as the
-/// Display Recording does.
+/// When the firing was a `Mark` carrying an inline annotation, `mark` holds the
+/// formatted local time or NMEA ZDA text and its exact anchor, so a live viewer can
+/// splice it into the rendered stream (§50.2) exactly as Display Recording does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TriggeredMatch {
     pub rule_id: MatchRuleId,
@@ -211,20 +210,25 @@ pub struct TriggeredMatch {
     /// The same byte's offset in the **view (scrollback) space** — the space
     /// `StreamDelta`/`stream_end_offset` use, which skips bytes received while
     /// the view was paused (§50), so it can lag `byte_offset` after a pause.
-    /// The live viewer anchors inline Mark timestamps here. `None` when the
-    /// byte never entered the view (it arrived while paused) or for `Idle`.
+    /// This remains the diagnostic match-start position; an inline Mark uses
+    /// `MarkRender::view_offset`, which may be the match's final byte. `None`
+    /// when the byte never entered the view (it arrived while paused) or for `Idle`.
     pub view_offset: Option<u64>,
     #[allow(clippy::doc_markdown)]
     pub mark: Option<MarkRender>,
 }
 
-/// The inline timestamp a `Mark` firing contributes to the rendered display and
-/// Display Recording (§50.2). `text` is already formatted in local time; `before`
-/// is its placement relative to the matched byte at `TriggeredMatch::byte_offset`.
+/// The inline annotation a `Mark` firing contributes to the rendered display and
+/// Display Recording (§50.2). `text` is already formatted; `before` is its
+/// placement around the byte at `view_offset`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkRender {
     pub text: String,
     pub before: bool,
+    /// Absolute view-space offset of the byte the annotation is attached to.
+    /// This is the match's first byte for `Before` and final byte for `After`.
+    /// `None` when the matched bytes did not enter the paused view.
+    pub view_offset: Option<u64>,
 }
 
 /// One Display View's snapshot: its identity and pause state (§50). The viewed

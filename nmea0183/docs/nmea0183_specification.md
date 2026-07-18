@@ -13,11 +13,14 @@
 
 `nmea0183` handles NMEA 0183 sentence construction, parsing, checksum, talker IDs,
 proprietary sentences (`$PRDID`, `$PASHR`, arbitrary `$P`), and AIS sentences
-(`!AIVDM`/`!AIVDO` with 6-bit payload armoring). It has no dependency on `talker`.
+(`!AIVDM`/`!AIVDO` with 6-bit payload armoring). `SentenceType::time_fields()`
+exposes the explicit zero-based time/date field positions applications need for
+live UTC substitution (ADR-028). The crate has no dependency on either application.
 
 ## To document here
 
-- [ ] Public API surface: sentence types, `TalkerId`, `ProprietarySentence`, `AisSentence`.
+- [ ] Public API surface: sentence types and `TimeFieldKind`, `TalkerId`,
+      `ProprietarySentence`, `AisSentence`.
 - [ ] Checksum semantics (inline XOR; `$PRDID` carries none by convention).
 - [ ] Extensibility model (`Custom(String)` variants) — cross-reference ADR-009.
 - [ ] `serde` feature gating.

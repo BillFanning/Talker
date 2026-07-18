@@ -1,7 +1,16 @@
 # Talker — Program Specification
-**Version:** 2.1.1
+**Version:** 2.2
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
+
+Revision v2.2 (live UTC fields in NMEA payloads):
+
+- **§5.1 / §6.4 live NMEA time (ADR-029)** — an NMEA message may replace the
+  known time/date fields for its sentence type at every send. UTC time is
+  `hhmmss` or `hhmmss.sss`; RMC/ZDA calendar fields use their protocol widths.
+  Short typed field lists are extended, the internal NMEA checksum is regenerated,
+  and unsupported sentence types fail preflight instead of silently staying static.
+- The two profile fields are additive and default off; profile `version` remains 2.
 
 Revision v2.1.1 (corrections and doc-alignment; no behavior change):
 
@@ -341,7 +350,7 @@ Each channel has one or more messages. Messages within a channel share the same 
 | UTF-8 | Unicode text encoded as UTF-8 |
 | UTF-16 | Unicode text encoded as UTF-16; byte order (LE or BE) and optional BOM are user-configurable |
 | ASCII | Text encoded through a selected code page (see 5.2); characters the code page cannot encode compile to a visible `?` fallback byte (ADR-023) |
-| NMEA 0183 | Handled by the `nmea0183` crate (see Section 6) |
+| NMEA 0183 | Constructed by `nmea0183`; known UTC time/date fields may optionally refresh at every send (see §6.4) |
 
 All format selections are saved as part of a profile.
 
@@ -572,6 +581,29 @@ Additional named proprietary sentences may be added as requirements are identifi
 
 ---
 
+### 6.4 Live UTC Field Substitution
+
+An NMEA message may enable **Live time (UTC)**. At every send, Talker replaces only
+the positions declared by `SentenceType::time_fields()` and rebuilds the sentence's
+protocol checksum. The prepended message timestamp (§5.4), when enabled, and these
+NMEA fields use the same captured UTC instant.
+
+| Sentence types | Replaced fields (zero-based within the NMEA field list) |
+|----------------|---------------------------------------------------------|
+| `ASHR`, `BWC`, `BWR`, `GBS`, `GGA`, `GNS`, `GRS`, `GST`, `ZFO`, `ZTG` | 0 = UTC time |
+| `GLL` | 4 = UTC time |
+| `RMC` | 0 = UTC time; 8 = UTC date (`ddmmyy`) |
+| `ZDA` | 0 = UTC time; 1 = day; 2 = month; 3 = four-digit year |
+
+UTC time is `hhmmss` by default and `hhmmss.sss` when **Milliseconds** is enabled.
+Day and month are two digits. Typed values remain in the profile but are overridden
+on wire; if the typed list is short, empty fields are appended through the final
+mapped position. Correct/Omit/Wrong NMEA checksum modes retain their meaning after
+substitution. Enabling Live time for any standard or custom sentence with no mapping
+is a validation error and blocks Start/Apply.
+
+---
+
 ## 7. Checksum and CRC Support
 
 Checksums are configured per message (see Section 5.5). They are optional; the default is no checksum. This is entirely separate from the NMEA protocol checksum, which is handled by the `nmea0183` crate.
@@ -654,6 +686,8 @@ baud = 9600
   talker = "GP"
   sentence = "GGA"
   fields = ["143045.00", "4807.038", "N", "01131.000", "E"]
+  live_time = true
+  live_time_millis = true
   interval_ms = 1000
 
   [channels.messages.timestamp]

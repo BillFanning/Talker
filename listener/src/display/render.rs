@@ -79,6 +79,34 @@ impl CellWriter {
         self.out.push_str(s);
     }
 
+    /// Emit annotation text verbatim while honoring explicit line controls.
+    /// Single-line annotations remain one indivisible cell. A multiline
+    /// annotation resets wrap state at each CR/LF and keeps each line segment
+    /// intact rather than wrapping inside it.
+    fn annotation(&mut self, s: &str) {
+        if !s.contains(['\r', '\n']) {
+            self.cell_str(s);
+            return;
+        }
+        let mut start = 0;
+        for (i, c) in s.char_indices() {
+            if !matches!(c, '\r' | '\n') {
+                continue;
+            }
+            let segment = &s[start..i];
+            if !segment.is_empty() {
+                self.cell_str(segment);
+            }
+            self.out.push(c);
+            self.line_len = 0;
+            start = i + c.len_utf8();
+        }
+        let tail = &s[start..];
+        if !tail.is_empty() {
+            self.cell_str(tail);
+        }
+    }
+
     fn cell_char(&mut self, c: char) {
         self.start_cell(1);
         self.out.push(c);
@@ -175,56 +203,80 @@ fn split_run(
     (before, after)
 }
 
+/// Text after the final explicit line control, or `None` for single-line text.
+/// CRLF naturally resolves to the portion after LF.
+fn tail_after_line_control(text: &str) -> Option<&str> {
+    text.char_indices()
+        .rev()
+        .find(|(_, c)| matches!(c, '\r' | '\n'))
+        .map(|(i, c)| &text[i + c.len_utf8()..])
+}
+
+fn start_hex_cell(
+    out: &mut String,
+    cells_on_line: &mut usize,
+    per_line: Option<usize>,
+    separator: &str,
+) {
+    if *cells_on_line > 0 {
+        if per_line.is_some_and(|n| *cells_on_line >= n) {
+            out.push('\n');
+            *cells_on_line = 0;
+        } else {
+            out.push_str(separator);
+        }
+    }
+    *cells_on_line += 1;
+}
+
+fn push_hex_annotation(
+    out: &mut String,
+    cells_on_line: &mut usize,
+    per_line: Option<usize>,
+    separator: &str,
+    text: &str,
+) {
+    start_hex_cell(out, cells_on_line, per_line, separator);
+    out.push_str(text);
+    if let Some(tail) = tail_after_line_control(text) {
+        *cells_on_line = usize::from(!tail.is_empty());
+    }
+}
+
 /// Render bytes as Hex (§45): each byte as two uppercase hex digits, joined by
 /// `separator`. When `bytes_per_line` is `Some`, wrap to that many *cells* per
 /// line (annotation cells count, matching the old per-cell chunking).
 /// `annotations` are spliced as extra cells before/after their target byte.
 /// Emits directly into one pre-sized `String` — no per-byte allocation.
-/// `continuation` marks a *streaming* chunk that follows earlier output, so the
-/// first cell gets a leading separator instead of starting flush.
+/// `cells_on_line` carries streaming continuation state across chunks. An
+/// annotation ending in CR/LF resets it, so the next byte starts flush.
 fn render_hex(
     bytes: &[u8],
     separator: &str,
     bytes_per_line: Option<usize>,
     annotations: &[RenderAnnotation],
-    continuation: bool,
+    cells_on_line: &mut usize,
 ) -> String {
     let per_line = bytes_per_line.filter(|&n| n > 0);
     let mut walker = AnnotationWalker::new(annotations);
     let mut out = String::with_capacity(bytes.len() * (2 + separator.len()));
-    let mut cells_on_line = usize::from(continuation);
-    // Start a new cell: a newline once the line is full, else the separator.
-    let start_cell = |out: &mut String, cells_on_line: &mut usize| {
-        if *cells_on_line > 0 {
-            if per_line.is_some_and(|n| *cells_on_line >= n) {
-                out.push('\n');
-                *cells_on_line = 0;
-            } else {
-                out.push_str(separator);
-            }
-        }
-        *cells_on_line += 1;
-    };
     for (i, b) in bytes.iter().enumerate() {
         let (before, after) = split_run(walker.run_at(i));
         for s in before {
-            start_cell(&mut out, &mut cells_on_line);
-            out.push_str(s);
+            push_hex_annotation(&mut out, cells_on_line, per_line, separator, s);
         }
-        start_cell(&mut out, &mut cells_on_line);
+        start_hex_cell(&mut out, cells_on_line, per_line, separator);
         out.push(HEX_DIGITS[(b >> 4) as usize] as char);
         out.push(HEX_DIGITS[(b & 0xF) as usize] as char);
         for s in after {
-            start_cell(&mut out, &mut cells_on_line);
-            out.push_str(s);
+            push_hex_annotation(&mut out, cells_on_line, per_line, separator, s);
         }
     }
     // Annotations targeting the one-past-the-end offset (an `After` on the final byte
     // is handled above; a `Before` at len is a trailing mark) attach at the end.
     let (end_before, _) = split_run(walker.run_at(bytes.len()));
     for s in end_before {
-        start_cell(&mut out, &mut cells_on_line);
-        out.push_str(s);
+        push_hex_annotation(&mut out, cells_on_line, per_line, separator, s);
     }
     out
 }
@@ -264,12 +316,26 @@ fn render_rendered(
 ) -> String {
     let mut out = String::new();
     let mut walker = AnnotationWalker::new(annotations);
-    // Annotation strings are inserted verbatim (they don't shift the tab column
-    // accounting — a timestamp is presentation, not stream content).
+    let push_annotation = |out: &mut String, text: &str, col: &mut usize| {
+        out.push_str(text);
+        let Some(tail) = tail_after_line_control(text) else {
+            // Preserve the established single-line rule: presentation text does
+            // not shift the underlying stream's tab stops.
+            return;
+        };
+        *col = 0;
+        for c in tail.chars() {
+            match c {
+                '\t' => *col += 8 - (*col % 8),
+                c if is_special(c) && c != ' ' => {}
+                _ => *col += 1,
+            }
+        }
+    };
     for (c, offset) in decode_with_offsets(bytes, encoding) {
         let (before, after) = split_run(walker.run_at(offset));
         for s in before {
-            out.push_str(s);
+            push_annotation(&mut out, s, col);
         }
         match c {
             '\n' => {
@@ -299,14 +365,14 @@ fn render_rendered(
             }
         }
         for s in after {
-            out.push_str(s);
+            push_annotation(&mut out, s, col);
         }
     }
     // A trailing annotation at the one-past-end offset (e.g. an After on the final
     // byte lands above; a Before at len is a trailing mark).
     let (end_before, _) = split_run(walker.run_at(bytes.len()));
     for s in end_before {
-        out.push_str(s);
+        push_annotation(&mut out, s, col);
     }
     out
 }
@@ -375,12 +441,13 @@ impl DisplayView {
         match self.mode {
             DisplayMode::Hex => {
                 let bytes_per_line = wrap.then_some(self.hex_bytes_per_line);
+                let mut cells_on_line = 0;
                 render_hex(
                     bytes,
                     &self.hex_separator,
                     bytes_per_line,
                     annotations,
-                    false,
+                    &mut cells_on_line,
                 )
             }
             DisplayMode::Raw => {
@@ -392,16 +459,16 @@ impl DisplayView {
                 for (c, offset) in decode_with_offsets(bytes, self.encoding) {
                     let (before, after) = split_run(walker.run_at(offset));
                     for s in before {
-                        w.cell_str(s);
+                        w.annotation(s);
                     }
                     w.cell_rendered(c, self.character_rendering);
                     for s in after {
-                        w.cell_str(s);
+                        w.annotation(s);
                     }
                 }
                 let (end_before, _) = split_run(walker.run_at(bytes.len()));
                 for s in end_before {
-                    w.cell_str(s);
+                    w.annotation(s);
                 }
                 w.out
             }
@@ -440,8 +507,9 @@ pub struct StreamRenderer {
     pending: Vec<RenderAnnotation>,
     /// Rendered-mode terminal column, so tab stops survive chunk boundaries.
     col: usize,
-    /// Whether any Hex cell has been emitted — drives the joining separator.
-    hex_continuation: bool,
+    /// Number of Hex cells on the current output line. Explicit annotation
+    /// newlines reset it so the next chunk starts flush.
+    hex_cells_on_line: usize,
 }
 
 impl StreamRenderer {
@@ -451,7 +519,7 @@ impl StreamRenderer {
             carry: Vec::new(),
             pending: Vec::new(),
             col: 0,
-            hex_continuation: false,
+            hex_cells_on_line: 0,
         }
     }
 
@@ -516,17 +584,13 @@ impl StreamRenderer {
     /// as the one-shot renderer, threaded with this recording's state.
     fn render_slice(&mut self, bytes: &[u8], annotations: &[RenderAnnotation]) -> String {
         match self.view.mode {
-            DisplayMode::Hex => {
-                let text = render_hex(
-                    bytes,
-                    &self.view.hex_separator,
-                    None,
-                    annotations,
-                    self.hex_continuation,
-                );
-                self.hex_continuation = self.hex_continuation || !text.is_empty();
-                text
-            }
+            DisplayMode::Hex => render_hex(
+                bytes,
+                &self.view.hex_separator,
+                None,
+                annotations,
+                &mut self.hex_cells_on_line,
+            ),
             DisplayMode::Rendered => {
                 render_rendered(bytes, self.view.encoding, annotations, &mut self.col)
             }
@@ -536,16 +600,16 @@ impl StreamRenderer {
                 for (c, offset) in decode_with_offsets(bytes, self.view.encoding) {
                     let (before, after) = split_run(walker.run_at(offset));
                     for s in before {
-                        w.cell_str(s);
+                        w.annotation(s);
                     }
                     w.cell_rendered(c, self.view.character_rendering);
                     for s in after {
-                        w.cell_str(s);
+                        w.annotation(s);
                     }
                 }
                 let (end_before, _) = split_run(walker.run_at(bytes.len()));
                 for s in end_before {
-                    w.cell_str(s);
+                    w.annotation(s);
                 }
                 w.out
             }
@@ -699,6 +763,22 @@ mod tests {
         assert_eq!(v.render_text_annotated(b"ABC", &anns), "41 [T]\n42 43");
     }
 
+    #[test]
+    fn multiline_annotation_resets_raw_wrap_state() {
+        let mut v = view(DisplayMode::Raw, CharacterRendering::Native);
+        v.wrapping = WrappingMode::Wrap;
+        v.wrap_width = Some(4);
+        let anns = [ann(1, AnnotationPlacement::After, "X\n")];
+        assert_eq!(v.render_text_annotated(b"ABCD", &anns), "ABX\nCD");
+    }
+
+    #[test]
+    fn multiline_annotation_resets_rendered_tab_column() {
+        let v = view(DisplayMode::Rendered, CharacterRendering::Native);
+        let anns = [ann(0, AnnotationPlacement::After, "<T>\n")];
+        assert_eq!(v.render_text_annotated(b"a\tX", &anns), "a<T>\n        X");
+    }
+
     // --- StreamRenderer (ADR-018: the exact rendered stream) ---
 
     #[test]
@@ -777,6 +857,16 @@ mod tests {
         let mut out = r.render_chunk(b"ab", &[]);
         out.push_str(&r.render_chunk(b"\tX", &[]));
         assert_eq!(out, "ab      X"); // col 2 → tab to 8
+    }
+
+    #[test]
+    fn multiline_annotation_resets_hex_continuation_across_chunks() {
+        let v = view(DisplayMode::Hex, CharacterRendering::Native);
+        let mut r = StreamRenderer::new(v);
+        let anns = [ann(0, AnnotationPlacement::After, "<T>\r\n")];
+        let mut out = r.render_chunk(b"A", &anns);
+        out.push_str(&r.render_chunk(b"B", &[]));
+        assert_eq!(out, "41 <T>\r\n42");
     }
 
     #[test]

@@ -803,6 +803,50 @@ fn show_nmea_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
     });
     ui.end_row();
 
+    let sentence_type: nmea0183::SentenceType = entry
+        .nmea_sentence_type
+        .parse()
+        .expect("SentenceType parse is infallible");
+    let time_fields = sentence_type.time_fields();
+    let supports_live_time = !time_fields.is_empty();
+    ui.label("Time fields");
+    ui.horizontal(|ui| {
+        let live_before = entry.nmea_live_time;
+        let live_response = ui.add_enabled(
+            supports_live_time || entry.nmea_live_time,
+            egui::Checkbox::new(&mut entry.nmea_live_time, "Live time (UTC)"),
+        );
+        if supports_live_time {
+            let fields = time_fields
+                .iter()
+                .map(|(index, kind)| format!("field {}: {}", index + 1, kind.label()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            live_response.on_hover_text(format!(
+                "Refreshed at every send: {fields}. Typed values are retained in the profile but \
+                 overridden on the wire. Missing fields are added through the last live field."
+            ));
+        } else {
+            live_response
+                .on_hover_text("No live UTC field positions are defined for this sentence type.");
+        }
+        changed |= entry.nmea_live_time != live_before;
+
+        let millis_before = entry.nmea_live_millis;
+        ui.add_enabled(
+            supports_live_time && entry.nmea_live_time,
+            egui::Checkbox::new(&mut entry.nmea_live_millis, "Milliseconds"),
+        )
+        .on_hover_text("Use hhmmss.sss instead of hhmmss for live UTC time fields.");
+        changed |= entry.nmea_live_millis != millis_before;
+
+        if entry.nmea_live_time && !supports_live_time {
+            ui.colored_label(theme_palette(ui).fault_red, "Unsupported sentence type")
+                .on_hover_text("Turn Live time off or choose a sentence with defined UTC fields.");
+        }
+    });
+    ui.end_row();
+
     ui.label("Fields");
     let fields_r = ui.add(
         egui::TextEdit::singleline(&mut entry.nmea_fields)

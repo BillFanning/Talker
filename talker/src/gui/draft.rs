@@ -393,6 +393,8 @@ pub struct ScheduleDraft {
     pub nmea_sentence_type: String,
     pub nmea_fields: String, // comma-separated field values
     pub nmea_checksum_mode: NmeaChecksumMode,
+    pub nmea_live_time: bool,
+    pub nmea_live_millis: bool,
     /// True when `nmea_fields` was last set by the auto-prefill helper —
     /// not by the user typing. Lets the sentence-picker safely overwrite
     /// stale example fields when the user picks a new sentence type, but
@@ -439,6 +441,8 @@ impl Default for ScheduleDraft {
             nmea_sentence_type: String::new(),
             nmea_fields: String::new(),
             nmea_checksum_mode: NmeaChecksumMode::Correct,
+            nmea_live_time: false,
+            nmea_live_millis: false,
             nmea_fields_autofilled: false,
             nmea_talker_filter: String::new(),
             nmea_sentence_filter: String::new(),
@@ -493,12 +497,16 @@ impl From<&MessageConfig> for ScheduleDraft {
                 sentence_type,
                 fields,
                 nmea_checksum,
+                live_time,
+                live_time_millis,
             } => {
                 d.payload_kind = PayloadKind::Nmea;
                 d.nmea_talker = talker.clone();
                 d.nmea_sentence_type = sentence_type.clone();
                 d.nmea_fields = fields.join(",");
                 d.nmea_checksum_mode = *nmea_checksum;
+                d.nmea_live_time = *live_time;
+                d.nmea_live_millis = *live_time_millis;
             }
         }
         d.interval_ms = m.interval_ms.to_string();
@@ -561,6 +569,8 @@ impl ScheduleDraft {
                     sentence_type: self.nmea_sentence_type.clone(),
                     fields,
                     nmea_checksum: self.nmea_checksum_mode,
+                    live_time: self.nmea_live_time,
+                    live_time_millis: self.nmea_live_millis,
                 }
             }
         };
@@ -728,6 +738,14 @@ mod tests {
         message_round_trip(MessageConfig::new(
             PayloadConfig::nmea("GN", "RMC", vec![]),
             2000,
+        ));
+    }
+
+    #[test]
+    fn live_nmea_message_round_trip() {
+        message_round_trip(MessageConfig::new(
+            PayloadConfig::nmea_live("GN", "RMC", vec!["typed".to_string()], true),
+            250,
         ));
     }
 

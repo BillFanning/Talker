@@ -24,6 +24,10 @@ path = "src/bin/listener-gui.rs"
 # Shared GUI chrome: fonts, palette, base style (ADR-019)
 wiredata-ui = { path = "../wiredata-ui" }
 
+# Presentation-only construction of inline NMEA ZDA Mark annotations (ADR-025).
+# Listener remains stream-only: received bytes are never decoded as NMEA.
+nmea0183 = { path = "../nmea0183" }
+
 # Error handling (application-level)
 anyhow = { workspace = true }
 

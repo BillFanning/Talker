@@ -31,6 +31,34 @@ files and never reused, so cross-references stay valid.
 
 ---
 
+## ADR-028 — Sentence types own explicit live UTC field metadata
+
+**Status:** Accepted 2026-07-17.
+
+**Context:** Applications that refresh NMEA time/date fields need protocol knowledge:
+the same logical instant occupies different zero-based field positions in GGA, GLL,
+RMC, ZDA, and related sentences. Keeping that table in a GUI or sender would duplicate
+NMEA semantics and let future consumers disagree.
+
+**Decision:** `SentenceType::time_fields()` returns a static slice of
+`(field_index, TimeFieldKind)` entries. `TimeFieldKind` distinguishes UTC time,
+`ddmmyy`, day, month, and four-digit year. The mapping is explicit, never inferred
+from mnemonic names: ASHR/BWC/BWR/GBS/GGA/GNS/GRS/GST/ZFO/ZTG use UTC field 0; GLL
+uses UTC field 4; RMC uses UTC field 0 and date field 8; ZDA uses fields 0–3 for UTC,
+day, month, and year. Every other standard or custom type returns an empty slice.
+Positions are relative to `NmeaSentence::fields`, excluding talker and mnemonic.
+
+`TimeFieldKind` is deliberately exhaustive: a new formatting kind must make consumers
+handle it at compile time. The existing extensible `SentenceType::Custom` boundary is
+unchanged.
+
+**Consequences:** NMEA field knowledge lives in the publishable library and Talker
+only supplies an instant and formatting policy. An empty mapping means substitution
+is unsupported, not that a sentence can never contain time-like data. Unit tests pin
+every supported entry, sorted unique positions, and empty custom/unsupported types.
+
+---
+
 ## Open questions
 
 **OQ-4 — `nmea0183` library MSRV policy.** ADR-008 sets the workspace MSRV to current stable Rust. The `nmea0183` library, intended for crates.io publication, may benefit from a looser MSRV to accommodate cautious downstream users. The policy (e.g., N-6 months of stable releases) and the mechanism (per-crate `rust-version` override) are deferred to a future ADR when publication approaches. See ADR-008 (in `talker/docs/ADR.md`) for context.

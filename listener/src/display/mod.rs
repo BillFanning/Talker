@@ -61,8 +61,8 @@ pub enum WrappingMode {
 /// (§141).
 ///
 /// Display Recording consumes this *after* rendering (§54) — it is explicitly
-/// not byte-exact and is not a substitute for Raw Recording. Any inline timestamps
-/// (§50.2 per-match Mark timestamps) are spliced into `text` by the renderer; the
+/// not byte-exact and is not a substitute for Raw Recording. Any inline Mark
+/// annotations (§50.2 compact time or NMEA ZDA) are spliced into `text`; the
 /// `timestamp` here is the chunk's arrival time, used to drive **time-based rotation**
 /// (§59) — a rotating display recorder picks the period file from it.
 #[derive(Clone, Debug)]

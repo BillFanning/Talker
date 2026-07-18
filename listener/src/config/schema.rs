@@ -412,10 +412,10 @@ pub enum MatchAction {
     /// Drop a correlation marker into the display, the Display Recording (`.disp`),
     /// and a tagged event (§137) — **never** into the raw `.raw` stream (§5.6/§49).
     ///
-    /// When `timestamp` is `Some`, the marked byte pattern also gets an inline local
-    /// arrival timestamp spliced into the rendered text (display + `.disp`) before or
-    /// after the match (§50.2). A bare `Mark` (no timestamp) keeps the `‹MARK …›`
-    /// marker-line behaviour.
+    /// When `timestamp` is `Some`, the marked byte pattern also gets an inline
+    /// arrival-time annotation (compact local time or NMEA ZDA) in the rendered
+    /// text and `.disp`, before or after the match (§50.2). A bare `Mark` keeps
+    /// the `‹MARK …›` marker-line behaviour.
     Mark {
         #[serde(default)]
         timestamp: Option<MarkTimestamp>,
@@ -431,14 +431,18 @@ pub enum MatchAction {
     },
 }
 
-/// The inline timestamp a `Mark` action splices next to a matched byte pattern
-/// (§50.2). The time is the matched chunk's **arrival** time, formatted in local
-/// time per `format`, and inserted `position` (before/after) the match in the
-/// rendered display and Display Recording (`.disp`) — never in `.raw`.
+/// The inline arrival-time annotation a `Mark` action splices next to a matched
+/// byte pattern (§50.2). `style` chooses compact local time or NMEA ZDA;
+/// `position` places it before/after the complete match in the rendered display
+/// and Display Recording (`.disp`) — never in `.raw`.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MarkTimestamp {
     #[serde(default)]
     pub position: MarkPosition,
+    #[serde(default)]
+    pub style: MarkTimestampStyle,
+    /// Plain-time formatting toggles. NMEA ZDA uses `include_millis`; its date
+    /// and local-zone fields are always present when representable.
     #[serde(default)]
     pub format: TimestampConfig,
     /// Text appended immediately **after** the formatted timestamp (e.g. a space
@@ -448,6 +452,25 @@ pub struct MarkTimestamp {
     /// written before this field round-trip (§72.1).
     #[serde(default)]
     pub separator: String,
+}
+
+/// Text style emitted by a timestamped `Mark` action.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MarkTimestampStyle {
+    /// Listener's compact local wall-clock text configured by `format`.
+    #[default]
+    Plain,
+    /// A checksum-bearing ZDA-shaped sentence carrying UTC date/time and the
+    /// local offset. IDs longer than two characters are accepted as custom IDs.
+    NmeaZda {
+        #[serde(default = "default_zda_talker")]
+        talker: String,
+    },
+}
+
+fn default_zda_talker() -> String {
+    "GP".to_string()
 }
 
 /// Where a `Mark` timestamp is spliced relative to the matched bytes (§50.2).

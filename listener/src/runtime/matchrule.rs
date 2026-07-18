@@ -67,6 +67,10 @@ pub struct FiredRule {
     /// (§50.2: matches are anchored on byte offsets — the stream-only model has no
     /// message numbers). `None` for an `Idle` firing, not tied to a data position.
     pub match_offset: Option<u64>,
+    /// Length of the matched byte pattern. Zero for an `Idle` firing. Keeping
+    /// the extent lets an `After` annotation anchor on the match's final byte
+    /// while diagnostics continue to report its first byte.
+    pub match_len: usize,
     /// Whether this match was a **boundary split** — its first byte fell in the
     /// previous chunk and it completed in this one, so a per-chunk scan would have
     /// missed it. Always `false` for `Idle`. Drives the where/why/how-often
@@ -228,6 +232,7 @@ impl MatchRuleSet {
                             id: rule.id,
                             actions: rule.actions.clone(),
                             match_offset: Some(self.carry_offset + match_start as u64),
+                            match_len: pattern.len(),
                             boundary_split: true,
                         });
                     }
@@ -245,6 +250,7 @@ impl MatchRuleSet {
                     id: rule.id,
                     actions: rule.actions.clone(),
                     match_offset: Some(chunk_offset + match_start as u64),
+                    match_len: pattern.len(),
                     boundary_split: false,
                 });
                 start = match_start + 1;
@@ -287,6 +293,7 @@ impl MatchRuleSet {
                     id: rule.id,
                     actions: rule.actions.clone(),
                     match_offset: None,
+                    match_len: 0,
                     boundary_split: false,
                 });
             }
@@ -526,6 +533,7 @@ mod tests {
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].actions.len(), 2);
         assert_eq!(fired[0].match_offset, Some(2));
+        assert_eq!(fired[0].match_len, 3);
     }
 
     #[test]

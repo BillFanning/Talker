@@ -1,9 +1,25 @@
-# Listener Specification v2.1
+# Listener Specification v2.2
 
 Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
+
+Revision v2.2 (NMEA ZDA Mark annotations and exact splice geometry):
+
+- **§50.2 Mark styles (ADR-025).** A timestamped Mark may retain compact local
+  time or emit an inline checksum-bearing NMEA ZDA sentence. ZDA time/date fields
+  are UTC, zone fields carry the local offset, milliseconds are optional, and
+  custom talker IDs longer than two characters are supported under a bounded
+  framing-safe policy.
+- `Before` anchors on the first match byte and `After` on the final match byte.
+  Separators remain verbatim and may contain CR/LF; Raw, Rendered, and Hex renderers
+  reset their line/column continuation state around those controls. `.raw` remains
+  byte-exact.
+- Listener again depends on `nmea0183`, solely to construct presentation text. It
+  still performs no protocol decoding or interpretation of received bytes.
+- `MarkTimestamp.style` is additive and defaults to `Plain`; profile
+  `schema_version` remains 3.
 
 Revision v2.1 (scope amendments — one display view per channel; TCP connection-channel
 visibility deferred; a §155 correction):
@@ -135,8 +151,9 @@ Rebased onto the stream:
   removed; `.raw` replaces the former `.dat`.
 
 `schema_version` bumps (a breaking config change: the extraction, decoder, subsample,
-and message-recording fields are gone). `nmea0183` remains a workspace crate used by
-`talker`; `listener` no longer depends on it.
+and message-recording fields are gone). `nmea0183` remains a workspace crate.
+Listener v2.2 reacquires it only to construct presentation-only ZDA Mark annotations;
+the receive path still performs no decoding.
 
 Revision v1.2 (feature expansion — troubleshooting & long-run logging). _Parts of
 this note are superseded by v2.0 above — the supersessions are flagged inline._
@@ -826,7 +843,7 @@ Total Byte Count is the number of bytes a Channel has received since it was Star
 
 ## 26. Chunk Arrival Time
 
-Each received chunk/datagram carries an arrival timestamp (`ChunkTime`: wall clock + monotonic, §133). This is a reception fact, not a per-Message timestamp (there are no Messages) — it drives the activity monitor (§166) and, when enabled, the recording timestamp sidecar (§57).
+Each received chunk/datagram carries an arrival timestamp (`ChunkTime`: wall clock + monotonic, §133). This is a reception fact, not a per-Message timestamp (there are no Messages) — it drives the activity monitor (§166), inline Mark annotations (§50.2), and, when enabled, the recording timestamp sidecar (§57).
 
 > **Precision is not accuracy.** A finer timestamp resolution selects how finely a time is displayed and stored; it does not guarantee timing accuracy. Userland serial/UDP arrival times carry OS scheduling and driver-buffering jitter that can exceed the selected resolution. See §133.
 
@@ -864,7 +881,10 @@ _Removed in v2.0 (see §29)._
 
 ## 33. NMEA0183 Scope
 
-_Removed in v2.0. `Listener` no longer decodes NMEA0183 and no longer depends on the `nmea0183` crate (which remains a workspace crate used by `talker`). NMEA data is carried, displayed, searched, and recorded as ordinary stream bytes._
+_Removed in v2.0. `Listener` no longer decodes NMEA0183. NMEA data is carried,
+displayed, searched, and recorded as ordinary stream bytes. v2.2 reacquires the
+`nmea0183` crate only to construct presentation-only ZDA Mark text (§50.2, ADR-025);
+no received bytes are parsed through it._
 
 ## 34. NMEA Message Boundary Requirement
 
@@ -1034,7 +1054,7 @@ enum MatchCondition {
 ```rust
 enum MatchAction {
     Record { target: RecordTarget, control: RecordControl }, // begin/stop, from the match forward
-    Mark { timestamp: Option<MarkTimestamp> },               // marker + optional inline arrival timestamp
+    Mark { timestamp: Option<MarkTimestamp> },               // marker + optional inline arrival annotation
     Notify { severity: DiagnosticSeverity },                 // raise an event/warning (§92–94)
     PauseDisplay { view: Option<DisplayViewId> },            // freeze a view, or all
 }
@@ -1042,15 +1062,22 @@ enum MatchAction {
 enum RecordTarget { Raw, Display, Both }
 enum RecordControl { Begin, Stop }
 
-// The inline timestamp a Mark splices next to the matched pattern (local arrival time).
-struct MarkTimestamp { position: MarkPosition, format: TimestampConfig }
+// The inline arrival-time annotation a Mark splices next to the matched pattern.
+struct MarkTimestamp {
+    position: MarkPosition,
+    style: MarkTimestampStyle,
+    format: TimestampConfig,
+    separator: String,
+}
 enum MarkPosition { Before, After }
-// Mirrors talker's TimestampConfig; formatted in **local** time (time-of-day always shown).
+enum MarkTimestampStyle { Plain, NmeaZda { talker: String } }
+// Plain mirrors talker's toggles in local time; ZDA reads include_millis only.
 struct TimestampConfig { include_date: bool, include_millis: bool, include_timezone: bool }
 ```
 
 - **Record** begins or stops recording **from the match forward**; there is **no pre-match backfill** (§158). Pre-trigger capture is deferred.
-- **Mark** correlates the match into the display and the Display Recording (`.disp`), plus a tagged event (§137). It is **never** written into the raw `.raw` byte stream, which stays byte-exact (§49, §53). A bare `Mark` (`timestamp = None`) writes a `‹MARK …›` marker line into each view's `.disp`. When `timestamp` is `Some`, the matched pattern's **local arrival time** is instead spliced **inline** — `position` before or after the match — into the rendered display and `.disp`, formatted per `TimestampConfig` (time-of-day always shown; date, milliseconds, and the local UTC offset independently toggleable). The timestamp is inserted by splicing its text at the match's byte offset during rendering, in every view mode (Raw/Rendered/Hex) — a text insertion, not on-screen byte-range styling (contrast the removed `Highlight`, ADR-015).
+- **Mark** correlates the match into the display and the Display Recording (`.disp`), plus a tagged event (§137). It is **never** written into the raw `.raw` byte stream, which stays byte-exact (§49, §53). A bare `Mark` (`timestamp = None`) writes a `‹MARK …›` marker line into the view's `.disp`. When `timestamp` is `Some`, `Plain` splices the matched chunk's local arrival time, formatted per `TimestampConfig` (time-of-day always shown; date, milliseconds, and local UTC offset independently toggleable). `NmeaZda` instead splices `$<talker>ZDA,<hhmmss[.sss]>,<dd>,<mm>,<yyyy>,<zone-hours>,<zone-minutes>*XX`: time/date are UTC and zone fields carry the local offset. An offset outside minute precision or the supported ±13:59 range leaves both zone fields empty. Standard two-character talker IDs and custom 1–32-character printable ASCII IDs are accepted; whitespace/control characters and NMEA framing characters `$ ! , *` are invalid. IDs longer than two produce explicitly custom ZDA-shaped output.
+- `Before` attaches immediately before the match's first byte; `After` attaches immediately after its final byte. `separator` is appended after either style and may contain CR/LF. Rendering honors those controls and resets Raw wrap state, Rendered tab columns, and Hex continuation before subsequent data. The style-generated ZDA has no trailing CR/LF of its own. All styles are text insertions in every view mode, not on-screen byte-range styling (contrast removed `Highlight`, ADR-015).
 - **Notify** raises a diagnostic event/warning (§92–94). **PauseDisplay** freezes a view (or all views, §50); reception and recording continue.
 
 **Configuration** (persists in profiles):
@@ -1128,7 +1155,7 @@ post-render.
 It may include character-rendering transformations, visible control-character
 representations, and display formatting. It is explicitly not byte-exact and is
 not a substitute for Raw Recording. Because the artifact is already formatted, any
-inline timestamps a `Mark` produces (§50.2) are already spliced into the rendered
+inline arrival annotations a `Mark` produces (§50.2) are already spliced into rendered
 text — the recorder writes what the display shows, verbatim, with no timestamp logic
 of its own. (There is no separate per-chunk Display-Recording timestamp; the only
 timestamping is the per-match Mark, §50.2.)
@@ -1685,7 +1712,7 @@ pub struct DefaultConfig {
 // §45; groups_per_line 0 = fit to the display width.
 pub struct HexGrouping { pub bytes_per_group: u8, pub groups_per_line: u8 }
 
-// §50.2 — the inline Mark timestamp format (local time; mirrors talker's config).
+// §50.2 — compact local-time options; NMEA ZDA reuses include_millis only.
 pub struct TimestampConfig { pub include_date: bool, pub include_millis: bool, pub include_timezone: bool }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2314,8 +2341,9 @@ consumer or a compile-time concern justifies it) without disturbing the module A
 
 This also corrects the original sketch, which nested `nmea0183/` inside `listener`.
 In this workspace `nmea0183` is a **top-level sibling crate**, shared with `talker`.
-As of v2.0 (ADR-010) `listener` no longer depends on it — the decoder that used it
-was removed (§29) — but it remains a workspace sibling for `talker`.
+ADR-010 removed Listener's decoder and its original dependency. v2.2 adds a narrowly
+scoped construction-only dependency for ZDA Mark presentation text (ADR-025); it does
+not restore decoding (§29).
 
 ```text
 wiredata/                    # workspace root
@@ -2386,7 +2414,8 @@ There is no extraction module; received bytes are a verbatim stream (§20).
 
 ### listener-decode — removed in v2.0
 
-There is no decoder module; `listener` no longer depends on `nmea0183` (§29).
+There is no decoder module. The `nmea0183` dependency is construction-only for ZDA
+Mark presentation text and never receives stream bytes (§29, ADR-025).
 
 ### listener-display  (`src/display/`)
 
@@ -2510,13 +2539,12 @@ _Removed in v2.0 (see §131)._
 
 ## 133. Timestamp
 
-Internal timing uses one model, not strings: a monotonic `Instant` for ordering and the §125 tie-break, and a wall-clock `SystemTime` for display. The unit is the per-chunk `ChunkTime` (§138); the raw recording timestamp sidecar (§57), the inline Mark timestamp (§50.2), and the activity monitor (§166) all derive from it. Formatting to a display string is done in the display layer, not in stored state.
+Internal timing uses one model, not strings: a monotonic `Instant` for ordering and the §125 tie-break, and a wall-clock `SystemTime` for display. The unit is the per-chunk `ChunkTime` (§138); the raw recording timestamp sidecar (§57), inline Mark annotations (§50.2), and the activity monitor (§166) all derive from it. Formatting happens at the Mark/rendering boundary, not in stored state.
 
-The only display timestamp is the per-match **Mark** timestamp (§50.2), formatted in **local** time by a toggleable `TimestampConfig` (mirroring talker's): time-of-day is always shown; date, milliseconds, and the local UTC offset are independently toggleable.
+The only display timestamp is the per-match **Mark** annotation (§50.2). `Plain` is formatted in **local** time by a toggleable `TimestampConfig` (mirroring talker's): time-of-day is always shown; date, milliseconds, and local UTC offset are independently toggleable. `NmeaZda` carries UTC time/date plus local-zone fields and uses only the millisecond toggle.
 
 ```rust
-// The inline Mark timestamp format (§50.2). Formats a chunk's wall-clock arrival time
-// in local time; the captured time itself is the ChunkTime defined in §138.
+// Compact local-time options for a Mark (§50.2); ZDA reads include_millis only.
 pub struct TimestampConfig { pub include_date: bool, pub include_millis: bool, pub include_timezone: bool }
 ```
 

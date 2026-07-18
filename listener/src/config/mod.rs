@@ -187,6 +187,20 @@ pub fn validate_channel(
                 errors.push(ChannelConfigError::EmptyMatchPattern);
             }
         }
+        for action in &rule.actions {
+            if let MatchAction::Mark {
+                timestamp:
+                    Some(MarkTimestamp {
+                        style: MarkTimestampStyle::NmeaZda { talker },
+                        ..
+                    }),
+            } = action
+            {
+                if let Err(error) = crate::core::validate_zda_talker_id(talker) {
+                    errors.push(ChannelConfigError::InvalidZdaTalkerId(error));
+                }
+            }
+        }
     }
 
     // Retention must be bounded (§80): use the channel's own limits, or the
@@ -254,6 +268,8 @@ pub enum ChannelConfigError {
     DuplicateChannelName,
     #[error("a match rule's byte pattern is empty (it would match at every byte offset, §50.2)")]
     EmptyMatchPattern,
+    #[error("invalid NMEA ZDA Mark talker ID: {0}")]
+    InvalidZdaTalkerId(crate::core::ZdaTalkerIdError),
 }
 
 /// A non-fatal configuration warning (§71): the channel runs, but this is likely
@@ -301,6 +317,7 @@ mod tests {
                 actions: vec![MatchAction::Mark {
                     timestamp: Some(MarkTimestamp {
                         position: MarkPosition::After,
+                        style: MarkTimestampStyle::Plain,
                         format: crate::core::TimestampConfig {
                             include_date: false,
                             include_millis: true,
@@ -331,6 +348,75 @@ mod tests {
         let toml = profile.to_toml().expect("serialize");
         let parsed = Profile::from_toml(&toml).expect("round trip");
         assert_eq!(parsed, profile);
+    }
+
+    #[test]
+    fn mark_timestamp_without_style_defaults_to_plain() {
+        let timestamp: MarkTimestamp = toml::from_str("separator = ' '").unwrap();
+        assert_eq!(timestamp.style, MarkTimestampStyle::Plain);
+    }
+
+    #[test]
+    fn zda_mark_style_round_trips_and_defaults_its_talker() {
+        let timestamp = MarkTimestamp {
+            position: MarkPosition::After,
+            style: MarkTimestampStyle::NmeaZda {
+                talker: "RECEIVER_A".to_string(),
+            },
+            format: crate::core::TimestampConfig {
+                include_millis: true,
+                ..Default::default()
+            },
+            separator: "\r\n".to_string(),
+        };
+        let text = toml::to_string(&timestamp).unwrap();
+        assert_eq!(toml::from_str::<MarkTimestamp>(&text).unwrap(), timestamp);
+
+        let defaulted: MarkTimestamp = toml::from_str("[style]\nkind = 'nmea_zda'").unwrap();
+        assert_eq!(
+            defaulted.style,
+            MarkTimestampStyle::NmeaZda {
+                talker: "GP".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn channel_validation_accepts_long_zda_talkers_and_rejects_unsafe_ones() {
+        let mut channel = templates::udp_template();
+        channel.match_rules.push(MatchRule {
+            name: "zda".to_string(),
+            condition: MatchCondition::BytePattern {
+                pattern: b"$GP".to_vec(),
+            },
+            actions: vec![MatchAction::Mark {
+                timestamp: Some(MarkTimestamp {
+                    style: MarkTimestampStyle::NmeaZda {
+                        talker: "CUSTOM_RECEIVER".to_string(),
+                    },
+                    ..Default::default()
+                }),
+            }],
+            enabled: true,
+        });
+        assert!(validate_channel(&channel, &DefaultConfig::default()).is_ok());
+
+        let MatchAction::Mark {
+            timestamp: Some(timestamp),
+        } = &mut channel.match_rules[0].actions[0]
+        else {
+            panic!("test rule must contain a timestamped Mark");
+        };
+        timestamp.style = MarkTimestampStyle::NmeaZda {
+            talker: "BAD,ID".to_string(),
+        };
+        let errors = validate_channel(&channel, &DefaultConfig::default()).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ChannelConfigError::InvalidZdaTalkerId(
+                crate::core::ZdaTalkerIdError::InvalidCharacter(',')
+            )
+        )));
     }
 
     #[test]

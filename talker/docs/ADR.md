@@ -24,7 +24,7 @@ An ADR captures *why* a significant decision was made, not just *what* was decid
 
 **Context:** The NMEA 0183 module was identified early as reusable across other projects. The question was whether to keep it as a module inside the `talker` binary or make it a separate library crate.
 
-**Decision:** The project is structured as a Cargo workspace, initially with `talker` (binary) and `nmea0183` (library). The `nmea0183` crate has no dependency on `talker` and no knowledge of its internals. The workspace now also contains `listener`, a sibling receive crate; it originally shared `nmea0183` but **dropped that dependency in its v2.0 stream-only pivot** (listener ADR-010 — no decoding), so today `nmea0183` is consumed only by `talker`.
+**Decision:** The project is structured as a Cargo workspace, initially with `talker` (binary) and `nmea0183` (library). The `nmea0183` crate has no dependency on `talker` and no knowledge of its internals. The workspace now also contains `listener`, a sibling receive crate; it dropped NMEA decoding in its v2.0 stream-only pivot (listener ADR-010). Listener v2.2 reuses `nmea0183` only to construct presentation-only ZDA Mark annotations (listener ADR-025); received bytes remain undecoded.
 
 **Alternatives considered:**
 - Single crate with `nmea0183` as an internal module: simpler initially, but makes future extraction painful — splitting a module into a crate after it has grown requires touching import paths throughout the codebase.
@@ -726,6 +726,39 @@ Profiles and the CLI still select a kind while constructing channels. There is n
 profile-schema or runtime-protocol change. Focused tests pin the common menu order and
 creation-time kind.
 
+## ADR-029 — Live NMEA time is a compiled per-send template
+
+**Status:** Accepted 2026-07-17 (spec v2.2).
+
+**Context:** NMEA payloads were fully serialized during schedule compilation. A typed
+GGA/RMC/ZDA time therefore stayed frozen across every send, unlike Talker's optional
+prepended timestamp. Rebuilding all messages or moving protocol decisions into the
+scheduler would weaken preflight and make the common static path pay for one dynamic
+format.
+
+**Decision:** `PayloadConfig::Nmea` gains additive, default-off `live_time` and
+`live_time_millis` flags. Compiling a message produces either static bytes or an
+immutable live-NMEA template containing parsed identity, typed fields, checksum mode,
+and millisecond policy. `CompiledMessage::render_at(now)` uses one UTC instant for the
+prepended timestamp and all live NMEA substitutions, then computes the outer checksum
+over the resulting message.
+
+The supported positions come only from `SentenceType::time_fields()` (nmea0183
+ADR-028). UTC time is `hhmmss` or `hhmmss.sss`; RMC date is `ddmmyy`; ZDA day/month
+are two digits and year is four. Typed fields are retained in the profile but replaced
+on wire; a short field list is extended with empty fields through the last mapped
+position. The NMEA checksum is rebuilt after substitution and still honors Correct,
+Omit, and Wrong modes. Enabling live time for an unmapped standard or custom sentence
+is a preflight error, never a silent static fallback.
+
+**Consequences:** Static payloads remain pre-encoded and allocation behavior is
+unchanged. A live NMEA send clones only that message's field vector, substitutes the
+small explicit map, and serializes one sentence; a Criterion live-GGA case tracks this
+cost beside the existing rendered-send benchmark. The GUI disables unsupported new
+selections, exposes the exact mapped fields, and leaves an already-invalid selection
+enabled so the user can turn it off. Old profiles deserialize with both flags false;
+the profile schema version is unchanged.
+
 ---
 
 ## Open questions
@@ -736,7 +769,7 @@ The following decisions are deferred until the relevant module is written. They 
 
 **OQ-2 — `toml` 1.x vs 0.8 API. — Resolved (v2.0).** `core::profile` was implemented against `toml = "1"` with no friction: `Profile::load` parses to a `toml::Value` to inspect the schema version before full deserialization, then `toml::from_str` / `toml::to_string_pretty` handle the round trip. The 1.x API surface was sufficient; the fallback to `"0.8"` was not needed. The workspace stays on `toml = "1"`.
 
-**OQ-3 — `nmea0183` serde feature activation in `talker`. — Resolved (v2.0).** `core::profile` uses a **`talker`-side representation**: an NMEA message is stored as `PayloadConfig::Nmea { talker: String, sentence_type: String, fields: Vec<String> }` — plain strings, not `nmea0183` types — and converted to a `nmea0183::NmeaSentence` only at compile time. The profile schema is therefore decoupled from the library's struct shapes, and the `talker` dependency on `nmea0183` does **not** enable the `serde` feature (`nmea0183 = { path = "../nmea0183" }`). The `serde` feature on `nmea0183` itself still exists and is still verified to compile, for the benefit of other potential consumers.
+**OQ-3 — `nmea0183` serde feature activation in `talker`. — Resolved (v2.0).** `core::profile` uses a **`talker`-side representation**: an NMEA message stores plain-string talker, sentence type, and fields plus Talker-owned checksum/live-time flags, not serialized `nmea0183` types. Those strings are parsed into library types at message compilation; a static sentence is serialized then, while ADR-029's live template serializes per send. The profile schema is therefore decoupled from the library's struct shapes, and the `talker` dependency on `nmea0183` does **not** enable the `serde` feature (`nmea0183 = { path = "../nmea0183" }`). The `serde` feature on `nmea0183` itself still exists and is still verified to compile, for the benefit of other potential consumers.
 
 **OQ-4 — `nmea0183` library MSRV policy.** Moved to [`nmea0183/docs/ADR.md`](../../nmea0183/docs/ADR.md) — it concerns the library's publication policy. See ADR-008 above for the workspace MSRV context it builds on.
 

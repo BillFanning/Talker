@@ -70,17 +70,19 @@ Message-model removal). Everything below this block is verified done:
       timestamps; a channel can run both at once. GUI: Raw panel above Configure
       (live on/off + setup), Display under Configure. Pinned by
       `raw_and_display_recording_run_to_independent_destinations`.
-- [x] Inline **`Mark` timestamps** in the live view and `.disp` (§50.2, ADR-016). A
-      `Mark { timestamp: Some(..) }` splices the matched pattern's local arrival time
-      (before/after, talker-style `TimestampConfig`) into the rendered text via
+- [x] Inline **`Mark` arrival annotations** in the live view and `.disp` (§50.2,
+      ADR-016/ADR-025). A `Mark { timestamp: Some(..) }` splices compact local time
+      or a checksum-bearing NMEA ZDA sentence (before/after) into the rendered text via
       `render_text_annotated`; the live viewer rebases the snapshot's `TriggeredMatch`
-      onto the scrollback window via its **`view_offset`** (view/scrollback space —
+      onto the scrollback window via the Mark's **`view_offset`** (view/scrollback space —
       not `byte_offset`, which counts bytes a paused view skipped; ADR-017) and
       splices the same `MarkRender` text, so display and `.disp` match. `.raw` is
-      untouched. A minimal `BytePattern → Mark(+ts)` editor lives under Configure
-      (Apply & Restart). Pinned by
+      untouched. `After` anchors on the complete match's final byte; CR/LF separators
+      reset renderer continuation state. A minimal `BytePattern → Mark(+ts)` editor
+      lives under Configure (Apply & Restart). Pinned by
       `timestamped_mark_splices_inline_time_into_disp_not_raw`,
-      `match_view_offset_tracks_the_paused_view_not_the_raw_stream` + renderer splice
+      `zda_mark_splices_valid_custom_sentence_and_newline_only_into_display`,
+      `after_mark_splices_after_the_complete_multibyte_match`, and multiline renderer
       tests. (On-screen **Highlight** byte-range styling was **dropped** as too
       complex — see ADR-015; ADR-016 explains why the inline timestamp does *not*
       inherit that cost.)
@@ -121,6 +123,9 @@ Message-model removal). Everything below this block is verified done:
 - [ ] General match-rule editor UI: the `Idle`/`Record`/`Notify`/`PauseDisplay`
       conditions + actions. The `BytePattern → Mark(+timestamp)` subset now has a
       minimal editor (ADR-016); the rest still arrive only via profiles.
+- [ ] Periodic `Every { interval }` match condition. Keep it out of the byte hot path:
+      evaluate from the existing idle timer and define whether it fires while a
+      channel is paused/stopped before adding it to profiles or the general editor.
 - [x] `RuntimeCommand`'s role (§136) — resolved by ADR-012: removed the vestigial
       `core::RuntimeCommand` enum; the command surface is the `Listener` async method
       API (the GUI's `UiCommand` is the bridge transport). Spec §136 rewritten to

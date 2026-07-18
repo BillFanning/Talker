@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Working agreement and codebase guide for the **wiredata** workspace. Applies to all
-three crates (`talker`, `nmea0183`, `listener`) and to **any** contributor — human or
+four crates (`talker`, `nmea0183`, `listener`, `wiredata-ui`) and to **any** contributor — human or
 coding agent (Claude Code, Codex, or otherwise). This is the tool-neutral source of
 truth; tool-specific files (e.g. `CLAUDE.md`) should import it rather than duplicate it.
 
@@ -110,9 +110,10 @@ Four crates in a Cargo workspace:
 - **`nmea0183/`** — library crate; no dependency on `talker` or `listener`; intended for
   independent crates.io publication. Handles NMEA 0183 sentence construction, parsing,
   checksum, talker IDs, proprietary sentences (`$PRDID`, `$PASHR`, arbitrary `$P`), and
-  AIS sentences (`!AIVDM`/`!AIVDO` with 6-bit payload armoring). Used by `talker`;
-  `listener` **dropped** its `nmea0183` dependency in the v2.0 stream-only strip
-  (ADR-010 — no decoding), so today only `talker` consumes it.
+  AIS sentences (`!AIVDM`/`!AIVDO` with 6-bit payload armoring). `talker` constructs
+  outgoing NMEA through it. `listener` dropped decoding in v2.0 (ADR-010) and v2.2
+  reacquired the crate only to construct presentation-only ZDA Mark annotations
+  (listener ADR-025); received bytes remain opaque.
 - **`talker/`** — library plus a thin binary (ADR-014). Sends/schedules data out over
   serial and network interfaces. All application logic lives in `core/`; `cli/` and
   `gui/` are thin interface layers that contain no business logic. `main.rs` only
@@ -120,7 +121,8 @@ Four crates in a Cargo workspace:
   default dead-code lint stays active.
 - **`listener/`** — receives byte-oriented data **streams** from serial and network
   sources (the inbound counterpart to `talker`). v2.0 is stream-only (ADR-010): it
-  displays/records the verbatim byte stream — no decoding, no `nmea0183` dependency.
+  displays/records the verbatim byte stream with no decoding. Its `nmea0183` use is
+  construction-only for ZDA presentation annotations (ADR-025).
   Single crate with modular internals (listener ADR-004 / spec §127); `lib.rs` + thin
   `main.rs`, same shape as `talker`.
 - **`wiredata-ui/`** — internal (`publish = false`) shared GUI **chrome** for the two
@@ -235,8 +237,8 @@ prepended timestamp, and an optional appended checksum. `PayloadConfig` variants
 
 `Utf8`/`Ascii` text may carry non-printable bytes as inline `‹XX›` markers (U+2039, two
 hex digits, U+203A — spec §5.3); `core::message::marker` splits marker-aware text and
-`compile()` expands the markers into raw bytes. `compile()` produces the static wire
-bytes; the timestamp, if any, is rendered per send.
+`compile()` expands the markers into raw bytes. Static payloads are encoded once;
+the timestamp and optional live NMEA time/date fields are rendered per send.
 
 ### Logging
 
