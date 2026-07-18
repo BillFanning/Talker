@@ -754,10 +754,33 @@ is a preflight error, never a silent static fallback.
 **Consequences:** Static payloads remain pre-encoded and allocation behavior is
 unchanged. A live NMEA send clones only that message's field vector, substitutes the
 small explicit map, and serializes one sentence; a Criterion live-GGA case tracks this
-cost beside the existing rendered-send benchmark. The GUI disables unsupported new
-selections, exposes the exact mapped fields, and leaves an already-invalid selection
-enabled so the user can turn it off. Old profiles deserialize with both flags false;
-the profile schema version is unchanged.
+cost beside an equal-wire-shape static GGA. The 2026-07-17 paired measurement was
+~2.21 µs live versus ~140 ns static: below the workspace's action threshold until
+roughly 4.5–5 kHz sustained live sends, so direct buffer rendering is deferred.
+The GUI disables unsupported new selections, exposes the exact mapped fields, and
+leaves an already-invalid selection enabled so the user can turn it off. Old profiles
+deserialize with both flags false; the profile schema version is unchanged.
+
+## ADR-031 — Payload compilation has one dynamic-safe public boundary
+
+**Status:** Accepted 2026-07-17.
+
+**Context:** `PayloadConfig::compile()` historically returned final `Vec<u8>` wire
+bytes because every payload was static. After ADR-029, preserving that API required
+rendering a live NMEA template at `Utc::now()` and returning a byte vector that looked
+compiled but was already frozen. No production path used the method, but a future
+caller could accidentally restore the stale-time defect ADR-029 removed.
+
+**Decision:** Remove direct byte compilation from `PayloadConfig`. Payload parsing and
+encoding stay private to the message module. The public path is
+`MessageConfig::compile() -> CompiledMessage`, followed by `render()` for a real send
+or `render_at()` for a deterministic preview/test. Static and dynamic payloads now
+share one API whose type retains the distinction internally.
+
+**Consequences:** Scheduled sends cannot lose live semantics by choosing an
+apparently equivalent payload method. Encoding tests exercise the same message-level
+compile/render boundary as production. This removes a pre-1.0 Rust API but changes no
+profile field, wire output, GUI behavior, or schema version.
 
 ---
 

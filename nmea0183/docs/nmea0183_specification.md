@@ -15,12 +15,14 @@
 proprietary sentences (`$PRDID`, `$PASHR`, arbitrary `$P`), and AIS sentences
 (`!AIVDM`/`!AIVDO` with 6-bit payload armoring). `SentenceType::time_fields()`
 exposes the explicit zero-based time/date field positions applications need for
-live UTC substitution (ADR-028). The crate has no dependency on either application.
+live UTC substitution (ADR-028), and `format_utc_time` supplies their shared
+fixed-width UTC field rendering without taking a clock-library dependency (ADR-030).
+The crate has no dependency on either application.
 
 ## To document here
 
-- [ ] Public API surface: sentence types and `TimeFieldKind`, `TalkerId`,
-      `ProprietarySentence`, `AisSentence`.
+- [ ] Public API surface: sentence types and `TimeFieldKind`, `format_utc_time`,
+      `TalkerId`, `ProprietarySentence`, `AisSentence`.
 - [ ] Checksum semantics (inline XOR; `$PRDID` carries none by convention).
 - [ ] Extensibility model (`Custom(String)` variants) — cross-reference ADR-009.
 - [ ] `serde` feature gating.

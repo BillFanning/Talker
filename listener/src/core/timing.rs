@@ -123,20 +123,16 @@ fn zda_sentence_at(
     include_millis: bool,
 ) -> Result<String, ZdaTalkerIdError> {
     use chrono::{Datelike, Timelike};
-    use nmea0183::{NmeaSentence, SentenceType, TalkerId};
+    use nmea0183::{format_utc_time, NmeaSentence, SentenceType, TalkerId};
 
     validate_zda_talker_id(talker)?;
-    let time = if include_millis {
-        format!(
-            "{:02}{:02}{:02}.{:03}",
-            at.hour(),
-            at.minute(),
-            at.second(),
-            at.timestamp_subsec_millis()
-        )
-    } else {
-        format!("{:02}{:02}{:02}", at.hour(), at.minute(), at.second())
-    };
+    let time = format_utc_time(
+        at.hour(),
+        at.minute(),
+        at.second(),
+        at.timestamp_subsec_millis(),
+        include_millis,
+    );
     let (zone_hours, zone_minutes) = zda_zone_fields(local_offset);
     let fields = vec![
         time,
@@ -266,6 +262,21 @@ mod tests {
         let parsed = nmea0183::NmeaSentence::parse(&text).unwrap();
 
         assert_eq!(parsed.fields, ["003045", "22", "05", "2026", "-05", "00"]);
+    }
+
+    #[test]
+    fn zda_helper_formats_a_chrono_leap_second_at_fixed_width() {
+        use chrono::{TimeZone, Timelike};
+
+        let leap = Utc
+            .with_ymd_and_hms(2016, 12, 31, 23, 59, 59)
+            .unwrap()
+            .with_nanosecond(1_800_000_000)
+            .unwrap();
+        let text = zda_sentence_at("GP", leap, FixedOffset::east_opt(0).unwrap(), true).unwrap();
+        let parsed = nmea0183::NmeaSentence::parse(&text).unwrap();
+
+        assert_eq!(parsed.field(0), Some("235960.800"));
     }
 
     #[test]

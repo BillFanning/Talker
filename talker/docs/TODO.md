@@ -176,6 +176,14 @@ Cross off items as they are completed. Add new ones inline as they come up.
   `render_into` + a preformatted timestamp buffer becomes worth building
   only if dynamically-rendered sends approach ~5 kHz sustained. Same-run
   comparisons only; absolute numbers swing with ambient load.
+- [x] **Live NMEA render path — MEASURED 2026-07-17, KILLED (with the same
+  threshold).** The paired equal-wire-shape Criterion cases measured static GGA
+  at ~140 ns/send and live millisecond GGA at ~2.21 µs/send. The field-vector
+  clone, substitutions, and checksum rebuild are about 16x the static clone, but
+  consume only ~0.22% of one core at 1,000 sends/s. Keep the simpler compiled
+  template; revisit direct borrowed-field/buffer rendering only near 4.5–5 kHz
+  sustained live-NMEA sends. Same-run comparison on 2026-07-17; command:
+  `cargo bench -p talker --bench scheduler -- nmea-gga`.
 
 ## Workspace items (external review, 2026-07-11)
 

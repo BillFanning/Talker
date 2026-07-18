@@ -105,6 +105,14 @@ async fn stop(listener: &mut Listener, id: ChannelId) {
         .expect("stop failed");
 }
 
+fn talker_udp_sender(port: u16) -> Box<dyn talker::core::channel::Interface> {
+    use talker::core::channel::{InterfaceConfig as TalkerInterfaceConfig, UdpConfig};
+
+    TalkerInterfaceConfig::Udp(UdpConfig::unicast(([127, 0, 0, 1], port).into()))
+        .open()
+        .expect("open Talker UDP loopback sender")
+}
+
 /// Await the next `MatchTriggered` event, with a timeout.
 async fn next_match(events: &mut Receiver<RuntimeEvent>) -> ChannelId {
     let wait = async {
@@ -145,6 +153,185 @@ async fn udp_channel_receives_datagrams_and_stops_cleanly() {
 
     stop(&mut listener, id).await;
     assert_eq!(listener.state(id), Some(ChannelState::Stopped));
+}
+
+#[tokio::test]
+async fn talker_live_nmea_advances_over_udp_into_listener() {
+    use talker::core::message::{MessageConfig, PayloadConfig};
+
+    let port = free_udp_port();
+    let mut config = listener::config::templates::udp_template();
+    if let InterfaceConfig::Udp(udp) = &mut config.interface {
+        udp.bind_address = "127.0.0.1".to_string();
+        udp.port = port;
+    }
+
+    let mut listener = Listener::with_default_capacities();
+    let id = listener.add_channel(config);
+    listener.start(id).await.unwrap();
+
+    let message = MessageConfig::new(
+        PayloadConfig::nmea_live(
+            "GP",
+            "GGA",
+            ",4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,"
+                .split(',')
+                .map(str::to_string)
+                .collect(),
+            true,
+        ),
+        1,
+    )
+    .compile()
+    .unwrap();
+    let mut sender = talker_udp_sender(port);
+    let first = message.render();
+    sender.send(&first).unwrap();
+
+    let second = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let candidate = message.render();
+            if candidate != first {
+                break candidate;
+            }
+        }
+    })
+    .await
+    .expect("live NMEA millisecond field did not advance");
+    sender.send(&second).unwrap();
+
+    let expected_len = first.len() + second.len();
+    let _ = await_snapshot(&listener, id, |s| {
+        s.activity.total_bytes >= expected_len as u64
+    })
+    .await;
+    let received = stream_bytes(&listener, id).await;
+    assert_eq!(received, [first.as_slice(), second.as_slice()].concat());
+
+    let text = std::str::from_utf8(&received).unwrap();
+    let parsed: Vec<_> = text
+        .split_terminator("\r\n")
+        .map(|wire| nmea0183::NmeaSentence::parse(wire).unwrap())
+        .collect();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].sentence_type, nmea0183::SentenceType::GGA);
+    assert_eq!(parsed[1].sentence_type, nmea0183::SentenceType::GGA);
+    assert_ne!(parsed[0].field(0), parsed[1].field(0));
+    assert_eq!(parsed[0].fields[1..], parsed[1].fields[1..]);
+
+    stop(&mut listener, id).await;
+}
+
+#[tokio::test]
+async fn talker_input_gets_zda_in_live_mark_and_disp_but_never_raw() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use listener::config::{
+        DisplayRecordingConfig, MarkPosition, MarkTimestamp, MarkTimestampStyle, MatchAction,
+        MatchCondition, MatchRule, RawRecordingConfig,
+    };
+    use listener::core::TimestampConfig;
+    use listener::record::{FileRotationPolicy, OverwritePolicy};
+    use talker::core::message::{MessageConfig, PayloadConfig};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let raw_path = std::env::temp_dir().join(format!(
+        "listener-talker-zda-{}-{n}.raw",
+        std::process::id()
+    ));
+    let disp_path = std::env::temp_dir().join(format!(
+        "listener-talker-zda-{}-{n}.disp",
+        std::process::id()
+    ));
+
+    let port = free_udp_port();
+    let mut config = listener::config::templates::udp_template();
+    if let InterfaceConfig::Udp(udp) = &mut config.interface {
+        udp.bind_address = "127.0.0.1".to_string();
+        udp.port = port;
+    }
+    config.match_rules = vec![MatchRule {
+        name: "ZDA correlate".to_string(),
+        condition: MatchCondition::BytePattern {
+            pattern: b"$GP".to_vec(),
+        },
+        actions: vec![MatchAction::Mark {
+            timestamp: Some(MarkTimestamp {
+                position: MarkPosition::Before,
+                style: MarkTimestampStyle::NmeaZda {
+                    talker: "RECEIVER_A".to_string(),
+                },
+                format: TimestampConfig {
+                    include_millis: true,
+                    ..Default::default()
+                },
+                separator: "\r\n".to_string(),
+            }),
+        }],
+        enabled: true,
+    }];
+    config.raw_recording = RawRecordingConfig {
+        enabled: true,
+        destination: Some(raw_path.clone()),
+        timestamp_enabled: false,
+        overwrite_policy: OverwritePolicy::Overwrite,
+        file_rotation: FileRotationPolicy::None,
+        disk_guard: None,
+    };
+    config.display_recording = DisplayRecordingConfig {
+        enabled: true,
+        destination: Some(disp_path.clone()),
+        overwrite_policy: OverwritePolicy::Overwrite,
+        file_rotation: FileRotationPolicy::None,
+    };
+
+    let mut listener = Listener::with_default_capacities();
+    let id = listener.add_channel(config);
+    listener.start(id).await.unwrap();
+
+    let message = MessageConfig::new(
+        PayloadConfig::nmea("GP", "GGA", vec!["123519".to_string()]),
+        1,
+    )
+    .compile()
+    .unwrap();
+    let wire = message.render();
+    talker_udp_sender(port).send(&wire).unwrap();
+
+    let snapshot = await_snapshot(&listener, id, |s| !s.matches.is_empty()).await;
+    let mark = snapshot.matches[0]
+        .mark
+        .as_ref()
+        .expect("timestamped Mark contributes a live-view annotation")
+        .clone();
+    assert!(mark.before);
+    assert_eq!(mark.view_offset, Some(0));
+    let zda = mark
+        .text
+        .strip_suffix("\r\n")
+        .expect("configured multiline separator is retained");
+    let parsed_zda = nmea0183::NmeaSentence::parse(zda).unwrap();
+    assert_eq!(parsed_zda.talker_id.to_string(), "RECEIVER_A");
+    assert_eq!(parsed_zda.sentence_type, nmea0183::SentenceType::ZDA);
+
+    stop(&mut listener, id).await;
+
+    let raw = std::fs::read(&raw_path).unwrap();
+    let disp = std::fs::read_to_string(&disp_path).unwrap();
+    assert_eq!(raw, wire);
+    assert!(!raw
+        .windows(b"RECEIVER_AZDA".len())
+        .any(|w| w == b"RECEIVER_AZDA"));
+    assert!(disp.contains(&mark.text), "display recording was {disp:?}");
+    assert!(
+        disp.contains(std::str::from_utf8(&wire).unwrap()),
+        "display recording was {disp:?}"
+    );
+
+    let _ = std::fs::remove_file(raw_path);
+    let _ = std::fs::remove_file(disp_path);
 }
 
 #[tokio::test]

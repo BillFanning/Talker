@@ -89,10 +89,22 @@ fn bench_poll_due_send_rendered(c: &mut Criterion) {
         })
     });
 
-    let fields = "typed,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,"
+    // Paired equal-shape sentences isolate the live substitution cost: same
+    // identity, fields, checksum mode, and wire length; only live rendering differs.
+    let fields = "010203.004,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,"
         .split(',')
         .map(str::to_string)
-        .collect();
+        .collect::<Vec<_>>();
+    let message = MessageConfig::new(PayloadConfig::nmea("GP", "GGA", fields.clone()), 1);
+    let mut schedule = Schedule::compile(&[message], start).unwrap();
+    let mut now = start;
+    c.bench_function("schedule/poll-due-send/static-nmea-gga", |b| {
+        b.iter(|| {
+            now += Duration::from_millis(1);
+            black_box(schedule.poll(now))
+        })
+    });
+
     let message = MessageConfig::new(PayloadConfig::nmea_live("GP", "GGA", fields, true), 1);
     let mut schedule = Schedule::compile(&[message], start).unwrap();
     let mut now = start;

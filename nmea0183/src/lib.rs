@@ -2,6 +2,7 @@ pub mod ais;
 pub mod checksum;
 pub mod sentence_type;
 pub mod talker_id;
+pub mod time;
 
 mod error;
 mod proprietary;
@@ -13,6 +14,7 @@ pub use proprietary::{PashrData, PrdidData, ProprietarySentence};
 pub use sentence::{NmeaChecksumMode, NmeaSentence};
 pub use sentence_type::{SentenceType, TimeFieldKind};
 pub use talker_id::TalkerId;
+pub use time::format_utc_time;
 
 /// The result of parsing any NMEA sentence.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

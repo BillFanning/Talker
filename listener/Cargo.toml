@@ -84,6 +84,9 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# Cross-app loopback tests drive Talker's real UDP interface into Listener's
+# orchestrator. This is test-only; Listener has no production dependency on Talker.
+talker = { path = "../talker" }
 # Integration tests (listener/tests/) drive the runtime over loopback sockets.
 # `test-util` adds the paused-clock (`start_paused` + `advance`) used to test
 # timer-driven behavior (the periodic recorder flush) without real waits.

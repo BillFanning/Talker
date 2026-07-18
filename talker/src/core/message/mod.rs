@@ -350,15 +350,6 @@ impl PayloadConfig {
         }
     }
 
-    /// Encode this payload to wire bytes. Live NMEA fields use the current UTC
-    /// instant; compiled messages render them again for every send.
-    pub fn compile(&self) -> anyhow::Result<Vec<u8>> {
-        match self.compile_payload()? {
-            CompiledPayload::Static(bytes) => Ok(bytes),
-            CompiledPayload::NmeaLive(template) => Ok(template.render_at(chrono::Utc::now())),
-        }
-    }
-
     fn compile_payload(&self) -> anyhow::Result<CompiledPayload> {
         match self {
             Self::RawHex { data } => compile_hex(data).map(CompiledPayload::Static),
@@ -473,7 +464,7 @@ impl NmeaLiveTemplate {
 
     fn append_at(&self, now: chrono::DateTime<chrono::Utc>, out: &mut Vec<u8>) {
         use chrono::{Datelike, Timelike};
-        use nmea0183::{NmeaSentence, TimeFieldKind};
+        use nmea0183::{format_utc_time, NmeaSentence, TimeFieldKind};
 
         let time_fields = self.sentence_type.time_fields();
         let required_len = time_fields.last().map_or(self.fields.len(), |(index, _)| {
@@ -484,16 +475,13 @@ impl NmeaLiveTemplate {
 
         for &(index, kind) in time_fields {
             fields[index] = match kind {
-                TimeFieldKind::UtcTime if self.include_millis => format!(
-                    "{:02}{:02}{:02}.{:03}",
+                TimeFieldKind::UtcTime => format_utc_time(
                     now.hour(),
                     now.minute(),
                     now.second(),
-                    now.timestamp_subsec_millis()
+                    now.timestamp_subsec_millis(),
+                    self.include_millis,
                 ),
-                TimeFieldKind::UtcTime => {
-                    format!("{:02}{:02}{:02}", now.hour(), now.minute(), now.second())
-                }
                 TimeFieldKind::DateDdmmyy => {
                     format!("{:02}{:02}{:02}", now.day(), now.month(), now.year() % 100)
                 }
@@ -693,12 +681,18 @@ mod tests {
         nmea0183::NmeaSentence::parse(&wire).unwrap()
     }
 
+    fn render_payload(payload: PayloadConfig) -> anyhow::Result<Vec<u8>> {
+        MessageConfig::new(payload, 1)
+            .compile()
+            .map(|message| message.render_at(utc_at(2026, 1, 1, 0, 0, 0, 0)))
+    }
+
     // ── RawHex ────────────────────────────────────────────────────────────────
 
     #[test]
     fn compile_raw_hex_basic() {
         assert_eq!(
-            PayloadConfig::raw_hex("DEADBEEF").compile().unwrap(),
+            render_payload(PayloadConfig::raw_hex("DEADBEEF")).unwrap(),
             vec![0xDE, 0xAD, 0xBE, 0xEF]
         );
     }
@@ -706,25 +700,25 @@ mod tests {
     #[test]
     fn compile_raw_hex_with_separators() {
         assert_eq!(
-            PayloadConfig::raw_hex("DE AD-BE EF").compile().unwrap(),
+            render_payload(PayloadConfig::raw_hex("DE AD-BE EF")).unwrap(),
             vec![0xDE, 0xAD, 0xBE, 0xEF]
         );
     }
 
     #[test]
     fn compile_raw_hex_odd_length_errors() {
-        assert!(PayloadConfig::raw_hex("DEA").compile().is_err());
+        assert!(render_payload(PayloadConfig::raw_hex("DEA")).is_err());
     }
 
     #[test]
     fn compile_raw_hex_invalid_byte_errors() {
-        assert!(PayloadConfig::raw_hex("DEXZ").compile().is_err());
+        assert!(render_payload(PayloadConfig::raw_hex("DEXZ")).is_err());
     }
 
     #[test]
     fn compile_raw_hex_accepts_lowercase() {
         assert_eq!(
-            PayloadConfig::raw_hex("dead beef").compile().unwrap(),
+            render_payload(PayloadConfig::raw_hex("dead beef")).unwrap(),
             vec![0xDE, 0xAD, 0xBE, 0xEF]
         );
     }
@@ -734,7 +728,7 @@ mod tests {
         // Multi-byte characters used to make byte-indexed slicing panic
         // mid-character; now they are a clean error.
         for input in ["€€", "DE€D", "0\u{00E9}"] {
-            let err = PayloadConfig::raw_hex(input).compile().unwrap_err();
+            let err = render_payload(PayloadConfig::raw_hex(input)).unwrap_err();
             assert!(
                 format!("{err:#}").contains("invalid hex character"),
                 "input {input:?} gave: {err:#}"
@@ -746,7 +740,7 @@ mod tests {
     fn compile_raw_hex_rejects_sign_characters() {
         // `from_str_radix` used to accept a leading '+' inside a pair
         // ("+F" parsed as 0x0F); strict scanning rejects it.
-        assert!(PayloadConfig::raw_hex("+F").compile().is_err());
+        assert!(render_payload(PayloadConfig::raw_hex("+F")).is_err());
     }
 
     // ── UTF-8 ─────────────────────────────────────────────────────────────────
@@ -756,7 +750,7 @@ mod tests {
         let p = PayloadConfig::Utf8 {
             text: "héllo".to_string(),
         };
-        assert_eq!(p.compile().unwrap(), "héllo".as_bytes());
+        assert_eq!(render_payload(p).unwrap(), "héllo".as_bytes());
     }
 
     #[test]
@@ -775,10 +769,10 @@ mod tests {
             allow_raw_bytes: false,
         };
 
-        assert_eq!(utf8.compile().unwrap(), b"first\nsecond");
-        assert_eq!(ascii.compile().unwrap(), b"first\nsecond");
+        assert_eq!(render_payload(utf8).unwrap(), b"first\nsecond");
+        assert_eq!(render_payload(ascii).unwrap(), b"first\nsecond");
         assert_eq!(
-            utf16.compile().unwrap(),
+            render_payload(utf16).unwrap(),
             vec![0x00, b'A', 0x00, b'\n', 0x00, b'B']
         );
     }
@@ -793,7 +787,7 @@ mod tests {
             bom: false,
             allow_raw_bytes: false,
         };
-        assert_eq!(p.compile().unwrap(), vec![0x00, 0x41, 0x00, 0x42]);
+        assert_eq!(render_payload(p).unwrap(), vec![0x00, 0x41, 0x00, 0x42]);
     }
 
     #[test]
@@ -805,7 +799,7 @@ mod tests {
             allow_raw_bytes: false,
         };
         // BOM U+FEFF then 'A' U+0041, little-endian
-        assert_eq!(p.compile().unwrap(), vec![0xFF, 0xFE, 0x41, 0x00]);
+        assert_eq!(render_payload(p).unwrap(), vec![0xFF, 0xFE, 0x41, 0x00]);
     }
 
     #[test]
@@ -821,7 +815,7 @@ mod tests {
         };
         // ‹ → 20 39, 'F' → 00 46, 'F' → 00 46, › → 20 3A
         assert_eq!(
-            p.compile().unwrap(),
+            render_payload(p).unwrap(),
             vec![0x20, 0x39, 0x00, 0x46, 0x00, 0x46, 0x20, 0x3A]
         );
     }
@@ -838,7 +832,10 @@ mod tests {
             allow_raw_bytes: true,
         };
         // 'A' → 00 41, marker ‹FF› → FF, 'B' → 00 42  →  5 bytes total
-        assert_eq!(p.compile().unwrap(), vec![0x00, 0x41, 0xFF, 0x00, 0x42]);
+        assert_eq!(
+            render_payload(p).unwrap(),
+            vec![0x00, 0x41, 0xFF, 0x00, 0x42]
+        );
     }
 
     #[test]
@@ -850,7 +847,7 @@ mod tests {
             allow_raw_bytes: true,
         };
         // BOM (LE) FF FE, then two raw marker bytes 01 02
-        assert_eq!(p.compile().unwrap(), vec![0xFF, 0xFE, 0x01, 0x02]);
+        assert_eq!(render_payload(p).unwrap(), vec![0xFF, 0xFE, 0x01, 0x02]);
     }
 
     #[test]
@@ -862,7 +859,7 @@ mod tests {
             bom: false,
             allow_raw_bytes: false,
         };
-        assert_eq!(p.compile().unwrap(), vec![0xD8, 0x3D, 0xDE, 0x00]);
+        assert_eq!(render_payload(p).unwrap(), vec![0xD8, 0x3D, 0xDE, 0x00]);
     }
 
     // ── ASCII / code pages ────────────────────────────────────────────────────
@@ -873,7 +870,7 @@ mod tests {
             text: "café".to_string(),
             code_page: CodePage::Iso8859_1,
         };
-        assert_eq!(p.compile().unwrap(), vec![b'c', b'a', b'f', 0xE9]);
+        assert_eq!(render_payload(p).unwrap(), vec![b'c', b'a', b'f', 0xE9]);
     }
 
     #[test]
@@ -882,7 +879,7 @@ mod tests {
             text: "—…→↔✅".to_string(),
             code_page: CodePage::Iso8859_1,
         };
-        assert_eq!(p.compile().unwrap(), b"?????");
+        assert_eq!(render_payload(p).unwrap(), b"?????");
     }
 
     #[test]
@@ -919,7 +916,7 @@ mod tests {
         let p = PayloadConfig::Utf8 {
             text: "AB‹0D›‹0A›".to_string(),
         };
-        assert_eq!(p.compile().unwrap(), vec![0x41, 0x42, 0x0D, 0x0A]);
+        assert_eq!(render_payload(p).unwrap(), vec![0x41, 0x42, 0x0D, 0x0A]);
     }
 
     #[test]
@@ -931,7 +928,7 @@ mod tests {
             text: "hello‹world".to_string(),
             code_page: CodePage::Iso8859_1,
         };
-        let err = format!("{:#}", p.compile().unwrap_err());
+        let err = format!("{:#}", render_payload(p).unwrap_err());
         assert!(err.contains("byte marker"), "error was: {err}");
         assert!(err.contains("‹XX›"), "error was: {err}");
     }
@@ -942,7 +939,7 @@ mod tests {
             text: "X‹FF›Y".to_string(),
             code_page: CodePage::Iso8859_1,
         };
-        assert_eq!(p.compile().unwrap(), vec![0x58, 0xFF, 0x59]);
+        assert_eq!(render_payload(p).unwrap(), vec![0x58, 0xFF, 0x59]);
     }
 
     // ── NMEA ──────────────────────────────────────────────────────────────────
@@ -950,7 +947,7 @@ mod tests {
     #[test]
     fn compile_nmea_wire_format() {
         let p = PayloadConfig::nmea("GP", "GGA", vec!["123519".to_string()]);
-        let wire = String::from_utf8(p.compile().unwrap()).unwrap();
+        let wire = String::from_utf8(render_payload(p).unwrap()).unwrap();
         assert!(wire.starts_with("$GPGGA,123519*"));
         assert!(wire.ends_with("\r\n"));
     }
@@ -959,7 +956,7 @@ mod tests {
     fn compile_nmea_custom_talker_and_sentence_still_compile() {
         // Non-standard IDs are a deliberate capability (Custom variants).
         let p = PayloadConfig::nmea("ZZ", "ABC", vec![]);
-        let wire = String::from_utf8(p.compile().unwrap()).unwrap();
+        let wire = String::from_utf8(render_payload(p).unwrap()).unwrap();
         assert!(wire.starts_with("$ZZABC"), "wire was: {wire}");
     }
 
@@ -974,9 +971,7 @@ mod tests {
             ("GP", "GGA\r\n"),
             ("G!P", "GGA"),
         ] {
-            let err = PayloadConfig::nmea(talker, sentence, vec![])
-                .compile()
-                .unwrap_err();
+            let err = render_payload(PayloadConfig::nmea(talker, sentence, vec![])).unwrap_err();
             assert!(
                 format!("{err:#}").contains("sentence framing"),
                 "({talker:?},{sentence:?}) gave: {err:#}"
@@ -1036,6 +1031,24 @@ mod tests {
 
         assert_eq!(parse_rendered_nmea(&without, at).field(0), Some("010203"));
         assert_eq!(parse_rendered_nmea(&with, at).field(0), Some("010203.045"));
+    }
+
+    #[test]
+    fn live_time_formats_a_chrono_leap_second_without_growing_the_field() {
+        let without =
+            MessageConfig::new(PayloadConfig::nmea_live("GP", "GGA", vec![], false), 1000)
+                .compile()
+                .unwrap();
+        let with = MessageConfig::new(PayloadConfig::nmea_live("GP", "GGA", vec![], true), 1000)
+            .compile()
+            .unwrap();
+        let leap = utc_at(2016, 12, 31, 23, 59, 59, 1_800);
+
+        assert_eq!(parse_rendered_nmea(&without, leap).field(0), Some("235960"));
+        assert_eq!(
+            parse_rendered_nmea(&with, leap).field(0),
+            Some("235960.800")
+        );
     }
 
     #[test]

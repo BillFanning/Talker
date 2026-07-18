@@ -57,6 +57,28 @@ only supplies an instant and formatting policy. An empty mapping means substitut
 is unsupported, not that a sentence can never contain time-like data. Unit tests pin
 every supported entry, sorted unique positions, and empty custom/unsupported types.
 
+## ADR-030 — UTC field formatting normalizes leap-second components
+
+**Status:** Accepted 2026-07-17.
+
+**Context:** Talker live fields and Listener ZDA annotations both formatted NMEA UTC
+time from clock components. Their duplicate format strings inherited an edge case
+from Chrono's leap-second representation: `second()` remains 59 while subsecond
+milliseconds may be 1000..=1999, and a minimum-width `{:03}` formatter then emits an
+invalid four-digit fraction. Depending on Chrono here would make the independently
+publishable protocol crate heavier for one component conversion.
+
+**Decision:** `format_utc_time` is a dependency-free NMEA helper over numeric clock
+components. Normal milliseconds emit `hhmmss[.sss]`. A Chrono-style leap component
+(`second == 59`, subsecond milliseconds 1000..=1999) emits second `60` and subtracts
+1000 from the fraction, preserving the field width and the represented instant. Both
+applications use this one formatter; component-range preconditions are documented and
+debug-asserted because their clock libraries already guarantee them.
+
+**Consequences:** Talker and Listener cannot drift on NMEA UTC precision or leap
+normalization, and `nmea0183` gains no clock dependency. Tests pin ordinary and leap
+forms in the library and at both application boundaries.
+
 ---
 
 ## Open questions
