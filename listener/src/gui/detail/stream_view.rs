@@ -65,6 +65,9 @@ impl ListenerApp {
                 if is_paused {
                     if ui.button("Resume").clicked() {
                         self.send(UiCommand::ResumeDisplay(id, view_id));
+                        // Jump the view back onto the newest bytes: pausing is
+                        // for scrolling back, which disengaged stick_to_bottom.
+                        self.resume_scroll_bottom = Some(id);
                     }
                     ui.label("view paused — reception continues");
                 } else if ui
@@ -233,11 +236,23 @@ impl ListenerApp {
                 // per row while rows drew at `row_h`, so the computed bottom overshot the
                 // real last row and the newest data never came into view.
                 ui.spacing_mut().item_spacing.y = 0.0;
-                let scroll = egui::ScrollArea::vertical()
+                // Resume's one-shot jump to the newest bytes: force the offset
+                // to the exact virtual content height (rows × row pitch — the
+                // spacing zeroed above is what makes this arithmetic hold;
+                // egui clamps overshoot). With the view at the bottom,
+                // `stick_to_bottom` re-latches and follows new data on its own.
+                let jump_to_bottom = self
+                    .resume_scroll_bottom
+                    .take_if(|channel| *channel == id)
+                    .is_some();
+                let mut scroll = egui::ScrollArea::vertical()
                     .id_salt("stream")
                     .stick_to_bottom(true)
                     .max_height(viewer_height)
                     .auto_shrink([false, false]);
+                if jump_to_bottom {
+                    scroll = scroll.vertical_scroll_offset(rows.len() as f32 * row_h);
+                }
                 if stream_len == 0 {
                     // No data yet: still occupy the full viewer height, with a note.
                     scroll.show(ui, |ui| {

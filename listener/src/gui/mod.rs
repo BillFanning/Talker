@@ -180,6 +180,12 @@ struct ListenerApp {
     /// (regression after the stream-only split). We recompute only when the inputs
     /// change; `show_rows` then lays out just the visible rows.
     stream_cache: Option<StreamRenderCache>,
+    /// One-shot: on the next render of this channel's stream view, jump the
+    /// scroll to the bottom. Set by the Resume button — egui's
+    /// `stick_to_bottom` disengages when the user scrolls up (which is what
+    /// Pause is for), so Resume forces the view back onto the newest bytes,
+    /// where stickiness re-latches on its own.
+    resume_scroll_bottom: Option<ChannelId>,
     /// The profile file the workspace is currently associated with (last saved or
     /// loaded). `Save` writes here silently; `Save As…` always re-prompts. `None`
     /// until the first save/load, so the first `Save` falls through to a picker.
@@ -298,6 +304,7 @@ impl ListenerApp {
             show_error: true,
             serial_ports: list_serial_ports(),
             stream_cache: None,
+            resume_scroll_bottom: None,
             current_profile_path: None,
             recent_profiles,
             command_drop: None,
