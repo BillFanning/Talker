@@ -16,6 +16,6 @@ pub use error::RecordError;
 pub use ids::{ChannelId, ChannelName, DisplayViewId, MatchRuleId, StableConfigId};
 pub use state::{ChannelKind, ChannelState, DisplayState, RecordingState};
 pub use timing::{
-    validate_zda_talker_id, zda_sentence, ChunkTime, TimestampConfig, ZdaTalkerIdError,
-    MAX_ZDA_TALKER_ID_BYTES,
+    validate_zda_talker_id, zda_sentence, ArrivalTimestampSource, ArrivalTimestampStatus,
+    ChunkTime, TimestampConfig, ZdaTalkerIdError, MAX_ZDA_TALKER_ID_BYTES,
 };

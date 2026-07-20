@@ -270,6 +270,7 @@ mod tests {
             received_at: ChunkTime {
                 monotonic: Instant::now(),
                 wall_clock: at,
+                wall_clock_source: crate::core::ArrivalTimestampSource::PostRead,
             },
         }
     }
@@ -401,6 +402,7 @@ mod tests {
             timestamp: Some(ChunkTime {
                 monotonic: Instant::now(),
                 wall_clock: at,
+                wall_clock_source: crate::core::ArrivalTimestampSource::PostRead,
             }),
         };
         rec.write_rendered(&render("day1", local(2026, 6, 3, 23, 50)))

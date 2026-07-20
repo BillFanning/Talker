@@ -20,6 +20,7 @@ use crate::core::{
     runner,
     scheduler::Schedule,
     supervisor::TalkerSupervisor,
+    timing::TimingMode,
 };
 
 use display::ChannelDisplay;
@@ -164,6 +165,8 @@ fn drafts_to_channels(
         }
         let mut cfg = ChannelConfig::new(interface, messages);
         cfg.name = draft.name.clone();
+        cfg.timing_mode = draft.timing_mode;
+        cfg.cadence_alignment = draft.cadence_alignment;
         channels.push(cfg);
     }
     if problems.is_empty() {
@@ -200,6 +203,10 @@ enum MessagePreview {
 struct MessageDraftAnalysis {
     config: Option<MessageConfig>,
     validation_error: Option<String>,
+    /// Exact wire length from the one fixed-time preview render. Dynamic
+    /// fields are fixed-width, so capacity preflight can reuse it without
+    /// rendering or cloning the message on every frame.
+    wire_len: Option<usize>,
     replacements: Option<CodePageReplacementSummary>,
     preview: MessagePreview,
 }
@@ -215,6 +222,7 @@ impl MessageDraftAnalysis {
             return Self {
                 config: None,
                 validation_error: None,
+                wire_len: None,
                 replacements,
                 preview: MessagePreview::Incomplete,
             };
@@ -230,6 +238,7 @@ impl MessageDraftAnalysis {
                     .map(|timestamp| timestamp.format(reference).len())
                     .unwrap_or(0);
                 let bytes = compiled.render_at(reference);
+                let wire_len = bytes.len();
                 let preview = match draft.payload_kind {
                     draft::PayloadKind::Ascii => MessagePreview::Ascii {
                         replacement_wire_offsets: replacements
@@ -262,6 +271,7 @@ impl MessageDraftAnalysis {
                 Self {
                     config: Some(config),
                     validation_error: None,
+                    wire_len: Some(wire_len),
                     replacements,
                     preview,
                 }
@@ -271,6 +281,7 @@ impl MessageDraftAnalysis {
                 Self {
                     config: Some(config),
                     validation_error: Some(error.clone()),
+                    wire_len: None,
                     replacements,
                     preview: MessagePreview::Invalid(error),
                 }
@@ -335,6 +346,8 @@ fn prepare_profile_load(path: &Path) -> anyhow::Result<PreparedProfileLoad> {
         .map(|channel| {
             let mut draft = ConnDraft::from(&channel.interface);
             draft.name = channel.name.clone();
+            draft.timing_mode = channel.timing_mode;
+            draft.cadence_alignment = channel.cadence_alignment;
             draft
         })
         .collect();
@@ -368,6 +381,7 @@ fn prepare_profile_load(path: &Path) -> anyhow::Result<PreparedProfileLoad> {
 #[derive(Debug)]
 struct PreparedChannelRun {
     interface: InterfaceConfig,
+    timing_mode: TimingMode,
     messages: Vec<MessageConfig>,
     schedule: Schedule,
 }
@@ -389,9 +403,10 @@ fn prepare_channel_run(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let schedule = Schedule::compile_unarmed(&messages)?;
+    let schedule = Schedule::compile_unarmed(&messages)?.with_alignment(conn.cadence_alignment);
     Ok(PreparedChannelRun {
         interface,
+        timing_mode: conn.timing_mode,
         messages,
         schedule,
     })
@@ -412,6 +427,7 @@ fn replace_channel_run(
         index,
         label,
         prepared.interface,
+        prepared.timing_mode,
         prepared.messages,
         prepared.schedule,
     );
@@ -701,17 +717,25 @@ impl TalkerApp {
 
     /// Compare the draft for channel `i` against the applied config (what
     /// the talker thread is actually using). Returns `(interface_drift,
-    /// message_drift)`:
+    /// run_drift)`:
     ///
     /// - `interface_drift`: the draft's interface params don't match the
     ///   applied interface. Can be applied live by pressing Enter (sends
     ///   `UpdateInterface` to the talker thread).
-    /// - `message_drift`: the message list compiled from drafts differs
-    ///   from the applied message list. Currently requires a stop+start
-    ///   to apply — the scheduler is compiled at channel open time and
-    ///   can't be hot-swapped today.
-    fn detect_drift(&self, i: usize) -> (bool, bool) {
-        let draft_interface = self.conn_drafts.get(i).and_then(ConnDraft::to_config);
+    /// - `run_drift`: the message list or Timing mode differs from the
+    ///   applied run. Both require a stop+start; the scheduler and its wait
+    ///   policy are fixed at channel start.
+    fn detect_drift(&self, i: usize, draft_interface: Option<&InterfaceConfig>) -> (bool, bool) {
+        let draft_timing_mode = self
+            .conn_drafts
+            .get(i)
+            .map(|draft| draft.timing_mode)
+            .unwrap_or_default();
+        let draft_cadence_alignment = self
+            .conn_drafts
+            .get(i)
+            .map(|draft| draft.cadence_alignment)
+            .unwrap_or_default();
         let analyses = self.message_analysis.get(i).map(Vec::as_slice);
         let messages_complete = analyses.is_some_and(|analyses| {
             analyses.iter().all(|cached| {
@@ -730,8 +754,10 @@ impl TalkerApp {
                 return (draft_interface.is_some(), messages_complete);
             };
             return (
-                draft_interface.as_ref() != Some(&applied.interface),
-                !analyzed_messages_match(analyses, &applied.messages),
+                draft_interface != Some(&applied.interface),
+                !analyzed_messages_match(analyses, &applied.messages)
+                    || draft_timing_mode != applied.timing_mode
+                    || draft_cadence_alignment != applied.cadence_alignment,
             );
         }
 
@@ -739,8 +765,10 @@ impl TalkerApp {
             return (false, false);
         };
         (
-            draft_interface.as_ref() != Some(&profile.interface),
-            !analyzed_messages_match(analyses, &profile.messages),
+            draft_interface != Some(&profile.interface),
+            !analyzed_messages_match(analyses, &profile.messages)
+                || draft_timing_mode != profile.timing_mode
+                || draft_cadence_alignment != profile.cadence_alignment,
         )
     }
 
@@ -1042,11 +1070,11 @@ impl TalkerApp {
         } else if i < self.profile.channels.len() {
             self.profile.channels[i].interface = cfg;
         } else {
-            self.profile.channels.push(ChannelConfig::named(
-                self.conn_drafts[i].name.clone(),
-                cfg,
-                Vec::new(),
-            ));
+            let mut channel =
+                ChannelConfig::named(self.conn_drafts[i].name.clone(), cfg, Vec::new());
+            channel.timing_mode = self.conn_drafts[i].timing_mode;
+            channel.cadence_alignment = self.conn_drafts[i].cadence_alignment;
+            self.profile.channels.push(channel);
         }
         self.dirty = true;
     }
@@ -1685,12 +1713,19 @@ mod tests {
             vec![message_draft("250").to_message_config().unwrap()],
         );
         channel.name = "A".to_string();
+        channel.timing_mode = TimingMode::Precise;
+        channel.cadence_alignment = crate::core::timing::CadenceAlignment::UtcPhase;
         profile.channels.push(channel);
         profile.save(&path).unwrap();
 
         let prepared = prepare_profile_load(&path).expect("valid candidate");
         assert_eq!(prepared.profile.channels.len(), 1);
         assert_eq!(prepared.conn_drafts[0].name, "A");
+        assert_eq!(prepared.conn_drafts[0].timing_mode, TimingMode::Precise);
+        assert_eq!(
+            prepared.conn_drafts[0].cadence_alignment,
+            crate::core::timing::CadenceAlignment::UtcPhase
+        );
         assert_eq!(prepared.sched_drafts[0][0].interval_ms, "250");
         let _ = std::fs::remove_file(path);
     }
@@ -1716,13 +1751,20 @@ mod tests {
 
     #[test]
     fn replacement_preflight_builds_the_complete_candidate_run() {
-        let conn = serial_draft("active");
+        let mut conn = serial_draft("active");
+        conn.timing_mode = TimingMode::Precise;
+        conn.cadence_alignment = crate::core::timing::CadenceAlignment::UtcPhase;
         let prepared =
             prepare_channel_run(&conn, &[message_draft("100")]).expect("valid candidate");
 
         assert_eq!(prepared.messages.len(), 1);
         assert_eq!(prepared.schedule.len(), 1);
         assert_eq!(prepared.interface, conn.to_config().unwrap());
+        assert_eq!(prepared.timing_mode, TimingMode::Precise);
+        assert_eq!(
+            prepared.schedule.cadence_alignment(),
+            crate::core::timing::CadenceAlignment::UtcPhase
+        );
     }
 
     #[test]

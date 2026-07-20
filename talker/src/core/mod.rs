@@ -1,8 +1,11 @@
+pub mod capacity;
 pub mod channel;
 pub mod logging;
 pub mod message;
 pub mod profile;
+pub mod run_summary;
 pub mod runner;
 pub mod scheduler;
 pub mod supervisor;
+pub mod telemetry;
 pub mod timing;

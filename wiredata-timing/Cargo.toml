@@ -1,0 +1,16 @@
+[package]
+name = "wiredata-timing"
+description = "Internal cross-platform process timing policy for wiredata applications"
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_System_Threading",
+] }

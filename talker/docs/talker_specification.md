@@ -1,7 +1,66 @@
 # Talker — Program Specification
-**Version:** 2.2
+**Version:** 2.4.2
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
+
+Revision v2.4.2 (optional UTC phase alignment and shared timer policy):
+
+- **§3.2 / §8.1 cadence phase (ADR-037)** — each channel may retain the default
+  immediate first send or wait for every active message's strict next
+  Unix-epoch-modulo interval boundary. After that anchor, cadence remains monotonic.
+  A wall-clock displacement of at least 250 ms is checked at most once per second
+  and rephases only future deadlines; it never replays elapsed wall-clock points.
+- **§8.2 process timer policy (ADR-038)** — Talker and Listener now share the small
+  `wiredata-timing` platform boundary for refcounted Windows 1 ms requests and the
+  minimized-window throttling opt-out. Linux and macOS retain native deadline waits
+  and make no analogous resolution request.
+- Alignment is independent of Standard/Precise wake policy and does not establish
+  physical wire time. The additive channel field defaults to immediate and is omitted
+  in that state, so profile schema `version` 2 remains unchanged.
+
+Revision v2.4.1 (retained completed-run summary and clipboard report):
+
+- **§3.2 / §8.1 completed-run summary (ADR-036)** — after a send loop ends,
+  Talker retains the newest exact summary for that stable channel slot across
+  ordinary stop/restart cycles. It includes wall-clock start/finish, monotonic
+  elapsed duration, final sent/failed/suppressed/missed outcomes, per-message
+  counts, observer drops, bounded timing, timer policy, and build/platform facts.
+- The selected-channel GUI exposes the summary in a collapsed block and creates a
+  versioned line-oriented clipboard report only when **Copy summary** is clicked.
+  Process-unique run ordering prevents a late predecessor tail from replacing a
+  newer completion. Retention is process-local, fresh profile slots clear it, and
+  profiles, wire bytes, scheduler cadence, and profile schema `version` 2 are
+  unchanged.
+
+Revision v2.4 (capacity preflight and measured application headroom):
+
+- **§3.2 / §8.1 capacity preflight (ADR-035)** — the selected channel reports
+  current-draft message and byte rates from exact compiled wire lengths. Serial
+  channels also report UART utilization using one start bit plus the configured
+  data, parity, and stop bits for every wire byte. Sustained demand above 100% is
+  identified as physically over capacity; 80% and above is highlighted as low
+  practical margin. The warning is advisory, so intentional overload tests remain
+  possible.
+- After 20 paired observations, Talker compares the draft rate with the sum of the
+  separate render and synchronous-send p99 histogram upper bounds. Recent data is
+  preferred and cumulative run data supports slow schedules. This is not a joint
+  p99, a physical-wire measurement, or a hard real-time guarantee. Capacity uses
+  existing memoized preview lengths and adds no per-frame payload render. Profiles
+  and profile schema `version` 2 are unchanged.
+
+Revision v2.3 (explicit precision timing and deadline-window timer resolution):
+
+- **§3.2 / §8.1 / §8.2 channel timing (ADR-034)** — each channel has a
+  `Standard` or `Precise` timing mode. Standard preserves the automatic continuous
+  Windows 1 ms timer request for active intervals below 32 ms. On a slower Precise
+  schedule, the runner requests 1 ms resolution only for the final 32 ms before the
+  next deadline and releases it before rendering and sending; dormant schedules hold
+  no request. Commands remain able to interrupt every wait.
+- Non-Windows targets keep one native deadline wait and make no Windows-style timer
+  request. Precise improves Windows deadline-wake cadence; the timing mode alone does
+  not choose wall-clock phase, improve the wall clock itself, or prove when bytes
+  leave hardware. v2.4.2 adds phase as an independent option. The profile field is
+  additive and defaults to Standard, so profile `version` remains 2.
 
 Revision v2.2 (live UTC fields in NMEA payloads):
 
@@ -76,15 +135,17 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 
 ### 2.1 Crate Structure
 
-`wiredata` is a Cargo workspace with four crates:
+`wiredata` is a Cargo workspace with five crates:
 
 - **`talker`** — the binary crate containing the CLI, GUI, and all application logic
 - **`nmea0183`** — a standalone library crate containing all NMEA 0183 support, with no dependency on `talker`
-- **`listener`** — the receive/decode counterpart to `talker`, with its own spec, ADR, and TODO
+- **`listener`** — the receive-side stream counterpart to `talker`, with its own spec, ADR, and TODO
 - **`wiredata-ui`** — internal shared GUI chrome for the two apps (fonts, color palette, base widget style, formatting helpers); egui-only, never published (talker ADR-016 / listener ADR-019)
+- **`wiredata-timing`** — internal shared Windows timer-resolution mechanism; app-specific scheduling and telemetry remain in Talker and Listener (ADR-038)
 
-Each crate keeps its own `docs/` folder (spec, ADR, TODO). There is no
-workspace-root docs directory.
+The application/library crates keep their own `docs/` folders (spec, ADR, TODO).
+The two small internal shared crates have no docs folder; their scope decisions live
+in the app ADRs. There is no workspace-root docs directory.
 
 ```
 wiredata/                        # workspace root
@@ -122,12 +183,20 @@ wiredata/                        # workspace root
 │   │   └── proprietary/         # $PRDID, $PASHR, and arbitrary $P builder
 │   └── tests/                   # integration tests for nmea0183
 │
-└── listener/                    # receive/decode utility crate
+├── listener/                    # receive-side stream utility crate
+│   ├── Cargo.toml
+│   ├── docs/
+│   │   ├── ADR.md              # listener decisions (own ADR numbering)
+│   │   ├── TODO.md
+│   │   └── listener_specification.md
+│   └── src/
+│
+├── wiredata-ui/                 # internal shared egui chrome
+│   ├── Cargo.toml
+│   └── src/
+│
+└── wiredata-timing/             # internal shared OS timing policy
     ├── Cargo.toml
-    ├── docs/
-    │   ├── ADR.md              # listener decisions (own ADR numbering)
-    │   ├── TODO.md
-    │   └── listener_specification.md
     └── src/
 ```
 
@@ -263,6 +332,16 @@ The **detail pane** (right) shows the selected channel:
     decomposes the total into failed sends, backoff-suppressed fires, and
     stall-skipped cadence points (§8.1). Sent + Unsent = scheduled, always.
   - *Throughput:* rolling `kB/s · msg/s` from cumulative successful sends.
+  - *Capacity:* current-draft aggregate `msg/s` and wire `B/s`; for Serial, UART
+    line utilization and headroom. A second line shows measured application
+    headroom after warm-up from the recent or cumulative render/send timing
+    histograms. Low margin and physical serial oversubscription are amber.
+  - *Timing health:* approximately last-ten-second deadline-lateness, render-time,
+    and synchronous send-call p99 upper bounds plus maxima; the deadline row also
+    retains the cumulative run maximum. The timer readout names the configured
+    timing mode, active policy, shortest active interval, cadence alignment,
+    wall-clock re-alignment count, and any Windows 1 ms request failure
+    (ADR-032 through ADR-038).
   - *Observer health:* `Display backlog: <len>/<cap> (peak <p>, <d> dropped)` —
     the runner→UI status-queue gauge (ADR-018/ADR-019); amber when the peak
     nears the cap or anything was dropped. Pressure here never delays a send;
@@ -271,8 +350,19 @@ The **detail pane** (right) shows the selected channel:
   [Start Channel / Apply & Restart / Retry Channel] + [Stop Channel]; the Start
   side's label and enabled state derive from run state, drift, and draft
   validity (a disabled Start's tooltip lists the exact blockers).
+- **Last completed run** — one collapsed process-local summary retained for the
+  channel's newest completed runner. Its heading shows elapsed, sent, and unsent;
+  expansion shows wall-clock start/finish, exact final outcomes, cumulative timing,
+  final timer/cadence policy, and build/platform facts. **Copy summary** places the
+  versioned line-oriented report on the clipboard; formatting is performed only on
+  click.
 - **Configure connection** / **Configure messages** sections (the editors), and
   the **Output** display pane (sampled at high rates, with a sub-sampling badge).
+
+Configure connection includes the channel's **Timing** choice (Standard / Precise)
+and an independent **Align sends to UTC interval boundaries** choice. Both are part
+of the run configuration, so changing either on an active channel is applied by
+**Apply & Restart**, together with the rest of the prepared replacement.
 
 #### GUI State Persistence
 
@@ -640,14 +730,94 @@ Each channel runs a **priority-queue scheduler**. Each message within the channe
 
 - The scheduler tracks each message's next-fire-time (conceptually a priority
   queue; see the model note above).
-- When a channel starts, all enabled messages (interval > 0) are inserted into the queue with next-fire-time = now (all fire immediately at t=0).
+- With the default **Immediate** cadence alignment, when a channel starts all enabled
+  messages (interval > 0) have next-fire-time = now and fire immediately at t=0.
+- With **UTC phase** alignment, each enabled message instead waits for the strict next
+  boundary where Unix-epoch time is an integer multiple of that message's interval.
+  Exactly on a boundary means waiting one full interval. Intervals need not divide a
+  day; phase is against the Unix epoch, not local midnight.
 - The scheduler picks the message with the earliest next-fire-time, waits until that time, sends the message, then re-inserts it with next-fire-time = previous-fire-time + interval.
 - When two messages are due at the same time, they fire in list order (the order in which they appear in the message list for that channel).
 - **After a stall** (a blocked send, the machine sleeping), a message that is more than one interval overdue fires **once**, then its next-fire-time jumps forward to the first grid point (`previous-fire-time + k·interval`) still in the future. Missed intervals are skipped, not burst out back-to-back: talker generates test cadence, so a receiver should see the rate resume, not a flood catching up the count.
 
 **Interval = 0 (dormant):** A message with interval = 0 is excluded from the queue and does not send. Changing a message's interval to 0 while the channel is running removes it from the queue immediately; other messages are unaffected and the channel continues running.
 
-**Live interval changes:** When a message's interval is changed to a non-zero value while the channel is running, the message is removed from the queue and re-inserted with next-fire-time = now + new-interval. All other messages continue unaffected. The channel is never stopped by an interval change.
+**Live interval changes:** When a message's interval is changed to a non-zero value
+while the channel is running, it is removed from the queue and re-inserted at
+now + new-interval in Immediate mode, or at the new interval's strict next UTC phase
+in UTC-phase mode. All other messages continue unaffected. The channel is never
+stopped by an interval change.
+
+After startup, both modes advance from monotonic deadlines so ordinary wall-clock
+slew cannot accumulate cadence drift. A UTC-phase schedule compares its paired
+monotonic/wall anchor with the wall clock at most once per second. A displacement of
+at least 250 ms rephases every active message to its next future UTC boundary and
+increments a visible re-alignment counter. It never emits catch-up sends or counts
+the elapsed wall-clock grid as scheduler misses.
+
+**Deadline waiting and channel Timing mode (ADR-017 / ADR-034):**
+
+- Every active runner blocks on an interruptible monotonic deadline wait. It does
+  not busy-spin, and queued commands can interrupt the wait.
+- **Standard** preserves the automatic policy: on Windows, a shortest active
+  interval below 32 ms holds the process's refcounted 1 ms timer-resolution request
+  continuously. Slower schedules use the platform's normal deadline wait.
+- **Precise** uses the same continuous policy when the schedule is already below
+  32 ms. For a slower active schedule on Windows, the runner first waits normally
+  until 32 ms before the next send deadline, acquires the 1 ms request for the final
+  wait, and releases it before payload rendering and `Interface::send`. Closely
+  spaced deadlines may make these windows touch; making every message dormant
+  releases the request before the runner's indefinite command wait.
+- On macOS and Linux, Precise keeps one native deadline wait. It adds no staging
+  wake and makes no Windows-style resolution request.
+
+Timing mode controls deadline-wake policy, not timestamp formatting or cadence phase.
+Cadence alignment independently chooses Immediate or UTC-phase startup/rebase
+deadlines. Neither choice changes `SystemTime` accuracy, compensates for render or
+interface time, or establishes when serial/network bytes physically leave the host.
+The timing telemetry in §3.2 exposes the configured alignment, wall-clock
+re-alignments, and measured application boundaries without claiming a hard real-time
+guarantee.
+
+**Capacity preflight (ADR-035):**
+
+- Draft demand is the sum, across non-dormant messages, of exact compiled wire
+  length divided by interval. Incomplete or invalid messages withhold the estimate
+  instead of understating it. UDP/TCP show requested `msg/s` and `B/s`; Talker does
+  not invent a network link capacity it cannot know.
+- For Serial, each wire byte consumes `1 + data bits + parity bits + stop bits` at
+  the configured baud. Aggregate demand above the resulting bit rate cannot be
+  sustained physically. Demand from 80% through 100% is valid but low-margin.
+  Flow control, USB adapter/driver buffering, operating-system delay, and aligned
+  message bursts can reduce practical capacity even below 100%.
+- Measured application headroom adds the separate render-p99 and send-call-p99
+  histogram upper bounds and compares that service estimate with aggregate draft
+  message rate. At least 20 paired samples are required; approximately last-ten-
+  second data is preferred, with cumulative run data as the slow-schedule fallback.
+  The sum is not a joint p99. A retained run can describe an older draft, and a
+  send call can return before bytes physically leave a driver or kernel buffer.
+
+All capacity findings are advisory. They do not disable Start because deliberately
+oversubscribed schedules are useful tests; actual deadline, unsent, and throughput
+telemetry shows what the run achieved.
+
+**Completed-run retention (ADR-036):**
+
+- A run begins when its schedule is armed, after interface open and any predecessor
+  join. Talker captures a wall-clock start beside that monotonic arm instant.
+- On Stop or owner disconnect, the send loop captures wall-clock finish and monotonic
+  elapsed duration. It attempts ADR-018's blocking final Counters delivery, then emits
+  one self-contained `RunFinished` over the reliable control lane from the same final
+  counter/timing snapshot. A failed interface open occurs before arming and does not
+  replace the last completed summary.
+- The supervisor retains only the greatest process-unique run id for each stable
+  channel slot. Apply & Restart discards predecessor sampled telemetry so it cannot
+  alter the replacement's counters, but drains the predecessor's reliable completion
+  tail. Thus polling order cannot make an older run replace a newer completion.
+- Retention is bounded to one summary and one per-message count vector per channel.
+  It is not profile data or an on-disk history. Loading a profile creates fresh slots
+  and clears it. Wall-clock values can reflect system-clock steps; elapsed duration
+  uses the monotonic clock.
 
 ### 8.2 Profiles
 
@@ -656,6 +826,8 @@ A profile is a named, saved configuration. A profile defines one or more channel
 Each channel entry within a profile includes:
 
 - Interface type and all parameters
+- Timing mode (`standard` by default, or `precise`)
+- Cadence alignment (`immediate` by default, or `utc_phase`)
 - One or more message definitions, each containing:
   - Format and encoding (including code page for ASCII)
   - Payload data
@@ -677,6 +849,8 @@ name = "GPS sim"
 
 [[channels]]
 name = "GPS feed"   # optional display name (v2.1); omitted when unnamed
+timing_mode = "precise" # optional; omitted when Standard
+cadence_alignment = "utc_phase" # optional; omitted when Immediate
 type = "serial"
 port = "COM3"
 baud = 9600

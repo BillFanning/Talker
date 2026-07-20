@@ -55,6 +55,37 @@ Message-model removal). Everything below this block is verified done:
 
 ## v2 feature gaps (after the strip)
 
+### Timing and telemetry plan (2026-07-19)
+
+- [x] **Post-read-to-pipeline timing (ADR-026).** UDP, TCP, and Serial capture
+      `ChunkTime` before payload copying; the pipeline records a cumulative,
+      fixed-size handoff-delay histogram and exposes it through stats/snapshots and
+      the selected detail pane. The completed run remains visible after Stop.
+- [x] **Measure total ingest processing duration (ADR-028).** Add one bounded
+      histogram around `ChannelPipeline::ingest`; correlate it with handoff delay and
+      ingest-queue peak. Split match/render/record stages only if the total proves
+      material, avoiding a clock read around every minor operation by default.
+- [x] **Recent handoff-delay window (ADR-027).** Ten fixed one-second histogram
+      segments feed the labeled recent p99 while the cumulative run maximum and final
+      recent state remain available at rest; no per-chunk event traffic.
+- [x] **Processing-window and chunk-shape telemetry (ADR-028).** Total ingest
+      processing now has the same rotating recent window as handoff timing. Chunk
+      count, size distribution, and inter-read gaps remain cumulative at-rest truth
+      and reuse the post-read monotonic capture.
+- [x] **Transport-specific loss and stall context (ADR-029).** Serial accumulates
+      backpressure episode count/duration; Linux exposes per-socket `SO_RXQ_OVFL`;
+      unsupported counters remain distinct from a measured zero.
+- [x] **Timing rule precision (ADR-030).** Idle rules use exact monotonic deadlines
+      and cumulative/recent firing lateness. Windows requests 1 ms resolution only in
+      the final 32 ms; Linux/macOS use native waits. Receive timing remains event-
+      driven and unaffected.
+- [x] **Advanced arrival timestamps (ADR-029).** UDP optionally requests Linux
+      `SO_TIMESTAMPNS`; actual kernel and post-read fallback samples are counted
+      separately. Serial/TCP and unsupported platforms retain explicit post-read time.
+- [x] **Run summary and export (ADR-031).** The newest completed run retains exact
+      bytes/chunks, diagnostics, queue peaks, timing/timer policy, transport health,
+      and platform/build facts in an on-click versioned clipboard report.
+
 - [x] Find & Triggers runtime: cross-chunk `BytePattern` scanner **with carry** —
       a pattern split across two reads now matches (`MatchRuleSet` keeps the prior
       chunk's tail and scans `carry ++ chunk`, reporting only matches ending in the

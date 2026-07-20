@@ -6,11 +6,15 @@
 //! order). A message whose interval is zero is *dormant*: it is kept so its
 //! interval can later be changed, but it never fires.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
 
 use crate::core::message::{CompiledMessage, MessageConfig};
+use crate::core::timing::CadenceAlignment;
+
+const CLOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const CLOCK_STEP_THRESHOLD: Duration = Duration::from_millis(250);
 
 /// One compiled message tracked by the scheduler.
 #[derive(Debug)]
@@ -32,8 +36,12 @@ impl ScheduledMessage {
 /// What the talker loop should do next, returned by [`Schedule::poll`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum Tick {
-    /// Send `payload` now; it belongs to the message at `index`.
-    Send { index: usize, payload: Vec<u8> },
+    /// Message `index` is due. `scheduled_for` is its original monotonic
+    /// deadline, retained so the runner can measure handling lateness.
+    Due {
+        index: usize,
+        scheduled_for: Instant,
+    },
     /// Nothing is due yet — sleep until at most this instant.
     Wait(Instant),
     /// No active messages; nothing fires until an interval is changed.
@@ -51,6 +59,10 @@ pub struct Schedule {
     /// Compilation is pure preflight; the runner arms cadence only after its
     /// interface is ready, so setup time can never count as missed sends.
     armed: bool,
+    alignment: CadenceAlignment,
+    wall_anchor: Option<(Instant, SystemTime)>,
+    next_clock_check: Option<Instant>,
+    clock_realignments: u64,
 }
 
 impl Schedule {
@@ -88,17 +100,92 @@ impl Schedule {
             messages,
             missed_sends: 0,
             armed: false,
+            alignment: CadenceAlignment::Immediate,
+            wall_anchor: None,
+            next_clock_check: None,
+            clock_realignments: 0,
         })
+    }
+
+    /// Select the cadence phase policy before the runner arms this schedule.
+    pub fn with_alignment(mut self, alignment: CadenceAlignment) -> Self {
+        self.alignment = alignment;
+        self
     }
 
     /// Establish a fresh cadence grid. Every active message is due immediately
     /// at `start`; dormant messages remain unscheduled.
     pub fn arm(&mut self, start: Instant) {
+        self.arm_at(start, SystemTime::now());
+    }
+
+    /// Establish a fresh cadence grid from paired monotonic/wall-clock anchors.
+    pub fn arm_at(&mut self, start: Instant, wall_clock: SystemTime) {
+        self.align_deadlines(start, wall_clock);
+        self.wall_anchor =
+            (self.alignment == CadenceAlignment::UtcPhase).then_some((start, wall_clock));
+        self.next_clock_check = self
+            .wall_anchor
+            .and_then(|_| start.checked_add(CLOCK_CHECK_INTERVAL));
         for message in &mut self.messages {
-            message.next_fire = message.is_active().then_some(start);
+            if self.alignment == CadenceAlignment::Immediate {
+                message.next_fire = message.is_active().then_some(start);
+            }
         }
         self.missed_sends = 0;
+        self.clock_realignments = 0;
         self.armed = true;
+    }
+
+    fn align_deadlines(&mut self, now: Instant, wall_clock: SystemTime) {
+        for message in &mut self.messages {
+            message.next_fire = if !message.is_active() {
+                None
+            } else if self.alignment == CadenceAlignment::Immediate {
+                Some(now)
+            } else {
+                next_phase_delay(wall_clock, message.interval)
+                    .and_then(|delay| now.checked_add(delay))
+            };
+        }
+    }
+
+    /// Check at most once per second for a material wall-clock step. UTC-aligned
+    /// schedules rebase only future deadlines and never replay the skipped wall grid.
+    pub fn reconcile_wall_clock(&mut self, now: Instant) -> bool {
+        if self.alignment != CadenceAlignment::UtcPhase
+            || self.next_clock_check.is_none_or(|check| now < check)
+        {
+            return false;
+        }
+        self.reconcile_wall_clock_at(now, SystemTime::now())
+    }
+
+    fn reconcile_wall_clock_at(&mut self, now: Instant, wall_clock: SystemTime) -> bool {
+        self.next_clock_check = now.checked_add(CLOCK_CHECK_INTERVAL);
+        let Some((anchor_mono, anchor_wall)) = self.wall_anchor else {
+            self.wall_anchor = Some((now, wall_clock));
+            return false;
+        };
+        let expected = anchor_wall
+            .checked_add(now.saturating_duration_since(anchor_mono))
+            .unwrap_or(anchor_wall);
+        if system_time_distance(expected, wall_clock) < CLOCK_STEP_THRESHOLD {
+            return false;
+        }
+
+        self.align_deadlines(now, wall_clock);
+        self.wall_anchor = Some((now, wall_clock));
+        self.clock_realignments = self.clock_realignments.saturating_add(1);
+        true
+    }
+
+    pub fn cadence_alignment(&self) -> CadenceAlignment {
+        self.alignment
+    }
+
+    pub fn clock_realignments(&self) -> u64 {
+        self.clock_realignments
     }
 
     /// Number of messages in the schedule (active and dormant).
@@ -128,7 +215,7 @@ impl Schedule {
     ///
     /// If a message is due, its next-fire time is advanced by its interval
     /// (from the previous fire time, so the cadence does not drift) and the
-    /// payload is returned for sending. Otherwise reports how long to wait.
+    /// due message is returned by index. Otherwise reports how long to wait.
     ///
     /// **Stall policy: fire once, skip the backlog.** After a stall (a
     /// blocked send, machine sleep), the missed fire times are *not* burst
@@ -151,7 +238,13 @@ impl Schedule {
             return Tick::Idle;
         };
         if next_fire <= now {
-            let mut following = next_fire + msg.interval;
+            let Some(mut following) = next_fire.checked_add(msg.interval) else {
+                msg.next_fire = None;
+                return Tick::Due {
+                    index,
+                    scheduled_for: next_fire,
+                };
+            };
             let mut skipped = 0u64;
             if following <= now {
                 // More than one interval behind: skip the missed grid
@@ -166,12 +259,16 @@ impl Schedule {
                 // additional lateness.
                 skipped = (late / interval + 1) as u64;
                 let rem = late % interval;
-                following = now - Duration::from_nanos(rem as u64) + msg.interval;
+                following = (now - Duration::from_nanos(rem as u64))
+                    .checked_add(msg.interval)
+                    .unwrap_or(following);
             }
             msg.next_fire = Some(following);
-            let payload = msg.compiled.render();
             self.missed_sends = self.missed_sends.saturating_add(skipped);
-            Tick::Send { index, payload }
+            Tick::Due {
+                index,
+                scheduled_for: next_fire,
+            }
         } else {
             Tick::Wait(next_fire)
         }
@@ -183,6 +280,17 @@ impl Schedule {
     /// send call blocks longer than the configured interval.
     pub fn missed_sends(&self) -> u64 {
         self.missed_sends
+    }
+
+    /// Render one compiled message immediately before a send attempt.
+    ///
+    /// Keeping rendering separate from [`poll`](Self::poll) lets the runner
+    /// suppress a due fire during retry backoff without allocating payload
+    /// bytes or sampling a dynamic timestamp that will never reach `send`.
+    pub fn render(&self, index: usize) -> Option<Vec<u8>> {
+        self.messages
+            .get(index)
+            .map(|message| message.compiled.render())
     }
 
     /// Lossy code-page substitution positions for one compiled message.
@@ -212,15 +320,57 @@ impl Schedule {
     /// (re)schedules it to fire at `now + interval`. An out-of-range index is
     /// rejected (`false`).
     pub fn set_interval(&mut self, index: usize, interval_ms: u64, now: Instant) -> bool {
+        self.set_interval_at(index, interval_ms, now, SystemTime::now())
+    }
+
+    fn set_interval_at(
+        &mut self,
+        index: usize,
+        interval_ms: u64,
+        now: Instant,
+        wall_clock: SystemTime,
+    ) -> bool {
         let armed = self.armed;
         if let Some(msg) = self.messages.get_mut(index) {
             msg.interval = Duration::from_millis(interval_ms);
-            msg.next_fire = (armed && msg.is_active()).then_some(now + msg.interval);
+            msg.next_fire = if !armed || !msg.is_active() {
+                None
+            } else if self.alignment == CadenceAlignment::UtcPhase {
+                next_phase_delay(wall_clock, msg.interval).and_then(|delay| now.checked_add(delay))
+            } else {
+                now.checked_add(msg.interval)
+            };
             true
         } else {
             false
         }
     }
+}
+
+fn next_phase_delay(wall_clock: SystemTime, interval: Duration) -> Option<Duration> {
+    if interval.is_zero() {
+        return None;
+    }
+    let wall_nanos = match wall_clock.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(since) => i128::try_from(since.as_nanos()).ok()?,
+        Err(before) => -i128::try_from(before.duration().as_nanos()).ok()?,
+    };
+    let interval_nanos = i128::try_from(interval.as_nanos()).ok()?;
+    let remainder = wall_nanos.rem_euclid(interval_nanos);
+    let wait_nanos = if remainder == 0 {
+        interval_nanos
+    } else {
+        interval_nanos - remainder
+    };
+    let wait_nanos = u128::try_from(wait_nanos).ok()?;
+    let secs = u64::try_from(wait_nanos / 1_000_000_000).ok()?;
+    let nanos = u32::try_from(wait_nanos % 1_000_000_000).ok()?;
+    Some(Duration::new(secs, nanos))
+}
+
+fn system_time_distance(left: SystemTime, right: SystemTime) -> Duration {
+    left.duration_since(right)
+        .unwrap_or_else(|before| before.duration())
 }
 
 #[cfg(test)]
@@ -255,7 +405,7 @@ mod tests {
         let first_poll = compiled_at + ms(10_000);
         let mut schedule = Schedule::compile_unarmed(&[msg("AB", 100)]).unwrap();
 
-        assert!(matches!(schedule.poll(first_poll), Tick::Send { .. }));
+        assert!(matches!(schedule.poll(first_poll), Tick::Due { .. }));
         assert_eq!(schedule.missed_sends(), 0);
         assert_eq!(schedule.poll(first_poll), Tick::Wait(first_poll + ms(100)));
     }
@@ -267,15 +417,19 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
         match s.poll(t0) {
-            Tick::Send { index, payload } => {
+            Tick::Due {
+                index,
+                scheduled_for,
+            } => {
                 assert_eq!(index, 0);
-                assert_eq!(payload, vec![0xAB]);
+                assert_eq!(scheduled_for, t0);
+                assert_eq!(s.render(index), Some(vec![0xAB]));
             }
-            other => panic!("expected Send, got {other:?}"),
+            other => panic!("expected Due, got {other:?}"),
         }
         assert_eq!(s.poll(t0), Tick::Wait(t0 + ms(100)));
         assert_eq!(s.poll(t0 + ms(99)), Tick::Wait(t0 + ms(100)));
-        assert!(matches!(s.poll(t0 + ms(100)), Tick::Send { index: 0, .. }));
+        assert!(matches!(s.poll(t0 + ms(100)), Tick::Due { index: 0, .. }));
     }
 
     #[test]
@@ -283,24 +437,30 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("01", 100), msg("02", 300)], t0).unwrap();
         // both due at t0; tie broken by message order
-        assert!(matches!(s.poll(t0), Tick::Send { index: 0, .. }));
-        assert!(matches!(s.poll(t0), Tick::Send { index: 1, .. }));
+        assert!(matches!(s.poll(t0), Tick::Due { index: 0, .. }));
+        assert!(matches!(s.poll(t0), Tick::Due { index: 1, .. }));
         assert_eq!(s.poll(t0), Tick::Wait(t0 + ms(100)));
         // the 100 ms message fires at 100 and 200 on its own
-        assert!(matches!(s.poll(t0 + ms(100)), Tick::Send { index: 0, .. }));
-        assert!(matches!(s.poll(t0 + ms(200)), Tick::Send { index: 0, .. }));
+        assert!(matches!(s.poll(t0 + ms(100)), Tick::Due { index: 0, .. }));
+        assert!(matches!(s.poll(t0 + ms(200)), Tick::Due { index: 0, .. }));
         // at 300 both are due again; message order decides
-        assert!(matches!(s.poll(t0 + ms(300)), Tick::Send { index: 0, .. }));
-        assert!(matches!(s.poll(t0 + ms(300)), Tick::Send { index: 1, .. }));
+        assert!(matches!(s.poll(t0 + ms(300)), Tick::Due { index: 0, .. }));
+        assert!(matches!(s.poll(t0 + ms(300)), Tick::Due { index: 1, .. }));
     }
 
     #[test]
     fn next_fire_does_not_drift_when_polled_late() {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
-        assert!(matches!(s.poll(t0), Tick::Send { .. })); // next fire -> t0+100
-                                                          // polled late at t0+150: still due; next fire advances from 100, not 150
-        assert!(matches!(s.poll(t0 + ms(150)), Tick::Send { .. }));
+        assert!(matches!(s.poll(t0), Tick::Due { .. })); // next fire -> t0+100
+                                                         // polled late at t0+150: still due; next fire advances from 100, not 150
+        assert!(matches!(
+            s.poll(t0 + ms(150)),
+            Tick::Due {
+                scheduled_for,
+                ..
+            } if scheduled_for == t0 + ms(100)
+        ));
         assert_eq!(s.poll(t0 + ms(150)), Tick::Wait(t0 + ms(200)));
     }
 
@@ -308,9 +468,15 @@ mod tests {
     fn stall_fires_once_then_skips_missed_ticks_staying_on_grid() {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
-        assert!(matches!(s.poll(t0), Tick::Send { .. })); // next fire → t0+100
-                                                          // 9½ intervals late: exactly one catch-up send fires…
-        assert!(matches!(s.poll(t0 + ms(1050)), Tick::Send { .. }));
+        assert!(matches!(s.poll(t0), Tick::Due { .. })); // next fire → t0+100
+                                                         // 9½ intervals late: exactly one catch-up send fires…
+        assert!(matches!(
+            s.poll(t0 + ms(1050)),
+            Tick::Due {
+                scheduled_for,
+                ..
+            } if scheduled_for == t0 + ms(100)
+        ));
         // …and the next fire is the first *future* point of the original
         // cadence grid (t0+1100) — not nine burst sends, and no drift.
         assert_eq!(s.poll(t0 + ms(1050)), Tick::Wait(t0 + ms(1100)));
@@ -324,8 +490,8 @@ mod tests {
         // lands the next fire in the future, so no skipping happens.
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
-        assert!(matches!(s.poll(t0), Tick::Send { .. }));
-        assert!(matches!(s.poll(t0 + ms(199)), Tick::Send { .. }));
+        assert!(matches!(s.poll(t0), Tick::Due { .. }));
+        assert!(matches!(s.poll(t0 + ms(199)), Tick::Due { .. }));
         assert_eq!(s.poll(t0 + ms(199)), Tick::Wait(t0 + ms(200)));
         assert_eq!(s.missed_sends(), 0);
     }
@@ -334,9 +500,9 @@ mod tests {
     fn on_time_sends_never_count_as_missed() {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
-        assert!(matches!(s.poll(t0), Tick::Send { .. }));
-        assert!(matches!(s.poll(t0 + ms(100)), Tick::Send { .. }));
-        assert!(matches!(s.poll(t0 + ms(200)), Tick::Send { .. }));
+        assert!(matches!(s.poll(t0), Tick::Due { .. }));
+        assert!(matches!(s.poll(t0 + ms(100)), Tick::Due { .. }));
+        assert!(matches!(s.poll(t0 + ms(200)), Tick::Due { .. }));
         assert_eq!(s.missed_sends(), 0);
     }
 
@@ -344,15 +510,15 @@ mod tests {
     fn missed_sends_accumulate_across_stalls() {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
-        assert!(matches!(s.poll(t0), Tick::Send { .. })); // next fire → t0+100
-                                                          // Two intervals late: the t0+200 point is skipped (fires at 250 as
-                                                          // the late t0+100 point; next fire lands on t0+300).
-        assert!(matches!(s.poll(t0 + ms(250)), Tick::Send { .. }));
+        assert!(matches!(s.poll(t0), Tick::Due { .. })); // next fire → t0+100
+                                                         // Two intervals late: the t0+200 point is skipped (fires at 250 as
+                                                         // the late t0+100 point; next fire lands on t0+300).
+        assert!(matches!(s.poll(t0 + ms(250)), Tick::Due { .. }));
         assert_eq!(s.missed_sends(), 1);
-        assert!(matches!(s.poll(t0 + ms(300)), Tick::Send { .. })); // on grid
-                                                                    // A second stall adds to the same counter: the send at 550 is the
-                                                                    // late t0+400 point, so only t0+500 is skipped.
-        assert!(matches!(s.poll(t0 + ms(550)), Tick::Send { .. }));
+        assert!(matches!(s.poll(t0 + ms(300)), Tick::Due { .. })); // on grid
+                                                                   // A second stall adds to the same counter: the send at 550 is the
+                                                                   // late t0+400 point, so only t0+500 is skipped.
+        assert!(matches!(s.poll(t0 + ms(550)), Tick::Due { .. }));
         assert_eq!(s.missed_sends(), 2);
     }
 
@@ -396,11 +562,12 @@ mod tests {
         )
         .unwrap();
         match s.poll(t0) {
-            Tick::Send { payload, .. } => {
+            Tick::Due { index, .. } => {
+                let payload = s.render(index).unwrap();
                 let wire = std::str::from_utf8(&payload).unwrap();
                 assert!(wire.starts_with("$GPGGA*"));
             }
-            other => panic!("expected Send, got {other:?}"),
+            other => panic!("expected Due, got {other:?}"),
         }
     }
 
@@ -411,7 +578,7 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("00", 0), msg("11", 100)], t0).unwrap();
         // only the active message fires
-        assert!(matches!(s.poll(t0), Tick::Send { index: 1, .. }));
+        assert!(matches!(s.poll(t0), Tick::Due { index: 1, .. }));
         assert_eq!(s.poll(t0), Tick::Wait(t0 + ms(100)));
     }
 
@@ -438,7 +605,7 @@ mod tests {
         let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
         assert!(s.set_interval(0, 200, t0 + ms(50)));
         assert_eq!(s.poll(t0 + ms(50)), Tick::Wait(t0 + ms(250)));
-        assert!(matches!(s.poll(t0 + ms(250)), Tick::Send { index: 0, .. }));
+        assert!(matches!(s.poll(t0 + ms(250)), Tick::Due { index: 0, .. }));
     }
 
     #[test]
@@ -455,6 +622,88 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
         assert!(!s.set_interval(99, 500, t0)); // must not panic
-        assert!(matches!(s.poll(t0), Tick::Send { index: 0, .. }));
+        assert!(matches!(s.poll(t0), Tick::Due { index: 0, .. }));
+    }
+
+    #[test]
+    fn utc_alignment_waits_for_the_next_strict_epoch_phase() {
+        let t0 = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + ms(12_345);
+        let mut schedule = Schedule::compile_unarmed(&[msg("AB", 1_000)])
+            .unwrap()
+            .with_alignment(CadenceAlignment::UtcPhase);
+        schedule.arm_at(t0, wall);
+
+        assert_eq!(schedule.poll(t0), Tick::Wait(t0 + ms(655)));
+        assert!(matches!(
+            schedule.poll(t0 + ms(655)),
+            Tick::Due { scheduled_for, .. } if scheduled_for == t0 + ms(655)
+        ));
+        assert_eq!(schedule.poll(t0 + ms(655)), Tick::Wait(t0 + ms(1_655)));
+
+        let mut exact = Schedule::compile_unarmed(&[msg("AB", 1_000)])
+            .unwrap()
+            .with_alignment(CadenceAlignment::UtcPhase);
+        exact.arm_at(t0, SystemTime::UNIX_EPOCH + ms(12_000));
+        assert_eq!(
+            exact.poll(t0),
+            Tick::Wait(t0 + ms(1_000)),
+            "an exact boundary waits for the next boundary rather than firing immediately"
+        );
+    }
+
+    #[test]
+    fn wall_clock_step_rebases_future_deadlines_without_replaying_history() {
+        let t0 = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + ms(10_250);
+        let mut schedule = Schedule::compile_unarmed(&[msg("AB", 1_000)])
+            .unwrap()
+            .with_alignment(CadenceAlignment::UtcPhase);
+        schedule.arm_at(t0, wall);
+        assert_eq!(schedule.poll(t0), Tick::Wait(t0 + ms(750)));
+
+        let checked_at = t0 + Duration::from_secs(1);
+        let stepped_wall = SystemTime::UNIX_EPOCH + ms(15_400);
+        assert!(schedule.reconcile_wall_clock_at(checked_at, stepped_wall));
+        assert_eq!(schedule.clock_realignments(), 1);
+        assert_eq!(schedule.missed_sends(), 0);
+        assert_eq!(schedule.poll(checked_at), Tick::Wait(checked_at + ms(600)));
+    }
+
+    #[test]
+    fn small_wall_clock_drift_does_not_churn_the_monotonic_grid() {
+        let t0 = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + ms(10_250);
+        let mut schedule = Schedule::compile_unarmed(&[msg("AB", 1_000)])
+            .unwrap()
+            .with_alignment(CadenceAlignment::UtcPhase);
+        schedule.arm_at(t0, wall);
+
+        let checked_at = t0 + Duration::from_secs(1);
+        let expected_plus_100ms = SystemTime::UNIX_EPOCH + ms(11_350);
+        assert!(!schedule.reconcile_wall_clock_at(checked_at, expected_plus_100ms));
+        assert_eq!(schedule.clock_realignments(), 0);
+        assert!(matches!(
+            schedule.poll(checked_at),
+            Tick::Due { scheduled_for, .. } if scheduled_for == t0 + ms(750)
+        ));
+        assert_eq!(schedule.poll(checked_at), Tick::Wait(t0 + ms(1_750)));
+    }
+
+    #[test]
+    fn aligned_live_interval_change_uses_the_new_intervals_next_utc_phase() {
+        let t0 = Instant::now();
+        let mut schedule = Schedule::compile_unarmed(&[msg("AB", 1_000)])
+            .unwrap()
+            .with_alignment(CadenceAlignment::UtcPhase);
+        schedule.arm_at(t0, SystemTime::UNIX_EPOCH + ms(10_250));
+
+        assert!(schedule.set_interval_at(
+            0,
+            2_000,
+            t0 + ms(100),
+            SystemTime::UNIX_EPOCH + ms(10_350),
+        ));
+        assert_eq!(schedule.poll(t0 + ms(100)), Tick::Wait(t0 + ms(1_750)));
     }
 }

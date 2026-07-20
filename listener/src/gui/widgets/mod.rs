@@ -295,6 +295,15 @@ pub(super) fn edit_interface(
                         }
                         ui.end_row();
                     }
+
+                    ui.label(bold("Arrival timing")).on_hover_text(
+                        "Choose whether UDP arrival wall-clock timestamps are captured after the read or requested from the OS receive path.",
+                    );
+                    ui.checkbox(&mut udp.kernel_timestamps, "Kernel timestamp")
+                        .on_hover_text(
+                            "Request a nanosecond-resolution software receive timestamp from the kernel. Linux uses SO_TIMESTAMPNS. Windows and macOS currently report the request as unavailable and continue with the normal post-read timestamp. This can reduce userland scheduling jitter, but it is still not hardware or per-byte wire timing.",
+                        );
+                    ui.end_row();
                 });
         }
         InterfaceConfig::TcpListener(tcp) => {

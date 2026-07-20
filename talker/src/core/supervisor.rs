@@ -26,11 +26,14 @@ use crossbeam_channel::{Receiver, TrySendError};
 
 use crate::core::channel::{ChannelId, InterfaceConfig};
 use crate::core::message::MessageConfig;
+use crate::core::run_summary::{RunId, RunSummary};
 use crate::core::runner::{
     self, CommandExecution, CommandId, CommandTarget, ObserverPolicy, RunnerControlStatus,
     RunnerIdentity, TalkerCommand, TalkerHandle, TalkerStatus,
 };
 use crate::core::scheduler::Schedule;
+use crate::core::telemetry::SendTimingTelemetry;
+use crate::core::timing::{CadenceAlignment, TimerStatus, TimingMode};
 
 /// Bound on each runner's status queue. Occupancy near this cap means
 /// observer updates are about to be dropped (and counted) — surfaced as the
@@ -41,10 +44,10 @@ pub const STATUS_QUEUE_CAP: usize = 256;
 /// queue means the runner is wedged in a blocking send.
 const CMD_QUEUE_CAP: usize = 32;
 
-/// One reliable result for the start-time open plus every command that can be
-/// queued at once. Keeping this separate from sampled telemetry prevents observer
-/// pressure from erasing control truth.
-const CONTROL_QUEUE_CAP: usize = CMD_QUEUE_CAP + 1;
+/// One reliable result for the start-time open, every command that can be
+/// queued at once, and the final run summary. Keeping this separate from sampled
+/// telemetry prevents observer pressure from erasing control truth.
+const CONTROL_QUEUE_CAP: usize = CMD_QUEUE_CAP + 2;
 
 #[derive(Clone, Debug)]
 struct CommandFailure {
@@ -71,6 +74,12 @@ pub struct ChannelTelemetry {
     pub failed_sends: u64,
     /// Due fires intentionally suppressed while send retry backoff was active.
     pub suppressed_sends: u64,
+    /// Bounded cumulative send-path timing measurements from the runner.
+    pub timing: SendTimingTelemetry,
+    /// Approximate last-ten-seconds timing from fixed one-second segments.
+    pub recent_timing: SendTimingTelemetry,
+    /// Current platform deadline-wait policy and its schedule input.
+    pub timer: TimerStatus,
     /// Status-queue occupancy sampled at the last poll, and its high-water
     /// mark since the channel started.
     pub queue_len: usize,
@@ -172,6 +181,8 @@ pub struct CommandSubmission {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedRunConfig {
     pub interface: InterfaceConfig,
+    pub timing_mode: TimingMode,
+    pub cadence_alignment: CadenceAlignment,
     pub messages: Vec<MessageConfig>,
 }
 
@@ -231,12 +242,18 @@ struct Slot {
     label: Option<String>,
     handle: Option<TalkerHandle>,
     draining: Vec<DrainingRunner>,
+    /// Reliable tails whose predecessor threads were handed to a replacement
+    /// runner to join. Sampled status is stale for the replacement, but the
+    /// self-contained completion summary must still be retained.
+    retired_control: Vec<Receiver<RunnerControlStatus>>,
     telemetry: ChannelTelemetry,
     /// Whole run configuration confirmed by the runner's successful open.
     applied_run: Option<AppliedRunConfig>,
     /// Start request retained until `InterfaceOpened` confirms it.
     pending_start: Option<AppliedRunConfig>,
     pending_commands: BTreeMap<CommandId, PendingCommand>,
+    /// Newest completed run for this stable channel slot.
+    last_run_summary: Option<RunSummary>,
 }
 
 impl Slot {
@@ -246,10 +263,12 @@ impl Slot {
             label: None,
             handle: None,
             draining: Vec::new(),
+            retired_control: Vec::new(),
             telemetry: ChannelTelemetry::default(),
             applied_run: None,
             pending_start: None,
             pending_commands: BTreeMap::new(),
+            last_run_summary: None,
         }
     }
 
@@ -364,7 +383,11 @@ impl TalkerSupervisor {
     /// interface timeout). Callers keep polling while true so reaping and
     /// tail-draining continue.
     pub fn any_draining(&self) -> bool {
-        !self.orphans.is_empty() || self.slots.iter().any(|s| !s.draining.is_empty())
+        !self.orphans.is_empty()
+            || self
+                .slots
+                .iter()
+                .any(|s| !s.draining.is_empty() || !s.retired_control.is_empty())
     }
 
     /// This slot's telemetry (zeroed default for an out-of-range index, so
@@ -384,6 +407,11 @@ impl TalkerSupervisor {
         self.slots.get(i).map(|s| &s.telemetry)
     }
 
+    /// Newest completed run retained for this slot, across ordinary restarts.
+    pub fn last_run_summary(&self, i: usize) -> Option<&RunSummary> {
+        self.slots.get(i)?.last_run_summary.as_ref()
+    }
+
     /// Start (or restart) channel `i` with an interface config and a compiled
     /// schedule. `label` is the human name for log text (frozen for the run —
     /// ADR-020; attribution itself rides the slot's stable id). Telemetry
@@ -394,6 +422,7 @@ impl TalkerSupervisor {
         i: usize,
         label: impl Into<String>,
         cfg: InterfaceConfig,
+        timing_mode: TimingMode,
         messages: Vec<MessageConfig>,
         schedule: Schedule,
     ) {
@@ -403,16 +432,27 @@ impl TalkerSupervisor {
             return;
         };
         let label = label.into();
+        let cadence_alignment = schedule.cadence_alignment();
         slot.label = Some(label.clone());
         slot.pending_start = Some(AppliedRunConfig {
             interface: cfg.clone(),
+            timing_mode,
+            cadence_alignment,
             messages,
         });
-        let who = RunnerIdentity { id: slot.id, label };
-        let predecessors: Vec<_> = std::mem::take(&mut slot.draining)
-            .into_iter()
-            .map(|d| d.thread)
-            .collect();
+        let who = RunnerIdentity {
+            id: slot.id,
+            label,
+            run_id: RunId::mint(),
+        };
+        let mut predecessors = Vec::new();
+        for predecessor in std::mem::take(&mut slot.draining) {
+            predecessors.push(predecessor.thread);
+            slot.retired_control.push(predecessor.control_rx);
+            // Its cumulative counters describe the old run and must not land
+            // in telemetry that `begin_start` reset for the replacement.
+            drop(predecessor.status_rx);
+        }
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(CMD_QUEUE_CAP);
         let (control_tx, control_rx) = crossbeam_channel::bounded(CONTROL_QUEUE_CAP);
         let (status_tx, status_rx) = crossbeam_channel::bounded(STATUS_QUEUE_CAP);
@@ -435,7 +475,7 @@ impl TalkerSupervisor {
                 Some(notify) => observer.with_notify(notify),
                 None => observer,
             };
-            runner::open_and_run(who, cfg, schedule, cmd_rx, observer);
+            runner::open_and_run(who, cfg, timing_mode, schedule, cmd_rx, observer);
         });
         self.slots[i].handle = Some(TalkerHandle {
             cmd_tx,
@@ -631,6 +671,7 @@ impl TalkerSupervisor {
                 for _ in d.status_rx.try_iter() {}
                 let _ = d.thread.join();
             }
+            slot.retired_control.clear();
         }
         for d in self.orphans.drain(..) {
             for _ in d.control_rx.try_iter() {}
@@ -658,10 +699,13 @@ impl TalkerSupervisor {
                 drain_control_statuses(
                     &h.control_rx,
                     slot.id,
-                    &mut slot.applied_run,
-                    &mut slot.pending_start,
-                    &mut slot.pending_commands,
-                    &mut slot.telemetry,
+                    ControlDrainState {
+                        applied_run: &mut slot.applied_run,
+                        pending_start: &mut slot.pending_start,
+                        pending_commands: &mut slot.pending_commands,
+                        last_run_summary: &mut slot.last_run_summary,
+                        telemetry: &mut slot.telemetry,
+                    },
                     &mut command_completions,
                 );
                 drain_statuses(i, &h.status_rx, &mut slot.telemetry, &mut samples);
@@ -682,20 +726,27 @@ impl TalkerSupervisor {
             // drain — finished first guarantees the queue already holds
             // everything the runner ever sent, so nothing is lost when the
             // entry is dropped.
+            let slot_id = slot.id;
+            let last_run_summary = &mut slot.last_run_summary;
+            let telemetry = &mut slot.telemetry;
             slot.draining.retain_mut(|d| {
                 let finished = d.thread.is_finished();
                 // Results from a stopped predecessor no longer describe a live
-                // interface. Drain only to keep its reliable lane unblocked.
-                for _ in d.control_rx.try_iter() {}
-                drain_statuses(i, &d.status_rx, &mut slot.telemetry, &mut samples);
+                // interface. Retain only its self-contained completion summary;
+                // drain the other results to keep the reliable lane unblocked.
+                drain_finished_summaries(&d.control_rx, slot_id, last_run_summary);
+                drain_statuses(i, &d.status_rx, telemetry, &mut samples);
                 !finished
+            });
+            slot.retired_control.retain_mut(|control_rx| {
+                !drain_finished_summaries(control_rx, slot_id, last_run_summary)
             });
         }
         self.orphans.retain_mut(|d| {
             for _ in d.control_rx.try_iter() {}
             // Discard status too (an orphan's slot is gone, so its telemetry
             // has no home). Draining is still required: the runner's final
-            // Counters send blocks on a full queue (runner exit path), and a
+            // Counters and run-summary sends can block on full queues, and a
             // never-drained orphan would wedge that thread — holding its
             // serial port / socket until exit (`join_all` is the only other
             // place that would unblock it).
@@ -707,15 +758,27 @@ impl TalkerSupervisor {
     }
 }
 
+struct ControlDrainState<'a> {
+    applied_run: &'a mut Option<AppliedRunConfig>,
+    pending_start: &'a mut Option<AppliedRunConfig>,
+    pending_commands: &'a mut BTreeMap<CommandId, PendingCommand>,
+    last_run_summary: &'a mut Option<RunSummary>,
+    telemetry: &'a mut ChannelTelemetry,
+}
+
 fn drain_control_statuses(
     control_rx: &Receiver<RunnerControlStatus>,
     slot_id: ChannelId,
-    applied_run: &mut Option<AppliedRunConfig>,
-    pending_start: &mut Option<AppliedRunConfig>,
-    pending_commands: &mut BTreeMap<CommandId, PendingCommand>,
-    telemetry: &mut ChannelTelemetry,
+    state: ControlDrainState<'_>,
     completions: &mut Vec<CommandCompletion>,
 ) {
+    let ControlDrainState {
+        applied_run,
+        pending_start,
+        pending_commands,
+        last_run_summary,
+        telemetry,
+    } = state;
     for status in control_rx.try_iter() {
         match status {
             RunnerControlStatus::InterfaceOpened { channel, config } => {
@@ -801,7 +864,51 @@ fn drain_control_statuses(
                     }
                 }
             }
+            RunnerControlStatus::RunFinished { channel, summary } => {
+                retain_run_summary(slot_id, channel, summary, last_run_summary);
+            }
         }
+    }
+}
+
+/// Drain a stopped predecessor's reliable lane without allowing stale live
+/// configuration results to affect its replacement. Completed-run summaries
+/// remain useful and are ordered independently by [`RunId`].
+fn drain_finished_summaries(
+    control_rx: &Receiver<RunnerControlStatus>,
+    slot_id: ChannelId,
+    last_run_summary: &mut Option<RunSummary>,
+) -> bool {
+    loop {
+        match control_rx.try_recv() {
+            Ok(RunnerControlStatus::RunFinished { channel, summary }) => {
+                retain_run_summary(slot_id, channel, summary, last_run_summary);
+            }
+            Ok(_) => {}
+            Err(crossbeam_channel::TryRecvError::Empty) => return false,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => return true,
+        }
+    }
+}
+
+fn retain_run_summary(
+    slot_id: ChannelId,
+    reported_channel: ChannelId,
+    summary: Box<RunSummary>,
+    retained: &mut Option<RunSummary>,
+) {
+    if reported_channel != slot_id || summary.channel != slot_id {
+        tracing::warn!(
+            channel = reported_channel.as_u64(),
+            "runner completed a run summary for the wrong channel"
+        );
+        return;
+    }
+    if retained
+        .as_ref()
+        .is_none_or(|current| summary.run_id > current.run_id)
+    {
+        *retained = Some(*summary);
     }
 }
 
@@ -850,6 +957,8 @@ fn drain_statuses(
                 missed_sends,
                 failed_sends,
                 suppressed_sends,
+                timing,
+                timer,
                 ..
             } => {
                 telemetry.total_count = total_count;
@@ -859,7 +968,11 @@ fn drain_statuses(
                 telemetry.missed_sends = missed_sends;
                 telemetry.failed_sends = failed_sends;
                 telemetry.suppressed_sends = suppressed_sends;
+                telemetry.timing = timing.cumulative;
+                telemetry.recent_timing = timing.recent;
+                telemetry.timer = timer;
             }
+            TalkerStatus::TimerStatus { status, .. } => telemetry.timer = status,
             TalkerStatus::SendSample {
                 payload,
                 replacement_wire_offsets,
@@ -891,7 +1004,7 @@ fn drain_statuses(
 mod tests {
     use std::net::UdpSocket;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
 
     use super::*;
     use crate::core::channel::{Interface, TcpClientConfig, UdpConfig};
@@ -910,11 +1023,14 @@ mod tests {
         let who = RunnerIdentity {
             id: slot.id,
             label: format!("{}", i + 1),
+            run_id: RunId::mint(),
         };
-        let predecessors: Vec<_> = std::mem::take(&mut slot.draining)
-            .into_iter()
-            .map(|d| d.thread)
-            .collect();
+        let mut predecessors = Vec::new();
+        for predecessor in std::mem::take(&mut slot.draining) {
+            predecessors.push(predecessor.thread);
+            slot.retired_control.push(predecessor.control_rx);
+            drop(predecessor.status_rx);
+        }
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(CMD_QUEUE_CAP);
         let (control_tx, control_rx) = crossbeam_channel::bounded(CONTROL_QUEUE_CAP);
         let (status_tx, status_rx) = crossbeam_channel::bounded(STATUS_QUEUE_CAP);
@@ -927,6 +1043,7 @@ mod tests {
                 who,
                 interface,
                 None,
+                TimingMode::Standard,
                 schedule,
                 cmd_rx,
                 runner::RunnerObserver::new(status_tx, policy).with_control(control_tx),
@@ -1022,9 +1139,52 @@ mod tests {
         let telemetry = sup.telemetry(0);
         let wire = sent.lock().unwrap().len() as u64;
         assert_eq!(telemetry.total_count, wire, "totals exact at rest");
+        let summary = sup.last_run_summary(0).expect("completed run retained");
+        assert_eq!(summary.total_count, wire, "summary is exact at rest");
+        assert_eq!(summary.total_bytes, telemetry.total_bytes);
+        assert_eq!(summary.per_message_counts, telemetry.per_message_counts);
+        assert_eq!(
+            summary.end_reason,
+            crate::core::run_summary::RunEndReason::StopCommand
+        );
         // every_send policy: one sample per send reached the display lane.
         assert_eq!(samples.len() as u64, wire);
         assert!(samples.iter().all(|s| s.slot == 0));
+    }
+
+    #[test]
+    fn newest_run_summary_wins_regardless_of_completion_arrival_order() {
+        let channel = ChannelId::mint();
+        let older_id = RunId::mint();
+        let newer_id = RunId::mint();
+        let make_summary = |run_id, total_count| {
+            Box::new(RunSummary {
+                run_id,
+                channel,
+                label: "test".to_owned(),
+                started_at: SystemTime::UNIX_EPOCH,
+                finished_at: SystemTime::UNIX_EPOCH,
+                elapsed: Duration::ZERO,
+                end_reason: crate::core::run_summary::RunEndReason::StopCommand,
+                total_count,
+                total_bytes: total_count,
+                per_message_counts: vec![total_count],
+                dropped_statuses: 0,
+                missed_sends: 0,
+                failed_sends: 0,
+                suppressed_sends: 0,
+                timing: Default::default(),
+                timer: Default::default(),
+            })
+        };
+        let mut retained = None;
+
+        retain_run_summary(channel, channel, make_summary(newer_id, 20), &mut retained);
+        retain_run_summary(channel, channel, make_summary(older_id, 10), &mut retained);
+
+        let retained = retained.expect("newest summary retained");
+        assert_eq!(retained.run_id, newer_id);
+        assert_eq!(retained.total_count, 20);
     }
 
     #[test]
@@ -1124,6 +1284,8 @@ mod tests {
         ));
         sup.slots[0].applied_run = Some(AppliedRunConfig {
             interface: original.clone(),
+            timing_mode: TimingMode::Standard,
+            cadence_alignment: CadenceAlignment::Immediate,
             messages: vec![msg("AB", 20)],
         });
 
@@ -1204,6 +1366,7 @@ mod tests {
             0,
             "1",
             config.clone(),
+            TimingMode::Standard,
             messages.clone(),
             schedule(&messages),
         );
@@ -1278,6 +1441,8 @@ mod tests {
             interface: InterfaceConfig::Udp(UdpConfig::unicast(
                 "127.0.0.1:9".parse().expect("socket address"),
             )),
+            timing_mode: TimingMode::Standard,
+            cadence_alignment: CadenceAlignment::Immediate,
             messages: vec![msg("AB", 20)],
         });
 
@@ -1398,6 +1563,15 @@ mod tests {
         assert_eq!(sup.telemetry(0).per_message_counts.len(), 2);
 
         poll_until(&mut sup, &mut samples, |s| s.telemetry(0).total_count >= 2);
+        let predecessor = sup
+            .last_run_summary(0)
+            .expect("restart retained the completed predecessor");
+        assert!(predecessor.total_count >= 2);
+        assert_eq!(
+            predecessor.total_count,
+            sent.lock().unwrap().len() as u64,
+            "predecessor summary remains exact without replacing new telemetry"
+        );
         sup.stop_all();
         poll_until(&mut sup, &mut samples, |s| !s.any_draining());
     }

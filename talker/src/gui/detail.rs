@@ -5,9 +5,22 @@
 
 use egui::{Align, Layout};
 
-use crate::core::message::NmeaChecksumMode;
+use crate::core::{
+    capacity::{
+        measured_service_estimate, serial_line_estimate, service_sample_count, ChannelDemand,
+        MessageDemand, MIN_SERVICE_SAMPLES,
+    },
+    channel::InterfaceConfig,
+    message::NmeaChecksumMode,
+    run_summary::RunSummary,
+    timing::{CadenceAlignment, TimerMode, TimerReason, TimerStatus, TimingMode},
+};
 
-use wiredata_ui::{fonts::bold, format::human_bytes, glyphs};
+use wiredata_ui::{
+    fonts::bold,
+    format::{compact_duration, human_bytes},
+    glyphs,
+};
 
 use super::draft::{ConnKind, PayloadKind, ScheduleDraft};
 use super::widgets::{
@@ -19,6 +32,166 @@ use super::widgets::{
 };
 use super::{MessageAnalysisCache, MessageDraftAnalysis, MessagePreview, TalkerApp};
 use wiredata_ui::palette::active as theme_palette;
+
+fn analyzed_channel_demand(
+    message_count: usize,
+    analyses: &[MessageAnalysisCache],
+) -> Option<ChannelDemand> {
+    if analyses.len() != message_count {
+        return None;
+    }
+    let mut demand = ChannelDemand::default();
+    for cache in analyses {
+        let analysis = cache.analysis.as_ref()?;
+        let config = analysis.config.as_ref()?;
+        demand.include(MessageDemand::new(analysis.wire_len?, config.interval_ms));
+    }
+    Some(demand)
+}
+
+fn compact_rate(value: f64, unit: &str) -> String {
+    let (value, prefix) = if value >= 1_000_000.0 {
+        (value / 1_000_000.0, "M")
+    } else if value >= 1_000.0 {
+        (value / 1_000.0, "k")
+    } else {
+        (value, "")
+    };
+    let precision = if value < 10.0 { 2 } else { 1 };
+    format!("{value:.precision$} {prefix}{unit}")
+}
+
+fn compact_factor(factor: f64) -> String {
+    if factor >= 1_000.0 {
+        ">999x".to_owned()
+    } else if factor >= 10.0 {
+        format!("{factor:.1}x")
+    } else {
+        format!("{factor:.2}x")
+    }
+}
+
+fn timer_status_detail(status: TimerStatus) -> (String, bool) {
+    let shortest = status
+        .shortest_active_interval
+        .map(compact_duration)
+        .unwrap_or_else(|| "no active messages".to_owned());
+    match (status.reason, status.mode) {
+        (TimerReason::HighRate, TimerMode::WindowsOneMillisecond) => (
+            format!("Windows 1 ms continuous (high rate) · shortest {shortest}"),
+            false,
+        ),
+        (TimerReason::HighRate, TimerMode::WindowsRequestFailed) => (
+            format!("Windows 1 ms request failed (high rate) · shortest {shortest}"),
+            true,
+        ),
+        (TimerReason::HighRate, TimerMode::NativeDeadlineWaits) => (
+            format!("native deadline waits (high rate) · shortest {shortest}"),
+            false,
+        ),
+        (TimerReason::HighRate, TimerMode::Standard) => (
+            format!("high-rate timer request pending · shortest {shortest}"),
+            false,
+        ),
+        (TimerReason::PrecisionWindow, TimerMode::WindowsOneMillisecond) => (
+            format!("Precise · Windows 1 ms deadline windows · shortest {shortest}"),
+            false,
+        ),
+        (TimerReason::PrecisionWindow, TimerMode::WindowsRequestFailed) => (
+            format!("Precise · Windows 1 ms request failed · shortest {shortest}"),
+            true,
+        ),
+        (TimerReason::PrecisionWindow, TimerMode::NativeDeadlineWaits) => (
+            format!("Precise · native deadline waits · shortest {shortest}"),
+            false,
+        ),
+        (TimerReason::PrecisionWindow, TimerMode::Standard) => (
+            format!("Precise armed · first deadline window pending · shortest {shortest}"),
+            false,
+        ),
+        (TimerReason::None, _) if status.timing_mode == TimingMode::Precise => {
+            (format!("Precise armed · {shortest}"), false)
+        }
+        (TimerReason::None, _) if status.shortest_active_interval.is_some() => {
+            (format!("standard deadline waits · {shortest}"), false)
+        }
+        (TimerReason::None, _) => ("stopped · no active messages".to_owned(), false),
+    }
+}
+
+fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
+    let unsent = summary.unsent_sends();
+    let heading = format!(
+        "Last completed run · {} · {} sent · {unsent} unsent",
+        compact_duration(summary.elapsed),
+        summary.total_count,
+    );
+    egui::CollapsingHeader::new(heading)
+        .id_salt("last_completed_run")
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Copy summary").clicked() {
+                    ui.ctx().copy_text(summary.to_report_text());
+                }
+                ui.weak(format!(
+                    "Talker {} · {} · {}/{}",
+                    env!("CARGO_PKG_VERSION"),
+                    if cfg!(debug_assertions) {
+                        "debug"
+                    } else {
+                        "release"
+                    },
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                ));
+            });
+            ui.weak(format!(
+                "Started {} · finished {}",
+                summary.started_utc(),
+                summary.finished_utc(),
+            ));
+            ui.weak(format!(
+                "Sent: {} · {} msgs · Unsent: {} ({} failed · {} suppressed · {} missed)",
+                human_bytes(summary.total_bytes),
+                summary.total_count,
+                unsent,
+                summary.failed_sends,
+                summary.suppressed_sends,
+                summary.missed_sends,
+            ));
+            let (timer_detail, timer_hot) = timer_status_detail(summary.timer);
+            let timer = egui::RichText::new(format!("Timer: {timer_detail}")).weak();
+            ui.label(if timer_hot {
+                timer.color(theme_palette(ui).warning_amber)
+            } else {
+                timer
+            });
+
+            let timing = summary.timing.cumulative;
+            let p99 = |histogram: crate::core::telemetry::DurationHistogram| {
+                histogram
+                    .percentile_upper_bound(99)
+                    .map(compact_duration)
+                    .unwrap_or_else(|| "n/a".to_owned())
+            };
+            let timing_text = if timing.deadline_lateness.sample_count() == 0 {
+                "Timing: no deadline samples".to_owned()
+            } else {
+                format!(
+                    "Timing (run): late p99 <= {} · render p99 <= {} · send call p99 <= {} · max late {}",
+                    p99(timing.deadline_lateness),
+                    p99(timing.render_duration),
+                    p99(timing.send_duration),
+                    timing
+                        .deadline_lateness
+                        .max()
+                        .map(compact_duration)
+                        .unwrap_or_else(|| "n/a".to_owned()),
+                )
+            };
+            ui.weak(timing_text);
+        });
+}
 
 impl TalkerApp {
     /// Render the central detail pane for the selected channel (or a hint
@@ -61,7 +234,8 @@ impl TalkerApp {
         let telemetry = self.sup.telemetry(i);
         let error: Option<String> = telemetry.banner_error().map(str::to_owned);
         let (glyph, glyph_color, status_word) = lifecycle_indicator(running, error.is_some(), pal);
-        let (iface_drift, msg_drift) = self.detect_drift(i);
+        let draft_interface = self.conn_drafts.get(i).and_then(|draft| draft.to_config());
+        let (iface_drift, run_drift) = self.detect_drift(i, draft_interface.as_ref());
 
         // Name row: status glyph (listener's symbol set/colors, painted into
         // a fixed cell so status changes never shift the row) + editable
@@ -172,6 +346,192 @@ impl TalkerApp {
             "Rolling observed rate calculated from cumulative successful sends.",
         );
 
+        // Capacity is computed from the current draft's memoized wire lengths,
+        // never by re-rendering payloads in this per-frame header path.
+        let demand = self
+            .sched_drafts
+            .get(i)
+            .zip(self.message_analysis.get(i))
+            .and_then(|(messages, analyses)| analyzed_channel_demand(messages.len(), analyses));
+        match demand {
+            None => perf_line(
+                ui,
+                "Capacity: complete all messages to calculate".to_owned(),
+                false,
+                "Capacity uses exact compiled wire lengths and active message intervals. Fix the message validation errors first.",
+            ),
+            Some(demand) if !demand.is_active() => perf_line(
+                ui,
+                "Capacity: no active messages".to_owned(),
+                false,
+                "Messages with interval 0 are dormant and create no scheduled wire demand.",
+            ),
+            Some(demand) => {
+                let requested = format!(
+                    "{} · {}",
+                    compact_rate(demand.messages_per_second, "msg/s"),
+                    compact_rate(demand.bytes_per_second, "B/s")
+                );
+                let serial = draft_interface.as_ref().and_then(|interface| {
+                    let InterfaceConfig::Serial(config) = interface else {
+                        return None;
+                    };
+                    serial_line_estimate(demand, config)
+                });
+                if let Some(line) = serial {
+                    let percentage = line.utilization * 100.0;
+                    let (text, hot) = if line.is_oversubscribed() {
+                        (
+                            format!(
+                                "Capacity: {requested} · serial OVER CAPACITY {percentage:.1}% · needs {} (baud {})",
+                                compact_rate(line.required_bits_per_second, "bit/s"),
+                                line.minimum_baud(),
+                            ),
+                            true,
+                        )
+                    } else if let Some(headroom) = line.headroom_factor() {
+                        (
+                            format!(
+                                "Capacity: {requested} · serial {percentage:.1}% · {} line headroom",
+                                compact_factor(headroom)
+                            ),
+                            line.utilization >= 0.8,
+                        )
+                    } else {
+                        (
+                            format!("Capacity: {requested} · serial idle"),
+                            false,
+                        )
+                    };
+                    perf_line(
+                        ui,
+                        text,
+                        hot,
+                        "Static draft estimate. Each compiled wire byte uses one UART frame: 1 start bit plus the configured data, parity, and stop bits. Above 100%, the sustained requested payload cannot physically fit at the configured baud. At or below 100% is not a real-time guarantee: flow control, adapter/driver buffering, operating-system delays, and same-deadline message bursts can reduce effective headroom. This warning is advisory so deliberate overload tests remain possible.",
+                    );
+                } else {
+                    perf_line(
+                        ui,
+                        format!("Capacity: requested {requested}"),
+                        false,
+                        "Static draft demand from exact compiled wire lengths and active intervals. Network link capacity is unknown, so Talker reports requested load without inventing a physical headroom figure.",
+                    );
+                }
+
+                let recent_samples = service_sample_count(telemetry.recent_timing);
+                let run_samples = service_sample_count(telemetry.timing);
+                let (source, source_timing) = if recent_samples >= MIN_SERVICE_SAMPLES {
+                    (if running { "last 10s" } else { "final 10s" }, telemetry.recent_timing)
+                } else {
+                    ("run", telemetry.timing)
+                };
+                if let Some(estimate) = measured_service_estimate(demand, source_timing) {
+                    let headroom = estimate.headroom_factor();
+                    perf_line(
+                        ui,
+                        format!(
+                            "Estimated app headroom ({source}): {} · summed p99 bounds <= {} · capacity ~{}",
+                            compact_factor(headroom),
+                            compact_duration(estimate.summed_p99_upper_bounds),
+                            compact_rate(estimate.capacity_messages_per_second, "msg/s"),
+                        ),
+                        estimate.utilization >= 0.8,
+                        "Advisory estimate: the separate render and synchronous send-call p99 histogram upper bounds are added, then compared with the current draft's aggregate requested message rate. Recent data is preferred after 20 paired samples; otherwise the run-wide histogram is used after it warms up. This is not a joint p99 or a hard capacity promise. A send call may return after driver/kernel buffering, coincident due messages still serialize, and a retained run may describe an older draft.",
+                    );
+                } else {
+                    let samples = recent_samples.max(run_samples);
+                    let text = if samples == 0 {
+                        "Estimated app headroom: run channel to measure".to_owned()
+                    } else {
+                        format!(
+                            "Estimated app headroom: warming up ({samples}/{MIN_SERVICE_SAMPLES} send attempts)"
+                        )
+                    };
+                    perf_line(
+                        ui,
+                        text,
+                        false,
+                        "At least 20 paired render/send-call observations are required before estimating application-service headroom. Slow schedules can use the cumulative run once enough samples exist.",
+                    );
+                }
+            }
+        }
+
+        // Fixed-size recent histograms answer "how is it behaving now?";
+        // the cumulative maximum preserves one-off stalls from earlier in the run.
+        let cumulative_timing = telemetry.timing;
+        let timing = telemetry.recent_timing;
+        let deadline_samples = timing.deadline_lateness.sample_count();
+        let window = if running { "last 10s" } else { "final 10s" };
+        let run_samples = cumulative_timing.deadline_lateness.sample_count();
+        let run_max = cumulative_timing
+            .deadline_lateness
+            .max()
+            .map(compact_duration)
+            .unwrap_or_else(|| "n/a".to_owned());
+        let p99 = |histogram: crate::core::telemetry::DurationHistogram| {
+            histogram
+                .percentile_upper_bound(99)
+                .map(compact_duration)
+                .unwrap_or_else(|| "n/a".to_owned())
+        };
+        let timing_text = if run_samples == 0 {
+            "Timing: awaiting first deadline".to_owned()
+        } else if deadline_samples == 0 {
+            format!("Timing ({window}): no deadline fires · run max late {run_max}")
+        } else if deadline_samples < 20 {
+            format!(
+                "Timing ({window}): warming up ({deadline_samples} due) · max late {} · run max {run_max}",
+                compact_duration(timing.deadline_lateness.max().unwrap_or_default()),
+            )
+        } else {
+            format!(
+                "Timing ({window}): late p99 <= {} · render p99 <= {} · send call p99 <= {} · run max late {run_max}",
+                p99(timing.deadline_lateness),
+                p99(timing.render_duration),
+                p99(timing.send_duration),
+            )
+        };
+        perf_line(
+            ui,
+            timing_text,
+            false,
+            "Recent timing uses ten fixed one-second segments; the run maximum is cumulative. 'Late' is monotonic elapsed time from a message's cadence deadline until the runner handled it. 'Render' covers per-send payload and timestamp construction. 'Send call' ends when the application/driver call returns; it does not claim that serial bits reached the wire or that a network peer received them. Percentiles are bounded histogram estimates shown as upper limits.",
+        );
+
+        let timer_prefix = if running {
+            "Timer"
+        } else if telemetry.timer.shortest_active_interval.is_some()
+            || telemetry.timer.reason != TimerReason::None
+        {
+            "Timer (last run)"
+        } else {
+            "Timer"
+        };
+        let (timer_detail, timer_hot) = timer_status_detail(telemetry.timer);
+        perf_line(
+            ui,
+            format!("{timer_prefix}: {timer_detail}"),
+            timer_hot,
+            "Standard automatically requests Windows 1 ms timer resolution for active intervals below 32 ms. Precise also requests it only during the final 32 ms before slower send deadlines; commands interrupt both wait stages normally. Other platforms keep native deadline waits. This affects cadence wake precision only and does not guarantee timestamp or wire-arrival accuracy.",
+        );
+        let cadence = match telemetry.timer.cadence_alignment {
+            CadenceAlignment::Immediate => "immediate start".to_owned(),
+            CadenceAlignment::UtcPhase if telemetry.timer.clock_realignments == 0 => {
+                "UTC phase".to_owned()
+            }
+            CadenceAlignment::UtcPhase => format!(
+                "UTC phase · {} clock-step rebases",
+                telemetry.timer.clock_realignments
+            ),
+        };
+        perf_line(
+            ui,
+            format!("Cadence: {cadence}"),
+            false,
+            "Immediate preserves the original behavior: all active messages fire when the interface opens. UTC phase waits for each message's next Unix-epoch interval boundary, then keeps a monotonic cadence. Talker checks the wall-clock mapping once per second; a step of at least 250 ms rebases future deadlines without replaying past sends. This aligns application deadlines, not physical wire arrival.",
+        );
+
         // ── Observer-path health: the runner→UI queue. A separate subsystem
         // from the wire above — pressure here never delays a send. The drop
         // count is folded in: the peak is the graduated headroom gauge (how
@@ -201,7 +561,11 @@ impl TalkerApp {
         }
 
         ui.add_space(12.0); // a blank line between the readouts and the buttons
-        self.show_lifecycle_buttons(ui, i, running, iface_drift || msg_drift, error.is_some());
+        self.show_lifecycle_buttons(ui, i, running, iface_drift || run_drift, error.is_some());
+        if let Some(summary) = self.sup.last_run_summary(i) {
+            ui.add_space(4.0);
+            show_last_run_summary(ui, summary);
+        }
     }
 
     /// The lifecycle button pair (listener's control row): [Start Channel /
@@ -277,7 +641,7 @@ impl TalkerApp {
             .id_salt(("conn_section", i))
             .default_open(true)
             .show(ui, |ui| {
-                match self.conn_drafts[i].kind() {
+                let interface_result = match self.conn_drafts[i].kind() {
                     // Each kind gets its own push_id namespace so the very
                     // different widget trees produced by Serial / UDP / TCP can't
                     // shift each other's auto-ids across egui's two layout passes.
@@ -299,7 +663,49 @@ impl TalkerApp {
                         })
                         .inner
                     }
+                };
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Timing");
+                    let before = self.conn_drafts[i].timing_mode;
+                    ui.radio_value(
+                        &mut self.conn_drafts[i].timing_mode,
+                        TimingMode::Standard,
+                        "Standard",
+                    )
+                    .on_hover_text(
+                        "Uses native deadline waits. On Windows, Talker still enables 1 ms timer resolution automatically for active intervals below 32 ms.",
+                    );
+                    ui.radio_value(
+                        &mut self.conn_drafts[i].timing_mode,
+                        TimingMode::Precise,
+                        "Precise",
+                    )
+                    .on_hover_text(
+                        "For slower schedules on Windows, enables 1 ms timer resolution only during the final 32 ms before each send deadline. This tightens the deadline wake and costs some power. It does not choose cadence phase; use the separate UTC alignment option for that. Other platforms keep their native deadline waits.",
+                    );
+                    if self.conn_drafts[i].timing_mode != before {
+                        self.dirty = true;
+                    }
+                });
+                let mut utc_aligned =
+                    self.conn_drafts[i].cadence_alignment == CadenceAlignment::UtcPhase;
+                if ui
+                    .checkbox(&mut utc_aligned, "Align sends to UTC interval boundaries")
+                    .on_hover_text(
+                        "Wait for each message's next UTC/Unix-epoch interval boundary before its first send. Cadence then uses monotonic deadlines. Wall-clock steps of at least 250 ms rebase future sends without replaying missed history. Interval 1000 ms aligns to whole UTC seconds; 60000 ms aligns to whole UTC minutes. Requires Apply & Restart.",
+                    )
+                    .changed()
+                {
+                    self.conn_drafts[i].cadence_alignment = if utc_aligned {
+                        CadenceAlignment::UtcPhase
+                    } else {
+                        CadenceAlignment::Immediate
+                    };
+                    self.dirty = true;
                 }
+                interface_result
             })
             .body_returned
             .unwrap_or((false, false));
@@ -1165,7 +1571,57 @@ fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::top_aligned_grid_cell;
+    use super::{analyzed_channel_demand, top_aligned_grid_cell};
+    use crate::gui::{
+        draft::{PayloadKind, ScheduleDraft},
+        MessageAnalysisCache,
+    };
+
+    #[test]
+    fn capacity_demand_reuses_exact_memoized_wire_lengths() {
+        let drafts = [
+            ScheduleDraft {
+                payload_kind: PayloadKind::Utf8,
+                utf8_text: "hello".to_owned(),
+                interval_ms: "1000".to_owned(),
+                ..ScheduleDraft::default()
+            },
+            ScheduleDraft {
+                payload_kind: PayloadKind::Hex,
+                hex_data: "DE AD".to_owned(),
+                interval_ms: "500".to_owned(),
+                ..ScheduleDraft::default()
+            },
+        ];
+        let analyses: Vec<_> = drafts
+            .iter()
+            .map(|draft| {
+                let mut cache = MessageAnalysisCache::default();
+                cache.refresh(draft);
+                cache
+            })
+            .collect();
+
+        assert_eq!(analyses[0].analysis.as_ref().unwrap().wire_len, Some(5));
+        assert_eq!(analyses[1].analysis.as_ref().unwrap().wire_len, Some(2));
+        let demand = analyzed_channel_demand(drafts.len(), &analyses).unwrap();
+        assert_eq!(demand.messages_per_second, 3.0);
+        assert_eq!(demand.bytes_per_second, 9.0);
+    }
+
+    #[test]
+    fn incomplete_message_withholds_capacity_instead_of_understating_it() {
+        let drafts = [ScheduleDraft {
+            payload_kind: PayloadKind::Utf8,
+            utf8_text: "hello".to_owned(),
+            interval_ms: "not-a-number".to_owned(),
+            ..ScheduleDraft::default()
+        }];
+        let mut cache = MessageAnalysisCache::default();
+        cache.refresh(&drafts[0]);
+
+        assert_eq!(analyzed_channel_demand(drafts.len(), &[cache]), None);
+    }
 
     #[test]
     fn multiline_grid_cells_share_the_same_top_edge() {

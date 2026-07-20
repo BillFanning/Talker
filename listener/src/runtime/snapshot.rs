@@ -25,6 +25,8 @@ use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
 
 use super::activity::ChannelActivity;
 use super::pipeline::{DisplayRecordingSettings, RawRecordingSettings};
+use super::run_summary::ListenerRunSummary;
+use super::telemetry::{ChunkShape, DurationHistogram, IdleDeadlineTimerSummary, TransportHealth};
 
 /// A query the pipeline task answers from its current state, replying on a
 /// oneshot. Dropping the reply sender simply yields nothing.
@@ -102,7 +104,7 @@ pub struct QueueDepth {
     pub capacity: usize,
 }
 
-/// Cheap, O(1) liveness counters for a Channel — everything a multi-channel
+/// Cheap, O(1) health counters for a Channel — everything a multi-channel
 /// overview needs per tab without cloning the stream scrollback (the expensive
 /// part of a full [`ChannelSnapshot`]).
 #[derive(Clone, Debug)]
@@ -134,6 +136,26 @@ pub struct ChannelStats {
     /// rising count tells an operator that read boundaries are routinely splitting
     /// the patterns they search for (the "how often").
     pub match_boundary_saves: u64,
+    /// Delay from the transport's post-read timestamp (captured before payload
+    /// copying) until the pipeline began processing the chunk.
+    pub ingest_delay: DurationHistogram,
+    /// Approximate last-ten-seconds view of [`Self::ingest_delay`].
+    pub recent_ingest_delay: DurationHistogram,
+    /// Total synchronous time spent processing each chunk inside
+    /// `ChannelPipeline::ingest`, accumulated for the current run.
+    pub ingest_processing: DurationHistogram,
+    /// Approximate last-ten-seconds view of [`Self::ingest_processing`].
+    pub recent_ingest_processing: DurationHistogram,
+    /// Cumulative read-chunk count, sizes, and post-read completion gaps.
+    pub chunk_shape: ChunkShape,
+    /// Transport-specific stall/loss counters with explicit support state.
+    pub transport_health: TransportHealth,
+    /// Cumulative Idle-rule firing lateness against monotonic deadlines.
+    pub rule_timer_lateness: DurationHistogram,
+    /// Approximate last-ten-seconds view of [`Self::rule_timer_lateness`].
+    pub recent_rule_timer_lateness: DurationHistogram,
+    /// Platform timer mechanism used for completed Idle deadline waits.
+    pub idle_deadline_timer: IdleDeadlineTimerSummary,
     /// Depth of the Transport→Pipeline ingest queue (§99) — the edge that backpressures
     /// the reader. A rising `peak` is the first sign reception is outrunning processing.
     pub ingest_queue: QueueDepth,
@@ -158,6 +180,8 @@ pub struct ChannelSnapshot {
     pub state: ChannelState,
     /// Auto-reconnect armed/in progress — see [`ChannelStats::reconnect_pending`].
     pub reconnect_pending: bool,
+    /// Newest completed run for this stable Channel, retained across restarts.
+    pub last_run_summary: Option<ListenerRunSummary>,
     /// One entry per Display View (§48), in creation order (default view first).
     pub display_views: Vec<DisplayViewSnapshot>,
     /// Retained diagnostics, separated by severity (§88).
@@ -177,6 +201,25 @@ pub struct ChannelSnapshot {
     /// a read-chunk boundary (§50.2). The aggregate "how often" of the cross-chunk
     /// measurement; per-occurrence detail (where/why) is in `diagnostics`.
     pub match_boundary_saves: u64,
+    /// Transport post-read to pipeline-start delay; see [`ChannelStats::ingest_delay`].
+    pub ingest_delay: DurationHistogram,
+    /// Approximate last-ten-seconds view; see [`ChannelStats::recent_ingest_delay`].
+    pub recent_ingest_delay: DurationHistogram,
+    /// Cumulative pipeline processing time; see [`ChannelStats::ingest_processing`].
+    pub ingest_processing: DurationHistogram,
+    /// Approximate last-ten-seconds processing view; see
+    /// [`ChannelStats::recent_ingest_processing`].
+    pub recent_ingest_processing: DurationHistogram,
+    /// Cumulative chunk-shape facts; see [`ChannelStats::chunk_shape`].
+    pub chunk_shape: ChunkShape,
+    /// Transport-specific stall/loss counters; see [`ChannelStats::transport_health`].
+    pub transport_health: TransportHealth,
+    /// Idle-rule deadline lateness; see [`ChannelStats::rule_timer_lateness`].
+    pub rule_timer_lateness: DurationHistogram,
+    /// Recent deadline lateness; see [`ChannelStats::recent_rule_timer_lateness`].
+    pub recent_rule_timer_lateness: DurationHistogram,
+    /// Platform timer mechanism used for completed Idle deadline waits.
+    pub idle_deadline_timer: IdleDeadlineTimerSummary,
     /// Absolute stream offset just past the last received byte (§87): the total
     /// bytes accepted into the scrollback since Start. The live viewer uses this as
     /// its cursor target and fetches the bytes themselves incrementally via

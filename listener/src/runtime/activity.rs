@@ -92,6 +92,11 @@ impl ActivityMeter {
         self.total_bytes
     }
 
+    /// Most recent transport capture time without computing the rolling rate.
+    pub fn last_data_at(&self) -> Option<Instant> {
+        self.last_data_at
+    }
+
     /// The read-model as of `now`: rolling rates over the last `WINDOW_SECS`,
     /// decaying to zero when data has stopped.
     pub fn snapshot(&self, now: Instant) -> ChannelActivity {

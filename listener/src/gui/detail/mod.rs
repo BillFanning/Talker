@@ -5,8 +5,9 @@
 
 mod stream_view;
 
-use crate::core::{ChannelId, RecordingState};
+use crate::core::{ArrivalTimestampStatus, ChannelId, RecordingState};
 use crate::diagnostics::DiagnosticSeverity;
+use crate::runtime::ListenerRunSummary;
 
 use super::bridge::{self, UiCommand};
 use super::state::ChannelStatus;
@@ -17,6 +18,7 @@ use super::widgets::{
 };
 use super::ListenerApp;
 use wiredata_ui::fonts::bold;
+use wiredata_ui::format::compact_duration;
 use wiredata_ui::palette::active as palette;
 
 /// Uniform size for the lifecycle / recording control buttons. Text wider than the
@@ -31,6 +33,52 @@ const CONTROL_BUTTON_SIZE: egui::Vec2 = egui::vec2(96.0, 32.0);
 enum RecTap {
     Raw,
     Display,
+}
+
+fn show_last_run_summary(ui: &mut egui::Ui, summary: &ListenerRunSummary) {
+    let heading = format!(
+        "Last completed run · {} · {} · {} chunks",
+        compact_duration(summary.elapsed),
+        human_bytes(summary.total_bytes),
+        summary.chunk_shape.chunk_count(),
+    );
+    egui::CollapsingHeader::new(heading)
+        .id_salt("listener_last_completed_run")
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Copy summary").clicked() {
+                    ui.ctx().copy_text(summary.to_report_text());
+                }
+                ui.weak(format!(
+                    "Listener {} · {} · {}/{}",
+                    env!("CARGO_PKG_VERSION"),
+                    if cfg!(debug_assertions) {
+                        "debug"
+                    } else {
+                        "release"
+                    },
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                ));
+            });
+            ui.weak(format!(
+                "Started {} · finished {}",
+                summary.started_utc(),
+                summary.finished_utc()
+            ));
+            ui.weak(format!(
+                "Ingest queue peak {}/{} · {} warnings · {} errors{}",
+                summary.ingest_queue.peak,
+                summary.ingest_queue.capacity,
+                summary.diagnostics_warnings,
+                summary.diagnostics_errors,
+                if summary.final_snapshot_complete {
+                    ""
+                } else {
+                    " · final snapshot incomplete"
+                }
+            ));
+        });
 }
 
 impl ListenerApp {
@@ -101,6 +149,15 @@ impl ListenerApp {
                      the other channel on that port) then Retry, or Remove this channel.",
                 );
             }
+        }
+        if let Some(summary) = self
+            .state
+            .channel(id)
+            .and_then(|view| view.snapshot.as_ref())
+            .and_then(|snapshot| snapshot.last_run_summary.as_ref())
+        {
+            ui.add_space(4.0);
+            show_last_run_summary(ui, summary);
         }
 
         // Configure: edit the full interface config on a working copy, then commit
@@ -400,6 +457,221 @@ impl ListenerApp {
         // The peak is the value that matters; near capacity means backpressure is
         // imminent (a reception stall or a recording-queue-overflow fault).
         if let Some(view) = self.state.channel(id) {
+            let cumulative_timing = view.ingest_delay;
+            let timing = view.recent_ingest_delay;
+            let samples = timing.sample_count();
+            let run_samples = cumulative_timing.sample_count();
+            let run_max = cumulative_timing
+                .max()
+                .map(compact_duration)
+                .unwrap_or_else(|| "n/a".to_owned());
+            let window = if matches!(status, ChannelStatus::Running | ChannelStatus::Reconnecting) {
+                "last 10s"
+            } else {
+                "final 10s"
+            };
+            let timing_text = if run_samples == 0 {
+                "Ingest timing: awaiting first chunk".to_owned()
+            } else if samples == 0 {
+                format!("Ingest timing ({window}): no chunks · run max {run_max}")
+            } else if samples < 20 {
+                format!(
+                    "Ingest timing ({window}): warming up ({samples} chunks) · max {} · run max {run_max}",
+                    compact_duration(timing.max().unwrap_or_default()),
+                )
+            } else {
+                format!(
+                    "Ingest timing ({window}): post-read to pipeline p99 <= {} · run max {run_max}",
+                    compact_duration(timing.percentile_upper_bound(99).unwrap_or_default()),
+                )
+            };
+            ui.label(egui::RichText::new(timing_text).weak()).on_hover_text(
+                "Recent timing uses ten fixed one-second segments; the run maximum is cumulative. The transport captures time immediately after its OS read returns and before copying the payload. This delay ends when pipeline processing begins, so it includes payload copying, bounded-queue wait, and task scheduling. It excludes device, adapter, driver, and kernel buffering before the read completed. Percentiles are bounded histogram estimates shown as upper limits.",
+            );
+
+            let cumulative_processing = view.ingest_processing;
+            let processing = view.recent_ingest_processing;
+            let processing_samples = processing.sample_count();
+            let processing_run_samples = cumulative_processing.sample_count();
+            let processing_run_max = cumulative_processing
+                .max()
+                .map(compact_duration)
+                .unwrap_or_else(|| "n/a".to_owned());
+            let processing_text = if processing_run_samples == 0 {
+                "Processing timing: awaiting first chunk".to_owned()
+            } else if processing_samples == 0 {
+                format!("Processing timing ({window}): no chunks · run max {processing_run_max}")
+            } else if processing_samples < 20 {
+                format!(
+                    "Processing timing ({window}): warming up ({processing_samples} chunks) · max {} · run max {processing_run_max}",
+                    compact_duration(processing.max().unwrap_or_default()),
+                )
+            } else {
+                format!(
+                    "Processing timing ({window}): p99 <= {} · run max {processing_run_max}",
+                    compact_duration(processing.percentile_upper_bound(99).unwrap_or_default()),
+                )
+            };
+            ui.label(egui::RichText::new(processing_text).weak())
+                .on_hover_text(
+                    "Recent processing uses the same ten fixed one-second segments as handoff timing; run maximum is cumulative. The boundary is synchronous time from pipeline start through byte accounting, scrollback, match rules, display rendering/enqueue, and recorder-fault checks. It excludes transport handoff, asynchronous recorder writes, and later async application of Record actions. Read it beside the ingest-queue peak: sustained processing pressure makes that queue rise. Percentiles are bounded histogram estimates shown as upper limits.",
+                );
+
+            let chunks = view.chunk_shape;
+            let chunk_count = chunks.chunk_count();
+            let chunk_text = if chunk_count == 0 {
+                "Chunk shape: awaiting first chunk".to_owned()
+            } else {
+                let size_text = if chunk_count < 20 {
+                    format!(
+                        "size mean {} · max {}",
+                        human_bytes(chunks.sizes.mean().unwrap_or_default()),
+                        human_bytes(chunks.sizes.max().unwrap_or_default()),
+                    )
+                } else {
+                    format!(
+                        "size p50 <= {} · p99 <= {} · max {}",
+                        human_bytes(chunks.sizes.percentile_upper_bound(50).unwrap_or_default()),
+                        human_bytes(chunks.sizes.percentile_upper_bound(99).unwrap_or_default()),
+                        human_bytes(chunks.sizes.max().unwrap_or_default()),
+                    )
+                };
+                let gap_samples = chunks.inter_read_gaps.sample_count();
+                let gap_text = if gap_samples == 0 {
+                    "read gap awaiting second chunk".to_owned()
+                } else if gap_samples < 20 {
+                    format!(
+                        "read gap max {}",
+                        compact_duration(chunks.inter_read_gaps.max().unwrap_or_default())
+                    )
+                } else {
+                    format!(
+                        "read gap p99 <= {}",
+                        compact_duration(
+                            chunks
+                                .inter_read_gaps
+                                .percentile_upper_bound(99)
+                                .unwrap_or_default()
+                        )
+                    )
+                };
+                format!("Chunks (run): {chunk_count} · {size_text} · {gap_text}")
+            };
+            ui.label(egui::RichText::new(chunk_text).weak()).on_hover_text(
+                "Cumulative read-chunk shape for this run. Size describes buffers returned by the transport, not protocol messages. Read gap is the monotonic interval between consecutive post-read capture times; it includes source quiet time and buffering and is not per-byte wire timing. The first chunk has no gap sample. Percentiles are bounded histogram estimates shown as upper limits.",
+            );
+
+            if let Some(stalls) = view.transport_health.serial_stalls {
+                let active = if stalls.active { " · active" } else { "" };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Serial backpressure (run): {} episodes · total {} · max {}{active}",
+                        stalls.episodes,
+                        compact_duration(stalls.total),
+                        compact_duration(stalls.max),
+                    ))
+                    .weak(),
+                )
+                .on_hover_text(
+                    "Cumulative time the Serial reader waited for the bounded Transport-to-Pipeline queue. In-process bytes are preserved, but a long stall can overflow an upstream UART or driver buffer whose lost-byte count is not available to Listener. The active duration advances in polled snapshots.",
+                );
+            }
+
+            let arrival = view.transport_health.arrival_timestamps;
+            let arrival_text = match arrival.status {
+                ArrivalTimestampStatus::PostRead => format!(
+                    "Arrival timestamps: post-read · {} chunks",
+                    arrival.post_read_samples
+                ),
+                ArrivalTimestampStatus::KernelSoftware => {
+                    let fallback = (arrival.post_read_samples > 0)
+                        .then(|| format!(" · {} post-read fallbacks", arrival.post_read_samples));
+                    format!(
+                        "Arrival timestamps: Linux kernel software · {} chunks{}",
+                        arrival.kernel_samples,
+                        fallback.as_deref().unwrap_or_default()
+                    )
+                }
+                ArrivalTimestampStatus::KernelRequestedUnavailable => format!(
+                    "Arrival timestamps: kernel unavailable · post-read fallback · {} chunks",
+                    arrival.post_read_samples
+                ),
+            };
+            ui.label(egui::RichText::new(arrival_text).weak()).on_hover_text(
+                "The wall-clock source used by Mark annotations and recording timestamps. Post-read is captured immediately after the OS read returns. Linux kernel software timing is captured in the socket receive path through SO_TIMESTAMPNS. Monotonic handoff and processing telemetry always starts at the post-read capture so its boundary remains consistent. Neither source is hardware or per-byte wire time.",
+            );
+
+            match view.transport_health.udp_kernel_drops {
+                crate::runtime::CounterAvailability::NotApplicable => {}
+                crate::runtime::CounterAvailability::Unsupported => {
+                    ui.label(egui::RichText::new("UDP kernel drops: unsupported on this OS").weak())
+                        .on_hover_text(
+                            "This operating system does not expose an attributable per-socket UDP receive-queue drop counter through the socket API Listener uses. Unsupported is intentionally distinct from zero.",
+                        );
+                }
+                crate::runtime::CounterAvailability::Available(dropped) => {
+                    let text = egui::RichText::new(format!(
+                        "UDP kernel receive-queue drops (run): {dropped}"
+                    ));
+                    ui.label(if dropped > 0 {
+                        text.color(palette(ui).warning_amber)
+                    } else {
+                        text.weak()
+                    })
+                    .on_hover_text(
+                        "Linux SO_RXQ_OVFL: datagrams dropped because this socket's kernel receive queue overflowed. It does not count loss elsewhere on the network. The value is cumulative for this run.",
+                    );
+                }
+            }
+
+            let has_idle_rule = view.config.match_rules.iter().any(|rule| {
+                rule.enabled && matches!(rule.condition, crate::config::MatchCondition::Idle { .. })
+            });
+            let cumulative_rule_timing = view.rule_timer_lateness;
+            let recent_rule_timing = view.recent_rule_timer_lateness;
+            if has_idle_rule || cumulative_rule_timing.sample_count() > 0 {
+                let recent_samples = recent_rule_timing.sample_count();
+                let run_samples = cumulative_rule_timing.sample_count();
+                let run_max = cumulative_rule_timing
+                    .max()
+                    .map(compact_duration)
+                    .unwrap_or_else(|| "n/a".to_owned());
+                let text = if run_samples == 0 {
+                    "Idle rule timing: awaiting first firing".to_owned()
+                } else if recent_samples == 0 {
+                    format!("Idle rule timing ({window}): no firings · run max {run_max}")
+                } else if recent_samples < 20 {
+                    format!(
+                        "Idle rule timing ({window}): {recent_samples} firings · max {} · run max {run_max}",
+                        compact_duration(recent_rule_timing.max().unwrap_or_default())
+                    )
+                } else {
+                    format!(
+                        "Idle rule timing ({window}): lateness p99 <= {} · run max {run_max}",
+                        compact_duration(
+                            recent_rule_timing
+                                .percentile_upper_bound(99)
+                                .unwrap_or_default()
+                        )
+                    )
+                };
+                ui.label(egui::RichText::new(text).weak()).on_hover_text(
+                    "Lateness is measured from each Idle rule's monotonic due deadline to the instant Listener evaluates and fires it. Rules now sleep to the earliest exact deadline instead of polling every 250 ms. Application scheduling can still delay a wake; this is that observed delay, not timestamp formatting precision.",
+                );
+                let timer = view.idle_deadline_timer;
+                let timer_text = if cfg!(windows) {
+                    format!(
+                        "Idle timer: 1 ms final-window waits {} · request failures {}",
+                        timer.windows_one_millisecond_waits, timer.windows_request_failures
+                    )
+                } else {
+                    format!("Idle timer: native deadline waits {}", timer.native_waits)
+                };
+                ui.label(egui::RichText::new(timer_text).weak()).on_hover_text(
+                    "Windows requests 1 ms process timer resolution only during the final 32 ms before an Idle deadline, then releases it. Linux and macOS use their native Tokio deadline wait without a process-wide resolution request. The counts include completed deadline wakes; a wait cancelled by new data is not a firing.",
+                );
+            }
+
             // Amber once a queue's peak has reached half its capacity — an early
             // backpressure warning while stress testing. One line per queue (rec
             // under ingest), each colored by its own pressure.

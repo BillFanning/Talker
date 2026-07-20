@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::mpsc;
 
@@ -42,8 +42,10 @@ use super::channel::{spawn_monitored_channel, MatchSetup, MonitoredChannel, TRAN
 use super::pipeline::{
     DisplayRecordingSettings, DisplayViewHandle, PipelineCapacities, RawRecordingSettings,
 };
+use super::run_summary::{ListenerRunSummary, RunEndReason, RunId};
 use super::snapshot::{ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, StreamDelta};
 use super::tcp::{start_tcp_listener, TcpListenerHandle};
+use super::telemetry::{ChunkShape, DurationHistogram, IdleDeadlineTimerSummary, TransportHealth};
 
 /// How many Display Views a Channel runs (§48): one per configured view, at
 /// least one (the pipeline's default view).
@@ -51,32 +53,38 @@ fn view_count(config: &ChannelConfig) -> usize {
     config.display.views.len().max(1)
 }
 
-/// A minimal [`ChannelSnapshot`] carrying only retained diagnostics — served for a
-/// stopped/faulted Channel (no live pipeline) so the GUI still shows its log. Liveness
-/// and match fields are empty/zero; the GUI keeps its own last byte totals.
-fn retained_snapshot(
-    id: ChannelId,
-    diagnostics: &[crate::diagnostics::Diagnostic],
-    activity: ChannelActivity,
-    boundary_saves: u64,
-) -> ChannelSnapshot {
+/// A minimal [`ChannelSnapshot`] for a stopped/faulted Channel (no live pipeline):
+/// retained diagnostics plus the completed run's activity and timing summaries.
+fn retained_snapshot(id: ChannelId, channel: &ManagedChannel) -> ChannelSnapshot {
     ChannelSnapshot {
         channel_id: id,
         // Placeholders — the caller stamps the effective lifecycle state, exactly
         // as it does over a live pipeline's snapshot.
         state: ChannelState::Stopped,
         reconnect_pending: false,
+        last_run_summary: None,
         display_views: Vec::new(),
-        diagnostics: DiagnosticsSnapshot::from_diagnostics(diagnostics.iter().cloned()),
+        diagnostics: DiagnosticsSnapshot::from_diagnostics(
+            channel.retained_diagnostics.iter().cloned(),
+        ),
         raw_recording: None,
         display_recording: None,
         // The last run's liveness facts, exact at rest (`finish_stop` zeroed
         // the rate). Without this a stopped channel's byte total read 0 on
         // the next poll — precisely when the user cross-checks it against
         // the sender's total.
-        activity,
+        activity: channel.retained_activity,
         matches: Vec::new(),
-        match_boundary_saves: boundary_saves,
+        match_boundary_saves: channel.retained_boundary_saves,
+        ingest_delay: channel.retained_ingest_delay,
+        recent_ingest_delay: channel.retained_recent_ingest_delay,
+        ingest_processing: channel.retained_ingest_processing,
+        recent_ingest_processing: channel.retained_recent_ingest_processing,
+        chunk_shape: channel.retained_chunk_shape,
+        transport_health: channel.retained_transport_health,
+        rule_timer_lateness: channel.retained_rule_timer_lateness,
+        recent_rule_timer_lateness: channel.retained_recent_rule_timer_lateness,
+        idle_deadline_timer: channel.retained_idle_deadline_timer,
         stream_end_offset: 0,
         ingest_queue: crate::runtime::QueueDepth::default(),
         raw_recording_queue: None,
@@ -107,6 +115,15 @@ fn retained_stats(channel: &ManagedChannel) -> ChannelStats {
         raw_recording: None,
         display_recording: None,
         match_boundary_saves: channel.retained_boundary_saves,
+        ingest_delay: channel.retained_ingest_delay,
+        recent_ingest_delay: channel.retained_recent_ingest_delay,
+        ingest_processing: channel.retained_ingest_processing,
+        recent_ingest_processing: channel.retained_recent_ingest_processing,
+        chunk_shape: channel.retained_chunk_shape,
+        transport_health: channel.retained_transport_health,
+        rule_timer_lateness: channel.retained_rule_timer_lateness,
+        recent_rule_timer_lateness: channel.retained_recent_rule_timer_lateness,
+        idle_deadline_timer: channel.retained_idle_deadline_timer,
         ingest_queue: crate::runtime::QueueDepth::default(),
         raw_recording_queue: None,
     }
@@ -143,6 +160,32 @@ struct ReconnectState {
     next_attempt_at: Instant,
     /// Whether `max_attempts` was exhausted (stop retrying, stay Faulted).
     gave_up: bool,
+}
+
+/// Start anchors for one successfully opened run. Wall time is reportable;
+/// monotonic time makes elapsed duration immune to wall-clock corrections.
+struct ActiveRun {
+    id: RunId,
+    started_at: SystemTime,
+    started_monotonic: Instant,
+}
+
+impl ActiveRun {
+    fn begin() -> Self {
+        Self {
+            id: RunId::mint(),
+            started_at: SystemTime::now(),
+            started_monotonic: Instant::now(),
+        }
+    }
+}
+
+fn transport_name(interface: &InterfaceConfig) -> &'static str {
+    match interface {
+        InterfaceConfig::Serial(_) => "serial",
+        InterfaceConfig::Udp(_) => "udp",
+        InterfaceConfig::TcpListener(_) => "tcp_listener",
+    }
 }
 
 /// Registry entry: the configuration, any accepted-but-unapplied change (§13),
@@ -183,6 +226,20 @@ struct ManagedChannel {
     retained_activity: ChannelActivity,
     /// The last run's boundary-save total, retained like the activity.
     retained_boundary_saves: u64,
+    /// The last run's post-read-to-pipeline timing summary, retained at rest.
+    retained_ingest_delay: DurationHistogram,
+    retained_recent_ingest_delay: DurationHistogram,
+    retained_ingest_processing: DurationHistogram,
+    retained_recent_ingest_processing: DurationHistogram,
+    retained_chunk_shape: ChunkShape,
+    retained_transport_health: TransportHealth,
+    retained_rule_timer_lateness: DurationHistogram,
+    retained_recent_rule_timer_lateness: DurationHistogram,
+    retained_idle_deadline_timer: IdleDeadlineTimerSummary,
+    /// Start anchors for the currently running Channel, if one opened successfully.
+    active_run: Option<ActiveRun>,
+    /// Newest completed run, retained across ordinary restarts.
+    last_run_summary: Option<ListenerRunSummary>,
 }
 
 impl ManagedChannel {
@@ -241,6 +298,7 @@ pub struct Listener {
 
 impl Listener {
     pub fn new(caps: PipelineCapacities) -> Self {
+        wiredata_timing::keep_timer_resolution_when_minimized();
         let (events_tx, events_rx) = mpsc::channel(caps.events);
         Self {
             channels: HashMap::new(),
@@ -282,6 +340,17 @@ impl Listener {
                     total_bytes: 0,
                 },
                 retained_boundary_saves: 0,
+                retained_ingest_delay: DurationHistogram::default(),
+                retained_recent_ingest_delay: DurationHistogram::default(),
+                retained_ingest_processing: DurationHistogram::default(),
+                retained_recent_ingest_processing: DurationHistogram::default(),
+                retained_chunk_shape: ChunkShape::default(),
+                retained_transport_health: TransportHealth::default(),
+                retained_rule_timer_lateness: DurationHistogram::default(),
+                retained_recent_rule_timer_lateness: DurationHistogram::default(),
+                retained_idle_deadline_timer: IdleDeadlineTimerSummary::default(),
+                active_run: None,
+                last_run_summary: None,
             },
         );
         id
@@ -365,16 +434,10 @@ impl Listener {
             // deferred) — serve the retained/lifecycle shell below.
             Some(ChannelHandle::TcpListener(_)) | None => None,
         };
-        let mut snap = live.unwrap_or_else(|| {
-            retained_snapshot(
-                id,
-                &channel.retained_diagnostics,
-                channel.retained_activity,
-                channel.retained_boundary_saves,
-            )
-        });
+        let mut snap = live.unwrap_or_else(|| retained_snapshot(id, channel));
         snap.state = channel.effective_state();
         snap.reconnect_pending = channel.reconnect_pending();
+        snap.last_run_summary = channel.last_run_summary.clone();
         Some(snap)
     }
 
@@ -627,6 +690,7 @@ impl Listener {
             // instead (the handle exists), so this stale copy is never shown; the next
             // stop replaces it with the new run's log.
         }
+        let active_run = ActiveRun::begin();
         match self.spawn_channel(id, &config, faulted).await {
             Ok((handle, serial_control)) => {
                 let display_handles = match &handle {
@@ -639,6 +703,7 @@ impl Listener {
                     channel.display_handles = display_handles;
                     channel.serial_control = serial_control;
                     channel.state = ChannelState::Running;
+                    channel.active_run = Some(active_run);
                 }
                 let _ = self.events_tx.try_send(RuntimeEvent::ChannelStarted(id));
                 Ok(())
@@ -709,6 +774,26 @@ impl Listener {
     /// the stop (§110).
     fn finish_stop(&mut self, id: ChannelId, final_snapshot: Option<ChannelSnapshot>) {
         if let Some(channel) = self.channels.get_mut(&id) {
+            let ended_by_fault =
+                channel.faulted.load(Ordering::Relaxed) || channel.state == ChannelState::Faulted;
+            if let Some(run) = channel.active_run.take() {
+                let finished_at = SystemTime::now();
+                channel.last_run_summary = Some(ListenerRunSummary::completed(
+                    run.id,
+                    id,
+                    channel.config.name.as_str().to_owned(),
+                    transport_name(&channel.config.interface).to_owned(),
+                    run.started_at,
+                    finished_at,
+                    run.started_monotonic.elapsed(),
+                    if ended_by_fault {
+                        RunEndReason::TransportFault
+                    } else {
+                        RunEndReason::StopRequested
+                    },
+                    final_snapshot.as_ref(),
+                ));
+            }
             channel.display_handles.clear();
             channel.serial_control = None;
             channel.reconnect_state = None;
@@ -728,6 +813,15 @@ impl Listener {
                     ..snap.activity
                 };
                 channel.retained_boundary_saves = snap.match_boundary_saves;
+                channel.retained_ingest_delay = snap.ingest_delay;
+                channel.retained_recent_ingest_delay = snap.recent_ingest_delay;
+                channel.retained_ingest_processing = snap.ingest_processing;
+                channel.retained_recent_ingest_processing = snap.recent_ingest_processing;
+                channel.retained_chunk_shape = snap.chunk_shape;
+                channel.retained_transport_health = snap.transport_health;
+                channel.retained_rule_timer_lateness = snap.rule_timer_lateness;
+                channel.retained_recent_rule_timer_lateness = snap.recent_rule_timer_lateness;
+                channel.retained_idle_deadline_timer = snap.idle_deadline_timer;
                 channel.retained_diagnostics = snap.diagnostics.into_sorted_vec();
             }
         }
@@ -1074,16 +1168,18 @@ impl Listener {
                 ))
             }
             InterfaceConfig::Udp(udp) => {
+                let (notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
                 let bound = build_udp(id, udp)?
                     .bind()
                     .await
-                    .map_err(OrchestratorError::Bind)?;
+                    .map_err(OrchestratorError::Bind)?
+                    .with_notice_sender(notice_tx.clone());
                 // "Record on start" is begun by the pipeline (auto_begin_recording), not
                 // pre-built here — so its failure surfaces like the live toggle.
                 let (display, display_diag) = self.build_display_recorder(id, config).await;
-                // UDP is async and never stalls the reader — only the fault
-                // monitor uses the notice sender here.
-                let (notice_tx, notice_rx) = mpsc::channel(TRANSPORT_NOTICES);
+                // UDP is async and never stalls the reader. On Linux the transport
+                // also publishes its cumulative SO_RXQ_OVFL socket-drop counter;
+                // other platforms explicitly report that counter unsupported.
                 let handle = ChannelHandle::Data(self.spawn_data(
                     id,
                     bound,
@@ -1976,10 +2072,22 @@ mod tests {
         }
         let expected = (5 * payload.len()) as u64;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
+        let (
+            live_handoff_timing,
+            live_processing_timing,
+            live_recent_processing,
+            live_chunks,
+            live_transport_health,
+        ) = loop {
             if let Some(stats) = listener.channel_stats(id).await {
                 if stats.activity.total_bytes == expected {
-                    break;
+                    break (
+                        stats.ingest_delay,
+                        stats.ingest_processing,
+                        stats.recent_ingest_processing,
+                        stats.chunk_shape,
+                        stats.transport_health,
+                    );
                 }
             }
             assert!(
@@ -1987,7 +2095,7 @@ mod tests {
                 "datagrams did not arrive"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        };
 
         listener.stop(id).await.unwrap();
         // No live pipeline: both polled lanes keep serving the retained final
@@ -1997,10 +2105,48 @@ mod tests {
         let stats = listener.channel_stats(id).await.expect("retained stats");
         assert_eq!(stats.state, ChannelState::Stopped, "state served at rest");
         assert_eq!(stats.activity.total_bytes, expected, "exact total at rest");
+        assert_eq!(
+            stats.ingest_delay, live_handoff_timing,
+            "handoff timing retained at rest"
+        );
+        assert!(stats.ingest_delay.sample_count() > 0);
+        assert_eq!(
+            stats.ingest_processing, live_processing_timing,
+            "processing timing retained at rest"
+        );
+        assert!(stats.ingest_processing.sample_count() > 0);
+        assert_eq!(stats.recent_ingest_processing, live_recent_processing);
+        assert_eq!(stats.chunk_shape, live_chunks);
+        assert_eq!(stats.transport_health, live_transport_health);
+        assert_eq!(stats.chunk_shape.chunk_count(), 5);
+        assert!(stats.recent_ingest_delay.sample_count() > 0);
         let snap = listener.snapshot(id).await.expect("retained snapshot");
         assert_eq!(snap.state, ChannelState::Stopped, "state served at rest");
         assert_eq!(snap.activity.total_bytes, expected, "exact total at rest");
         assert_eq!(snap.activity.bytes_per_sec, 0.0, "no rate at rest");
+        assert_eq!(
+            snap.ingest_delay, live_handoff_timing,
+            "both lanes agree on handoff timing at rest"
+        );
+        assert_eq!(
+            snap.ingest_processing, live_processing_timing,
+            "both lanes agree on processing timing at rest"
+        );
+        assert_eq!(snap.recent_ingest_processing, live_recent_processing);
+        assert_eq!(snap.chunk_shape, live_chunks);
+        assert_eq!(snap.transport_health, live_transport_health);
+        assert_eq!(snap.recent_ingest_delay, stats.recent_ingest_delay);
+        let summary = snap
+            .last_run_summary
+            .as_ref()
+            .expect("completed run summary retained");
+        assert!(summary.final_snapshot_complete);
+        assert_eq!(summary.total_bytes, expected);
+        assert_eq!(summary.chunk_shape.chunk_count(), 5);
+        assert_eq!(summary.ingest_delay, live_handoff_timing);
+        assert!(summary
+            .to_report_text()
+            .contains(&format!("received_bytes={expected}\n")));
     }
 
     #[tokio::test]

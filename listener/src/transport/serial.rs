@@ -368,8 +368,16 @@ fn run_blocking_receive_loop(
     mut control: Option<SerialControlHooks>,
 ) -> TransportOutcome {
     let mut buf = vec![0u8; READ_BUFFER];
-    // One warning per stall episode; reset once the queue accepts again.
-    let mut stall_warned = false;
+    let mut stall_episodes = 0u64;
+    let mut total_stalled = Duration::ZERO;
+    let mut max_stall = Duration::ZERO;
+    report_serial_stalls(
+        &notices,
+        channel_id,
+        stall_episodes,
+        total_stalled,
+        max_stall,
+    );
     // Live control-line state (§161), tracked across the session.
     let mut lines = SerialControlLines::default();
     // First input-line poll happens immediately (initial state), then throttled.
@@ -395,10 +403,11 @@ fn run_blocking_receive_loop(
             // Timeout / no data: loop back to re-check cancellation.
             Ok(0) => continue,
             Ok(n) => {
+                let received_at = ChunkTime::now();
                 let data = ReceivedData {
                     channel_id,
                     payload: ReceivedPayload::Bytes(buf[..n].to_vec()),
-                    received_at: ChunkTime::now(),
+                    received_at,
                 };
                 // Fast path: a non-full queue accepts at once and ends any stall
                 // episode. On Full we stall — retrying, never dropping (§97.1,
@@ -408,19 +417,48 @@ fn run_blocking_receive_loop(
                 // still ends the loop (§111). A `Closed` queue means the pipeline
                 // is gone.
                 match out.try_send(data) {
-                    Ok(()) => stall_warned = false,
+                    Ok(()) => {}
                     Err(TrySendError::Closed(_)) => return TransportOutcome::Completed,
                     Err(TrySendError::Full(data)) => {
                         let stalled_at = Instant::now();
                         let mut pending = data;
+                        let mut warned = false;
                         loop {
                             if cancel.is_cancelled() {
+                                finish_serial_stall(
+                                    &notices,
+                                    channel_id,
+                                    stalled_at,
+                                    &mut stall_episodes,
+                                    &mut total_stalled,
+                                    &mut max_stall,
+                                );
                                 return TransportOutcome::Cancelled;
                             }
                             std::thread::sleep(STALL_POLL);
                             match out.try_send(pending) {
-                                Ok(()) => break,
-                                Err(TrySendError::Closed(_)) => return TransportOutcome::Completed,
+                                Ok(()) => {
+                                    finish_serial_stall(
+                                        &notices,
+                                        channel_id,
+                                        stalled_at,
+                                        &mut stall_episodes,
+                                        &mut total_stalled,
+                                        &mut max_stall,
+                                    );
+                                    break;
+                                }
+                                Err(TrySendError::Closed(_)) => {
+                                    finish_serial_stall(
+                                        &notices,
+                                        channel_id,
+                                        stalled_at,
+                                        &mut stall_episodes,
+                                        &mut total_stalled,
+                                        &mut max_stall,
+                                    );
+                                    return TransportOutcome::Completed;
+                                }
                                 Err(TrySendError::Full(again)) => {
                                     pending = again;
                                     // A sustained stall risks a UART/driver overrun
@@ -430,7 +468,7 @@ fn run_blocking_receive_loop(
                                     // deliver a stall warning). Momentary backpressure
                                     // that drains fast never reaches the threshold.
                                     let waited = stalled_at.elapsed();
-                                    if !stall_warned && waited >= stall_warning {
+                                    if !warned && waited >= stall_warning {
                                         if let Some(notices) = &notices {
                                             let _ = notices.try_send(
                                                 TransportNotice::ReceptionStalled {
@@ -439,7 +477,7 @@ fn run_blocking_receive_loop(
                                                 },
                                             );
                                         }
-                                        stall_warned = true;
+                                        warned = true;
                                     }
                                 }
                             }
@@ -451,6 +489,38 @@ fn run_blocking_receive_loop(
             // may have lost bytes before this; that loss is reported here (§101).
             Err(e) => return TransportOutcome::Faulted(format!("serial read failed: {e}")),
         }
+    }
+}
+
+fn finish_serial_stall(
+    notices: &Option<Sender<TransportNotice>>,
+    channel_id: ChannelId,
+    stalled_at: Instant,
+    episodes: &mut u64,
+    total: &mut Duration,
+    max: &mut Duration,
+) {
+    let elapsed = stalled_at.elapsed();
+    *episodes = episodes.saturating_add(1);
+    *total = total.saturating_add(elapsed);
+    *max = (*max).max(elapsed);
+    report_serial_stalls(notices, channel_id, *episodes, *total, *max);
+}
+
+fn report_serial_stalls(
+    notices: &Option<Sender<TransportNotice>>,
+    channel_id: ChannelId,
+    episodes: u64,
+    total: Duration,
+    max: Duration,
+) {
+    if let Some(notices) = notices {
+        let _ = notices.try_send(TransportNotice::SerialStallSummary {
+            channel_id,
+            episodes,
+            total,
+            max,
+        });
     }
 }
 
@@ -795,14 +865,19 @@ mod tests {
             )
         });
 
+        assert!(matches!(
+            notice_rx.recv().await.unwrap(),
+            TransportNotice::SerialStallSummary { episodes: 0, .. }
+        ));
+
         // Let the reader fill the queue and then stall on the second chunk for
         // well over the threshold before we start draining.
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");
         assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"2");
 
-        // Exactly one stall notice surfaced, naming the channel and carrying a
-        // duration ≥ the threshold.
+        // One warning surfaces while stalled, then a cumulative summary replaces
+        // the zero baseline once the queue accepts again.
         match notice_rx.recv().await.unwrap() {
             TransportNotice::ReceptionStalled {
                 channel_id,
@@ -812,6 +887,20 @@ mod tests {
                 assert!(stalled_for >= threshold);
             }
             other => panic!("expected ReceptionStalled, got {other:?}"),
+        }
+        match notice_rx.recv().await.unwrap() {
+            TransportNotice::SerialStallSummary {
+                channel_id,
+                episodes,
+                total,
+                max,
+            } => {
+                assert_eq!(channel_id, cid);
+                assert_eq!(episodes, 1);
+                assert!(total >= threshold);
+                assert!(max >= threshold);
+            }
+            other => panic!("expected SerialStallSummary, got {other:?}"),
         }
 
         cancel.cancel();
@@ -845,6 +934,11 @@ mod tests {
             let _ = done_tx.send(outcome);
         });
 
+        assert!(matches!(
+            notice_rx.recv().await.unwrap(),
+            TransportNotice::SerialStallSummary { episodes: 0, .. }
+        ));
+
         // Without draining anything, the notice arrives mid-stall.
         let notice = tokio::time::timeout(Duration::from_secs(5), notice_rx.recv())
             .await
@@ -868,13 +962,17 @@ mod tests {
             .expect("cancellation must end a stalled reader")
             .unwrap();
         assert!(matches!(outcome, TransportOutcome::Cancelled));
+        assert!(matches!(
+            notice_rx.recv().await.unwrap(),
+            TransportNotice::SerialStallSummary { episodes: 1, .. }
+        ));
         drop(rx);
     }
 
     #[tokio::test]
-    async fn momentary_backpressure_sends_no_notice() {
-        // A queue that drains promptly is normal backpressure, not loss: no notice
-        // even though the reader briefly stalls (§101 false-positive guard).
+    async fn momentary_backpressure_updates_totals_without_a_warning() {
+        // A queue that drains promptly is normal backpressure, not possible loss:
+        // account for the wait but emit no ReceptionStalled warning.
         let (tx, mut rx) = mpsc::channel(1);
         let (notice_tx, mut notice_rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
@@ -895,12 +993,22 @@ mod tests {
             )
         });
 
+        assert!(matches!(
+            notice_rx.recv().await.unwrap(),
+            TransportNotice::SerialStallSummary { episodes: 0, .. }
+        ));
+
         for expected in [b"1", b"2", b"3"] {
             assert_eq!(rx.recv().await.unwrap().payload.bytes(), expected);
         }
         cancel.cancel();
 
-        // No notice for the brief, self-clearing backpressure.
-        assert!(notice_rx.try_recv().is_err());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        while let Ok(notice) = notice_rx.try_recv() {
+            assert!(
+                matches!(notice, TransportNotice::SerialStallSummary { .. }),
+                "brief backpressure must not raise a warning: {notice:?}"
+            );
+        }
     }
 }

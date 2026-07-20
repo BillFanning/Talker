@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::{ChannelId, ChunkTime};
+use crate::core::{ArrivalTimestampStatus, ChannelId, ChunkTime};
 
 pub mod serial;
 pub mod tcp;
@@ -105,6 +105,15 @@ pub enum TransportOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransportNotice {
+    /// Cumulative Serial Transport-to-Pipeline stall summary. A zero summary is
+    /// emitted when the receive loop starts so observers know the counter applies;
+    /// later summaries replace it and recover naturally if an advisory update drops.
+    SerialStallSummary {
+        channel_id: ChannelId,
+        episodes: u64,
+        total: Duration,
+        max: Duration,
+    },
     /// The reader stalled on the Transport→Pipeline edge — the only edge that may
     /// backpressure the reader (§97.1, §99) — for `stalled_for`. Long enough to
     /// risk a UART/driver overrun: possible transport-specific loss, unquantifiable
@@ -112,6 +121,19 @@ pub enum TransportNotice {
     ReceptionStalled {
         channel_id: ChannelId,
         stalled_for: Duration,
+    },
+    /// Linux's attributable per-socket UDP receive-queue drop count. `None` is an
+    /// explicit unsupported state on platforms without an equivalent socket API;
+    /// `Some(0)` is a supported counter with no observed drops.
+    UdpKernelDrops {
+        channel_id: ChannelId,
+        dropped: Option<u64>,
+    },
+    /// Effective UDP arrival-timestamp policy after socket setup. An unavailable
+    /// request remains explicit instead of silently looking like ordinary post-read timing.
+    UdpArrivalTimestamps {
+        channel_id: ChannelId,
+        status: ArrivalTimestampStatus,
     },
     /// The transport ended on a spontaneous fault (§94). Sent by the channel's
     /// fault monitor so the **cause** reaches the pipeline's diagnostics log —

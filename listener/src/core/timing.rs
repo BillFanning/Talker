@@ -12,6 +12,28 @@ use std::time::{Instant, SystemTime};
 use chrono::{DateTime, FixedOffset, Local, Offset, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Where a chunk's wall-clock arrival timestamp was captured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ArrivalTimestampSource {
+    /// Captured in userland immediately after the transport read completed.
+    #[default]
+    PostRead,
+    /// Captured by the kernel when a UDP datagram entered the socket receive path.
+    KernelSoftware,
+}
+
+/// Effective timestamping policy for a running transport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ArrivalTimestampStatus {
+    /// Userland post-read timestamps are in use (the default for every transport).
+    #[default]
+    PostRead,
+    /// Kernel software receive timestamps were requested and activated.
+    KernelSoftware,
+    /// Kernel timestamps were requested, but this platform/socket could not provide them.
+    KernelRequestedUnavailable,
+}
+
 /// A single timing capture taken when a transport chunk is read (§138).
 ///
 /// `monotonic` orders chunks, measures durations, and breaks timestamp ties
@@ -19,8 +41,11 @@ use serde::{Deserialize, Serialize};
 /// accuracy — userland arrival times carry OS scheduling jitter (§26, §133).
 #[derive(Clone, Copy, Debug)]
 pub struct ChunkTime {
+    /// Always captured immediately after the OS read returns. Runtime duration
+    /// telemetry uses this monotonic point even when `wall_clock` came from the kernel.
     pub monotonic: Instant,
     pub wall_clock: SystemTime,
+    pub wall_clock_source: ArrivalTimestampSource,
 }
 
 impl ChunkTime {
@@ -29,7 +54,16 @@ impl ChunkTime {
         Self {
             monotonic: Instant::now(),
             wall_clock: SystemTime::now(),
+            wall_clock_source: ArrivalTimestampSource::PostRead,
         }
+    }
+
+    /// Replace only the display/recording wall clock with an OS receive timestamp.
+    /// The monotonic post-read capture remains unchanged for queue-delay telemetry.
+    pub fn with_kernel_wall_clock(mut self, wall_clock: SystemTime) -> Self {
+        self.wall_clock = wall_clock;
+        self.wall_clock_source = ArrivalTimestampSource::KernelSoftware;
+        self
     }
 }
 
@@ -185,6 +219,20 @@ mod tests {
     #[test]
     fn time_only_is_the_default() {
         assert_eq!(TimestampConfig::default().format(sample()), "14:30:45");
+    }
+
+    #[test]
+    fn kernel_wall_clock_does_not_replace_the_post_read_monotonic_capture() {
+        let post_read = ChunkTime::now();
+        let kernel_wall_clock = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(42);
+        let stamped = post_read.with_kernel_wall_clock(kernel_wall_clock);
+
+        assert_eq!(stamped.monotonic, post_read.monotonic);
+        assert_eq!(stamped.wall_clock, kernel_wall_clock);
+        assert_eq!(
+            stamped.wall_clock_source,
+            ArrivalTimestampSource::KernelSoftware
+        );
     }
 
     #[test]

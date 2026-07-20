@@ -168,7 +168,7 @@ Cross off items as they are completed. Add new ones inline as they come up.
   Pinned by `channel_ids_are_stable_across_slot_removal` + the id assertions
   in the runner status tests.
 - [x] **Timestamp/checksum render path — MEASURED 2026-07-12, KILLED (with a
-  threshold).** `schedule/poll-due-send/64B-timestamp-crc16`: ~2.1 µs/send
+  threshold).** `schedule/due-and-render/64B-timestamp-crc16`: ~2.1 µs/send
   vs ~126 ns for the static 64B clone — the "render is ~free" reading does
   **not** generalize (17×, mostly the three chrono `format().to_string()`
   temporaries), but the decision does: at the ADR-017 practical ceiling
@@ -185,10 +185,51 @@ Cross off items as they are completed. Add new ones inline as they come up.
   sustained live-NMEA sends. Same-run comparison on 2026-07-17; command:
   `cargo bench -p talker --bench scheduler -- nmea-gga`.
 
+## Timing and telemetry plan (2026-07-19)
+
+- [x] **Truthful send-path boundaries (ADR-032).** Due selection now returns the
+  original monotonic deadline without rendering. The runner records cumulative,
+  fixed-size deadline-lateness, render-duration, and synchronous-send-call
+  histograms; retry-suppressed fires do not render. The selected detail pane shows
+  warm-up, p99 upper bounds, and maximums with boundary tooltips.
+- [x] **Recent-window health without raw samples (ADR-033).** Ten fixed one-second
+  histogram segments supply the explicitly labeled recent view; cumulative run
+  maxima remain visible and final recent state is retained at Stop.
+- [x] **Surface timer mode and reason (ADR-033).** Core reports Standard / Windows
+  1 ms / request failed / native deadline waits plus the shortest active interval.
+  The GUI presents that state without re-deriving platform policy. Timer reconciliation
+  now follows queued interval changes, and a failed begin is never paired with an end.
+- [x] **Explicit Precise timing mode (ADR-034).** A channel can opt into bounded
+  Windows 1 ms requests for the final 32 ms before slow send deadlines. Standard
+  keeps automatic continuous resolution below 32 ms, dormant schedules hold no
+  request, non-Windows targets keep one native wait, and timer telemetry exposes
+  configured mode, active reason, and request outcome. Timestamp formatting remains
+  independent; the additive field defaults to Standard within profile schema v2.
+- [x] **Optional UTC phase alignment (ADR-037).** This remains separate from Precise
+  wake policy. Each message targets its strict next Unix-epoch-modulo interval phase,
+  then advances monotonically; intervals need not divide a day. Material wall-clock
+  steps rebase future deadlines only, with no replay, and telemetry reports the
+  re-alignment count without implying physical wire time.
+- [x] **Shared process timer policy (ADR-038).** `wiredata-timing` now owns the
+  refcounted Windows 1 ms request and minimized-window opt-out used by both apps.
+  Application thresholds, wait staging, cadence, and telemetry remain local; Linux
+  and macOS retain native deadline waits.
+- [x] **Capacity preflight (ADR-035).** Current-draft exact wire lengths and
+  intervals produce aggregate message/byte demand. Serial adds framing-aware baud
+  utilization, marks >100% physically over capacity and >=80% low-margin, but stays
+  advisory for deliberate overload tests. After 20 paired samples, recent (or
+  cumulative for slow schedules) render/send p99 bounds estimate application
+  headroom with explicit buffering, burst, stale-draft, and non-joint-p99 caveats.
+- [x] **Run summary and export (ADR-036).** Each completed runner emits one exact,
+  self-contained summary after its final counters. The supervisor retains the newest
+  process-unique run per channel across ordinary restarts, and the selected-channel
+  GUI offers a collapsed final readout plus an on-click, versioned clipboard report
+  with times, outcomes, timer/timing, and platform/build facts.
+
 ## Workspace items (external review, 2026-07-11)
 
 - [x] **Criterion benchmark harness** — landed: `talker/benches/scheduler.rs`
-  (poll idle-scan at 8/64/512 messages, due-send incl. the per-send payload
+  (poll idle-scan at 8/64/512 messages, due-and-render incl. the per-send payload
   clone at 64 B/1 KiB, `min_active_interval`) and `listener/benches/pipeline.rs`
   (64-byte ingest floor, steady-state at the scrollback cap, BytePattern rule
   scaling at 1/8/32). `cargo bench -p talker` / `-p listener`; smoke-tested via
@@ -264,14 +305,16 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 ## macOS target (planned, 2026-07-10)
 
-- [ ] **App Nap opt-out in `core::timing` (ADR-017 counterpart).** macOS timers
+- [ ] **App Nap opt-out in `core::timing` (ADR-017/ADR-034 counterpart).** macOS timers
   are sub-ms (no `timeBeginPeriod` analog needed), but App Nap throttles the
   timers of hidden/occluded apps — the macOS analog of the Windows 11 timer
   throttling we opt out of. Implement `raise()`/`lower()` for
   `cfg(target_os = "macos")`: hold an `NSProcessInfo`
   `beginActivityWithOptions(NSActivityLatencyCritical |
-  NSActivityUserInitiated, reason)` token while the high-resolution guard is
-  held, end it on release. Needs `objc2`/`objc2-foundation` as a
+  NSActivityUserInitiated, reason)` token for active high-rate work and measure
+  whether Precise final windows also need it; today's non-Windows Precise path keeps
+  one native wait. End the token when the protected activity ends. Needs
+  `objc2`/`objc2-foundation` as a
   `cfg(target_os = "macos")` dependency. The refcount plumbing
   (`ResolutionCounter`) is platform-neutral and already in place.
 - [ ] **Platform pass.** Verify `serialport` enumeration on macOS (ports are
@@ -289,6 +332,10 @@ Cross off items as they are completed. Add new ones inline as they come up.
     resolution while any schedule has an interval < 32 ms (`core::timing`,
     no elevation needed, released when the last fast channel stops, cleaned
     up by the OS even on a kill).
+  - A channel set to Precise requests the same Windows resolution only for the
+    final 32 ms before slower deadlines. Standard is the default. Precise does not
+    align sends to wall-clock boundaries; on macOS/Linux it keeps the native
+    one-stage wait because there is no equivalent timer-resolution request.
   - What **Missed sends** means: one missed send = one message transmission
     skipped under the stall policy ("fire once, skip the backlog, stay on
     grid" — cadence over count); `should-have-fired = sent + missed`;

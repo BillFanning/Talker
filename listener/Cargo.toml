@@ -23,6 +23,7 @@ path = "src/bin/listener-gui.rs"
 
 # Shared GUI chrome: fonts, palette, base style (ADR-019)
 wiredata-ui = { path = "../wiredata-ui" }
+wiredata-timing = { path = "../wiredata-timing" }
 
 # Presentation-only construction of inline NMEA ZDA Mark annotations (ADR-025).
 # Listener remains stream-only: received bytes are never decoded as NMEA.
@@ -81,6 +82,11 @@ tracing-subscriber = { workspace = true }
 # the console (FreeConsole) so a double-click doesn't leave an empty console window.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
+# Linux ancillary receive metadata: per-socket SO_RXQ_OVFL counts and optional
+# SO_TIMESTAMPNS software arrival timestamps.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

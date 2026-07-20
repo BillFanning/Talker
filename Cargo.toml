@@ -4,6 +4,7 @@ members = [
     "talker",
     "listener",
     "wiredata-ui",
+    "wiredata-timing",
 ]
 resolver = "2"
 
@@ -23,6 +24,7 @@ serialport = "4"
 
 # ── Raw socket options (SO_RCVBUF, §167) ──────────────────────────────────────
 socket2 = "0.5"
+libc = "0.2"
 
 # ── Filesystem free space for the recording disk guard (§168) ─────────────────
 # fs4 is the maintained successor to fs2 (same free-function disk-space API). The

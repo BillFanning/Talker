@@ -2536,4 +2536,21 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn serial_overload_is_advisory_and_does_not_disable_start() {
+        let mut conn = ConnDraft::new(ConnKind::Serial);
+        conn.serial_port = "COM1".to_owned();
+        conn.baud_rate = 4_800;
+        let message = ScheduleDraft {
+            payload_kind: PayloadKind::Utf8,
+            utf8_text: "X".repeat(10_000),
+            interval_ms: "1".to_owned(),
+            ..ScheduleDraft::default()
+        };
+        let mut analysis = MessageAnalysisCache::default();
+        analysis.refresh(&message);
+
+        assert!(start_blockers_analyzed(&conn, &[message], &[analysis]).is_empty());
+    }
 }

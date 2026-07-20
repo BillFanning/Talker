@@ -107,6 +107,15 @@ pub struct ChannelView {
     pub display_recording: Option<RecordingState>,
     /// Bounded-queue occupancy from the latest snapshot/stats (§99) — for stress
     /// testing / backpressure diagnosis. Shown in the detail pane.
+    pub ingest_delay: crate::runtime::DurationHistogram,
+    pub recent_ingest_delay: crate::runtime::DurationHistogram,
+    pub ingest_processing: crate::runtime::DurationHistogram,
+    pub recent_ingest_processing: crate::runtime::DurationHistogram,
+    pub chunk_shape: crate::runtime::ChunkShape,
+    pub transport_health: crate::runtime::TransportHealth,
+    pub rule_timer_lateness: crate::runtime::DurationHistogram,
+    pub recent_rule_timer_lateness: crate::runtime::DurationHistogram,
+    pub idle_deadline_timer: crate::runtime::IdleDeadlineTimerSummary,
     pub ingest_queue: crate::runtime::QueueDepth,
     pub raw_recording_queue: Option<crate::runtime::QueueDepth>,
     /// Accumulated stream scrollback bytes for the live viewer (§87, ADR-009),
@@ -163,6 +172,15 @@ impl ChannelView {
             control_lines: None,
             recording: None,
             display_recording: None,
+            ingest_delay: crate::runtime::DurationHistogram::default(),
+            recent_ingest_delay: crate::runtime::DurationHistogram::default(),
+            ingest_processing: crate::runtime::DurationHistogram::default(),
+            recent_ingest_processing: crate::runtime::DurationHistogram::default(),
+            chunk_shape: crate::runtime::ChunkShape::default(),
+            transport_health: crate::runtime::TransportHealth::default(),
+            rule_timer_lateness: crate::runtime::DurationHistogram::default(),
+            recent_rule_timer_lateness: crate::runtime::DurationHistogram::default(),
+            idle_deadline_timer: crate::runtime::IdleDeadlineTimerSummary::default(),
             ingest_queue: crate::runtime::QueueDepth::default(),
             raw_recording_queue: None,
             stream_bytes: std::collections::VecDeque::new(),
@@ -449,6 +467,15 @@ impl AppState {
                     view.errors = snapshot.diagnostics.errors.len();
                     view.recording = snapshot.raw_recording;
                     view.display_recording = snapshot.display_recording;
+                    view.ingest_delay = snapshot.ingest_delay;
+                    view.recent_ingest_delay = snapshot.recent_ingest_delay;
+                    view.ingest_processing = snapshot.ingest_processing;
+                    view.recent_ingest_processing = snapshot.recent_ingest_processing;
+                    view.chunk_shape = snapshot.chunk_shape;
+                    view.transport_health = snapshot.transport_health;
+                    view.rule_timer_lateness = snapshot.rule_timer_lateness;
+                    view.recent_rule_timer_lateness = snapshot.recent_rule_timer_lateness;
+                    view.idle_deadline_timer = snapshot.idle_deadline_timer;
                     view.ingest_queue = snapshot.ingest_queue;
                     view.raw_recording_queue = snapshot.raw_recording_queue;
                     // Pin this window's Mark annotations before the snapshot is
@@ -472,6 +499,15 @@ impl AppState {
                     view.errors = stats.error_count;
                     view.recording = stats.raw_recording;
                     view.display_recording = stats.display_recording;
+                    view.ingest_delay = stats.ingest_delay;
+                    view.recent_ingest_delay = stats.recent_ingest_delay;
+                    view.ingest_processing = stats.ingest_processing;
+                    view.recent_ingest_processing = stats.recent_ingest_processing;
+                    view.chunk_shape = stats.chunk_shape;
+                    view.transport_health = stats.transport_health;
+                    view.rule_timer_lateness = stats.rule_timer_lateness;
+                    view.recent_rule_timer_lateness = stats.recent_rule_timer_lateness;
+                    view.idle_deadline_timer = stats.idle_deadline_timer;
                     view.ingest_queue = stats.ingest_queue;
                     view.raw_recording_queue = stats.raw_recording_queue;
                     clear_error_if_recording_ok(view);
@@ -533,6 +569,15 @@ impl AppState {
                     // the first poll of the fresh pipeline.
                     view.bytes_total = 0;
                     view.bytes_per_sec = 0.0;
+                    view.ingest_delay = crate::runtime::DurationHistogram::default();
+                    view.recent_ingest_delay = crate::runtime::DurationHistogram::default();
+                    view.ingest_processing = crate::runtime::DurationHistogram::default();
+                    view.recent_ingest_processing = crate::runtime::DurationHistogram::default();
+                    view.chunk_shape = crate::runtime::ChunkShape::default();
+                    view.transport_health = crate::runtime::TransportHealth::default();
+                    view.rule_timer_lateness = crate::runtime::DurationHistogram::default();
+                    view.recent_rule_timer_lateness = crate::runtime::DurationHistogram::default();
+                    view.idle_deadline_timer = crate::runtime::IdleDeadlineTimerSummary::default();
                 }
             }
             RuntimeEvent::ChannelStopped(id) => {
@@ -559,6 +604,15 @@ impl AppState {
                 self.set_status(id, ChannelStatus::Running);
                 if let Some(view) = self.views.get_mut(&id) {
                     view.clear_stream_for_new_run();
+                    view.ingest_delay = crate::runtime::DurationHistogram::default();
+                    view.recent_ingest_delay = crate::runtime::DurationHistogram::default();
+                    view.ingest_processing = crate::runtime::DurationHistogram::default();
+                    view.recent_ingest_processing = crate::runtime::DurationHistogram::default();
+                    view.chunk_shape = crate::runtime::ChunkShape::default();
+                    view.transport_health = crate::runtime::TransportHealth::default();
+                    view.rule_timer_lateness = crate::runtime::DurationHistogram::default();
+                    view.recent_rule_timer_lateness = crate::runtime::DurationHistogram::default();
+                    view.idle_deadline_timer = crate::runtime::IdleDeadlineTimerSummary::default();
                 }
             }
             RuntimeEvent::ChannelReconnectGaveUp(id) => self.set_status(id, ChannelStatus::Faulted),
@@ -689,6 +743,7 @@ mod tests {
             channel_id: id,
             state: ChannelState::Running,
             reconnect_pending: false,
+            last_run_summary: None,
             display_views: vec![],
             diagnostics: DiagnosticsSnapshot {
                 warnings: vec![crate::diagnostics::Diagnostic::warning("w"); warnings],
@@ -703,6 +758,15 @@ mod tests {
             },
             matches: vec![],
             match_boundary_saves: 0,
+            ingest_delay: crate::runtime::DurationHistogram::default(),
+            recent_ingest_delay: crate::runtime::DurationHistogram::default(),
+            ingest_processing: crate::runtime::DurationHistogram::default(),
+            recent_ingest_processing: crate::runtime::DurationHistogram::default(),
+            chunk_shape: crate::runtime::ChunkShape::default(),
+            transport_health: crate::runtime::TransportHealth::default(),
+            rule_timer_lateness: crate::runtime::DurationHistogram::default(),
+            recent_rule_timer_lateness: crate::runtime::DurationHistogram::default(),
+            idle_deadline_timer: crate::runtime::IdleDeadlineTimerSummary::default(),
             stream_end_offset: total_bytes,
             ingest_queue: crate::runtime::QueueDepth::default(),
             raw_recording_queue: None,
@@ -776,6 +840,73 @@ mod tests {
     }
 
     #[test]
+    fn ingest_timing_is_retained_at_stop_and_reset_on_start() {
+        let mut state = AppState::default();
+        let id = ChannelId::new();
+        state.apply(added(id, "udp", "UDP · test"));
+        let mut snapshot = snapshot_with(id, 1, 0.0, 0);
+        snapshot
+            .ingest_delay
+            .record(std::time::Duration::from_millis(4));
+        snapshot
+            .ingest_processing
+            .record(std::time::Duration::from_millis(2));
+        snapshot
+            .recent_ingest_processing
+            .record(std::time::Duration::from_millis(2));
+        snapshot.chunk_shape.sizes.record(12);
+        snapshot.transport_health.serial_stalls = Some(crate::runtime::SerialStallSummary {
+            episodes: 1,
+            total: std::time::Duration::from_millis(8),
+            max: std::time::Duration::from_millis(8),
+            active: false,
+        });
+        snapshot
+            .rule_timer_lateness
+            .record(std::time::Duration::from_millis(3));
+        snapshot
+            .recent_rule_timer_lateness
+            .record(std::time::Duration::from_millis(3));
+
+        state.apply(UiUpdate::Snapshot(id, Box::new(snapshot)));
+        let view = state.channel(id).unwrap();
+        assert_eq!(view.ingest_delay.sample_count(), 1);
+        assert_eq!(view.ingest_processing.sample_count(), 1);
+        assert_eq!(view.recent_ingest_processing.sample_count(), 1);
+        assert_eq!(view.chunk_shape.chunk_count(), 1);
+        assert_eq!(view.transport_health.serial_stalls.unwrap().episodes, 1);
+        assert_eq!(view.rule_timer_lateness.sample_count(), 1);
+        assert_eq!(view.recent_rule_timer_lateness.sample_count(), 1);
+
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelStopped(id)));
+        let view = state.channel(id).unwrap();
+        assert_eq!(view.ingest_delay.sample_count(), 1);
+        assert_eq!(
+            view.ingest_processing.sample_count(),
+            1,
+            "the completed run remains inspectable at rest"
+        );
+        assert_eq!(view.recent_ingest_processing.sample_count(), 1);
+        assert_eq!(view.chunk_shape.chunk_count(), 1);
+        assert_eq!(view.transport_health.serial_stalls.unwrap().episodes, 1);
+        assert_eq!(view.rule_timer_lateness.sample_count(), 1);
+        assert_eq!(view.recent_rule_timer_lateness.sample_count(), 1);
+
+        state.apply(UiUpdate::Event(RuntimeEvent::ChannelStarted(id)));
+        let view = state.channel(id).unwrap();
+        assert_eq!(view.ingest_delay.sample_count(), 0);
+        assert_eq!(view.ingest_processing.sample_count(), 0);
+        assert_eq!(view.recent_ingest_processing.sample_count(), 0);
+        assert_eq!(view.chunk_shape.chunk_count(), 0);
+        assert_eq!(
+            view.transport_health,
+            crate::runtime::TransportHealth::default()
+        );
+        assert_eq!(view.rule_timer_lateness.sample_count(), 0);
+        assert_eq!(view.recent_rule_timer_lateness.sample_count(), 0);
+    }
+
+    #[test]
     fn faulting_keeps_the_diagnostics_log_but_clears_live_indicators() {
         // A fault keeps the diagnostics snapshot (so the last run's log persists across a
         // stop/start) but neutralizes the live-only indicators (recording, queues), which
@@ -822,6 +953,15 @@ mod tests {
                 raw_recording: None,
                 display_recording: None,
                 match_boundary_saves: 0,
+                ingest_delay: crate::runtime::DurationHistogram::default(),
+                recent_ingest_delay: crate::runtime::DurationHistogram::default(),
+                ingest_processing: crate::runtime::DurationHistogram::default(),
+                recent_ingest_processing: crate::runtime::DurationHistogram::default(),
+                chunk_shape: crate::runtime::ChunkShape::default(),
+                transport_health: crate::runtime::TransportHealth::default(),
+                rule_timer_lateness: crate::runtime::DurationHistogram::default(),
+                recent_rule_timer_lateness: crate::runtime::DurationHistogram::default(),
+                idle_deadline_timer: crate::runtime::IdleDeadlineTimerSummary::default(),
                 ingest_queue: crate::runtime::QueueDepth::default(),
                 raw_recording_queue: None,
             }),

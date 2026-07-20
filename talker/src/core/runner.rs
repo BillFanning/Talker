@@ -9,13 +9,15 @@
 //! (ADR-002): a due message fires on time (no sleep-slice jitter), a command
 //! is handled the moment it arrives, and an idle channel consumes no CPU.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
 use crate::core::{
     channel::{ChannelId, Interface, InterfaceConfig},
+    run_summary::{RunEndReason, RunId, RunSummary},
     scheduler::{Schedule, Tick},
+    telemetry::{SendTimingRecorder, SendTimingReport},
     timing,
 };
 
@@ -28,6 +30,7 @@ use crate::core::{
 pub struct RunnerIdentity {
     pub id: ChannelId,
     pub label: String,
+    pub run_id: RunId,
 }
 
 /// Process-unique identity of a live control command. The id lets observers
@@ -74,6 +77,11 @@ pub enum RunnerControlStatus {
         id: CommandId,
         target: CommandTarget,
         execution: CommandExecution,
+    },
+    /// Exact, self-contained facts retained after one send loop completes.
+    RunFinished {
+        channel: ChannelId,
+        summary: Box<RunSummary>,
     },
 }
 
@@ -126,6 +134,19 @@ pub enum TalkerStatus {
         failed_sends: u64,
         /// Cumulative due fires suppressed by the bounded-backoff gate.
         suppressed_sends: u64,
+        /// Cumulative bounded measurements of deadline handling, payload
+        /// rendering, and the application-level interface send call.
+        timing: Box<SendTimingReport>,
+        /// Current platform deadline-wait policy and the shortest active
+        /// interval that selected it.
+        timer: timing::TimerStatus,
+    },
+    /// Low-frequency edge update when a schedule change selects a different
+    /// timer policy. Counters repeat the same state while sends are active;
+    /// this edge also keeps a newly idle channel's readout current.
+    TimerStatus {
+        channel: ChannelId,
+        status: timing::TimerStatus,
     },
     /// A sampled send (ADR-018 lane 2): the exact wire bytes of one send,
     /// for the Output pane. Newest-per-interval — the first send after
@@ -278,6 +299,7 @@ impl RunnerObserver {
 pub fn open_and_run(
     who: RunnerIdentity,
     cfg: InterfaceConfig,
+    timing_mode: timing::TimingMode,
     schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
     observer: RunnerObserver,
@@ -292,7 +314,15 @@ pub fn open_and_run(
                     config: cfg.clone(),
                 },
             );
-            run(who, interface, Some(cfg), schedule, cmd_rx, observer);
+            run(
+                who,
+                interface,
+                Some(cfg),
+                timing_mode,
+                schedule,
+                cmd_rx,
+                observer,
+            );
         }
         Err(e) => {
             tracing::error!(
@@ -325,21 +355,26 @@ pub fn run(
     who: RunnerIdentity,
     interface: Box<dyn Interface>,
     current_config: Option<InterfaceConfig>,
-    mut schedule: Schedule,
+    timing_mode: timing::TimingMode,
+    schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
     observer: RunnerObserver,
 ) {
-    // Cadence starts only now: any profile preflight, predecessor join, TCP
-    // connect, or serial open happened before this runner boundary and must not
-    // inflate missed-send telemetry or shift the first-fire grid.
-    schedule.arm(Instant::now());
     tracing::info!(
         channel = who.id.as_u64(),
         "channel {} running ({}-message schedule)",
         who.label,
         schedule.len()
     );
-    run_loop(&who, interface, current_config, schedule, cmd_rx, observer);
+    run_loop(
+        &who,
+        interface,
+        current_config,
+        timing_mode,
+        schedule,
+        cmd_rx,
+        observer,
+    );
     tracing::info!(channel = who.id.as_u64(), "channel {} stopped", who.label);
 }
 
@@ -352,10 +387,17 @@ fn run_loop(
     who: &RunnerIdentity,
     mut interface: Box<dyn Interface>,
     mut current_config: Option<InterfaceConfig>,
+    timing_mode: timing::TimingMode,
     mut schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
     observer: RunnerObserver,
 ) {
+    // Cadence starts only now: any profile preflight, predecessor join, TCP
+    // connect, or serial open happened before this runner boundary and must not
+    // inflate missed-send telemetry or shift the first-fire grid.
+    let started_at = SystemTime::now();
+    let started_mono = Instant::now();
+    schedule.arm_at(started_mono, started_at);
     let RunnerObserver {
         control_tx,
         status_tx,
@@ -366,6 +408,7 @@ fn run_loop(
     let mut total_bytes = 0u64;
     let mut failed_sends = 0u64;
     let mut suppressed_sends = 0u64;
+    let mut send_timing = SendTimingRecorder::default();
     // Lane rate limits (ADR-018): `None` = nothing emitted yet, so the first
     // send always produces both a sample and counters (instant first paint).
     let mut last_sample: Option<Instant> = None;
@@ -476,24 +519,17 @@ fn run_loop(
         }
     };
 
-    // Hold the OS high-resolution timer exactly while the schedule needs it
-    // (an interval below the threshold makes 15.625 ms deadline wakes skip
-    // grid points — ADR-017). Re-evaluated every pass, so a SetInterval can
-    // raise or release it mid-run; dropped with the runner either way.
+    // Standard high-rate schedules hold this continuously (ADR-017). Precise
+    // slower schedules acquire it only for final deadline windows (ADR-034).
+    // SetInterval re-evaluates both policies on the next loop pass.
     let mut timer_guard: Option<timing::HighResolutionGuard> = None;
+    let mut timer_status = timing::TimerStatus::default();
 
     // The current failing episode, if any (bounded-backoff retry policy —
     // see [`RETRY_BACKOFF_INITIAL`]). `None` while sends are succeeding.
     let mut episode: Option<FailureEpisode> = None;
 
-    'run: loop {
-        let fast = schedule
-            .min_active_interval()
-            .is_some_and(|i| i < timing::HIGH_RATE_THRESHOLD);
-        if fast != timer_guard.is_some() {
-            timer_guard = fast.then(timing::high_resolution);
-        }
-
+    let end_reason = 'run: loop {
         // Drain anything already queued so back-to-back sends can't starve
         // command handling.
         for cmd in cmd_rx.try_iter() {
@@ -504,25 +540,101 @@ fn run_loop(
                 &mut schedule,
                 &mut episode,
             ) {
-                break 'run;
+                break 'run RunEndReason::StopCommand;
             }
         }
 
-        match schedule.poll(Instant::now()) {
-            Tick::Send { index, payload } => {
+        if schedule.reconcile_wall_clock(Instant::now()) {
+            tracing::info!(
+                channel = who.id.as_u64(),
+                realignments = schedule.clock_realignments(),
+                "channel {} rebased future sends after a wall-clock step",
+                who.label
+            );
+        }
+
+        // Reconcile continuous intent only after applying queued interval
+        // changes. Windowed intent is finalized once `poll` supplies the next
+        // deadline; dormant/ordinary schedules release before they block.
+        let shortest_interval = schedule.min_active_interval();
+        let timer_intent = timing::timer_intent(timing_mode, shortest_interval);
+        match timer_intent {
+            timing::TimerIntent::ContinuousHighRate if timer_guard.is_none() => {
+                timer_guard = Some(timing::high_resolution());
+            }
+            timing::TimerIntent::None => drop(timer_guard.take()),
+            timing::TimerIntent::ContinuousHighRate | timing::TimerIntent::PrecisionWindow => {}
+        }
+        refresh_timer_status(
+            who,
+            &status_tx,
+            &notify,
+            timing_mode,
+            timer_intent,
+            shortest_interval,
+            schedule.cadence_alignment(),
+            schedule.clock_realignments(),
+            timer_guard.as_ref(),
+            &mut timer_status,
+            &mut last_counters,
+            &mut dropped_statuses,
+        );
+
+        let poll_at = Instant::now();
+        match schedule.poll(poll_at) {
+            Tick::Due {
+                index,
+                scheduled_for,
+            } => {
+                if timer_intent == timing::TimerIntent::PrecisionWindow {
+                    // The finer resolution has done its job once the deadline
+                    // wait returns. Rendering and clock reads do not benefit
+                    // from holding it through the send call.
+                    drop(timer_guard.take());
+                }
+                let due_handled_at = Instant::now();
+                send_timing.record_deadline_lateness(
+                    due_handled_at,
+                    due_handled_at.saturating_duration_since(scheduled_for),
+                );
                 let suppressed = episode
                     .as_ref()
-                    .is_some_and(|ep| Instant::now() < ep.next_attempt);
+                    .is_some_and(|ep| due_handled_at < ep.next_attempt);
                 if suppressed {
                     // Backoff gate: this due fire is suppressed — counted,
-                    // not attempted. The scheduler has already advanced,
-                    // consistent with the stall policy (cadence over count).
+                    // not rendered or attempted. The scheduler has already
+                    // advanced, consistent with the stall policy (cadence
+                    // over count).
                     if let Some(ep) = episode.as_mut() {
                         ep.suppressed += 1;
                     }
                     suppressed_sends += 1;
                 } else {
-                    match interface.send(&payload) {
+                    let render_started = Instant::now();
+                    let Some(payload) = schedule.render(index) else {
+                        // `poll` obtains this index from the same immutable-size
+                        // schedule. Stay panic-free if that invariant ever changes.
+                        tracing::error!(
+                            channel = who.id.as_u64(),
+                            "channel {} scheduler returned missing message index {index}",
+                            who.label
+                        );
+                        continue;
+                    };
+                    let render_finished = Instant::now();
+                    send_timing.record_render_duration(
+                        render_finished,
+                        render_finished.saturating_duration_since(render_started),
+                    );
+
+                    let send_started = Instant::now();
+                    let send_result = interface.send(&payload);
+                    let send_finished = Instant::now();
+                    send_timing.record_send_duration(
+                        send_finished,
+                        send_finished.saturating_duration_since(send_started),
+                    );
+                    match send_result {
                         Ok(()) => {
                             if let Some(ep) = episode.take() {
                                 tracing::info!(
@@ -647,6 +759,8 @@ fn run_loop(
                             missed_sends: schedule.missed_sends(),
                             failed_sends,
                             suppressed_sends,
+                            timing: Box::new(send_timing.snapshot_at(now)),
+                            timer: timer_status,
                         },
                     );
                 }
@@ -654,21 +768,57 @@ fn run_loop(
             // Nothing due yet: block on the command channel until the next
             // fire deadline. Wakes instantly for a command, exactly on time
             // for the schedule, and detects a dropped handle.
-            Tick::Wait(until) => match cmd_rx.recv_deadline(until) {
-                Ok(cmd) => {
-                    if let Flow::Stop = handle(
-                        cmd,
-                        &mut interface,
-                        &mut current_config,
-                        &mut schedule,
-                        &mut episode,
-                    ) {
-                        break 'run;
+            Tick::Wait(until) => {
+                let wait_until = match timing::wait_plan(timer_intent, Instant::now(), until) {
+                    timing::WaitPlan::Direct(deadline) => {
+                        if timer_intent != timing::TimerIntent::ContinuousHighRate {
+                            drop(timer_guard.take());
+                        }
+                        deadline
+                    }
+                    timing::WaitPlan::Stage(window_start) => {
+                        drop(timer_guard.take());
+                        window_start
+                    }
+                    timing::WaitPlan::Precision(deadline) => {
+                        if timer_guard.is_none() {
+                            timer_guard = Some(timing::high_resolution());
+                        }
+                        refresh_timer_status(
+                            who,
+                            &status_tx,
+                            &notify,
+                            timing_mode,
+                            timer_intent,
+                            shortest_interval,
+                            schedule.cadence_alignment(),
+                            schedule.clock_realignments(),
+                            timer_guard.as_ref(),
+                            &mut timer_status,
+                            &mut last_counters,
+                            &mut dropped_statuses,
+                        );
+                        deadline
+                    }
+                };
+                match cmd_rx.recv_deadline(wait_until) {
+                    Ok(cmd) => {
+                        if let Flow::Stop = handle(
+                            cmd,
+                            &mut interface,
+                            &mut current_config,
+                            &mut schedule,
+                            &mut episode,
+                        ) {
+                            break 'run RunEndReason::StopCommand;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        break 'run RunEndReason::OwnerDisconnected;
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break 'run,
-            },
+            }
             // No active messages: nothing can happen until a command arrives,
             // so block indefinitely — zero wakeups.
             Tick::Idle => match cmd_rx.recv() {
@@ -680,13 +830,17 @@ fn run_loop(
                         &mut schedule,
                         &mut episode,
                     ) {
-                        break 'run;
+                        break 'run RunEndReason::StopCommand;
                     }
                 }
-                Err(_) => break 'run,
+                Err(_) => break 'run RunEndReason::OwnerDisconnected,
             },
         }
-    }
+    };
+
+    // Stop paying the platform timer-resolution cost before the exact final
+    // status delivery, which may briefly wait for a full observer queue.
+    drop(timer_guard.take());
 
     // Final counters (ADR-018): the rate-limited lane can be up to one
     // interval stale when the runner stops — emit once more so the observer's
@@ -697,19 +851,102 @@ fn run_loop(
     // runner's receiver until the thread exits (supervisor `poll`/`join_all`,
     // the CLI's funnel loop), and a dropped receiver returns an error
     // immediately — so this cannot hang.
+    let finished_mono = Instant::now();
+    let finished_at = SystemTime::now();
+    let missed_sends = schedule.missed_sends();
+    let final_timing = send_timing.snapshot_at(finished_mono);
     let _ = status_tx.send(TalkerStatus::Counters {
         channel: who.id,
         total_count,
         total_bytes,
-        per_message_counts,
+        per_message_counts: per_message_counts.clone(),
         dropped_statuses,
-        missed_sends: schedule.missed_sends(),
+        missed_sends,
         failed_sends,
         suppressed_sends,
+        timing: Box::new(final_timing),
+        timer: timer_status,
     });
     if let Some(n) = &notify {
         n();
     }
+    emit_control(
+        &control_tx,
+        &notify,
+        RunnerControlStatus::RunFinished {
+            channel: who.id,
+            summary: Box::new(RunSummary {
+                run_id: who.run_id,
+                channel: who.id,
+                label: who.label.clone(),
+                started_at,
+                finished_at,
+                elapsed: finished_mono.saturating_duration_since(started_mono),
+                end_reason,
+                total_count,
+                total_bytes,
+                per_message_counts,
+                dropped_statuses,
+                missed_sends,
+                failed_sends,
+                suppressed_sends,
+                timing: final_timing,
+                timer: timer_status,
+            }),
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refresh_timer_status(
+    who: &RunnerIdentity,
+    status_tx: &Sender<TalkerStatus>,
+    notify: &Option<StatusNotify>,
+    timing_mode: timing::TimingMode,
+    intent: timing::TimerIntent,
+    shortest_interval: Option<Duration>,
+    cadence_alignment: timing::CadenceAlignment,
+    clock_realignments: u64,
+    guard: Option<&timing::HighResolutionGuard>,
+    current: &mut timing::TimerStatus,
+    last_counters: &mut Option<Instant>,
+    dropped_statuses: &mut u64,
+) {
+    let next = timing::timer_status(
+        timing_mode,
+        intent,
+        shortest_interval,
+        guard,
+        current.mode,
+        cadence_alignment,
+        clock_realignments,
+    );
+    if next == *current {
+        return;
+    }
+    if next.mode == timing::TimerMode::WindowsRequestFailed
+        && current.mode != timing::TimerMode::WindowsRequestFailed
+    {
+        tracing::warn!(
+            channel = who.id.as_u64(),
+            "channel {} could not enable Windows 1 ms timer resolution; deadline wakes may be late",
+            who.label
+        );
+    }
+    *current = next;
+    // A due fire should carry the changed state immediately instead of
+    // waiting for the ordinary counter cadence.
+    *last_counters = None;
+    emit_status(
+        status_tx,
+        notify,
+        who,
+        dropped_statuses,
+        TalkerStatus::TimerStatus {
+            channel: who.id,
+            status: *current,
+        },
+    );
 }
 
 /// Queue one status update, best-effort (never blocks the send cadence): a
@@ -798,6 +1035,15 @@ mod tests {
         fail: bool,
         policy: ObserverPolicy,
     ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle, ChannelId) {
+        spawn_runner_with_mode(messages, fail, policy, timing::TimingMode::Standard)
+    }
+
+    fn spawn_runner_with_mode(
+        messages: &[MessageConfig],
+        fail: bool,
+        policy: ObserverPolicy,
+        timing_mode: timing::TimingMode,
+    ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle, ChannelId) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let interface = Box::new(MockInterface {
             sent: Arc::clone(&sent),
@@ -810,6 +1056,7 @@ mod tests {
         let who = RunnerIdentity {
             id: ChannelId::mint(),
             label: "test".into(),
+            run_id: RunId::mint(),
         };
         let id = who.id;
         let thread = std::thread::spawn(move || {
@@ -817,6 +1064,7 @@ mod tests {
                 who,
                 interface,
                 None,
+                timing_mode,
                 schedule,
                 cmd_rx,
                 RunnerObserver::new(status_tx, policy).with_control(control_tx),
@@ -910,6 +1158,14 @@ mod tests {
                     assert_eq!(per_message_counts.iter().sum::<u64>(), *total_count);
                     assert_eq!(*dropped_statuses, 0);
                 }
+                TalkerStatus::TimerStatus { channel, status } => {
+                    assert_eq!(*channel, id, "timer status carries the stable id");
+                    assert_eq!(
+                        status.shortest_active_interval,
+                        Some(Duration::from_millis(10))
+                    );
+                    assert_ne!(status.mode, timing::TimerMode::Standard);
+                }
                 _ => panic!("unexpected status variant"),
             }
         }
@@ -917,6 +1173,74 @@ mod tests {
         // the totals exact.
         assert_eq!(samples, payloads.len());
         assert_eq!(last_total as usize, payloads.len());
+    }
+
+    #[test]
+    fn finished_summary_matches_the_exact_final_counters() {
+        let (sent, handle, id) = spawn_runner(&[msg("AB", 5)], false);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while sent.lock().unwrap().len() < 3 {
+            assert!(Instant::now() < deadline, "runner did not send in time");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let status_rx = handle.status_rx.clone();
+        let control_rx = handle.control_rx.clone();
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        join_within(handle, Duration::from_secs(2));
+
+        let final_counters = status_rx
+            .try_iter()
+            .filter_map(|status| match status {
+                TalkerStatus::Counters {
+                    total_count,
+                    total_bytes,
+                    per_message_counts,
+                    dropped_statuses,
+                    missed_sends,
+                    failed_sends,
+                    suppressed_sends,
+                    timing,
+                    timer,
+                    ..
+                } => Some((
+                    total_count,
+                    total_bytes,
+                    per_message_counts,
+                    dropped_statuses,
+                    missed_sends,
+                    failed_sends,
+                    suppressed_sends,
+                    *timing,
+                    timer,
+                )),
+                _ => None,
+            })
+            .last()
+            .expect("final counters");
+        let summary = control_rx
+            .try_iter()
+            .find_map(|status| match status {
+                RunnerControlStatus::RunFinished { channel, summary } => {
+                    assert_eq!(channel, id);
+                    Some(*summary)
+                }
+                _ => None,
+            })
+            .expect("run completion");
+
+        assert_eq!(summary.channel, id);
+        assert_eq!(summary.end_reason, RunEndReason::StopCommand);
+        assert_eq!(summary.total_count, final_counters.0);
+        assert_eq!(summary.total_bytes, final_counters.1);
+        assert_eq!(summary.per_message_counts, final_counters.2);
+        assert_eq!(summary.dropped_statuses, final_counters.3);
+        assert_eq!(summary.missed_sends, final_counters.4);
+        assert_eq!(summary.failed_sends, final_counters.5);
+        assert_eq!(summary.suppressed_sends, final_counters.6);
+        assert_eq!(summary.timing, final_counters.7);
+        assert_eq!(summary.timer, final_counters.8);
+        assert_eq!(summary.total_count, sent.lock().unwrap().len() as u64);
     }
 
     #[test]
@@ -1014,6 +1338,7 @@ mod tests {
             match s {
                 TalkerStatus::SendSample { .. } => samples += 1,
                 TalkerStatus::Counters { total_count, .. } => last_total = total_count,
+                TalkerStatus::TimerStatus { .. } => {}
                 _ => panic!("unexpected status variant"),
             }
         }
@@ -1031,11 +1356,137 @@ mod tests {
     }
 
     #[test]
+    fn making_fast_schedule_dormant_releases_timer_policy_before_idle() {
+        let policy = ObserverPolicy {
+            counter_interval: Duration::from_secs(3600),
+            sample_interval: Duration::from_secs(3600),
+        };
+        let (_, handle, id) = spawn_runner_with(&[msg("AB", 5)], false, policy);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_fast = false;
+        while !saw_fast {
+            for status in handle.status_rx.try_iter() {
+                if let TalkerStatus::TimerStatus { channel, status } = status {
+                    assert_eq!(channel, id);
+                    saw_fast = status.shortest_active_interval == Some(Duration::from_millis(5));
+                }
+            }
+            assert!(Instant::now() < deadline, "fast timer status not reported");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        handle
+            .cmd_tx
+            .send(TalkerCommand::SetInterval {
+                id: CommandId::mint(),
+                index: 0,
+                interval_ms: 0,
+            })
+            .unwrap();
+        let mut dormant = None;
+        while dormant.is_none() {
+            for status in handle.status_rx.try_iter() {
+                if let TalkerStatus::TimerStatus { status, .. } = status {
+                    if status.shortest_active_interval.is_none() {
+                        dormant = Some(status);
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dormant timer status not reported before idle"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(dormant.unwrap().mode, timing::TimerMode::Standard);
+
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        join_within(handle, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn precise_slow_schedule_uses_windowed_policy_and_dormant_releases_it() {
+        let policy = ObserverPolicy {
+            counter_interval: Duration::from_secs(3600),
+            sample_interval: Duration::from_secs(3600),
+        };
+        let (_, handle, id) = spawn_runner_with_mode(
+            &[msg("AB", 100)],
+            false,
+            policy,
+            timing::TimingMode::Precise,
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_window_policy = false;
+        let mut saw_platform_result = false;
+        while !saw_platform_result {
+            for status in handle.status_rx.try_iter() {
+                if let TalkerStatus::TimerStatus { channel, status } = status {
+                    assert_eq!(channel, id);
+                    if status.reason == timing::TimerReason::PrecisionWindow {
+                        saw_window_policy = true;
+                        #[cfg(windows)]
+                        {
+                            saw_platform_result = matches!(
+                                status.mode,
+                                timing::TimerMode::WindowsOneMillisecond
+                                    | timing::TimerMode::WindowsRequestFailed
+                            );
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            saw_platform_result =
+                                status.mode == timing::TimerMode::NativeDeadlineWaits;
+                        }
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "precise deadline-window status not reported"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(saw_window_policy);
+
+        handle
+            .cmd_tx
+            .send(TalkerCommand::SetInterval {
+                id: CommandId::mint(),
+                index: 0,
+                interval_ms: 0,
+            })
+            .unwrap();
+        let mut dormant = None;
+        while dormant.is_none() {
+            for status in handle.status_rx.try_iter() {
+                if let TalkerStatus::TimerStatus { status, .. } = status {
+                    if status.shortest_active_interval.is_none() {
+                        dormant = Some(status);
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dormant precise policy not reported before idle"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let dormant = dormant.unwrap();
+        assert_eq!(dormant.timing_mode, timing::TimingMode::Precise);
+        assert_eq!(dormant.reason, timing::TimerReason::None);
+        assert_eq!(dormant.mode, timing::TimerMode::Standard);
+
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        join_within(handle, Duration::from_secs(1));
+    }
+
+    #[test]
     fn dropped_command_handle_stops_the_runner() {
         let (_, handle, _id) = spawn_runner(&[msg("AB", 0)], false);
         let TalkerHandle {
             cmd_tx,
-            control_rx: _control_rx,
+            control_rx,
             status_rx: _status_rx,
             thread,
         } = handle;
@@ -1046,6 +1497,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         thread.join().unwrap();
+        let end_reason = control_rx.try_iter().find_map(|status| match status {
+            RunnerControlStatus::RunFinished { summary, .. } => Some(summary.end_reason),
+            _ => None,
+        });
+        assert_eq!(end_reason, Some(RunEndReason::OwnerDisconnected));
     }
 
     #[test]
@@ -1111,16 +1567,38 @@ mod tests {
                 total_count,
                 failed_sends,
                 suppressed_sends,
+                timing,
                 ..
-            } => Some((*total_count, *failed_sends, *suppressed_sends)),
+            } => Some((*total_count, *failed_sends, *suppressed_sends, **timing)),
             _ => None,
         });
-        let (sent, failed, suppressed) = outcomes.expect("live cumulative counters");
+        let (sent, failed, suppressed, timing) = outcomes.expect("live cumulative counters");
+        let cumulative = timing.cumulative;
         assert_eq!(sent, 0);
         assert!(failed >= 1, "the failed attempt is visible before stop");
         assert!(
             suppressed >= 1,
             "backoff-suppressed sends are visible before stop"
+        );
+        assert_eq!(
+            cumulative.deadline_lateness.sample_count(),
+            sent + failed + suppressed,
+            "every handled due fire contributes one deadline sample"
+        );
+        assert_eq!(
+            cumulative.render_duration.sample_count(),
+            sent + failed,
+            "suppressed due fires must not render payloads"
+        );
+        assert_eq!(
+            cumulative.send_duration.sample_count(),
+            sent + failed,
+            "only attempted sends contribute send-call samples"
+        );
+        assert_eq!(
+            timing.recent.deadline_lateness.sample_count(),
+            cumulative.deadline_lateness.sample_count(),
+            "this short run fits entirely inside the recent window"
         );
         handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
         join_within(handle, Duration::from_secs(2));
@@ -1159,12 +1637,14 @@ mod tests {
         let who = RunnerIdentity {
             id: ChannelId::mint(),
             label: "test".into(),
+            run_id: RunId::mint(),
         };
         let thread = std::thread::spawn(move || {
             run(
                 who,
                 interface,
                 None,
+                timing::TimingMode::Standard,
                 schedule,
                 cmd_rx,
                 RunnerObserver::new(status_tx, ObserverPolicy::every_send())
@@ -1238,11 +1718,13 @@ mod tests {
         let who = RunnerIdentity {
             id: ChannelId::mint(),
             label: "3".into(),
+            run_id: RunId::mint(),
         };
         let id = who.id;
         open_and_run(
             who,
             cfg,
+            timing::TimingMode::Standard,
             schedule,
             cmd_rx,
             RunnerObserver::new(status_tx, ObserverPolicy::every_send()),

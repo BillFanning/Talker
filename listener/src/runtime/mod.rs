@@ -17,6 +17,7 @@
 //!   start/stop/apply-pending exposed as async methods (the command surface; ADR-012).
 //! - [`snapshot`] — on-demand, pull-side readout: the small [`snapshot::ChannelSnapshot`]
 //!   plus incremental [`snapshot::StreamDelta`] scrollback reads (ADR-011).
+//! - [`telemetry`] — fixed-size cumulative timing summaries (ADR-026).
 
 pub mod activity;
 pub mod build;
@@ -25,8 +26,10 @@ pub mod listener;
 pub mod matchrule;
 pub mod pipeline;
 pub mod queue;
+pub mod run_summary;
 pub mod snapshot;
 pub mod tcp;
+pub mod telemetry;
 
 pub use crate::diagnostics::{Diagnostic, DiagnosticSeverity};
 pub use activity::{ActivityMeter, ChannelActivity};
@@ -35,8 +38,13 @@ pub use listener::{Listener, OrchestratorError};
 pub use matchrule::{FiredRule, MatchRuleSet};
 pub use pipeline::{run_channel, ChannelPipeline, PipelineCapacities};
 pub use queue::DropOldestQueue;
+pub use run_summary::{ListenerRunSummary, RunEndReason, RunId};
 pub use snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
     QueueDepth, StreamDelta, TriggeredMatch,
 };
 pub use tcp::{start_tcp_listener, TcpListenerHandle};
+pub use telemetry::{
+    ArrivalTimestampSummary, ByteHistogram, ChunkShape, CounterAvailability, DurationHistogram,
+    IdleDeadlineTimerMode, IdleDeadlineTimerSummary, SerialStallSummary, TransportHealth,
+};

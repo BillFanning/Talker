@@ -28,6 +28,10 @@ use super::snapshot::{
     ChannelSnapshot, ChannelStats, DiagnosticsSnapshot, DisplayViewSnapshot, PipelineRequest,
     QueueDepth, StreamDelta,
 };
+use super::telemetry::{
+    ChunkShape, CounterAvailability, DurationHistogram, IdleDeadlineTimerMode,
+    IdleDeadlineTimerSummary, RecentDurationHistogram, SerialStallSummary, TransportHealth,
+};
 use crate::config::{
     DiskGuard, DiskThreshold, LowDiskAction, MarkPosition, MarkTimestampStyle, MatchAction,
     MatchRule, RecordControl, RecordTarget,
@@ -209,6 +213,10 @@ pub struct ChannelPipeline {
     /// Raw Recording handle (§53). `None` when recording is disabled or its
     /// enable failed (§55). Faults non-blockingly on overflow (§56.1).
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
+    /// Queue high-water mark retained after a Raw recorder is finalized or
+    /// restarted. The active handle owns the live counter; this preserves its
+    /// run-level evidence after that handle is gone.
+    raw_recording_queue_history: Option<QueueDepth>,
     /// Whether the raw recorder's fault has already been reported.
     recording_fault_reported: bool,
     /// Whether a display recorder's fault has already been reported —
@@ -231,6 +239,24 @@ pub struct ChannelPipeline {
     disk_low_reported: bool,
     /// Per-Channel liveness facts (§91.1): rolling throughput + last-data time.
     activity: ActivityMeter,
+    /// Post-read capture to pipeline-start delay, accumulated without retaining
+    /// individual samples.
+    ingest_delay: DurationHistogram,
+    recent_ingest_delay: RecentDurationHistogram,
+    /// Pipeline-start through completion of synchronous per-chunk work.
+    ingest_processing: DurationHistogram,
+    recent_ingest_processing: RecentDurationHistogram,
+    /// Cumulative read-chunk sizes and post-read completion gaps for this run.
+    chunk_shape: ChunkShape,
+    last_read_completed_at: Option<Instant>,
+    transport_health: TransportHealth,
+    /// Start inferred from a live Serial stall warning. The cumulative transport
+    /// summary replaces it when the queue accepts again.
+    serial_stall_active_since: Option<Instant>,
+    /// Idle-rule firing lateness against each rule's monotonic deadline.
+    rule_timer_lateness: DurationHistogram,
+    recent_rule_timer_lateness: RecentDurationHistogram,
+    idle_deadline_timer: IdleDeadlineTimerSummary,
     events: Option<Sender<RuntimeEvent>>,
     /// Compiled find/trigger rules (§50.2, §165); empty when none are configured.
     match_rules: MatchRuleSet,
@@ -329,6 +355,7 @@ impl ChannelPipeline {
                 caps.error_retention,
             ),
             raw_recorder: None,
+            raw_recording_queue_history: None,
             recording_fault_reported: false,
             display_fault_reported: false,
             begin_faulted: false,
@@ -337,6 +364,17 @@ impl ChannelPipeline {
             disk_guard: None,
             disk_low_reported: false,
             activity: ActivityMeter::new(),
+            ingest_delay: DurationHistogram::default(),
+            recent_ingest_delay: RecentDurationHistogram::default(),
+            ingest_processing: DurationHistogram::default(),
+            recent_ingest_processing: RecentDurationHistogram::default(),
+            chunk_shape: ChunkShape::default(),
+            last_read_completed_at: None,
+            transport_health: TransportHealth::default(),
+            serial_stall_active_since: None,
+            rule_timer_lateness: DurationHistogram::default(),
+            recent_rule_timer_lateness: RecentDurationHistogram::default(),
+            idle_deadline_timer: IdleDeadlineTimerSummary::default(),
             events: None,
             match_rules: MatchRuleSet::compile(&[]),
             recent_matches: DropOldestQueue::with_capacity(RECENT_MATCHES_CAP),
@@ -435,6 +473,25 @@ impl ChannelPipeline {
     /// first with a non-blocking enqueue, then the stream scrollback, display
     /// recording, and find/trigger evaluation. Every edge is non-blocking.
     pub fn ingest(&mut self, data: ReceivedData) {
+        let ingest_started = Instant::now();
+        let ingest_delay = ingest_started.saturating_duration_since(data.received_at.monotonic);
+        self.ingest_delay.record(ingest_delay);
+        self.recent_ingest_delay
+            .record_at(ingest_started, ingest_delay);
+        self.transport_health
+            .arrival_timestamps
+            .record(data.received_at.wall_clock_source);
+        self.chunk_shape.sizes.record(data.payload.bytes().len());
+        if let Some(previous) = self
+            .last_read_completed_at
+            .replace(data.received_at.monotonic)
+        {
+            self.chunk_shape.inter_read_gaps.record(
+                data.received_at
+                    .monotonic
+                    .saturating_duration_since(previous),
+            );
+        }
         let data = Arc::new(data);
         // The chunk's start offset in the stream (total bytes before it) — the
         // anchor for find/trigger firings (§50.2: byte offsets, not numbers).
@@ -537,6 +594,12 @@ impl ChannelPipeline {
 
         // 5. Surface any recorder fault (raw or display) exactly once (§56.1).
         self.check_recording_faults();
+
+        let ingest_finished = Instant::now();
+        let processing = ingest_finished.saturating_duration_since(ingest_started);
+        self.ingest_processing.record(processing);
+        self.recent_ingest_processing
+            .record_at(ingest_finished, processing);
     }
 
     /// Report any recorder fault once: an error diagnostic carrying the
@@ -782,18 +845,29 @@ impl ChannelPipeline {
         if !self.match_rules.has_idle_rule() {
             return;
         }
-        let last = self
-            .activity
-            .snapshot(now)
-            .last_data_at
-            .unwrap_or(self.created_at);
+        let last = self.activity.last_data_at().unwrap_or(self.created_at);
         let idle_for = now.saturating_duration_since(last);
         let fired = self.match_rules.evaluate_idle(idle_for);
         if !fired.is_empty() {
+            for lateness in fired.iter().filter_map(|rule| rule.timer_lateness) {
+                self.rule_timer_lateness.record(lateness);
+                self.recent_rule_timer_lateness.record_at(now, lateness);
+            }
             // Idle firings carry no byte offset, so they produce no inline Mark
             // timestamp (and no view offset); the returned annotations are empty.
             let _ = self.apply_fired_rules(fired, ChunkTime::now(), None, 0);
         }
+    }
+
+    /// Earliest pending Idle-rule deadline for the current quiet episode.
+    pub fn next_idle_deadline(&self, now: Instant) -> Option<Instant> {
+        if !self.match_rules.has_idle_rule() {
+            return None;
+        }
+        let last = self.activity.last_data_at().unwrap_or(self.created_at);
+        let idle_for = now.saturating_duration_since(last);
+        let wait = self.match_rules.next_idle_wait(idle_for)?;
+        now.checked_add(wait)
     }
 
     /// Apply queued `Record` actions (§50.2). Called from the async ingest loop,
@@ -872,7 +946,7 @@ impl ChannelPipeline {
             // user's retry (the button reads "Record" — it must work without
             // a channel restart). Drop the dead recording, then recreate.
             Some(_) => {
-                if let Some(recorder) = self.raw_recorder.take() {
+                if let Some(recorder) = self.take_raw_recorder() {
                     let _ = recorder.finalize(RecordingStopReason::Disabled).await;
                 }
             }
@@ -963,7 +1037,7 @@ impl ChannelPipeline {
     /// "off" again, not ⚠.
     async fn stop_recording(&mut self) {
         self.begin_faulted = false;
-        if let Some(recorder) = self.raw_recorder.take() {
+        if let Some(recorder) = self.take_raw_recorder() {
             let already_reported = self.recording_fault_reported;
             self.retiring.spawn(async move {
                 let fault = recorder.finalize(RecordingStopReason::Disabled).await;
@@ -1191,10 +1265,30 @@ impl ChannelPipeline {
     /// §137 event paired in one place.
     pub fn record_notice(&mut self, notice: TransportNotice) {
         match notice {
+            TransportNotice::SerialStallSummary {
+                channel_id: _,
+                episodes,
+                total,
+                max,
+            } => {
+                self.transport_health.serial_stalls = Some(SerialStallSummary {
+                    episodes,
+                    total,
+                    max,
+                    active: false,
+                });
+                self.serial_stall_active_since = None;
+            }
             TransportNotice::ReceptionStalled {
                 channel_id,
                 stalled_for,
             } => {
+                self.transport_health.serial_stalls.get_or_insert_default();
+                self.serial_stall_active_since.get_or_insert_with(|| {
+                    Instant::now()
+                        .checked_sub(stalled_for)
+                        .unwrap_or_else(Instant::now)
+                });
                 self.diagnostics.record(Diagnostic::warning(format!(
                     "reception stalled {} ms on channel {channel_id}; possible transport-specific \
                      loss (UART/driver overrun) — lost byte count is not observable (§101)",
@@ -1208,6 +1302,21 @@ impl ChannelPipeline {
                         events.try_send(RuntimeEvent::ReceptionStalled(channel_id, stalled_for));
                 }
             }
+            TransportNotice::UdpKernelDrops {
+                channel_id: _,
+                dropped,
+            } => {
+                self.transport_health.udp_kernel_drops = dropped.map_or(
+                    CounterAvailability::Unsupported,
+                    CounterAvailability::Available,
+                );
+            }
+            TransportNotice::UdpArrivalTimestamps {
+                channel_id: _,
+                status,
+            } => {
+                self.transport_health.arrival_timestamps.status = status;
+            }
             TransportNotice::TransportFaulted { channel_id, cause } => {
                 // The fault's CAUSE, retained where an operator will look for
                 // it (the diagnostics log, which survives stop via the
@@ -1218,6 +1327,19 @@ impl ChannelPipeline {
                 )));
             }
         }
+    }
+
+    fn transport_health_at(&self, now: Instant) -> TransportHealth {
+        let mut health = self.transport_health;
+        if let Some(started) = self.serial_stall_active_since {
+            let elapsed = now.saturating_duration_since(started);
+            let summary = health.serial_stalls.get_or_insert_default();
+            summary.episodes = summary.episodes.saturating_add(1);
+            summary.total = summary.total.saturating_add(elapsed);
+            summary.max = summary.max.max(elapsed);
+            summary.active = true;
+        }
+        health
     }
 
     /// Poll the recording filesystem's free space and act on a low condition
@@ -1275,7 +1397,7 @@ impl ChannelPipeline {
     /// detached (this runs from the disk guard on the acquisition task — the
     /// low-disk stop must not itself stall reception, §96).
     async fn stop_all_recording(&mut self) {
-        if let Some(recorder) = self.raw_recorder.take() {
+        if let Some(recorder) = self.take_raw_recorder() {
             let already = self.recording_fault_reported;
             self.retiring.spawn(async move {
                 let fault = recorder.finalize(RecordingStopReason::Disabled).await;
@@ -1309,7 +1431,7 @@ impl ChannelPipeline {
         // Land any detached stops first: a channel stop reports every
         // recording outcome before the final snapshot is taken (§56.1).
         self.drain_retiring().await;
-        if let Some(recorder) = self.raw_recorder.take() {
+        if let Some(recorder) = self.take_raw_recorder() {
             let already = self.recording_fault_reported;
             let fault = recorder.finalize(RecordingStopReason::ChannelStopped).await;
             self.note_recording_stop(RecordingTap::Raw, already, fault, true);
@@ -1399,25 +1521,35 @@ impl ChannelPipeline {
         }
     }
 
-    /// Cheap O(1) counters for a multi-channel overview (§91.1): liveness plus
-    /// per-severity diagnostic counts and the boundary-save total. Polled
+    /// Cheap O(1) counters for a multi-channel overview (§91.1): liveness and
+    /// timing plus per-severity diagnostic counts and the boundary-save total. Polled
     /// per-Channel each tick; [`snapshot`](Self::snapshot) (the full diagnostic/match
     /// detail) is reserved for the Channel actually on screen, and the scrollback
     /// bytes come from [`stream_delta`](Self::stream_delta) — neither call clones the
     /// scrollback.
     pub fn stats(&self) -> ChannelStats {
+        let now = Instant::now();
         ChannelStats {
             // Placeholders: lifecycle is the orchestrator's, not the pipeline's —
             // `Listener::channel_stats` stamps the effective state before serving.
             state: crate::core::ChannelState::Running,
             reconnect_pending: false,
-            activity: self.activity.snapshot(Instant::now()),
+            activity: self.activity.snapshot(now),
             event_count: self.diagnostics.events().count(),
             warning_count: self.diagnostics.warnings().count(),
             error_count: self.diagnostics.errors().count(),
             raw_recording: self.raw_recording_state(),
             display_recording: self.display_recording_state(),
             match_boundary_saves: self.match_rules.boundary_saves(),
+            ingest_delay: self.ingest_delay,
+            recent_ingest_delay: self.recent_ingest_delay.snapshot_at(now),
+            ingest_processing: self.ingest_processing,
+            recent_ingest_processing: self.recent_ingest_processing.snapshot_at(now),
+            chunk_shape: self.chunk_shape,
+            transport_health: self.transport_health_at(now),
+            rule_timer_lateness: self.rule_timer_lateness,
+            recent_rule_timer_lateness: self.recent_rule_timer_lateness.snapshot_at(now),
+            idle_deadline_timer: self.idle_deadline_timer,
             ingest_queue: self.ingest_queue(),
             raw_recording_queue: self.raw_recording_queue(),
         }
@@ -1432,16 +1564,38 @@ impl ChannelPipeline {
         }
     }
 
-    /// Raw-recording queue occupancy, or `None` when no recorder is attached (§56.1).
+    /// Take the active Raw recorder while preserving its queue high-water mark.
+    fn take_raw_recorder(&mut self) -> Option<Recording<Arc<ReceivedData>>> {
+        if let Some(recorder) = self.raw_recorder.as_ref() {
+            let (_, peak, capacity) = recorder.queue_depth();
+            let retained = self.raw_recording_queue_history.get_or_insert_default();
+            retained.peak = retained.peak.max(peak);
+            retained.capacity = retained.capacity.max(capacity);
+            retained.current = 0;
+        }
+        self.raw_recorder.take()
+    }
+
+    /// Raw-recording queue occupancy, retaining the run peak after a recorder is
+    /// finalized or replaced (§56.1).
     fn raw_recording_queue(&self) -> Option<QueueDepth> {
-        self.raw_recorder.as_ref().map(|r| {
+        let active = self.raw_recorder.as_ref().map(|r| {
             let (current, peak, capacity) = r.queue_depth();
             QueueDepth {
                 current,
                 peak,
                 capacity,
             }
-        })
+        });
+        match (self.raw_recording_queue_history, active) {
+            (Some(history), Some(mut active)) => {
+                active.peak = active.peak.max(history.peak);
+                active.capacity = active.capacity.max(history.capacity);
+                Some(active)
+            }
+            (history, None) => history,
+            (None, active) => active,
+        }
     }
 
     /// Build an owned, point-in-time snapshot of the *small* observable state (§137,
@@ -1450,12 +1604,14 @@ impl ChannelPipeline {
     /// included — they are fetched incrementally via [`stream_delta`](Self::stream_delta)
     /// so this stays cheap at high throughput.
     pub fn snapshot(&self) -> ChannelSnapshot {
+        let now = Instant::now();
         ChannelSnapshot {
             channel_id: self.channel_id,
             // Placeholders — the orchestrator stamps the effective lifecycle state
             // before serving (see `ChannelStats::state`).
             state: crate::core::ChannelState::Running,
             reconnect_pending: false,
+            last_run_summary: None,
             display_views: self
                 .display_views
                 .iter()
@@ -1471,9 +1627,18 @@ impl ChannelPipeline {
             },
             raw_recording: self.raw_recording_state(),
             display_recording: self.display_recording_state(),
-            activity: self.activity.snapshot(Instant::now()),
+            activity: self.activity.snapshot(now),
             matches: self.recent_matches.iter().cloned().collect(),
             match_boundary_saves: self.match_rules.boundary_saves(),
+            ingest_delay: self.ingest_delay,
+            recent_ingest_delay: self.recent_ingest_delay.snapshot_at(now),
+            ingest_processing: self.ingest_processing,
+            recent_ingest_processing: self.recent_ingest_processing.snapshot_at(now),
+            chunk_shape: self.chunk_shape,
+            transport_health: self.transport_health_at(now),
+            rule_timer_lateness: self.rule_timer_lateness,
+            recent_rule_timer_lateness: self.recent_rule_timer_lateness.snapshot_at(now),
+            idle_deadline_timer: self.idle_deadline_timer,
             // The scrollback bytes are fetched incrementally (StreamDelta), not
             // bundled here — only the cursor target travels in the snapshot.
             stream_end_offset: self.stream_end_offset(),
@@ -1587,10 +1752,11 @@ pub async fn run_channel(
     // guard is configured (the check returns immediately).
     let mut disk_check = tokio::time::interval(Duration::from_secs(5));
     disk_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Idle rule timer (§50.2): a sub-second tick so an `Idle` condition fires
-    // promptly once the stream goes quiet. Cheap no-op when no idle rule exists.
-    let mut idle_check = tokio::time::interval(Duration::from_millis(250));
-    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Recorder maintenance cadence, independent of rule timing. It bounds
+    // asynchronous fault visibility and detached-stop outcome reaping on a quiet
+    // stream; Idle rules use exact deadlines below rather than this poll.
+    let mut recorder_check = tokio::time::interval(Duration::from_millis(250));
+    recorder_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     pipeline.record_event("Channel started");
     // "Record on start" (§53): begin once at startup through the same path as the live
     // Record toggle, so a failure (e.g. Refuse over an existing file) records a
@@ -1601,8 +1767,9 @@ pub async fn run_channel(
     loop {
         // Detached recorder stops (§56.1): report any outcome that landed
         // since the last pass. Non-blocking — reception never waits on a
-        // file close; the idle tick guarantees a pass on a quiet stream.
+        // file close; the recorder-maintenance tick guarantees a pass on quiet input.
         pipeline.reap_retired_recordings();
+        let idle_deadline = pipeline.next_idle_deadline(Instant::now());
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
@@ -1636,7 +1803,9 @@ pub async fn run_channel(
                 }
             },
             _ = disk_check.tick() => pipeline.check_disk_guard().await,
-            _ = idle_check.tick() => {
+            _ = recorder_check.tick() => pipeline.check_recording_faults(),
+            timer_mode = wait_for_idle_deadline(idle_deadline) => {
+                pipeline.idle_deadline_timer.record(timer_mode);
                 pipeline.evaluate_idle_rules(Instant::now());
                 pipeline.apply_pending_records().await;
                 // Recorder tasks fault asynchronously; on a quiet stream this
@@ -1674,6 +1843,37 @@ pub async fn run_channel(
     pipeline
 }
 
+const IDLE_PRECISION_WINDOW: Duration = Duration::from_millis(32);
+
+async fn wait_for_idle_deadline(deadline: Option<Instant>) -> IdleDeadlineTimerMode {
+    match deadline {
+        Some(deadline) => {
+            #[cfg(windows)]
+            {
+                let now = Instant::now();
+                let window_start = deadline.checked_sub(IDLE_PRECISION_WINDOW).unwrap_or(now);
+                if now < window_start {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(window_start)).await;
+                }
+                let guard = wiredata_timing::high_resolution();
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                if guard.is_effective() {
+                    IdleDeadlineTimerMode::WindowsOneMillisecond
+                } else {
+                    IdleDeadlineTimerMode::WindowsRequestFailed
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = IDLE_PRECISION_WINDOW;
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                IdleDeadlineTimerMode::NativeDeadlineWait
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1699,6 +1899,75 @@ mod tests {
             payload: ReceivedPayload::Datagram(data.to_vec()),
             received_at: ChunkTime::now(),
         }
+    }
+
+    #[test]
+    fn ingest_records_handoff_delay_and_total_processing_time() {
+        let cid = ChannelId::new();
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        let captured = Instant::now()
+            .checked_sub(Duration::from_millis(10))
+            .expect("monotonic clock has at least 10 ms of history");
+
+        p.ingest(ReceivedData {
+            channel_id: cid,
+            payload: ReceivedPayload::Bytes(vec![0xAB]),
+            received_at: ChunkTime {
+                monotonic: captured,
+                wall_clock: std::time::SystemTime::now(),
+                wall_clock_source: crate::core::ArrivalTimestampSource::PostRead,
+            },
+        });
+
+        let stats = p.stats();
+        assert_eq!(stats.ingest_delay.sample_count(), 1);
+        assert_eq!(stats.ingest_processing.sample_count(), 1);
+        assert_eq!(stats.recent_ingest_processing.sample_count(), 1);
+        assert_eq!(stats.chunk_shape.chunk_count(), 1);
+        assert_eq!(stats.chunk_shape.sizes.max(), Some(1));
+        assert_eq!(stats.chunk_shape.inter_read_gaps.sample_count(), 0);
+        assert!(
+            stats.ingest_delay.max().unwrap() >= Duration::from_millis(10),
+            "the measured boundary includes the deliberate pre-ingest delay"
+        );
+        let snapshot = p.snapshot();
+        assert_eq!(snapshot.ingest_delay, stats.ingest_delay);
+        assert_eq!(snapshot.ingest_processing, stats.ingest_processing);
+        assert_eq!(
+            snapshot.recent_ingest_processing,
+            stats.recent_ingest_processing
+        );
+        assert_eq!(snapshot.chunk_shape, stats.chunk_shape);
+    }
+
+    #[test]
+    fn chunk_shape_uses_transport_capture_times_not_pipeline_queue_time() {
+        let cid = ChannelId::new();
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        let captured = Instant::now()
+            .checked_sub(Duration::from_millis(20))
+            .expect("monotonic clock has at least 20 ms of history");
+
+        for (offset_ms, payload) in [(0, vec![0; 8]), (7, vec![0; 1_500])] {
+            p.ingest(ReceivedData {
+                channel_id: cid,
+                payload: ReceivedPayload::Bytes(payload),
+                received_at: ChunkTime {
+                    monotonic: captured + Duration::from_millis(offset_ms),
+                    wall_clock: std::time::SystemTime::now(),
+                    wall_clock_source: crate::core::ArrivalTimestampSource::PostRead,
+                },
+            });
+        }
+
+        let stats = p.stats();
+        assert_eq!(stats.chunk_shape.chunk_count(), 2);
+        assert_eq!(stats.chunk_shape.sizes.max(), Some(1_500));
+        assert_eq!(stats.chunk_shape.inter_read_gaps.sample_count(), 1);
+        assert_eq!(
+            stats.chunk_shape.inter_read_gaps.max(),
+            Some(Duration::from_millis(7))
+        );
     }
 
     #[test]
@@ -2152,6 +2421,59 @@ mod tests {
     }
 
     #[test]
+    fn transport_health_distinguishes_active_serial_stalls_and_udp_support() {
+        let cid = ChannelId::new();
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        p.record_notice(TransportNotice::SerialStallSummary {
+            channel_id: cid,
+            episodes: 0,
+            total: Duration::ZERO,
+            max: Duration::ZERO,
+        });
+        assert_eq!(
+            p.snapshot().transport_health.serial_stalls,
+            Some(SerialStallSummary::default())
+        );
+
+        p.record_notice(TransportNotice::ReceptionStalled {
+            channel_id: cid,
+            stalled_for: Duration::from_millis(750),
+        });
+        let active = p.snapshot().transport_health.serial_stalls.unwrap();
+        assert!(active.active);
+        assert_eq!(active.episodes, 1);
+        assert!(active.total >= Duration::from_millis(750));
+
+        p.record_notice(TransportNotice::SerialStallSummary {
+            channel_id: cid,
+            episodes: 1,
+            total: Duration::from_millis(800),
+            max: Duration::from_millis(800),
+        });
+        let completed = p.snapshot().transport_health.serial_stalls.unwrap();
+        assert!(!completed.active);
+        assert_eq!(completed.episodes, 1);
+        assert_eq!(completed.total, Duration::from_millis(800));
+
+        p.record_notice(TransportNotice::UdpKernelDrops {
+            channel_id: cid,
+            dropped: None,
+        });
+        assert_eq!(
+            p.stats().transport_health.udp_kernel_drops,
+            CounterAvailability::Unsupported
+        );
+        p.record_notice(TransportNotice::UdpKernelDrops {
+            channel_id: cid,
+            dropped: Some(3),
+        });
+        assert_eq!(
+            p.stats().transport_health.udp_kernel_drops,
+            CounterAvailability::Available(3)
+        );
+    }
+
+    #[test]
     fn disk_is_low_compares_bytes_and_percent_thresholds() {
         assert!(disk_is_low(9, 100, DiskThreshold::Bytes { bytes: 10 }));
         assert!(!disk_is_low(10, 100, DiskThreshold::Bytes { bytes: 10 }));
@@ -2464,6 +2786,47 @@ mod tests {
         p.ingest(bytes_chunk(cid, b"x"));
         p.evaluate_idle_rules(Instant::now() + Duration::from_secs(1));
         assert_eq!(p.snapshot().matches.len(), 2);
+        assert_eq!(p.snapshot().rule_timer_lateness.sample_count(), 2);
+        assert_eq!(p.snapshot().recent_rule_timer_lateness.sample_count(), 2);
+    }
+
+    #[test]
+    fn idle_rule_deadline_and_lateness_use_the_same_monotonic_anchor() {
+        let cid = ChannelId::new();
+        let base = Instant::now();
+        let mut p = pipeline(cid, PipelineCapacities::default()).with_match_rules(&[MatchRule {
+            name: "quiet".to_string(),
+            condition: MatchCondition::Idle { timeout_ms: 500 },
+            actions: vec![],
+            enabled: true,
+        }]);
+        p.created_at = base;
+
+        assert_eq!(
+            p.next_idle_deadline(base + Duration::from_millis(100)),
+            Some(base + Duration::from_millis(500))
+        );
+        p.evaluate_idle_rules(base + Duration::from_millis(620));
+        let timing = p.stats().rule_timer_lateness;
+        assert_eq!(timing.sample_count(), 1);
+        assert_eq!(timing.max(), Some(Duration::from_millis(120)));
+        assert_eq!(
+            p.next_idle_deadline(base + Duration::from_millis(700)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_deadline_wait_reports_the_platform_timer_policy() {
+        let mode = wait_for_idle_deadline(Some(Instant::now() + Duration::from_millis(2))).await;
+        #[cfg(windows)]
+        assert!(matches!(
+            mode,
+            IdleDeadlineTimerMode::WindowsOneMillisecond
+                | IdleDeadlineTimerMode::WindowsRequestFailed
+        ));
+        #[cfg(not(windows))]
+        assert_eq!(mode, IdleDeadlineTimerMode::NativeDeadlineWait);
     }
 
     #[tokio::test]
@@ -2767,6 +3130,12 @@ mod tests {
         // The stop returned with the retirement possibly still in flight:
         // the recording already reads off, and ingest keeps flowing.
         assert!(p.raw_recording_state().is_none());
+        let queue = p
+            .snapshot()
+            .raw_recording_queue
+            .expect("queue peak survives recorder teardown");
+        assert!(queue.peak >= 1);
+        assert_eq!(queue.capacity, 64);
         p.ingest(bytes_chunk(cid, b"while closing"));
 
         // The outcome is reported through the reap path.
@@ -3142,6 +3511,7 @@ mod tests {
         let arrival = ChunkTime {
             monotonic: Instant::now(),
             wall_clock: std::time::UNIX_EPOCH + Duration::from_millis(1_784_282_096_789),
+            wall_clock_source: crate::core::ArrivalTimestampSource::PostRead,
         };
         pipeline.ingest(ReceivedData {
             channel_id: cid,

@@ -1,9 +1,10 @@
 # AGENTS.md
 
 Working agreement and codebase guide for the **wiredata** workspace. Applies to all
-four crates (`talker`, `nmea0183`, `listener`, `wiredata-ui`) and to **any** contributor — human or
-coding agent (Claude Code, Codex, or otherwise). This is the tool-neutral source of
-truth; tool-specific files (e.g. `CLAUDE.md`) should import it rather than duplicate it.
+five crates (`talker`, `nmea0183`, `listener`, `wiredata-ui`, `wiredata-timing`) and to
+**any** contributor — human or coding agent (Claude Code, Codex, or otherwise). This
+is the tool-neutral source of truth; tool-specific files (e.g. `CLAUDE.md`) should
+import it rather than duplicate it.
 
 ---
 
@@ -105,7 +106,7 @@ toolchain.
 
 ### Workspace layout
 
-Four crates in a Cargo workspace:
+Five crates in a Cargo workspace:
 
 - **`nmea0183/`** — library crate; no dependency on `talker` or `listener`; intended for
   independent crates.io publication. Handles NMEA 0183 sentence construction, parsing,
@@ -132,6 +133,11 @@ Four crates in a Cargo workspace:
   `listener`, `eframe`, or any runtime crate. A piece belongs here only if it is purely
   presentational, identical across both apps, and egui-only; app-specific widgets,
   layouts, and view-models stay in the apps.
+- **`wiredata-timing/`** — internal (`publish = false`) shared process-timing policy.
+  It owns the refcounted Windows 1 ms timer-resolution guard and the one-time
+  minimized-window throttling opt-out used by both applications. It is a narrow
+  platform boundary, not a general shared runtime or scheduling crate; non-Windows
+  calls preserve the same RAII shape but make no timer-resolution request.
 
 ```
 talker/src/
@@ -175,6 +181,8 @@ I/O shape (see talker ADR-002 vs listener ADR-001):
   `tokio`, etc.). It stays a pure, publishable library.
 - `wiredata-ui` imports only `egui`. It must never depend on `talker`, `listener`,
   `eframe`, or runtime crates — chrome only (talker ADR-016 / listener ADR-019).
+- `wiredata-timing` owns only cross-application OS timing policy. Cadence,
+  scheduling, telemetry, and application configuration remain in their owning apps.
 - UI threads never perform I/O and never block.
 - `cli/` and `gui/` are thin layers; business logic lives in `core/` (or the equivalent
   internal modules).

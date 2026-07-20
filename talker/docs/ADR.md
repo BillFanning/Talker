@@ -338,12 +338,26 @@ predated the merge settling and had become pure indirection.
 
 **Options:** (a) request 1 ms resolution process-wide for the whole app lifetime — simple but pays an idle power cost and is against Microsoft guidance; (b) hybrid wait (sleep short, spin the last ~2 ms) — precise to sub-ms but burns a core per fast channel; (c) request 1 ms resolution **only while a schedule actually needs it**.
 
-**Decision:** (c), in `core::timing`. A refcounted RAII guard (`high_resolution()` / `HighResolutionGuard`) wraps `timeBeginPeriod(1)`/`timeEndPeriod(1)`: the first holder raises the request, the last drop releases it, and the count and OS call share one lock so concurrent acquire/release can't reorder the pair. Each runner re-evaluates `Schedule::min_active_interval() < HIGH_RATE_THRESHOLD` (32 ms = two default ticks) every loop pass, so `SetInterval` acquires/releases mid-run. Both entry points (GUI funnel, CLI run) additionally opt out of Windows 11's minimized-window timer throttling via `SetProcessInformation(ProcessPowerThrottling, IGNORE_TIMER_RESOLUTION)` — otherwise a minimized long soak silently falls back to 15.6 ms wakes. Everything is a no-op off Windows.
+**Decision:** (c). Talker's policy remains in `core::timing`; ADR-038 later moves
+the cross-application OS mechanism into `wiredata-timing`. A refcounted RAII guard
+(`high_resolution()` / `HighResolutionGuard`) wraps
+`timeBeginPeriod(1)`/`timeEndPeriod(1)`: the first holder raises the request, the last
+drop releases it, and the count and OS call share one lock so concurrent
+acquire/release cannot reorder the pair. Each runner re-evaluates
+`Schedule::min_active_interval() < HIGH_RATE_THRESHOLD` (32 ms = two default ticks)
+every loop pass, so `SetInterval` acquires/releases mid-run. Both entry points (GUI
+funnel, CLI run) additionally opt out of Windows 11's minimized-window timer
+throttling via `SetProcessInformation(ProcessPowerThrottling,
+IGNORE_TIMER_RESOLUTION)` — otherwise a minimized long soak silently falls back to
+15.6 ms wakes. Everything is a no-op off Windows.
 
 **Consequences:**
 - 100 Hz sends hit cadence (wake jitter ~1–2 ms ≪ 10 ms interval); the practical ceiling moves to roughly 500 Hz–1 kHz, beyond which option (b) would be needed.
 - No elevation required; per-process since Windows 10 2004, so other processes are unaffected. The kernel releases the request on process death (any kind), so a leaked guard cannot outlive talker — the RAII release is about dropping the power cost early, not correctness.
 - The GUI's "Missed sends" readout is the acceptance signal: it should stay 0 at 100 Hz on an otherwise healthy interface.
+- ADR-034 later extends the request to bounded final-deadline windows for an
+  explicitly Precise slow schedule. Standard retains the automatic high-rate policy
+  decided here.
 
 ---
 
@@ -781,6 +795,280 @@ share one API whose type retains the distinction internally.
 apparently equivalent payload method. Encoding tests exercise the same message-level
 compile/render boundary as production. This removes a pre-1.0 Rust API but changes no
 profile field, wire output, GUI behavior, or schema version.
+
+## ADR-032 — Send timing telemetry uses due deadlines and bounded cumulative histograms
+
+**Status:** Accepted 2026-07-19.
+
+**Context:** Missed-send totals identify cadence grid points that were skipped, but
+they do not show near misses or distinguish scheduler wake delay from payload-render
+and interface-call cost. `Schedule::poll` also rendered a dynamic payload before the
+runner's retry-backoff gate, allocating bytes and sampling a timestamp even when that
+due fire would be suppressed.
+
+**Decision:** Scheduling and rendering are separate boundaries. `Schedule::poll`
+returns `Due { index, scheduled_for }`, advances the same drift-free cadence grid, and
+does not render. The runner records monotonic deadline lateness when it handles that
+due result, applies retry suppression, and only then renders and calls the interface.
+It records render duration and synchronous interface-call duration around those two
+operations.
+
+Each boundary uses a fixed-size cumulative histogram: bucket counts, sample count,
+sum, and maximum, with no retained samples and no allocation while recording. The
+three histograms travel in the existing cumulative `Counters` lane, so dropped
+intermediate updates self-correct and the final blocking counters keep the completed
+run exact at rest. The GUI shows a warm-up state, then p99 bucket upper bounds and
+maximums. It labels those percentile values as `<=`, not exact observations.
+
+**Measurement boundary:** deadline lateness begins at the message's monotonic cadence
+deadline and ends after scheduler due selection. Render covers construction of the
+wire payload, including dynamic timestamps. Send-call duration ends when the
+application-level `Interface::send` returns. It does **not** prove that serial bits
+left the adapter, a network packet left the kernel, or a peer received the bytes.
+
+**Consequences:** A suppressed fire still contributes deadline telemetry but performs
+no render, timestamp sample, allocation, or send call; tests pin the corresponding
+sample-count identities. Per-fire collection remains constant-space and constant-time.
+Cumulative p99 is deliberately coarse and can hide a recent change after a long run;
+recent-window views, timer-mode reasons, capacity estimates, and export belong to the
+staged telemetry follow-ups in `TODO.md`. No profile, wire format, timer-resolution
+policy, or spec version changes in this decision.
+
+## ADR-033 — Recent timing and timer policy are explicit bounded telemetry
+
+**Status:** Accepted 2026-07-19.
+
+**Context:** ADR-032's cumulative histograms preserve run-wide truth but eventually
+make a recent slowdown almost invisible in the percentile. The GUI also could not say
+which deadline-wait policy a runner was using, whether Windows accepted its 1 ms
+request, or why that request was held. A queued interval change was applied after the
+timer guard was reconciled; making the last fast message dormant could therefore enter
+the indefinite idle wait while retaining the high-resolution request.
+
+**Decision:** Each send-path histogram now has a companion recent view made from ten
+fixed one-second segments. Recording remains allocation-free and constant-space.
+Counter snapshots merge segments younger than ten seconds; no individual samples or
+per-send telemetry events are retained. The GUI uses that approximate last-ten-second
+view for p99 and keeps the cumulative deadline maximum as the run-wide outlier.
+
+Timer policy is reconciled after queued commands and before schedule polling. The
+refcounted Windows request records whether `timeBeginPeriod(1)` succeeded; only a
+successful first request is paired with `timeEndPeriod(1)`, and nested holders share
+the same outcome. `TimerStatus` reports the shortest active interval and one of
+Standard, Windows 1 ms, Windows request failed, or native deadline waits. It travels
+in cumulative counters and as a low-frequency edge update so an interval change can
+refresh a channel that is about to become idle. Non-Windows targets do not make a
+Windows-style resolution request and report their native deadline waits for fast
+schedules.
+
+**Consequences:** Current behavior and a past outlier are visible at the same time,
+without telemetry work scaling with send rate or run length. A failed Windows request
+is no longer presented as success or incorrectly lowered. Making a fast schedule
+dormant releases the process request before the zero-wakeup idle block. At this
+decision's boundary, high-resolution intent was not extended to slow schedules merely
+because their payload printed milliseconds. ADR-034 resolves the follow-up with an
+explicit channel mode instead of coupling cadence policy to output formatting. No
+profile, wire-format, scheduler-cadence, or spec-version change was introduced by
+ADR-033 itself.
+
+## ADR-034 — Explicit Precise mode uses bounded deadline-resolution windows
+
+**Status:** Accepted 2026-07-19 (spec v2.3).
+
+**Context:** ADR-017's automatic Windows 1 ms request fixes high-rate schedules, but
+a slow schedule can still wake several milliseconds late on the default Windows
+timer tick. That jitter is visible when a payload prints milliseconds even though
+the cadence is only 1 Hz. Timestamp formatting is not a reliable proxy for user
+intent: a millisecond field may be informational, while a static payload may still
+need a tighter trigger. Holding 1 ms resolution throughout every slow run would pay
+the power cost while almost all of each interval is idle. Wall-clock phase alignment
+is a separate semantic choice and must not be implied by a timer-resolution control.
+
+**Decision:** `ChannelConfig` gains an additive, default-Standard `TimingMode` with
+Standard and Precise choices. It is a run-fixed setting: GUI edits are prepared and
+applied through Apply & Restart, and CLI profile runs pass the same value to the
+runner. Standard preserves ADR-017 exactly. Any active schedule whose shortest
+interval is below 32 ms continues to hold the Windows request continuously in either
+mode.
+
+For a slower Precise schedule on Windows, each runner uses a two-stage interruptible
+wait. It first waits until `deadline - 32 ms` without a request, then acquires the
+existing process-refcounted RAII guard for the final `recv_deadline`. The guard is
+released as soon as the deadline is due, before dynamic rendering or the synchronous
+send call. Commands interrupt both stages; changed deadlines are recomputed on the
+next loop. Nearby windows naturally overlap through the process refcount, and a
+dormant schedule reaches its indefinite command wait with no guard held. On
+non-Windows targets, Precise deliberately remains one native deadline wait with no
+extra staging wake.
+
+Timer telemetry carries both configured mode and active reason (`HighRate` or
+`PrecisionWindow`). A Windows request outcome remains stable between precision
+windows so the GUI does not flicker back to Standard. Repeated per-window OS-call
+logging is suppressed; a failed request is warned on the state transition and stays
+visible in telemetry.
+
+**Consequences:** Slow Precise schedules spend only their final deadline windows at
+requested 1 ms resolution; a lone 1 Hz deadline is approximately a 3.2% duty cycle,
+while close or interleaved deadlines can make the effective duty cycle higher. There
+is no spin wait and no dedicated timing thread. Precise can reduce Windows wake
+quantization, but cannot remove scheduler load, rendering cost, blocking interface
+cost, or hardware/driver buffering. `TimingMode` does not itself align sends or make
+`SystemTime` more accurate; ADR-037 adds alignment as a separate explicit choice.
+The new profile field is backward-compatible through `serde(default)`, so profile
+schema version 2 remains unchanged.
+
+## ADR-035 — Capacity preflight separates physical proof from measured estimates
+
+**Status:** Accepted 2026-07-19 (spec v2.4).
+
+**Context:** Timing percentiles and observed throughput explain an active run, but a
+user should see obvious capacity limits before Start. Serial provides enough facts
+for a physical sustained-rate calculation; UDP and TCP do not expose the path's link
+capacity. Application render/send timing can estimate runner service headroom, but
+the two boundaries are separate histograms and synchronous `send` commonly ends at a
+driver or kernel buffer rather than at the wire. Treating either estimate as a hard
+real-time admission test would overstate what Talker knows and prevent intentional
+overload testing.
+
+**Decision:** `core::capacity` owns pure, GUI-independent calculations. Channel draft
+demand sums each non-dormant message's exact compiled wire bytes divided by interval.
+The GUI stores that byte count beside its memoized fixed-time preview, so selected-
+channel repaint folds scalar values only; it never recompiles or rerenders payloads.
+If any message is incomplete or invalid, the aggregate is withheld rather than
+silently computed from a partial schedule.
+
+For Serial, one byte consumes one frame of `1 start + configured data + parity +
+stop` bits. Required bits per second are compared with baud. Greater than 100% is a
+physical sustained-rate impossibility; 80% through 100% is highlighted as low
+margin. Flow control is not credited as capacity because it can only pause output.
+UDP/TCP report requested messages and bytes per second without an invented link
+limit.
+
+Measured application headroom requires 20 paired render/send observations. The
+separate p99 histogram upper bounds are added and divided into the draft's aggregate
+message rate. A sufficiently populated recent ten-second view wins; otherwise the
+cumulative run supports slow schedules. The readout calls this a sum of p99 bounds,
+not a joint p99, and warns when estimated utilization reaches 80%. Tooltips state the
+buffering, aligned-burst, stale-draft, and physical-wire limits.
+
+All findings are advisory and never join Start blockers. A regression test pins that
+an obviously oversubscribed serial draft remains startable. Existing draft-interface
+materialization is shared by drift and capacity checks, avoiding a second per-frame
+string-owning config build.
+
+**Consequences:** Users can distinguish an impossible sustained serial request from
+an application-side estimate and see both before and during a run. Actual misses,
+failures, suppression, lateness, and throughput remain the verdict. The model is
+constant-space, performs no send-path work, and introduces no profile or wire-format
+change. A future per-message or phase-aware schedulability analysis may model aligned
+bursts more tightly, but it must remain separate from this aggregate capacity view.
+
+## ADR-036 — Completed runs retain one exact, self-contained summary
+
+**Status:** Accepted 2026-07-19 (spec v2.4.1).
+
+**Context:** Live cumulative counters are exact at rest, but a new start deliberately
+resets them. That made before/after timing comparisons and issue reports depend on
+manual transcription before restarting. A restart can also finish an old runner's
+tail after a newer run, so retaining whichever completion happened to be polled last
+would be incorrect. Building an export string continuously would add pointless work
+to the selected-channel repaint path.
+
+**Decision:** Each runner receives a process-unique, increasing `RunId`. It records a
+wall-clock start beside the monotonic instant that arms the schedule, then records a
+wall-clock finish and monotonic elapsed duration when its command loop ends. After
+attempting delivery of ADR-018's blocking final Counters, the runner emits one
+`RunFinished` on the reliable control lane from the same final counter/timing
+snapshot. The bounded lane reserves room for start-open truth, every simultaneously
+queued command completion, and this one completion record.
+
+`RunSummary` owns the channel/run identity, label, start/finish time, monotonic
+elapsed duration, end reason, sent bytes/messages and per-message counts,
+failed/suppressed/missed outcomes, observer drops, cumulative/recent bounded timing,
+and final timer policy. The supervisor retains only the greatest `RunId` per stable
+channel slot. During Apply & Restart, stale sampled status from the predecessor is
+discarded so it cannot contaminate replacement telemetry, but its reliable control
+tail remains drainable until the self-contained summary arrives. Loading a profile
+creates fresh slots and therefore clears retained summaries.
+
+The selected-channel GUI shows one collapsed "Last completed run" block. Its heading
+contains elapsed, sent, and unsent totals; expansion shows final times, outcomes,
+timer/timing facts, and build/platform facts. `Copy summary` produces a versioned,
+line-oriented text report only on click. It does not perform file I/O, and no report
+string is built during an ordinary repaint.
+
+**Consequences:** One completed run remains available through normal stop/restart
+cycles without unbounded history or per-send work. Retention is process-local and
+bounded to one summary plus one per-message count vector per channel. Wall-clock
+timestamps remain subject to system clock steps; elapsed duration is monotonic. An
+interface-open failure occurs before a send run is armed and therefore does not
+replace the last completed-run summary. CLI behavior, profiles, wire bytes, and
+scheduler cadence are unchanged.
+
+## ADR-037 — UTC phase alignment anchors once, then advances monotonically
+
+**Status:** Accepted 2026-07-19 (spec v2.4.2).
+
+**Context:** Precise mode improves when a deadline wait wakes, but some test sources
+also need their application send calls phased to recognizable UTC boundaries. Making
+that behavior implicit in Precise would conflate wake mechanics with schedule
+semantics. Scheduling directly from `SystemTime` every interval would also expose
+cadence to clock slew and steps, while replaying elapsed boundaries after a forward
+step would create the same harmful catch-up bursts the stall policy rejects.
+
+**Decision:** `ChannelConfig` gains an additive, default-Immediate
+`CadenceAlignment`. Immediate preserves the existing first-send-at-arm behavior.
+`UtcPhase` computes each active message's strict next boundary by Unix-epoch modulo
+that message's interval. Exactly on a boundary waits one complete interval. The
+first boundary is mapped to `Instant`; subsequent deadlines advance from the prior
+monotonic grid, so ordinary wall-clock slew does not accumulate cadence drift and
+intervals need not divide a day.
+
+An aligned runner compares a paired wall/monotonic anchor with `SystemTime` at most
+once per second. A displacement of at least 250 ms rebases only future deadlines to
+their next UTC phases, increments a telemetry counter, and never replays past grid
+points or adds scheduler misses. A live nonzero interval change uses the new
+interval's strict next phase. Immediate mode performs no periodic wall-clock check.
+Checked deadline arithmetic turns an unrepresentable extreme interval into an
+unscheduled deadline instead of panicking.
+
+The GUI exposes alignment beside Timing and applies a change through the existing
+Apply & Restart path. Timer status and completed-run reports name the configured
+alignment and wall-clock rebase count. The setting does not compensate for rendering,
+synchronous send, kernel/driver buffering, or physical serialization.
+
+**Consequences:** Independent channels can share a UTC phase without a central clock
+thread, spin wait, or per-send wall-clock syscall. Default profiles and immediate
+startup are unchanged; `serde(default)` plus omission of Immediate keeps profile
+schema version 2. A wall-clock step deliberately moves future aligned sends, while
+elapsed timing and each between-step cadence remain monotonic.
+
+## ADR-038 — Process timer-resolution mechanics live in `wiredata-timing`
+
+**Status:** Accepted 2026-07-19 (spec v2.4.2).
+
+**Context:** ADR-017 and ADR-034 originally kept the Windows timer guard inside
+Talker. Listener's exact Idle deadlines now need the same refcounted
+`timeBeginPeriod(1)` lifetime and minimized-window throttling policy. Copying this
+process-wide state into both binaries would duplicate the lock/call ordering and make
+the two implementations drift. This is narrower than the general `wiredata-core`
+runtime crate rejected in ADR-016: no schedules, config, telemetry, or application
+types need to be shared.
+
+**Decision:** Add the internal, non-published `wiredata-timing` crate. It owns only
+the refcounted RAII `HighResolutionGuard`, the Windows 1 ms begin/end calls, their
+success state, and the one-time process throttling opt-out. Talker retains threshold,
+window, intent, and telemetry policy in `core::timing`; Listener retains its Idle
+deadline policy in its runtime. On Linux and macOS the guard preserves the same RAII
+shape but performs no resolution call and native deadline waits remain unchanged.
+Poisoned lock recovery and a defensive holder underflow check keep release behavior
+bounded; a failed first Windows request is shared by nested holders and is never
+paired with an end call.
+
+**Consequences:** Talker and Listener cannot issue conflicting process timer-period
+lifetimes, and Windows feature dependencies have one owner. The crate is intentionally
+not a home for histogram helpers, schedulers, wall-clock alignment, or GUI state.
+macOS App Nap is a separate activity-policy question, not a timer-resolution analog.
 
 ---
 

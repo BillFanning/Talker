@@ -13,15 +13,19 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+use std::time::SystemTime;
 
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::{ChannelId, ChunkTime};
+use crate::core::{ArrivalTimestampStatus, ChannelId, ChunkTime};
 
 use super::{
-    DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHandle, TransportOutcome,
+    DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHandle, TransportNotice,
+    TransportOutcome,
 };
 
 /// Maximum size of a single UDP datagram payload (IPv4 theoretical max). The
@@ -46,6 +50,7 @@ pub struct UdpTransport {
     multicast_group: Option<IpAddr>,
     multicast_interface: Option<Ipv4Addr>,
     recv_buffer: Option<usize>,
+    kernel_timestamps: bool,
 }
 
 impl UdpTransport {
@@ -57,6 +62,7 @@ impl UdpTransport {
             multicast_group: None,
             multicast_interface: None,
             recv_buffer: None,
+            kernel_timestamps: false,
         }
     }
 
@@ -79,10 +85,18 @@ impl UdpTransport {
         self
     }
 
+    /// Request OS receive timestamps for UDP datagrams. Unsupported systems retain
+    /// the post-read timestamp and report that fallback through transport health.
+    pub fn with_kernel_timestamps(mut self) -> Self {
+        self.kernel_timestamps = true;
+        self
+    }
+
     /// Bind the socket and apply mode-specific setup (§8.2). Fallible so the
     /// runtime can take Starting → Faulted on failure (§9, §71).
     pub async fn bind(self) -> io::Result<BoundUdpTransport> {
-        let std_socket = build_udp_socket(self.bind_addr, self.recv_buffer)?;
+        let (std_socket, drop_counter_supported, kernel_timestamps_active) =
+            build_udp_socket(self.bind_addr, self.recv_buffer, self.kernel_timestamps)?;
         std_socket.set_nonblocking(true)?;
         let socket = UdpSocket::from_std(std_socket)?;
         match self.mode {
@@ -107,6 +121,10 @@ impl UdpTransport {
         Ok(BoundUdpTransport {
             channel_id: self.channel_id,
             socket,
+            notices: None,
+            drop_counter_supported,
+            kernel_timestamps_requested: self.kernel_timestamps,
+            kernel_timestamps_active,
         })
     }
 }
@@ -117,7 +135,8 @@ impl UdpTransport {
 fn build_udp_socket(
     addr: SocketAddr,
     recv_buffer: Option<usize>,
-) -> io::Result<std::net::UdpSocket> {
+    kernel_timestamps: bool,
+) -> io::Result<(std::net::UdpSocket, bool, bool)> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = if addr.is_ipv4() {
         Domain::IPV4
@@ -128,8 +147,63 @@ fn build_udp_socket(
     if let Some(bytes) = recv_buffer {
         socket.set_recv_buffer_size(bytes)?;
     }
+    let drop_counter_supported = enable_udp_drop_counter(&socket);
+    let kernel_timestamps_active = enable_udp_kernel_timestamps(&socket, kernel_timestamps);
     socket.bind(&addr.into())?;
-    Ok(socket.into())
+    Ok((
+        socket.into(),
+        drop_counter_supported,
+        kernel_timestamps_active,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn enable_udp_drop_counter(socket: &socket2::Socket) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let enabled: libc::c_int = 1;
+    // SAFETY: `socket` owns a valid descriptor; `enabled` points to an initialized
+    // integer for exactly the size passed to `setsockopt`.
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RXQ_OVFL,
+            (&raw const enabled).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        ) == 0
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_udp_drop_counter(_socket: &socket2::Socket) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn enable_udp_kernel_timestamps(socket: &socket2::Socket, requested: bool) -> bool {
+    use std::os::fd::AsRawFd;
+
+    if !requested {
+        return false;
+    }
+    let enabled: libc::c_int = 1;
+    // SAFETY: `socket` owns a valid descriptor; `enabled` is a live integer with
+    // the exact byte length passed to `setsockopt`.
+    unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPNS,
+            (&raw const enabled).cast(),
+            std::mem::size_of_val(&enabled) as libc::socklen_t,
+        ) == 0
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_udp_kernel_timestamps(_socket: &socket2::Socket, _requested: bool) -> bool {
+    false
 }
 
 /// A bound UDP socket ready to receive. Implements [`DataTransportRunner`].
@@ -137,6 +211,10 @@ fn build_udp_socket(
 pub struct BoundUdpTransport {
     channel_id: ChannelId,
     socket: UdpSocket,
+    notices: Option<Sender<TransportNotice>>,
+    drop_counter_supported: bool,
+    kernel_timestamps_requested: bool,
+    kernel_timestamps_active: bool,
 }
 
 impl BoundUdpTransport {
@@ -148,24 +226,75 @@ impl BoundUdpTransport {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
+
+    pub fn with_notice_sender(mut self, notices: Sender<TransportNotice>) -> Self {
+        self.notices = Some(notices);
+        self
+    }
 }
 
 impl DataTransportRunner for BoundUdpTransport {
     fn run(self, out: Sender<ReceivedData>, cancel: CancellationToken) -> TransportJoinHandle {
-        let BoundUdpTransport { channel_id, socket } = self;
+        let BoundUdpTransport {
+            channel_id,
+            socket,
+            notices,
+            drop_counter_supported,
+            kernel_timestamps_requested,
+            kernel_timestamps_active,
+        } = self;
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_DATAGRAM];
+            let mut last_kernel_drops = 0u32;
+            let mut cumulative_kernel_drops = 0u64;
+            if let Some(notices) = &notices {
+                let _ = notices.try_send(TransportNotice::UdpKernelDrops {
+                    channel_id,
+                    dropped: drop_counter_supported.then_some(0),
+                });
+                let status = if kernel_timestamps_active {
+                    ArrivalTimestampStatus::KernelSoftware
+                } else if kernel_timestamps_requested {
+                    ArrivalTimestampStatus::KernelRequestedUnavailable
+                } else {
+                    ArrivalTimestampStatus::PostRead
+                };
+                let _ =
+                    notices.try_send(TransportNotice::UdpArrivalTimestamps { channel_id, status });
+            }
             loop {
                 tokio::select! {
                     biased;
                     // Cooperative cancellation, checked first (§111).
                     _ = cancel.cancelled() => return TransportOutcome::Cancelled,
-                    res = socket.recv_from(&mut buf) => match res {
-                        Ok((n, _from)) => {
+                    res = receive_datagram(&socket, &mut buf) => match res {
+                        Ok((n, kernel_drops, kernel_wall_clock)) => {
+                            let received_at = kernel_wall_clock.map_or_else(
+                                ChunkTime::now,
+                                |wall_clock| ChunkTime::now().with_kernel_wall_clock(wall_clock),
+                            );
+                            if drop_counter_supported {
+                                if let Some(kernel_drops) = kernel_drops {
+                                    let newly_dropped = kernel_drops.wrapping_sub(last_kernel_drops);
+                                    last_kernel_drops = kernel_drops;
+                                    if newly_dropped > 0 {
+                                        cumulative_kernel_drops = cumulative_kernel_drops
+                                            .saturating_add(u64::from(newly_dropped));
+                                        if let Some(notices) = &notices {
+                                            let _ = notices.try_send(
+                                                TransportNotice::UdpKernelDrops {
+                                                    channel_id,
+                                                    dropped: Some(cumulative_kernel_drops),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             let data = ReceivedData {
                                 channel_id,
                                 payload: ReceivedPayload::Datagram(buf[..n].to_vec()),
-                                received_at: ChunkTime::now(),
+                                received_at,
                             };
                             // Awaiting `send` is the one place this transport may
                             // stall: a full Transport→Pipeline queue backpressures the
@@ -187,6 +316,88 @@ impl DataTransportRunner for BoundUdpTransport {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+async fn receive_datagram(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<(usize, Option<u32>, Option<SystemTime>)> {
+    socket
+        .recv_from(buf)
+        .await
+        .map(|(bytes, _)| (bytes, None, None))
+}
+
+#[cfg(target_os = "linux")]
+async fn receive_datagram(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<(usize, Option<u32>, Option<SystemTime>)> {
+    use std::os::fd::AsRawFd;
+
+    socket
+        .async_io(tokio::io::Interest::READABLE, || {
+            receive_datagram_with_metadata(socket.as_raw_fd(), buf)
+        })
+        .await
+}
+
+#[cfg(target_os = "linux")]
+fn receive_datagram_with_metadata(
+    socket: std::os::fd::RawFd,
+    buf: &mut [u8],
+) -> io::Result<(usize, Option<u32>, Option<SystemTime>)> {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // u64 storage gives the control buffer cmsghdr alignment as well as ample room.
+    let mut control = [0u64; 16];
+    // SAFETY: every pointer in `message` names initialized, live storage for the
+    // duration of this nonblocking recvmsg call. The socket is owned by `UdpSocket`.
+    let (received, message) = unsafe {
+        let mut message: libc::msghdr = std::mem::zeroed();
+        message.msg_iov = &raw mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = std::mem::size_of_val(&control);
+        let received = libc::recvmsg(socket, &raw mut message, 0);
+        (received, message)
+    };
+    if received < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut dropped = None;
+    let mut kernel_wall_clock = None;
+    // SAFETY: libc's CMSG helpers walk only the control range initialized by
+    // recvmsg. We verify the level/type and payload length before reading u32.
+    unsafe {
+        let mut header = libc::CMSG_FIRSTHDR(&message);
+        while !header.is_null() {
+            if (*header).cmsg_level == libc::SOL_SOCKET
+                && (*header).cmsg_type == libc::SO_RXQ_OVFL
+                && (*header).cmsg_len >= libc::CMSG_LEN(std::mem::size_of::<u32>() as _) as usize
+            {
+                dropped = Some((libc::CMSG_DATA(header).cast::<u32>()).read_unaligned());
+            } else if (*header).cmsg_level == libc::SOL_SOCKET
+                && (*header).cmsg_type == libc::SCM_TIMESTAMPNS
+                && (*header).cmsg_len
+                    >= libc::CMSG_LEN(std::mem::size_of::<libc::timespec>() as _) as usize
+            {
+                let timestamp = (libc::CMSG_DATA(header).cast::<libc::timespec>()).read_unaligned();
+                if timestamp.tv_sec >= 0 && (0..1_000_000_000).contains(&timestamp.tv_nsec) {
+                    kernel_wall_clock = SystemTime::UNIX_EPOCH.checked_add(Duration::new(
+                        timestamp.tv_sec as u64,
+                        timestamp.tv_nsec as u32,
+                    ));
+                }
+            }
+            header = libc::CMSG_NXTHDR(&message, header);
+        }
+    }
+    Ok((received as usize, dropped, kernel_wall_clock))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,7 +408,7 @@ mod tests {
         // doubles), so the effective size is at least what we requested.
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let requested = 512 * 1024;
-        let socket = build_udp_socket(addr, Some(requested)).unwrap();
+        let (socket, _, _) = build_udp_socket(addr, Some(requested), false).unwrap();
         let actual = socket2::SockRef::from(&socket).recv_buffer_size().unwrap();
         assert!(
             actual >= requested,
@@ -207,17 +418,30 @@ mod tests {
 
     #[tokio::test]
     async fn unicast_receives_each_datagram_as_a_chunk() {
-        let transport = UdpTransport::new(
-            ChannelId::new(),
-            "127.0.0.1:0".parse().unwrap(),
-            UdpMode::Unicast,
-        );
+        let cid = ChannelId::new();
+        let transport = UdpTransport::new(cid, "127.0.0.1:0".parse().unwrap(), UdpMode::Unicast);
         let bound = transport.bind().await.unwrap();
         let server_addr = bound.local_addr().unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel(4);
         let cancel = CancellationToken::new();
-        let handle = bound.run(tx, cancel.clone());
+        let handle = bound.with_notice_sender(notice_tx).run(tx, cancel.clone());
+
+        assert_eq!(
+            notice_rx.recv().await.unwrap(),
+            TransportNotice::UdpKernelDrops {
+                channel_id: cid,
+                dropped: cfg!(target_os = "linux").then_some(0),
+            }
+        );
+        assert_eq!(
+            notice_rx.recv().await.unwrap(),
+            TransportNotice::UdpArrivalTimestamps {
+                channel_id: cid,
+                status: ArrivalTimestampStatus::PostRead,
+            }
+        );
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.send_to(b"$GPGGA,first", server_addr).await.unwrap();
@@ -229,6 +453,50 @@ mod tests {
         assert_eq!(first.payload.bytes(), b"$GPGGA,first");
         assert_eq!(second.payload.bytes(), b"second");
         assert!(matches!(first.payload, ReceivedPayload::Datagram(_)));
+        assert_eq!(
+            first.received_at.wall_clock_source,
+            crate::core::ArrivalTimestampSource::PostRead
+        );
+
+        cancel.cancel();
+        assert!(matches!(handle.join().await, TransportOutcome::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn requested_kernel_timestamps_report_active_or_explicit_fallback() {
+        let cid = ChannelId::new();
+        let transport = UdpTransport::new(cid, "127.0.0.1:0".parse().unwrap(), UdpMode::Unicast)
+            .with_kernel_timestamps();
+        let bound = transport.bind().await.unwrap();
+        let server_addr = bound.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let handle = bound.with_notice_sender(notice_tx).run(tx, cancel.clone());
+
+        let _drop_status = notice_rx.recv().await.unwrap();
+        let expected_status = if cfg!(target_os = "linux") {
+            ArrivalTimestampStatus::KernelSoftware
+        } else {
+            ArrivalTimestampStatus::KernelRequestedUnavailable
+        };
+        assert_eq!(
+            notice_rx.recv().await.unwrap(),
+            TransportNotice::UdpArrivalTimestamps {
+                channel_id: cid,
+                status: expected_status,
+            }
+        );
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"timestamped", server_addr).await.unwrap();
+        let received = rx.recv().await.unwrap();
+        let expected_source = if cfg!(target_os = "linux") {
+            crate::core::ArrivalTimestampSource::KernelSoftware
+        } else {
+            crate::core::ArrivalTimestampSource::PostRead
+        };
+        assert_eq!(received.received_at.wall_clock_source, expected_source);
 
         cancel.cancel();
         assert!(matches!(handle.join().await, TransportOutcome::Cancelled));

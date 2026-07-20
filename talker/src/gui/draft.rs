@@ -10,6 +10,7 @@ use crate::core::{
         ByteOrder, ChecksumAlgorithm, ChecksumConfig, CodePage, MessageConfig, NmeaChecksumMode,
         PayloadConfig, TimestampConfig,
     },
+    timing::{CadenceAlignment, TimingMode},
 };
 
 // ── Channel interface ─────────────────────────────────────────────────────────
@@ -113,6 +114,11 @@ pub struct ConnDraft {
     /// `to_config()` (which builds only the interface); the profile writer
     /// carries it separately.
     pub name: String,
+    /// Channel-level cadence wait policy, persisted with
+    /// [`crate::core::channel::ChannelConfig`] by the GUI's all-or-none draft
+    /// conversion.
+    pub timing_mode: TimingMode,
+    pub cadence_alignment: CadenceAlignment,
     // Creation-time identity of the interface draft. Kept private so the GUI
     // cannot accidentally reintroduce an in-place transport switch; Add or a
     // loaded profile chooses it, while Configure edits only its parameters.
@@ -149,6 +155,8 @@ impl Default for ConnDraft {
     fn default() -> Self {
         Self {
             name: String::new(),
+            timing_mode: TimingMode::default(),
+            cadence_alignment: CadenceAlignment::default(),
             kind: ConnKind::Serial,
             serial_port: String::new(),
             baud_rate: 9600,
@@ -603,7 +611,10 @@ mod tests {
             ["UDP", "TCP", "Serial"]
         );
         for kind in ConnKind::ADD_MENU {
-            assert_eq!(ConnDraft::new(kind).kind(), kind);
+            let draft = ConnDraft::new(kind);
+            assert_eq!(draft.kind(), kind);
+            assert_eq!(draft.timing_mode, TimingMode::Standard);
+            assert_eq!(draft.cadence_alignment, CadenceAlignment::Immediate);
         }
     }
 

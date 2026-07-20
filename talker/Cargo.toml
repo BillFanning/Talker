@@ -23,6 +23,7 @@ path = "src/bin/talker-gui.rs"
 # Workspace crates
 nmea0183 = { path = "../nmea0183" }
 wiredata-ui = { path = "../wiredata-ui" }   # shared GUI chrome (ADR-016)
+wiredata-timing = { path = "../wiredata-timing" }
 
 # Serial
 serialport = { workspace = true }
@@ -68,16 +69,8 @@ chrono = { workspace = true }
 # FreeConsole for the GUI path of the console binary (`talker --gui`), so a
 # double-click of talker.exe into the GUI doesn't keep an empty console window.
 # talker-gui.exe never allocates one in the first place (windows subsystem).
-# Win32_Media + Win32_System_Threading + Win32_Foundation: the high-resolution
-# timer scope for high-rate schedules (timeBeginPeriod / power-throttling
-# opt-out, `core::timing`, ADR-017).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_System_Console",
-    "Win32_Media",
-    "Win32_System_Threading",
-    "Win32_Foundation",
-] }
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -149,10 +149,11 @@ impl DataTransportRunner for TcpConnectionTransport {
                         // EOF: the client closed the connection (§16, disconnect).
                         Ok(0) => return TransportOutcome::Completed,
                         Ok(n) => {
+                            let received_at = ChunkTime::now();
                             let data = ReceivedData {
                                 channel_id,
                                 payload: ReceivedPayload::Bytes(buf[..n].to_vec()),
-                                received_at: ChunkTime::now(),
+                                received_at,
                             };
                             // Awaiting `send` is the one place this transport may
                             // stall (§97.1); an `Err` means the pipeline is gone.

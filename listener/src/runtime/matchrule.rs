@@ -76,6 +76,8 @@ pub struct FiredRule {
     /// missed it. Always `false` for `Idle`. Drives the where/why/how-often
     /// measurement in the pipeline.
     pub boundary_split: bool,
+    /// Timer evaluation lateness for an `Idle` firing. `None` for byte matches.
+    pub timer_lateness: Option<Duration>,
 }
 
 /// A Channel's compiled Match Rules (§50.2). Owned by the pipeline.
@@ -143,6 +145,21 @@ impl MatchRuleSet {
         self.rules
             .iter()
             .any(|r| r.enabled && matches!(r.condition, MatchCondition::Idle { .. }))
+    }
+
+    /// Time until the earliest enabled, not-yet-fired Idle rule becomes due.
+    /// `None` means no timer work is pending for the current quiet episode.
+    pub fn next_idle_wait(&self, idle_for: Duration) -> Option<Duration> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.enabled && !rule.idle_fired)
+            .filter_map(|rule| match rule.condition {
+                MatchCondition::Idle { timeout_ms } => {
+                    Some(Duration::from_millis(timeout_ms).saturating_sub(idle_for))
+                }
+                MatchCondition::BytePattern { .. } => None,
+            })
+            .min()
     }
 
     /// The ids of every rule, in config order. The name lives in config; the id
@@ -234,6 +251,7 @@ impl MatchRuleSet {
                             match_offset: Some(self.carry_offset + match_start as u64),
                             match_len: pattern.len(),
                             boundary_split: true,
+                            timer_lateness: None,
                         });
                     }
                     start = match_start + 1;
@@ -252,6 +270,7 @@ impl MatchRuleSet {
                     match_offset: Some(chunk_offset + match_start as u64),
                     match_len: pattern.len(),
                     boundary_split: false,
+                    timer_lateness: None,
                 });
                 start = match_start + 1;
             }
@@ -295,6 +314,9 @@ impl MatchRuleSet {
                     match_offset: None,
                     match_len: 0,
                     boundary_split: false,
+                    timer_lateness: Some(
+                        idle_for.saturating_sub(Duration::from_millis(timeout_ms)),
+                    ),
                 });
             }
         }
@@ -496,8 +518,15 @@ mod tests {
 
         // Below the timeout: nothing fires.
         assert!(set.evaluate_idle(Duration::from_millis(300)).is_empty());
+        assert_eq!(
+            set.next_idle_wait(Duration::from_millis(300)),
+            Some(Duration::from_millis(200))
+        );
         // At/over the timeout: fires once.
-        assert_eq!(set.evaluate_idle(Duration::from_millis(600)).len(), 1);
+        let fired = set.evaluate_idle(Duration::from_millis(600));
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].timer_lateness, Some(Duration::from_millis(100)));
+        assert_eq!(set.next_idle_wait(Duration::from_millis(600)), None);
         // Still quiet, already fired: latched, no repeat.
         assert!(set.evaluate_idle(Duration::from_millis(900)).is_empty());
         // Data resumes, then quiet again: it can fire again.

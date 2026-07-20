@@ -1,9 +1,31 @@
-# Listener Specification v2.2
+# Listener Specification v2.2.1
 
 Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
+
+Revision v2.2.1 (bounded receive timing, transport health, and completed-run reports):
+
+- **§26 / §91.2 / §102 receive telemetry (ADR-026–ADR-029).** Listener exposes
+  cumulative and recent post-read handoff and total pipeline-processing histograms,
+  cumulative chunk size/inter-read-gap shape, exact queue high-water marks, Serial
+  stall duration, and platform-explicit UDP loss counters. Histograms are bounded,
+  use p99 bucket upper bounds, and add no per-chunk GUI event traffic.
+- **§50.2 exact Idle deadlines (ADR-030).** Idle rules wait on their next monotonic
+  deadline rather than a periodic rule poll and report firing lateness. Windows asks
+  for 1 ms timer resolution only during the final 32 ms; Linux and macOS keep native
+  deadline waits. The mechanism is shared with Talker through `wiredata-timing`.
+- **§15 / §26 / §75 optional UDP kernel time (ADR-029).** Linux can request
+  `SO_TIMESTAMPNS` software receive times; other platforms and missing ancillary
+  metadata explicitly fall back to post-read wall time. The post-read monotonic point
+  remains the ordering and elapsed-time anchor in every mode.
+- **§86 / §91.2 retained run report (ADR-031).** The newest completed run retains
+  exact bytes/chunks, diagnostics, queue peaks, timing, timer policy, transport health,
+  and build/platform facts, with an on-click versioned clipboard report. Retention is
+  process-local and bounded to one summary per Channel.
+- `UdpConfig.kernel_timestamps` is additive and defaults off; no other new setting is
+  persisted. Profile `schema_version` remains 3.
 
 Revision v2.2 (NMEA ZDA Mark annotations and exact splice geometry):
 
@@ -725,6 +747,14 @@ A UDP Channel shall receive complete UDP datagrams.
 
 UDP datagram boundaries shall be preserved (as a reception/recording detail, §53); the payload is otherwise carried as ordinary stream bytes.
 
+UDP arrival wall time defaults to the portable post-read capture (§26). When the
+additive `kernel_timestamps` option is enabled, Linux requests a per-datagram software
+receive timestamp with `SO_TIMESTAMPNS`; unavailable support or missing ancillary
+metadata falls back explicitly to post-read wall time and is counted as such. This is
+not a hardware timestamp. Linux also exposes a per-socket `SO_RXQ_OVFL` drop count;
+unsupported platforms report that the counter is unavailable rather than reporting a
+synthetic zero (§101).
+
 ## 16. TCP Listener and TCP Connection Channels
 
 ### 16.1 TCP Listener Channel
@@ -843,9 +873,28 @@ Total Byte Count is the number of bytes a Channel has received since it was Star
 
 ## 26. Chunk Arrival Time
 
-Each received chunk/datagram carries an arrival timestamp (`ChunkTime`: wall clock + monotonic, §133). This is a reception fact, not a per-Message timestamp (there are no Messages) — it drives the activity monitor (§166), inline Mark annotations (§50.2), and, when enabled, the recording timestamp sidecar (§57).
+Each received chunk/datagram carries one `ChunkTime` (§133). Every transport captures
+its monotonic member immediately after the OS read returns and before copying into the
+owned payload. That post-read monotonic point drives ordering, activity, inter-read
+gaps, and elapsed-time telemetry. It is never replaced by a kernel timestamp.
 
-> **Precision is not accuracy.** A finer timestamp resolution selects how finely a time is displayed and stored; it does not guarantee timing accuracy. Userland serial/UDP arrival times carry OS scheduling and driver-buffering jitter that can exceed the selected resolution. See §133.
+The wall-clock member defaults to the paired post-read `SystemTime`. A UDP Channel may
+request Linux kernel software receive timestamps (§15, §75); when one accompanies the
+datagram, it replaces only the wall-clock member and records
+`KernelSoftware` as its source. Unsupported platforms, a failed request, or a datagram
+without metadata use and count the post-read fallback. The actual source and sample
+counts are visible in Channel telemetry and the completed-run report (§91.2).
+
+This is a reception fact, not a per-Message timestamp (there are no Messages). It
+drives the activity monitor (§166), inline Mark annotations (§50.2), and, when
+enabled, the recording timestamp sidecar (§57).
+
+> **Precision is not accuracy.** A finer timestamp resolution selects how finely a
+> time is displayed and stored; it does not guarantee timing accuracy. Post-read
+> Serial/TCP/UDP times include OS scheduling and driver-buffering jitter. Linux
+> software UDP timestamps can remove the post-receive userland scheduling portion,
+> but remain kernel/software, datagram-granular times rather than per-byte or hardware
+> wire times. See §133.
 
 ## 27. Reception Duration
 
@@ -1047,7 +1096,7 @@ enum MatchCondition {
 }
 ```
 
-`BytePattern` scans the live stream and matches **across receive-chunk boundaries** (a pattern split between two reads still matches): the runtime retains the previous chunk's tail (the longest enabled pattern minus one byte) and scans it joined to each new chunk, reporting matches once. A match that only completes because of that carry — its first byte lay in the previous chunk — is a **boundary split**: it is recovered (not lost), its firing anchors on the match's true start offset, and it is **measured** so an operator can see read boundaries splitting their patterns. Each boundary split records an event Diagnostic naming *where* (the stream offset) and *why* (the chunk-boundary split), and increments a monotonic `match_boundary_saves` counter exposed in the Channel's stats and snapshot (*how often*). `Idle` uses the per-Channel activity monitor (§166): it fires once when the stream has been quiet for `timeout` and re-arms when data resumes. (The former `DecodedField` and `MessageSize` conditions are removed with the decoder/message infrastructure.)
+`BytePattern` scans the live stream and matches **across receive-chunk boundaries** (a pattern split between two reads still matches): the runtime retains the previous chunk's tail (the longest enabled pattern minus one byte) and scans it joined to each new chunk, reporting matches once. A match that only completes because of that carry — its first byte lay in the previous chunk — is a **boundary split**: it is recovered (not lost), its firing anchors on the match's true start offset, and it is **measured** so an operator can see read boundaries splitting their patterns. Each boundary split records an event Diagnostic naming *where* (the stream offset) and *why* (the chunk-boundary split), and increments a monotonic `match_boundary_saves` counter exposed in the Channel's stats and snapshot (*how often*). `Idle` uses the per-Channel activity monitor (§166): it waits on the earliest exact monotonic deadline, fires once when the stream has been quiet for `timeout`, and re-arms when data resumes. Firing lateness is measured against that deadline. On Windows only, the final 32 ms of a completed Idle wait requests 1 ms timer resolution; Linux and macOS retain a native deadline wait. New data or cancellation abandons the pending wait and its guard without recording a firing. (The former `DecodedField` and `MessageSize` conditions are removed with the decoder/message infrastructure.)
 
 **Actions:**
 
@@ -1093,7 +1142,7 @@ struct MatchRule {
 
 Rules are part of `ChannelConfig` (§72) as `match_rules: Vec<MatchRule>`.
 
-**Evaluation and constraints.** `BytePattern` rules evaluate as bytes arrive (the scanner keeps a carry of up to `pattern.len() − 1` bytes across chunks); `Idle` runs on a timer. Evaluation is bounded and shall not stall reception (§100). One condition per rule; no cross-channel rules; no pre-trigger capture — all deferred.
+**Evaluation and constraints.** `BytePattern` rules evaluate as bytes arrive (the scanner keeps a carry of up to `pattern.len() − 1` bytes across chunks); `Idle` uses one recomputed earliest-deadline wait, not a periodic rule poll. Evaluation is bounded and shall not stall reception (§100). Timer resolution can tighten a deadline wake but cannot improve data-arrival timestamps or make Listener hard real-time (§126). One condition per rule; no cross-channel rules; no pre-trigger capture — all deferred.
 
 ---
 
@@ -1539,6 +1588,7 @@ struct UdpConfig {
     multicast_group: Option<String>,
     multicast_interface: Option<String>, // NIC to join on (multi-homed hosts)
     recv_buffer_bytes: Option<usize>,    // SO_RCVBUF
+    kernel_timestamps: bool,             // default false; Linux SO_TIMESTAMPNS
 }
 
 enum UdpMode {
@@ -1770,6 +1820,7 @@ Defaults:
 Kind: UDP
 Name: UDP Channel
 Bind Address: 0.0.0.0
+Kernel Timestamp: Disabled
 Recording: Disabled
 Display: Raw + Hex
 ```
@@ -1799,6 +1850,7 @@ Listener may retain:
 - Events
 - Warnings
 - Errors
+- The newest completed-run summary for each configured Channel
 
 Retention is runtime-only.
 
@@ -1820,6 +1872,12 @@ Supported limits:
 - Event Count
 - Warning Count
 - Error Count
+
+Completed-run retention is exactly one self-contained summary per Channel. A newer
+successful run completion replaces the older summary; a failed Start that never
+opened a transport does not. The summary and its report text are runtime-only and are
+never stored in a profile. Report formatting occurs only when the user chooses
+**Copy summary** (§91.2).
 
 Memory-based limits may be implementation-specific but are not primary user-facing limits.
 
@@ -1893,6 +1951,41 @@ threshold** — a display uses a UI threshold; a Match Rule's `Idle` condition (
 uses its own `timeout` — so there is one fact source and no competing definitions
 of "idle". The monitor is bounded and shall not affect reception (§100, §124); it
 is runtime-only and never persisted.
+
+### 91.2 Timing and Transport Telemetry
+
+Each Channel exposes bounded facts that describe where receive time and capacity were
+spent without turning every chunk into an observer event:
+
+- **Handoff:** post-read monotonic capture to pipeline entry, as cumulative and
+  approximate recent-ten-second duration histograms.
+- **Processing:** total synchronous `ChannelPipeline::ingest` duration, with matching
+  cumulative and recent histograms. It includes accounting, activity/scrollback,
+  match evaluation/actions, rendering/enqueue, and recorder-fault checks; it excludes
+  asynchronous file writes and pending Record actions applied after ingest.
+- **Chunk shape:** cumulative read count, size histogram, and monotonic inter-read-gap
+  histogram. Chunk boundaries describe transport reads, never protocol messages.
+- **Queues:** exact observed Transport→Pipeline and Raw-recorder high-water marks plus
+  capacities. The Raw peak survives recorder retirement so Stop does not erase it.
+- **Rules:** cumulative and recent Idle firing lateness plus completed wait counts by
+  native, successful Windows 1 ms, or failed Windows-request policy.
+- **Transport health:** cumulative Serial backpressure episodes/total/maximum,
+  platform-explicit UDP kernel drop availability/count, and configured/observed
+  arrival timestamp sources.
+
+Duration and byte percentiles are fixed-bucket estimates displayed as upper bounds.
+Recent windows use ten fixed one-second segments, retain no raw samples, and are an
+approximation rather than an exact sliding cutoff. Recording is constant-space and
+does not add per-chunk GUI events.
+
+When a successfully opened Channel run ends, Listener retains one self-contained
+summary with exact bytes/chunks, diagnostics counts, queue peaks, bounded timing,
+timer policy, transport health, wall-clock start/finish, monotonic elapsed duration,
+end reason, and build/platform facts. If a task panic or shutdown grace limit prevents
+the final snapshot, the summary is marked incomplete rather than presenting zeroes as
+complete truth. **Copy summary** creates a versioned line-oriented clipboard report
+only on click. Process-unique run IDs prevent a late predecessor completion from
+replacing a newer run.
 
 ## 92. Events
 
@@ -1994,8 +2087,9 @@ Consequences:
 - Continuous blocking receive loops require a bounded read timeout (or handle
   close) so they can observe cancellation; shutdown does not rely on interrupting
   an in-progress blocking read (§111).
-- Timing is chunk-granular, not true per-byte hardware timing (`ChunkTime`, §138);
-  recording timestamps derive from it (§26, §57).
+- Timing is chunk-granular, not true per-byte hardware timing (`ChunkTime`, §138).
+  The monotonic anchor is always post-read; optional Linux UDP software metadata may
+  supply only the wall-clock member. Recording timestamps derive from it (§26, §57).
 
 ### 97.2 Blocking-to-Async Handoff
 
@@ -2027,6 +2121,11 @@ Each Channel shall maintain independent:
 
 Only the Transport→Pipeline edge may exert backpressure on the reader. Every
 other edge shall drop, evict, or fault — never stall acquisition.
+
+The runtime records exact observed high-water marks for the Transport→Pipeline and
+Raw-recorder queues, including capacity (§91.2). Reading these scalar counters does
+not alter queue behavior. A retired Raw recorder leaves its peak behind for the
+completed run rather than erasing the evidence during teardown.
 
 ### 99.1 Queue Topology
 
@@ -2067,9 +2166,13 @@ When Listener discards data due to overflow, it shall report:
 - Overflow Type
 - Estimated Data Loss where practical
 
-Listener shall report detectable data loss. Some loss — e.g. kernel-dropped UDP
-datagrams — is not reliably observable from userland; Listener reports the loss it
-can detect rather than guaranteeing detection of all loss.
+Listener shall report detectable data loss. Linux UDP uses the socket's cumulative
+`SO_RXQ_OVFL` ancillary counter when available. Other platforms expose the counter as
+unsupported, not zero; Listener does not infer a per-socket count from host-wide
+statistics. Serial cannot know the byte count lost by an adapter or driver overrun,
+so it instead accumulates Transport→Pipeline backpressure episode count, total,
+maximum, and current-active state. These measurements provide context but do not
+guarantee detection of all loss.
 
 ---
 
@@ -2093,6 +2196,12 @@ Fan-out (non-blocking, §99–100)
 ```
 
 There is no extraction, metadata, or decoding stage. The only edge that may backpressure the reader is the bounded transport→pipeline queue (§99); every fan-out consumer is non-blocking and may drop or fault rather than stall reception (§100).
+
+The pipeline records one total synchronous ingest duration around the stages above,
+plus post-read-to-entry handoff delay, cumulative chunk shape, and queue high-water
+marks (§91.2). It does not place separate clock reads around each minor stage unless
+the aggregate later demonstrates a need. Histogram updates are fixed-memory and no
+per-chunk timing event is emitted.
 
 ## 103. Ownership Principle
 
@@ -2324,6 +2433,9 @@ Listener does not guarantee:
 - Deterministic network latency
 
 Listener is a monitoring and analysis tool, not a hard real-time control system.
+Exact monotonic Idle deadlines and a Windows 1 ms timer-period request reduce one
+known wake-quantization source but cannot remove executor load or OS scheduling.
+Software receive timestamps likewise do not establish hardware or per-byte wire time.
 
 ---
 
@@ -2344,6 +2456,10 @@ In this workspace `nmea0183` is a **top-level sibling crate**, shared with `talk
 ADR-010 removed Listener's decoder and its original dependency. v2.2 adds a narrowly
 scoped construction-only dependency for ZDA Mark presentation text (ADR-025); it does
 not restore decoding (§29).
+
+The sibling internal `wiredata-timing` crate owns only the refcounted Windows timer-
+resolution mechanism shared with Talker (ADR-030). Listener's deadlines, telemetry,
+configuration, and runtime remain in the `listener` crate.
 
 ```text
 wiredata/                    # workspace root
@@ -2539,7 +2655,15 @@ _Removed in v2.0 (see §131)._
 
 ## 133. Timestamp
 
-Internal timing uses one model, not strings: a monotonic `Instant` for ordering and the §125 tie-break, and a wall-clock `SystemTime` for display. The unit is the per-chunk `ChunkTime` (§138); the raw recording timestamp sidecar (§57), inline Mark annotations (§50.2), and the activity monitor (§166) all derive from it. Formatting happens at the Mark/rendering boundary, not in stored state.
+Internal timing uses one model, not strings: a monotonic `Instant` for ordering,
+elapsed measurements, and the §125 tie-break, plus a wall-clock `SystemTime` for
+display. The unit is the per-chunk `ChunkTime` (§138). Its monotonic point is always
+captured immediately post-read. Its wall clock is normally captured at the same
+boundary, but optional Linux UDP `SO_TIMESTAMPNS` metadata may replace that member
+only; an explicit source enum records which boundary supplied it. The raw recording
+timestamp sidecar (§57), inline Mark annotations (§50.2), and the activity monitor
+(§166) all derive from this model. Formatting happens at the Mark/rendering boundary,
+not in stored state.
 
 The only display timestamp is the per-match **Mark** annotation (§50.2). `Plain` is formatted in **local** time by a toggleable `TimestampConfig` (mirroring talker's): time-of-day is always shown; date, milliseconds, and local UTC offset are independently toggleable. `NmeaZda` carries UTC time/date plus local-zone fields and uses only the millisecond toggle.
 
@@ -2548,7 +2672,10 @@ The only display timestamp is the per-match **Mark** annotation (§50.2). `Plain
 pub struct TimestampConfig { pub include_date: bool, pub include_millis: bool, pub include_timezone: bool }
 ```
 
-Timestamp *resolution* is a display/storage precision choice, not an accuracy guarantee; userland serial/UDP arrival times carry OS scheduling jitter that may exceed the displayed resolution.
+Timestamp *resolution* is a display/storage precision choice, not an accuracy
+guarantee. Post-read times carry OS scheduling and driver-buffering jitter that may
+exceed the displayed resolution. Linux software UDP timestamps move the wall-clock
+capture into the receive path but remain datagram-granular and are not hardware time.
 
 ## 134. Protocol Metadata
 
@@ -2654,13 +2781,16 @@ pub enum ReceivedPayload {
     Datagram(Vec<u8>), // one UDP datagram; boundary preserved as a recording detail (§15)
 }
 
-// Single capture per chunk. Monotonic for ordering/duration/tie-break (§125);
-// wall clock for Local/UTC display (§26). Per-byte arrival time is not available
-// from the OS and is not represented.
+// Post-read monotonic capture per chunk. Wall clock is post-read by default and may
+// be replaced by optional Linux UDP kernel software metadata (§26). Per-byte arrival
+// time is not represented.
 pub struct ChunkTime {
     pub monotonic: std::time::Instant,
     pub wall_clock: std::time::SystemTime,
+    pub wall_clock_source: ArrivalTimestampSource,
 }
+
+pub enum ArrivalTimestampSource { PostRead, KernelSoftware }
 
 pub struct NewConnection {
     pub listener_channel_id: ChannelId,
@@ -2888,6 +3018,10 @@ Raw Display shall show actual data only and shall not insert structure of its ow
 
 - Total bytes received (§25)
 - Rolling throughput and last-data time (§166)
+- Cumulative and recent handoff, ingest-processing, and Idle-lateness summaries
+- Chunk size/inter-read-gap shape and ingest/Raw-recorder queue peaks
+- Applicable Serial stall, UDP drop-counter, arrival-source, and Idle timer-policy facts
+- One retained completed-run summary with an on-click clipboard report
 
 Recording timestamps (§57), when enabled, use the per-chunk arrival time (§26).
 

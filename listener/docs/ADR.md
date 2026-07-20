@@ -840,6 +840,205 @@ ordinary chunks. Tests pin long custom IDs, unsafe-ID validation, UTC/date and z
 formatting, checksum validity, multiline renderer state, complete-match anchoring,
 profile round trips, and byte-exact Raw recording.
 
+## ADR-026 — Receive timing starts at the post-read boundary and stays bounded
+
+**Status:** Accepted 2026-07-19.
+
+**Context:** Listener exposed queue depth and throughput but not the time a received
+chunk spent between transport delivery and pipeline processing. Its UDP, TCP, and
+Serial transports also constructed the payload vector before calling
+`ChunkTime::now`, so a large copy was omitted from any downstream userland-delay
+measurement. Calling that timestamp true wire arrival would overstate what a
+portable userland receiver can know.
+
+**Decision:** Every data transport captures `ChunkTime` immediately after its OS read
+returns and before copying the payload into its owned vector. `ChannelPipeline::ingest`
+captures a monotonic start time before other work and records the elapsed interval in
+a fixed-size cumulative histogram. That histogram retains bucket counts, sample count,
+sum, and maximum, never individual samples. It travels through the existing O(1)
+`ChannelStats` and bounded `ChannelSnapshot` surfaces and is retained with the final
+run state after Stop. The selected-channel GUI shows a warm-up state followed by a
+p99 bucket upper bound and maximum.
+
+**Measurement boundary:** the interval includes payload copying after the read,
+bounded Transport-to-Pipeline queue wait, runtime scheduling, and handoff overhead. It
+excludes device, adapter, driver, and kernel buffering before the read completed. It
+is chunk-granular and cannot provide per-byte arrival times. The wall-clock member of
+the same `ChunkTime` remains the source for recording and Mark timestamps; elapsed
+telemetry uses only `Instant` and is therefore immune to wall-clock adjustments.
+ADR-029 later permits optional Linux UDP software metadata to replace only that
+wall-clock member while preserving this post-read monotonic anchor.
+
+**Consequences:** The new hot-path work is one monotonic clock read, one fixed bucket
+search, and saturating arithmetic per chunk; stats traffic and memory do not scale
+with run length or receive rate. The number diagnoses userland handoff pressure when
+read alongside ingest-queue depth, but is not end-to-end latency. Listener remains
+event-driven and does not request a finer OS timer merely to receive data. ADR-029
+resolves optional platform timestamps and ADR-030 resolves strict timer-based rules
+without changing this receive boundary. No profile, recording format, or receive
+bytes change.
+
+## ADR-027 — Recent receive timing uses a fixed segmented window
+
+**Status:** Accepted 2026-07-19.
+
+**Context:** ADR-026's cumulative post-read histogram preserves completed-run truth,
+but a long healthy history can dilute a new queueing or task-scheduling slowdown. Raw
+sample retention or per-chunk GUI events would make telemetry memory or observer cost
+scale with receive rate, undermining the bounded receive architecture.
+
+**Decision:** The pipeline keeps a companion recent histogram as ten fixed one-second
+segments. Every chunk records into the current segment alongside the cumulative
+histogram. Stats and snapshot creation merge only segments younger than ten seconds;
+large gaps clear and reuse the same fixed storage. The GUI uses the explicitly labeled
+recent window for warm-up and p99, while retaining the cumulative maximum as the
+run-wide outlier. Stop preserves both final summaries with the channel's other retained
+state.
+
+The implementation remains local to Listener. Talker uses the same deliberately small
+algorithm and matching boundary tests, but `wiredata-ui` is presentation-only and
+neither existing core crate is a valid owner for runtime telemetry. A new shared crate
+for this one helper would add more architecture than reuse; extraction can be revisited
+if additional non-GUI consumers emerge.
+
+**Consequences:** Recent degradation becomes visible without retaining samples,
+increasing event traffic, or changing the O(1) stats/snapshot shape. The window is an
+approximation at one-second segment granularity, not an exact sliding sample cutoff.
+No receive behavior, profile, recording format, or spec version changes.
+
+## ADR-028 — Total ingest processing uses one pipeline boundary
+
+**Status:** Accepted 2026-07-19.
+
+**Context:** ADR-026 measures the userland handoff before pipeline work begins. A high
+handoff delay can therefore indicate queueing or task scheduling, but it cannot show
+whether `ChannelPipeline::ingest` itself is consuming the available receive budget.
+Timing each match, render, and recording operation separately would add several clock
+reads to every chunk before evidence shows that stage-level attribution is needed.
+
+**Decision:** `ChannelPipeline::ingest` records one fixed-size cumulative duration
+histogram. Its start reuses the monotonic instant already captured for handoff timing;
+one additional monotonic clock read follows the final recorder-fault check. The
+measurement includes byte accounting, activity and scrollback updates, match-rule
+evaluation and immediate actions, display rendering and enqueueing, and recorder-fault
+checks. It excludes transport reads, payload copying and queue wait before pipeline
+entry, asynchronous recorder writes, and pending Record actions applied later by the
+channel run loop.
+
+The histogram uses the same bounded buckets as handoff timing and travels through the
+existing O(1) stats and snapshot lanes. Stop retains the completed run's summary;
+Start and reconnect reset it. The selected-channel GUI places run p99 and maximum next
+to handoff timing and ingest-queue peak so pipeline cost can be distinguished from
+handoff pressure. The completed follow-up adds the same ten-segment recent window and
+cumulative chunk-size/inter-read-gap histograms. Chunk shape reuses the existing
+post-read monotonic capture, adds no clock read, and describes transport reads rather
+than protocol records.
+
+**Consequences:** The ingest hot path gains one clock read and fixed histogram updates
+per chunk, with no allocations, per-chunk events, or run-length-dependent memory. The
+aggregate identifies whether total pipeline work is material but does not attribute
+cost to an internal stage; stage-level clocks should be added only when this metric
+demonstrates a need. The recent processing window and chunk-shape context make a
+short slowdown interpretable without raw sample retention. No receive behavior,
+profile, or recording format changes.
+
+## ADR-029 — Transport health keeps unsupported, zero, and fallback distinct
+
+**Status:** Accepted 2026-07-19 (spec v2.2.1).
+
+**Context:** Queue depth and post-read handoff timing show userland pressure but do
+not say whether a Serial reader was blocked long enough to risk adapter overrun or
+whether the kernel discarded UDP datagrams. A missing platform counter must not look
+like a measured zero. Optional kernel arrival timestamps also need to expose their
+actual source; silently mixing post-read and kernel boundaries under one label would
+make Mark and recording times hard to interpret.
+
+**Decision:** `TransportHealth` uses transport-specific optional/availability types.
+The Serial reader accumulates every Transport-to-Pipeline backpressure episode's
+duration and publishes count, total, maximum, and active state; its existing 250 ms
+warning remains an advisory possible-loss threshold, not the accounting threshold.
+Linux UDP enables `SO_RXQ_OVFL`, unwraps the kernel's 32-bit cumulative counter into a
+run-local `u64`, and reports supported zero separately from unsupported. Other
+platforms remain explicitly unsupported because no equivalent attributable
+per-socket counter is available through the current transport boundary.
+
+`UdpConfig` gains additive, default-off `kernel_timestamps`. Linux requests
+`SO_TIMESTAMPNS` and parses `SCM_TIMESTAMPNS` from the same `recvmsg` ancillary data.
+When present, it replaces only `ChunkTime.wall_clock` and records
+`KernelSoftware`; monotonic ordering, handoff, gaps, and processing retain the
+post-read capture. Failed setup, unsupported platforms, or missing per-datagram
+metadata use and count the post-read fallback. The startup status and observed source
+counts both travel through O(1) stats/snapshots without a per-datagram event.
+
+**Consequences:** Users can distinguish inapplicable, unsupported, supported-zero,
+and observed-loss states and can tell whether each run actually received kernel
+timestamps. Software timestamps reduce one userland scheduling component but are not
+hardware or per-byte timing. Serial stall duration is evidence of risk, not a lost-
+byte estimate. The only profile addition defaults off, so schema version 3 remains
+unchanged.
+
+## ADR-030 — Idle rules wait on exact deadlines with bounded Windows precision
+
+**Status:** Accepted 2026-07-19 (spec v2.2.1).
+
+**Context:** Idle rules were evaluated by a shared 250 ms maintenance tick, adding up
+to one tick of avoidable lateness before executor or OS wake jitter. Receiving data is
+event-driven and gains nothing from a finer timer period, but an explicitly configured
+timer condition should target its own monotonic deadline. Holding a Windows 1 ms
+request for an entire quiet channel would pay a continuous power cost.
+
+**Decision:** The pipeline computes the earliest armed Idle-rule deadline for each
+select pass and waits directly on it. New data, commands, or cancellation discard the
+future and recompute it; only a completed deadline wait records a timer-policy sample
+and evaluates rules. Each firing records nonnegative monotonic lateness in cumulative
+and ten-segment recent histograms. Recorder maintenance remains on its independent
+250 ms tick.
+
+On Windows, a deadline more than 32 ms away first waits natively to the final window,
+then holds the shared 1 ms RAII guard through the deadline and releases it immediately
+after wake. Linux and macOS use one native Tokio deadline wait. The internal
+`wiredata-timing` crate owns only the process-wide refcounted Windows begin/end calls
+and minimized-window throttling opt-out shared with Talker; Listener owns its rule,
+window, and telemetry policy. Successful requests, failed requests, and native waits
+are counted separately. There is no spin wait or dedicated timing thread.
+
+**Consequences:** Idle evaluation no longer carries intentional 250 ms polling delay,
+while ordinary receive paths make no timer-resolution request. Windows precision is
+held only near a real rule deadline and composes safely with Talker in the shared
+mechanism. Wake accuracy still depends on executor and OS scheduling, and no timer
+policy improves arrival timestamps. macOS App Nap remains a separate activity-policy
+question rather than a resolution-call analog.
+
+## ADR-031 — Completed Listener runs retain one bounded truth snapshot
+
+**Status:** Accepted 2026-07-19 (spec v2.2.1).
+
+**Context:** Stop retained live counters for inspection, but the next Start reset
+them and recorder teardown could erase a queue peak. That made before/after support
+comparisons depend on screenshots. A task panic or shutdown grace timeout can also
+prevent a final pipeline snapshot, and presenting a default-filled report as exact
+would hide that failure.
+
+**Decision:** A run begins only after transport open succeeds and receives a process-
+unique increasing `RunId`, paired wall-clock start, and monotonic start. Stop or a
+terminal transport fault captures finish time and monotonic elapsed duration, then
+builds a self-contained `ListenerRunSummary` before the final snapshot is consumed.
+It owns exact bytes/chunks, diagnostics counts, match-boundary saves, cumulative and
+recent timing, Idle timer policy, transport health, ingest/Raw-recorder queue peaks,
+end reason, and a `final_snapshot_complete` flag. Raw-recorder queue history is
+retained before task retirement so teardown cannot erase its peak.
+
+The orchestrator retains one summary per stable configured Channel and only replaces
+it with a newer `RunId`; failed opens never replace it. The selected detail pane keeps
+the summary collapsed by default. `Copy summary` creates a stable versioned line-
+oriented report with build/platform facts only when clicked, so ordinary repaint does
+not allocate the export. Profiles and disk recording contain no summary history.
+
+**Consequences:** A completed run remains comparable after Stop/Start with constant
+memory. Wall-clock start/finish may reflect clock changes, while elapsed duration is
+monotonic. An incomplete final snapshot is visible as incomplete rather than silently
+zero. Retention is process-local and clears with fresh Channel slots/profile load.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

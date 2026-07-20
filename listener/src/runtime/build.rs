@@ -132,6 +132,9 @@ pub fn build_udp(channel_id: ChannelId, config: &UdpConfig) -> Result<UdpTranspo
     if let Some(bytes) = config.recv_buffer_bytes {
         transport = transport.with_recv_buffer(bytes);
     }
+    if config.kernel_timestamps {
+        transport = transport.with_kernel_timestamps();
+    }
     Ok(transport)
 }
 
@@ -177,6 +180,7 @@ mod tests {
             multicast_group: None,
             multicast_interface: None,
             recv_buffer_bytes: None,
+            kernel_timestamps: false,
         };
         assert!(build_udp(ChannelId::new(), &good).is_ok());
 
@@ -187,6 +191,7 @@ mod tests {
             multicast_group: None,
             multicast_interface: None,
             recv_buffer_bytes: None,
+            kernel_timestamps: false,
         };
         assert!(matches!(
             build_udp(ChannelId::new(), &bad),

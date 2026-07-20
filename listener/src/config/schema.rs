@@ -177,6 +177,11 @@ pub struct UdpConfig {
     /// §13 apply-pending restart.
     #[serde(default)]
     pub recv_buffer_bytes: Option<usize>,
+    /// Request a kernel software receive timestamp for each UDP datagram. Linux
+    /// activates `SO_TIMESTAMPNS`; unsupported platforms fall back explicitly to
+    /// the normal post-read timestamp. Disabled by default for profile compatibility.
+    #[serde(default)]
+    pub kernel_timestamps: bool,
 }
 
 /// TCP listener interface configuration (§76).
