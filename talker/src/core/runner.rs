@@ -137,6 +137,13 @@ pub enum TalkerStatus {
         /// Cumulative bounded measurements of deadline handling, payload
         /// rendering, and the application-level interface send call.
         timing: Box<SendTimingReport>,
+        /// Exact monotonic instant at which `timing` was collapsed. This is
+        /// snapshot provenance, not necessarily the newest sample time.
+        captured_at: Instant,
+        /// Whether this is the mandatory exact-at-rest snapshot emitted after
+        /// the send loop ends. Finality travels with the measurement rather
+        /// than being inferred from observer thread lifecycle.
+        final_snapshot: bool,
         /// Current platform deadline-wait policy and the shortest active
         /// interval that selected it.
         timer: timing::TimerStatus,
@@ -383,6 +390,198 @@ enum Flow {
     Stop,
 }
 
+/// Reconciles one runner's timer-resolution guard with its current schedule and
+/// owns the observer state coupled to timer-policy edges. Keeping these fields
+/// together makes acquire/stage/release transitions explicit and prevents a timer
+/// change from drifting away from its immediate counter refresh.
+struct TimerReconciler<'a> {
+    who: &'a RunnerIdentity,
+    status_tx: &'a Sender<TalkerStatus>,
+    notify: &'a Option<StatusNotify>,
+    timing_mode: timing::TimingMode,
+    intent: timing::TimerIntent,
+    shortest_interval: Option<Duration>,
+    cadence_alignment: timing::CadenceAlignment,
+    clock_realignments: u64,
+    guard: Option<timing::HighResolutionGuard>,
+    current: timing::TimerStatus,
+    last_counters: Option<Instant>,
+    dropped_statuses: u64,
+    #[cfg(test)]
+    guard_acquisitions: u64,
+    #[cfg(test)]
+    guard_releases: u64,
+}
+
+impl<'a> TimerReconciler<'a> {
+    fn new(
+        who: &'a RunnerIdentity,
+        status_tx: &'a Sender<TalkerStatus>,
+        notify: &'a Option<StatusNotify>,
+        timing_mode: timing::TimingMode,
+    ) -> Self {
+        Self {
+            who,
+            status_tx,
+            notify,
+            timing_mode,
+            intent: timing::TimerIntent::None,
+            shortest_interval: None,
+            cadence_alignment: timing::CadenceAlignment::Immediate,
+            clock_realignments: 0,
+            guard: None,
+            current: timing::TimerStatus::default(),
+            last_counters: None,
+            dropped_statuses: 0,
+            #[cfg(test)]
+            guard_acquisitions: 0,
+            #[cfg(test)]
+            guard_releases: 0,
+        }
+    }
+
+    /// Apply schedule changes before polling. Entering a windowed policy from
+    /// another intent releases any continuous guard immediately; an interrupted
+    /// final-window wait retains its guard until the recomputed wait plan says
+    /// whether the new deadline is still inside that window.
+    fn reconcile_schedule(
+        &mut self,
+        shortest_interval: Option<Duration>,
+        cadence_alignment: timing::CadenceAlignment,
+        clock_realignments: u64,
+    ) {
+        let next_intent = timing::timer_intent(self.timing_mode, shortest_interval);
+        match next_intent {
+            timing::TimerIntent::ContinuousHighRate => self.acquire(),
+            timing::TimerIntent::None => self.release(),
+            timing::TimerIntent::PrecisionWindow
+                if self.intent != timing::TimerIntent::PrecisionWindow =>
+            {
+                self.release();
+            }
+            timing::TimerIntent::PrecisionWindow => {}
+        }
+        self.intent = next_intent;
+        self.shortest_interval = shortest_interval;
+        self.cadence_alignment = cadence_alignment;
+        self.clock_realignments = clock_realignments;
+        self.refresh_status();
+    }
+
+    /// Release a bounded-window request before rendering or sending a due item.
+    fn before_due(&mut self) {
+        if self.intent == timing::TimerIntent::PrecisionWindow {
+            self.release();
+        }
+    }
+
+    /// Select and prepare the next interruptible wait, including the guard
+    /// transition at the start of a Precise deadline window.
+    fn prepare_wait(&mut self, now: Instant, deadline: Instant) -> Instant {
+        match timing::wait_plan(self.intent, now, deadline) {
+            timing::WaitPlan::Direct(deadline) => {
+                if self.intent != timing::TimerIntent::ContinuousHighRate {
+                    self.release();
+                }
+                deadline
+            }
+            timing::WaitPlan::Stage(window_start) => {
+                self.release();
+                window_start
+            }
+            timing::WaitPlan::Precision(deadline) => {
+                self.acquire();
+                self.refresh_status();
+                deadline
+            }
+        }
+    }
+
+    fn acquire(&mut self) {
+        if self.guard.is_none() {
+            self.guard = Some(timing::high_resolution());
+            #[cfg(test)]
+            {
+                self.guard_acquisitions += 1;
+            }
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            #[cfg(test)]
+            {
+                self.guard_releases += 1;
+            }
+            drop(guard);
+        }
+    }
+
+    fn refresh_status(&mut self) {
+        let next = timing::timer_status(timing::TimerStatusInput {
+            timing_mode: self.timing_mode,
+            intent: self.intent,
+            shortest_active_interval: self.shortest_interval,
+            guard: self.guard.as_ref(),
+            previous_mode: self.current.mode,
+            cadence_alignment: self.cadence_alignment,
+            clock_realignments: self.clock_realignments,
+        });
+        if next == self.current {
+            return;
+        }
+        if next.mode == timing::TimerMode::WindowsRequestFailed
+            && self.current.mode != timing::TimerMode::WindowsRequestFailed
+        {
+            tracing::warn!(
+                channel = self.who.id.as_u64(),
+                "channel {} could not enable Windows 1 ms timer resolution; deadline wakes may be late",
+                self.who.label
+            );
+        }
+        self.current = next;
+        // A due fire should carry the changed state immediately instead of
+        // waiting for the ordinary counter cadence.
+        self.last_counters = None;
+        self.emit(TalkerStatus::TimerStatus {
+            channel: self.who.id,
+            status: self.current,
+        });
+    }
+
+    fn counters_due(&mut self, now: Instant, interval: Duration) -> bool {
+        if self.last_counters.is_some_and(|last| now - last < interval) {
+            return false;
+        }
+        self.last_counters = Some(now);
+        true
+    }
+
+    fn emit(&mut self, status: TalkerStatus) {
+        emit_status(
+            self.status_tx,
+            self.notify,
+            self.who,
+            &mut self.dropped_statuses,
+            status,
+        );
+    }
+
+    fn status(&self) -> timing::TimerStatus {
+        self.current
+    }
+
+    fn dropped_statuses(&self) -> u64 {
+        self.dropped_statuses
+    }
+
+    /// End guard ownership before the final blocking observer delivery.
+    fn finish(mut self) -> (timing::TimerStatus, u64) {
+        self.release();
+        (self.current, self.dropped_statuses)
+    }
+}
+
 fn run_loop(
     who: &RunnerIdentity,
     mut interface: Box<dyn Interface>,
@@ -412,7 +611,6 @@ fn run_loop(
     // Lane rate limits (ADR-018): `None` = nothing emitted yet, so the first
     // send always produces both a sample and counters (instant first paint).
     let mut last_sample: Option<Instant> = None;
-    let mut last_counters: Option<Instant> = None;
     // Sample rotation: the scheduler breaks grid ties by lowest index, so an
     // aligned multi-message schedule would sample message 0 forever if the
     // lane just took the first due send. Skip a repeat of the last sampled
@@ -424,7 +622,6 @@ fn run_loop(
     // compiled schedule. The resize is defensive; the schedule's size is
     // fixed at compile time.
     let mut per_message_counts: Vec<u64> = vec![0; schedule.len()];
-    let mut dropped_statuses = 0u64;
 
     let handle = |cmd: TalkerCommand,
                   interface: &mut Box<dyn Interface>,
@@ -519,11 +716,10 @@ fn run_loop(
         }
     };
 
-    // Standard high-rate schedules hold this continuously (ADR-017). Precise
-    // slower schedules acquire it only for final deadline windows (ADR-034).
-    // SetInterval re-evaluates both policies on the next loop pass.
-    let mut timer_guard: Option<timing::HighResolutionGuard> = None;
-    let mut timer_status = timing::TimerStatus::default();
+    // Timer guard, policy-edge notification, counter invalidation, and dropped
+    // observer accounting advance as one state machine. SetInterval re-evaluates
+    // its policy on the next loop pass.
+    let mut timer = TimerReconciler::new(who, &status_tx, &notify, timing_mode);
 
     // The current failing episode, if any (bounded-backoff retry policy —
     // see [`RETRY_BACKOFF_INITIAL`]). `None` while sends are succeeding.
@@ -557,27 +753,10 @@ fn run_loop(
         // changes. Windowed intent is finalized once `poll` supplies the next
         // deadline; dormant/ordinary schedules release before they block.
         let shortest_interval = schedule.min_active_interval();
-        let timer_intent = timing::timer_intent(timing_mode, shortest_interval);
-        match timer_intent {
-            timing::TimerIntent::ContinuousHighRate if timer_guard.is_none() => {
-                timer_guard = Some(timing::high_resolution());
-            }
-            timing::TimerIntent::None => drop(timer_guard.take()),
-            timing::TimerIntent::ContinuousHighRate | timing::TimerIntent::PrecisionWindow => {}
-        }
-        refresh_timer_status(
-            who,
-            &status_tx,
-            &notify,
-            timing_mode,
-            timer_intent,
+        timer.reconcile_schedule(
             shortest_interval,
             schedule.cadence_alignment(),
             schedule.clock_realignments(),
-            timer_guard.as_ref(),
-            &mut timer_status,
-            &mut last_counters,
-            &mut dropped_statuses,
         );
 
         let poll_at = Instant::now();
@@ -586,12 +765,10 @@ fn run_loop(
                 index,
                 scheduled_for,
             } => {
-                if timer_intent == timing::TimerIntent::PrecisionWindow {
-                    // The finer resolution has done its job once the deadline
-                    // wait returns. Rendering and clock reads do not benefit
-                    // from holding it through the send call.
-                    drop(timer_guard.take());
-                }
+                // A bounded-window request has done its job once the deadline
+                // wait returns. Rendering and clock reads do not benefit from
+                // holding it through the send call.
+                timer.before_due();
                 let due_handled_at = Instant::now();
                 send_timing.record_deadline_lateness(
                     due_handled_at,
@@ -644,17 +821,11 @@ fn run_loop(
                             ep.failures,
                             ep.suppressed
                         );
-                                emit_status(
-                                    &status_tx,
-                                    &notify,
-                                    who,
-                                    &mut dropped_statuses,
-                                    TalkerStatus::SendRecovered {
-                                        channel: who.id,
-                                        failures: ep.failures,
-                                        suppressed: ep.suppressed,
-                                    },
-                                );
+                                timer.emit(TalkerStatus::SendRecovered {
+                                    channel: who.id,
+                                    failures: ep.failures,
+                                    suppressed: ep.suppressed,
+                                });
                             }
                             total_count += 1;
                             total_bytes += payload.len() as u64;
@@ -676,18 +847,12 @@ fn run_loop(
                                     repeats_skipped_while_due = 0;
                                     let replacement_wire_offsets =
                                         schedule.replacement_wire_offsets(index).to_vec();
-                                    emit_status(
-                                        &status_tx,
-                                        &notify,
-                                        who,
-                                        &mut dropped_statuses,
-                                        TalkerStatus::SendSample {
-                                            channel: who.id,
-                                            message_index: index,
-                                            payload,
-                                            replacement_wire_offsets,
-                                        },
-                                    );
+                                    timer.emit(TalkerStatus::SendSample {
+                                        channel: who.id,
+                                        message_index: index,
+                                        payload,
+                                        replacement_wire_offsets,
+                                    });
                                 } else {
                                     repeats_skipped_while_due += 1;
                                 }
@@ -710,16 +875,10 @@ fn run_loop(
                                         backoff: RETRY_BACKOFF_INITIAL,
                                         next_attempt: Instant::now() + RETRY_BACKOFF_INITIAL,
                                     });
-                                    emit_status(
-                                        &status_tx,
-                                        &notify,
-                                        who,
-                                        &mut dropped_statuses,
-                                        TalkerStatus::ConnectionError {
-                                            channel: who.id,
-                                            message: format!("{e:#}"),
-                                        },
-                                    );
+                                    timer.emit(TalkerStatus::ConnectionError {
+                                        channel: who.id,
+                                        message: format!("{e:#}"),
+                                    });
                                 }
                                 // A failed retry deepens the backoff; no re-report.
                                 Some(ep) => {
@@ -742,65 +901,29 @@ fn run_loop(
                 // send is failing or suppressed. This lane is rate-limited
                 // and best-effort, so it cannot slow the scheduler hot path.
                 let now = Instant::now();
-                if last_counters.is_none_or(|t| now - t >= policy.counter_interval) {
-                    last_counters = Some(now);
-                    let drops_so_far = dropped_statuses;
-                    emit_status(
-                        &status_tx,
-                        &notify,
-                        who,
-                        &mut dropped_statuses,
-                        TalkerStatus::Counters {
-                            channel: who.id,
-                            total_count,
-                            total_bytes,
-                            per_message_counts: per_message_counts.clone(),
-                            dropped_statuses: drops_so_far,
-                            missed_sends: schedule.missed_sends(),
-                            failed_sends,
-                            suppressed_sends,
-                            timing: Box::new(send_timing.snapshot_at(now)),
-                            timer: timer_status,
-                        },
-                    );
+                if timer.counters_due(now, policy.counter_interval) {
+                    let drops_so_far = timer.dropped_statuses();
+                    timer.emit(TalkerStatus::Counters {
+                        channel: who.id,
+                        total_count,
+                        total_bytes,
+                        per_message_counts: per_message_counts.clone(),
+                        dropped_statuses: drops_so_far,
+                        missed_sends: schedule.missed_sends(),
+                        failed_sends,
+                        suppressed_sends,
+                        timing: Box::new(send_timing.snapshot_at(now)),
+                        captured_at: now,
+                        final_snapshot: false,
+                        timer: timer.status(),
+                    });
                 }
             }
             // Nothing due yet: block on the command channel until the next
             // fire deadline. Wakes instantly for a command, exactly on time
             // for the schedule, and detects a dropped handle.
             Tick::Wait(until) => {
-                let wait_until = match timing::wait_plan(timer_intent, Instant::now(), until) {
-                    timing::WaitPlan::Direct(deadline) => {
-                        if timer_intent != timing::TimerIntent::ContinuousHighRate {
-                            drop(timer_guard.take());
-                        }
-                        deadline
-                    }
-                    timing::WaitPlan::Stage(window_start) => {
-                        drop(timer_guard.take());
-                        window_start
-                    }
-                    timing::WaitPlan::Precision(deadline) => {
-                        if timer_guard.is_none() {
-                            timer_guard = Some(timing::high_resolution());
-                        }
-                        refresh_timer_status(
-                            who,
-                            &status_tx,
-                            &notify,
-                            timing_mode,
-                            timer_intent,
-                            shortest_interval,
-                            schedule.cadence_alignment(),
-                            schedule.clock_realignments(),
-                            timer_guard.as_ref(),
-                            &mut timer_status,
-                            &mut last_counters,
-                            &mut dropped_statuses,
-                        );
-                        deadline
-                    }
-                };
+                let wait_until = timer.prepare_wait(Instant::now(), until);
                 match cmd_rx.recv_deadline(wait_until) {
                     Ok(cmd) => {
                         if let Flow::Stop = handle(
@@ -840,7 +963,7 @@ fn run_loop(
 
     // Stop paying the platform timer-resolution cost before the exact final
     // status delivery, which may briefly wait for a full observer queue.
-    drop(timer_guard.take());
+    let (timer_status, dropped_statuses) = timer.finish();
 
     // Final counters (ADR-018): the rate-limited lane can be up to one
     // interval stale when the runner stops — emit once more so the observer's
@@ -865,6 +988,8 @@ fn run_loop(
         failed_sends,
         suppressed_sends,
         timing: Box::new(final_timing),
+        captured_at: finished_mono,
+        final_snapshot: true,
         timer: timer_status,
     });
     if let Some(n) = &notify {
@@ -893,58 +1018,6 @@ fn run_loop(
                 timing: final_timing,
                 timer: timer_status,
             }),
-        },
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn refresh_timer_status(
-    who: &RunnerIdentity,
-    status_tx: &Sender<TalkerStatus>,
-    notify: &Option<StatusNotify>,
-    timing_mode: timing::TimingMode,
-    intent: timing::TimerIntent,
-    shortest_interval: Option<Duration>,
-    cadence_alignment: timing::CadenceAlignment,
-    clock_realignments: u64,
-    guard: Option<&timing::HighResolutionGuard>,
-    current: &mut timing::TimerStatus,
-    last_counters: &mut Option<Instant>,
-    dropped_statuses: &mut u64,
-) {
-    let next = timing::timer_status(
-        timing_mode,
-        intent,
-        shortest_interval,
-        guard,
-        current.mode,
-        cadence_alignment,
-        clock_realignments,
-    );
-    if next == *current {
-        return;
-    }
-    if next.mode == timing::TimerMode::WindowsRequestFailed
-        && current.mode != timing::TimerMode::WindowsRequestFailed
-    {
-        tracing::warn!(
-            channel = who.id.as_u64(),
-            "channel {} could not enable Windows 1 ms timer resolution; deadline wakes may be late",
-            who.label
-        );
-    }
-    *current = next;
-    // A due fire should carry the changed state immediately instead of
-    // waiting for the ordinary counter cadence.
-    *last_counters = None;
-    emit_status(
-        status_tx,
-        notify,
-        who,
-        dropped_statuses,
-        TalkerStatus::TimerStatus {
-            channel: who.id,
-            status: *current,
         },
     );
 }
@@ -1097,6 +1170,145 @@ mod tests {
     }
 
     #[test]
+    fn timer_reconciler_retains_high_rate_guard_and_windows_fifty_milliseconds() {
+        let (status_tx, _status_rx) = crossbeam_channel::bounded(16);
+        let notify = None;
+        let who = RunnerIdentity {
+            id: ChannelId::mint(),
+            label: "timer-test".into(),
+            run_id: RunId::mint(),
+        };
+        let mut timer =
+            TimerReconciler::new(&who, &status_tx, &notify, timing::TimingMode::Precise);
+
+        timer.reconcile_schedule(
+            Some(Duration::from_millis(10)),
+            timing::CadenceAlignment::Immediate,
+            0,
+        );
+        assert_eq!(timer.intent, timing::TimerIntent::ContinuousHighRate);
+        assert_eq!(timer.status().reason, timing::TimerReason::HighRate);
+        assert!(timer.guard.is_some());
+        assert_eq!(timer.guard_acquisitions, 1);
+        assert_eq!(timer.guard_releases, 0);
+
+        let now = Instant::now();
+        for multiple in 1..=3 {
+            let short_deadline = now + Duration::from_millis(10 * multiple);
+            assert_eq!(timer.prepare_wait(now, short_deadline), short_deadline);
+            timer.before_due();
+            assert!(timer.guard.is_some());
+        }
+        assert_eq!(
+            (timer.guard_acquisitions, timer.guard_releases),
+            (1, 0),
+            "automatic high-rate deadlines retain one continuous guard"
+        );
+
+        timer.reconcile_schedule(None, timing::CadenceAlignment::Immediate, 0);
+        assert!(timer.guard.is_none(), "an idle schedule releases the guard");
+        assert_eq!(timer.status().mode, timing::TimerMode::Standard);
+        assert_eq!((timer.guard_acquisitions, timer.guard_releases), (1, 1));
+
+        timer.reconcile_schedule(
+            Some(Duration::from_millis(50)),
+            timing::CadenceAlignment::Immediate,
+            0,
+        );
+        assert_eq!(timer.intent, timing::TimerIntent::PrecisionWindow);
+        assert_eq!(timer.status().reason, timing::TimerReason::PrecisionWindow);
+        assert!(timer.guard.is_none());
+        assert_eq!((timer.guard_acquisitions, timer.guard_releases), (1, 1));
+
+        let near_threshold_deadline = now + Duration::from_millis(50);
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                timer.prepare_wait(now, near_threshold_deadline),
+                near_threshold_deadline - timing::PRECISION_WINDOW,
+                "Windows stages before the final 32 ms precision window"
+            );
+            assert!(timer.guard.is_none());
+            assert_eq!(
+                timer.prepare_wait(
+                    near_threshold_deadline - Duration::from_millis(1),
+                    near_threshold_deadline,
+                ),
+                near_threshold_deadline
+            );
+            assert!(timer.guard.is_some());
+            assert_eq!((timer.guard_acquisitions, timer.guard_releases), (2, 1));
+            timer.before_due();
+            assert!(timer.guard.is_none());
+            assert_eq!((timer.guard_acquisitions, timer.guard_releases), (2, 2));
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                timer.prepare_wait(now, near_threshold_deadline),
+                near_threshold_deadline,
+                "native-wait platforms do not add a staging wake"
+            );
+            assert!(timer.guard.is_none());
+        }
+        #[cfg(windows)]
+        assert_eq!((timer.guard_acquisitions, timer.guard_releases), (2, 2));
+        #[cfg(not(windows))]
+        assert_eq!((timer.guard_acquisitions, timer.guard_releases), (1, 1));
+    }
+
+    #[test]
+    fn timer_reconciler_owns_policy_edge_notification_and_counter_refresh() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (status_tx, status_rx) = crossbeam_channel::bounded(1);
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let notify_count = Arc::clone(&notifications);
+        let notify: Option<StatusNotify> = Some(Box::new(move || {
+            notify_count.fetch_add(1, Ordering::Relaxed);
+        }));
+        let who = RunnerIdentity {
+            id: ChannelId::mint(),
+            label: "timer-edge-test".into(),
+            run_id: RunId::mint(),
+        };
+        let mut timer =
+            TimerReconciler::new(&who, &status_tx, &notify, timing::TimingMode::Precise);
+        let now = Instant::now();
+
+        timer.reconcile_schedule(None, timing::CadenceAlignment::UtcPhase, 0);
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        assert!(timer.counters_due(now, Duration::from_secs(60)));
+        assert!(!timer.counters_due(now, Duration::from_secs(60)));
+
+        // The first edge still occupies the one-slot queue, so the changed
+        // clock count is dropped and accounted without blocking.
+        timer.reconcile_schedule(None, timing::CadenceAlignment::UtcPhase, 1);
+        assert_eq!(timer.dropped_statuses(), 1);
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        assert!(
+            timer.counters_due(now, Duration::from_secs(60)),
+            "every timer-policy edge invalidates the counter rate limit"
+        );
+
+        let first = status_rx.try_recv().expect("first timer edge");
+        assert!(matches!(first, TalkerStatus::TimerStatus { .. }));
+        timer.reconcile_schedule(None, timing::CadenceAlignment::UtcPhase, 2);
+        assert_eq!(notifications.load(Ordering::Relaxed), 2);
+        let latest = status_rx.try_recv().expect("latest timer edge");
+        assert!(matches!(
+            latest,
+            TalkerStatus::TimerStatus {
+                status: timing::TimerStatus {
+                    clock_realignments: 2,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn sends_on_schedule_and_reports_self_describing_counts() {
         let (sent, handle, id) = spawn_runner(&[msg("AB", 10)], false);
         // Wait (bounded) for a few fires rather than assuming a wall-clock
@@ -1127,6 +1339,7 @@ mod tests {
         // (the final Counters emitted at stop — ADR-018).
         let mut samples = 0usize;
         let mut last_total = 0u64;
+        let mut counter_finality = Vec::new();
         for s in &statuses {
             match s {
                 TalkerStatus::SendSample {
@@ -1147,6 +1360,7 @@ mod tests {
                     total_bytes,
                     per_message_counts,
                     dropped_statuses,
+                    final_snapshot,
                     ..
                 } => {
                     assert_eq!(*channel, id, "counters carry the stable id");
@@ -1157,6 +1371,7 @@ mod tests {
                     assert_eq!(*total_bytes, *total_count);
                     assert_eq!(per_message_counts.iter().sum::<u64>(), *total_count);
                     assert_eq!(*dropped_statuses, 0);
+                    counter_finality.push(*final_snapshot);
                 }
                 TalkerStatus::TimerStatus { channel, status } => {
                     assert_eq!(*channel, id, "timer status carries the stable id");
@@ -1173,6 +1388,17 @@ mod tests {
         // the totals exact.
         assert_eq!(samples, payloads.len());
         assert_eq!(last_total as usize, payloads.len());
+        assert!(
+            counter_finality.len() > 1,
+            "the run should include periodic and final snapshots"
+        );
+        assert!(
+            counter_finality[..counter_finality.len() - 1]
+                .iter()
+                .all(|final_snapshot| !final_snapshot),
+            "periodic snapshots must not claim final provenance"
+        );
+        assert_eq!(counter_finality.last(), Some(&true));
     }
 
     #[test]
@@ -1353,6 +1579,76 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
         join_within(handle, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn dormant_runner_has_no_counter_heartbeat_but_still_reports_a_final_snapshot() {
+        let policy = ObserverPolicy {
+            counter_interval: Duration::ZERO,
+            sample_interval: Duration::ZERO,
+        };
+        let (_, handle, _id) = spawn_runner_with(&[msg("AB", 0)], false, policy);
+        let status_rx = handle.status_rx.clone();
+
+        // A completed no-op interval command proves that the runner has
+        // started and processed its dormant receive loop; the assertion
+        // below therefore cannot pass merely because the thread was late to
+        // start.
+        let barrier_id = CommandId::mint();
+        handle
+            .cmd_tx
+            .send(TalkerCommand::SetInterval {
+                id: barrier_id,
+                index: 0,
+                interval_ms: 0,
+            })
+            .unwrap();
+        loop {
+            match handle.control_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(RunnerControlStatus::CommandCompleted { id, execution, .. })
+                    if id == barrier_id =>
+                {
+                    assert_eq!(execution, CommandExecution::Applied);
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => panic!("dormant runner did not reach command barrier: {error}"),
+            }
+        }
+        status_rx.try_iter().for_each(drop);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            status_rx
+                .try_iter()
+                .all(|status| !matches!(status, TalkerStatus::Counters { .. })),
+            "an idle runner must not wake merely to refresh counters"
+        );
+
+        let stop_requested_at = Instant::now();
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        join_within(handle, Duration::from_secs(1));
+        let snapshots = status_rx
+            .try_iter()
+            .filter_map(|status| match status {
+                TalkerStatus::Counters {
+                    captured_at,
+                    final_snapshot,
+                    ..
+                } => Some((captured_at, final_snapshot)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "a dormant run still emits one exact final counter snapshot"
+        );
+        assert!(snapshots[0].0 >= stop_requested_at);
+        assert!(snapshots[0].0 <= Instant::now());
+        assert!(
+            snapshots[0].1,
+            "the exact-at-rest snapshot must carry final provenance"
+        );
     }
 
     #[test]

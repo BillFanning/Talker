@@ -253,7 +253,7 @@ impl TalkerApp {
                         .on_hover_text(row.error.as_deref().unwrap_or(word));
                     // Line 2: connection details.
                     ui.weak(&row.summary);
-                    // Line 3: live stats (talker's message-count view),
+                    // Line 3: live local-acceptance stats,
                     // weak like listener's stats line.
                     if row.running {
                         let rate = if row.per_sec > 0.05 {
@@ -261,7 +261,14 @@ impl TalkerApp {
                         } else {
                             String::new()
                         };
-                        ui.label(egui::RichText::new(format!("Sent: {}{rate}", row.sent)).weak());
+                        ui.label(
+                            egui::RichText::new(format!("Accepted: {}{rate}", row.sent)).weak(),
+                        )
+                        .on_hover_text(
+                            "Accepted means the configured-interface write returned success; it \
+                             does not confirm physical-wire or peer delivery. The rate is a \
+                             rolling five-second average of locally accepted messages.",
+                        );
                     }
                     // Line 4: per-severity log counts (since the channel's
                     // last start) — the shared row line (info · warn · err;

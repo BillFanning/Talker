@@ -150,8 +150,20 @@ pub struct ServiceEstimate {
 }
 
 impl ServiceEstimate {
+    /// Estimated service capacity divided by requested demand.
+    ///
+    /// A zero utilization has unbounded headroom. Positive infinity has no
+    /// headroom; invalid negative or NaN values, which can only arise when a
+    /// caller constructs this public value directly, also fail conservatively
+    /// to zero headroom instead of leaking a misleading negative/NaN readout.
     pub fn headroom_factor(self) -> f64 {
-        1.0 / self.utilization
+        if self.utilization == 0.0 {
+            f64::INFINITY
+        } else if !self.utilization.is_finite() || self.utilization < 0.0 {
+            0.0
+        } else {
+            self.utilization.recip()
+        }
     }
 }
 
@@ -260,6 +272,22 @@ mod tests {
         assert!((estimate.capacity_messages_per_second - 1_666.666_666).abs() < 0.001);
         assert!((estimate.utilization - 0.6).abs() < f64::EPSILON * 4.0);
         assert!((estimate.headroom_factor() - 1.666_666_666).abs() < 0.001);
+    }
+
+    #[test]
+    fn service_headroom_has_defined_results_for_public_edge_values() {
+        let with_utilization = |utilization| ServiceEstimate {
+            samples: MIN_SERVICE_SAMPLES,
+            summed_p99_upper_bounds: Duration::from_millis(1),
+            capacity_messages_per_second: 1_000.0,
+            utilization,
+        };
+
+        assert_eq!(with_utilization(0.0).headroom_factor(), f64::INFINITY);
+        assert_eq!(with_utilization(f64::INFINITY).headroom_factor(), 0.0);
+        assert_eq!(with_utilization(f64::NEG_INFINITY).headroom_factor(), 0.0);
+        assert_eq!(with_utilization(-1.0).headroom_factor(), 0.0);
+        assert_eq!(with_utilization(f64::NAN).headroom_factor(), 0.0);
     }
 
     #[test]

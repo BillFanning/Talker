@@ -523,46 +523,114 @@ struct LogCounts {
     error: u32,
 }
 
-/// Lightweight throughput estimator for a channel: samples the cumulative
-/// sent count and byte total over a ~1 s window and reports the delta rates
-/// (msgs/s for the channel-list row, both for the detail header).
+/// Rolling-throughput window, matching Listener's technician-facing rate.
+const RATE_WINDOW_SECS: u64 = 5;
+const RATE_BUCKETS: usize = RATE_WINDOW_SECS as usize;
+
+/// Lightweight bounded throughput estimator for a channel. Deltas from the
+/// cumulative locally accepted message/byte totals are placed in five fixed
+/// one-second buckets, so the displayed rate is a true rolling five-second
+/// average that decays to zero during a quiet period.
 #[derive(Clone, Copy)]
 struct RateTracker {
-    last_sample: Instant,
+    epoch: Instant,
     last_total: u64,
     last_bytes: u64,
+    messages: [u64; RATE_BUCKETS],
+    bytes: [u64; RATE_BUCKETS],
+    newest_sec: u64,
     per_sec: f32,
     bytes_per_sec: f32,
 }
 
 impl RateTracker {
     fn new() -> Self {
+        Self::with_epoch(Instant::now())
+    }
+
+    fn with_epoch(epoch: Instant) -> Self {
         Self {
-            last_sample: Instant::now(),
+            epoch,
             last_total: 0,
             last_bytes: 0,
+            messages: [0; RATE_BUCKETS],
+            bytes: [0; RATE_BUCKETS],
+            newest_sec: 0,
             per_sec: 0.0,
             bytes_per_sec: 0.0,
         }
     }
 
-    fn sample(&mut self, now: Instant, total: u64, bytes: u64, running: bool) {
-        if !running {
-            self.per_sec = 0.0;
-            self.bytes_per_sec = 0.0;
-            self.last_total = total;
-            self.last_bytes = bytes;
-            self.last_sample = now;
+    fn second_at(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.epoch).as_secs()
+    }
+
+    fn advance_to(&mut self, second: u64) {
+        if second <= self.newest_sec {
             return;
         }
-        let dt = now.duration_since(self.last_sample).as_secs_f32();
-        if dt >= 1.0 {
-            self.per_sec = total.saturating_sub(self.last_total) as f32 / dt;
-            self.bytes_per_sec = bytes.saturating_sub(self.last_bytes) as f32 / dt;
+        let gap = (second - self.newest_sec).min(RATE_BUCKETS as u64);
+        for offset in 1..=gap {
+            let index = ((self.newest_sec + offset) % RATE_BUCKETS as u64) as usize;
+            self.messages[index] = 0;
+            self.bytes[index] = 0;
+        }
+        self.newest_sec = second;
+    }
+
+    fn refresh_rates(&mut self, second: u64) {
+        let mut messages = 0u64;
+        let mut bytes = 0u64;
+        for candidate in second.saturating_sub(RATE_BUCKETS as u64 - 1)..=second {
+            if candidate > self.newest_sec
+                || self.newest_sec.saturating_sub(candidate) >= RATE_BUCKETS as u64
+            {
+                continue;
+            }
+            let index = (candidate % RATE_BUCKETS as u64) as usize;
+            messages = messages.saturating_add(self.messages[index]);
+            bytes = bytes.saturating_add(self.bytes[index]);
+        }
+        self.per_sec = messages as f32 / RATE_WINDOW_SECS as f32;
+        self.bytes_per_sec = bytes as f32 / RATE_WINDOW_SECS as f32;
+    }
+
+    fn reset_window(&mut self, now: Instant) {
+        self.epoch = now;
+        self.messages.fill(0);
+        self.bytes.fill(0);
+        self.newest_sec = 0;
+        self.per_sec = 0.0;
+        self.bytes_per_sec = 0.0;
+    }
+
+    fn sample(&mut self, now: Instant, total: u64, bytes: u64, running: bool) {
+        if !running {
+            self.reset_window(now);
             self.last_total = total;
             self.last_bytes = bytes;
-            self.last_sample = now;
+            return;
         }
+
+        // A new run resets cumulative telemetry before its first UI sample.
+        // If that first update already includes accepted messages, count them
+        // from zero instead of losing them to saturating subtraction against
+        // the preceding run's larger totals.
+        if total < self.last_total || bytes < self.last_bytes {
+            self.reset_window(now);
+            self.last_total = 0;
+            self.last_bytes = 0;
+        }
+
+        let second = self.second_at(now);
+        self.advance_to(second);
+        let index = (second % RATE_BUCKETS as u64) as usize;
+        self.messages[index] =
+            self.messages[index].saturating_add(total.saturating_sub(self.last_total));
+        self.bytes[index] = self.bytes[index].saturating_add(bytes.saturating_sub(self.last_bytes));
+        self.last_total = total;
+        self.last_bytes = bytes;
+        self.refresh_rates(second);
     }
 }
 
@@ -1141,7 +1209,7 @@ impl TalkerApp {
         // drains the public completion feed so it stays bounded.
         let _ = self.sup.take_command_completions();
 
-        // Refresh the per-channel send-rate samples (~1 s window).
+        // Refresh the per-channel rolling five-second acceptance rates.
         let now = Instant::now();
         for i in 0..self.rates.len() {
             let (count, bytes) = self
@@ -1342,7 +1410,11 @@ impl TalkerApp {
                     .fold((0u64, 0u64), |(s, e), t| {
                         (s + t.total_count, e + t.errors_total)
                     });
-                ui.label(format!("Sent: {total_sent}"));
+                ui.label(format!("Accepted locally: {total_sent}"))
+                    .on_hover_text(
+                        "Configured-interface writes that returned success across all channels. \
+                         This does not confirm physical-wire or peer delivery.",
+                    );
                 ui.separator();
                 // Per-run errors: each channel's tally resets when it starts,
                 // like the send counts and log tallies.
@@ -1616,6 +1688,67 @@ fn level_color(level: tracing::Level, dark: bool) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn throughput_uses_a_five_second_rolling_window_and_decays() {
+        let base = Instant::now();
+        let mut rate = RateTracker::with_epoch(base);
+
+        rate.sample(base + std::time::Duration::from_millis(100), 10, 100, true);
+        assert_eq!(rate.per_sec, 2.0);
+        assert_eq!(rate.bytes_per_sec, 20.0);
+
+        rate.sample(
+            base + std::time::Duration::from_millis(1_100),
+            20,
+            300,
+            true,
+        );
+        assert_eq!(rate.per_sec, 4.0);
+        assert_eq!(rate.bytes_per_sec, 60.0);
+
+        rate.sample(base + std::time::Duration::from_secs(6), 20, 300, true);
+        assert_eq!(rate.per_sec, 0.0);
+        assert_eq!(rate.bytes_per_sec, 0.0);
+    }
+
+    #[test]
+    fn stopped_throughput_resets_without_recounting_old_totals() {
+        let base = Instant::now();
+        let mut rate = RateTracker::with_epoch(base);
+        rate.sample(base + std::time::Duration::from_millis(100), 10, 100, true);
+
+        rate.sample(base + std::time::Duration::from_secs(1), 10, 100, false);
+        assert_eq!(rate.per_sec, 0.0);
+        assert_eq!(rate.bytes_per_sec, 0.0);
+
+        rate.sample(base + std::time::Duration::from_secs(2), 10, 100, true);
+        assert_eq!(rate.per_sec, 0.0);
+        assert_eq!(rate.bytes_per_sec, 0.0);
+    }
+
+    #[test]
+    fn throughput_counts_the_first_update_after_cumulative_totals_reset() {
+        let base = Instant::now();
+        let mut rate = RateTracker::with_epoch(base);
+        rate.sample(base + std::time::Duration::from_millis(100), 10, 100, true);
+        rate.sample(base + std::time::Duration::from_secs(1), 10, 100, false);
+
+        let first_new_run = base + std::time::Duration::from_secs(2);
+        rate.sample(first_new_run, 1, 10, true);
+        assert!((rate.per_sec - 0.2).abs() < f32::EPSILON);
+        assert_eq!(rate.bytes_per_sec, 2.0);
+
+        // Repainting the same cumulative snapshot must not count it twice.
+        rate.sample(
+            first_new_run + std::time::Duration::from_millis(100),
+            1,
+            10,
+            true,
+        );
+        assert!((rate.per_sec - 0.2).abs() < f32::EPSILON);
+        assert_eq!(rate.bytes_per_sec, 2.0);
+    }
 
     // ── zoom widget ───────────────────────────────────────────────────────────
 

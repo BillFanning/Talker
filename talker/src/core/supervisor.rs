@@ -21,6 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossbeam_channel::{Receiver, TrySendError};
 
@@ -78,6 +79,12 @@ pub struct ChannelTelemetry {
     pub timing: SendTimingTelemetry,
     /// Approximate last-ten-seconds timing from fixed one-second segments.
     pub recent_timing: SendTimingTelemetry,
+    /// Exact monotonic instant when `recent_timing` was collapsed by the
+    /// runner. `None` until the first counter snapshot arrives.
+    pub recent_timing_captured_at: Option<Instant>,
+    /// Whether the retained timing came from the runner's mandatory
+    /// exact-at-rest snapshot.
+    pub recent_timing_is_final: bool,
     /// Current platform deadline-wait policy and its schedule input.
     pub timer: TimerStatus,
     /// Status-queue occupancy sampled at the last poll, and its high-water
@@ -958,6 +965,8 @@ fn drain_statuses(
                 failed_sends,
                 suppressed_sends,
                 timing,
+                captured_at,
+                final_snapshot,
                 timer,
                 ..
             } => {
@@ -970,6 +979,8 @@ fn drain_statuses(
                 telemetry.suppressed_sends = suppressed_sends;
                 telemetry.timing = timing.cumulative;
                 telemetry.recent_timing = timing.recent;
+                telemetry.recent_timing_captured_at = Some(captured_at);
+                telemetry.recent_timing_is_final = final_snapshot;
                 telemetry.timer = timer;
             }
             TalkerStatus::TimerStatus { status, .. } => telemetry.timer = status,
@@ -1129,6 +1140,10 @@ mod tests {
         // Wait for a few sends to land in the telemetry.
         let mut samples = Vec::new();
         poll_until(&mut sup, &mut samples, |s| s.telemetry(0).total_count >= 3);
+        assert!(
+            !sup.telemetry(0).recent_timing_is_final,
+            "live periodic telemetry must not claim final provenance"
+        );
 
         assert_eq!(sup.stop(0), CommandOutcome::Enqueued);
         assert!(!sup.is_running(0));
@@ -1139,6 +1154,10 @@ mod tests {
         let telemetry = sup.telemetry(0);
         let wire = sent.lock().unwrap().len() as u64;
         assert_eq!(telemetry.total_count, wire, "totals exact at rest");
+        assert!(
+            telemetry.recent_timing_is_final,
+            "the reaped exact-at-rest snapshot retains final provenance"
+        );
         let summary = sup.last_run_summary(0).expect("completed run retained");
         assert_eq!(summary.total_count, wire, "summary is exact at rest");
         assert_eq!(summary.total_bytes, telemetry.total_bytes);

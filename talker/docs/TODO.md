@@ -199,12 +199,18 @@ Cross off items as they are completed. Add new ones inline as they come up.
   1 ms / request failed / native deadline waits plus the shortest active interval.
   The GUI presents that state without re-deriving platform policy. Timer reconciliation
   now follows queued interval changes, and a failed begin is never paired with an end.
-- [x] **Explicit Precise timing mode (ADR-034).** A channel can opt into bounded
-  Windows 1 ms requests for the final 32 ms before slow send deadlines. Standard
-  keeps automatic continuous resolution below 32 ms, dormant schedules hold no
-  request, non-Windows targets keep one native wait, and timer telemetry exposes
-  configured mode, active reason, and request outcome. Timestamp formatting remains
-  independent; the additive field defaults to Standard within profile schema v2.
+- [x] **Explicit Precise timing mode (ADR-034).** Standard and Precise both keep the
+  automatic continuous Windows 1 ms request below 32 ms. At 32 ms or longer, Precise
+  uses bounded final-32-ms windows while Standard keeps native waits. Dormant
+  schedules hold no request, non-Windows targets keep one native wait, and timer
+  telemetry exposes configured mode, active reason, and request outcome. Timestamp
+  formatting remains independent; the additive field defaults to Standard within
+  profile schema v2.
+- [x] **Explicit timer lifecycle state (ADR-040).** `TimerReconciler` owns the guard,
+  staged waits, derived status, edge notifications, counter invalidation, and
+  observer-drop accounting. The proposed continuous hold for near-threshold Precise
+  intervals was rejected without timing or energy evidence; ADR-034's bounded windows
+  remain in force.
 - [x] **Optional UTC phase alignment (ADR-037).** This remains separate from Precise
   wake policy. Each message targets its strict next Unix-epoch-modulo interval phase,
   then advances monotonically; intervals need not divide a day. Material wall-clock
@@ -212,8 +218,17 @@ Cross off items as they are completed. Add new ones inline as they come up.
   re-alignment count without implying physical wire time.
 - [x] **Shared process timer policy (ADR-038).** `wiredata-timing` now owns the
   refcounted Windows 1 ms request and minimized-window opt-out used by both apps.
-  Application thresholds, wait staging, cadence, and telemetry remain local; Linux
-  and macOS retain native deadline waits.
+  Application thresholds, wait staging, cadence, and timer telemetry remain local;
+  Linux and macOS retain native deadline waits.
+- [x] **Shared bounded duration primitives (ADR-039).** `wiredata-telemetry` now owns
+  the fixed duration buckets and ten-segment aging engine used by both apps. Send
+  aggregates, measurement boundaries, retention, and presentation remain local.
+- [x] **Decision-oriented diagnostics summary (ADR-041).** The selected-channel
+  view leads with compact Send outcomes, Cadence, and Capacity rows plus
+  exception-only Attention, while the exact telemetry and caveats remain under
+  collapsed details. There is no composite health score. Classification stays
+  Talker-owned; only the identical egui card/row/callout chrome is shared through
+  `wiredata-ui`.
 - [x] **Capacity preflight (ADR-035).** Current-draft exact wire lengths and
   intervals produce aggregate message/byte demand. Serial adds framing-aware baud
   utilization, marks >100% physically over capacity and >=80% low-margin, but stays
@@ -332,10 +347,11 @@ Cross off items as they are completed. Add new ones inline as they come up.
     resolution while any schedule has an interval < 32 ms (`core::timing`,
     no elevation needed, released when the last fast channel stops, cleaned
     up by the OS even on a kill).
-  - A channel set to Precise requests the same Windows resolution only for the
-    final 32 ms before slower deadlines. Standard is the default. Precise does not
-    align sends to wall-clock boundaries; on macOS/Linux it keeps the native
-    one-stage wait because there is no equivalent timer-resolution request.
+  - A channel set to Precise uses the same continuous Windows policy below 32 ms,
+    then requests it only for the final 32 ms at 32 ms or longer. Standard is the
+    default. Precise does not align sends to wall-clock boundaries; on macOS/Linux it
+    keeps the native one-stage wait because there is no equivalent timer-resolution
+    request.
   - What **Missed sends** means: one missed send = one message transmission
     skipped under the stall policy ("fire once, skip the backlog, stay on
     grid" — cadence over count); `should-have-fired = sent + missed`;

@@ -57,7 +57,9 @@ pub enum CadenceAlignment {
     #[default]
     Immediate,
     /// First fire at the next UTC/Unix-epoch interval boundary, then continue
-    /// on a monotonic grid. Wall-clock steps rebase future deadlines only.
+    /// on a monotonic grid. Intervals need not divide a second: alignment means
+    /// exact epoch multiples, so 1.5 s alternates whole- and half-second phases.
+    /// Wall-clock steps rebase future deadlines only.
     UtcPhase,
 }
 
@@ -190,15 +192,26 @@ pub struct TimerStatus {
 
 /// Describe the timer policy after the runner has reconciled its guard with
 /// the current schedule.
-pub(crate) fn timer_status(
-    timing_mode: TimingMode,
-    intent: TimerIntent,
-    shortest_active_interval: Option<Duration>,
-    guard: Option<&HighResolutionGuard>,
-    previous_mode: TimerMode,
-    cadence_alignment: CadenceAlignment,
-    clock_realignments: u64,
-) -> TimerStatus {
+pub(crate) struct TimerStatusInput<'a> {
+    pub timing_mode: TimingMode,
+    pub intent: TimerIntent,
+    pub shortest_active_interval: Option<Duration>,
+    pub guard: Option<&'a HighResolutionGuard>,
+    pub previous_mode: TimerMode,
+    pub cadence_alignment: CadenceAlignment,
+    pub clock_realignments: u64,
+}
+
+pub(crate) fn timer_status(input: TimerStatusInput<'_>) -> TimerStatus {
+    let TimerStatusInput {
+        timing_mode,
+        intent,
+        shortest_active_interval,
+        guard,
+        previous_mode,
+        cadence_alignment,
+        clock_realignments,
+    } = input;
     let mode = match intent {
         TimerIntent::None => TimerMode::Standard,
         TimerIntent::ContinuousHighRate | TimerIntent::PrecisionWindow => {
@@ -239,6 +252,8 @@ mod tests {
 
     #[test]
     fn intent_preserves_automatic_high_rate_and_adds_explicit_precision() {
+        let just_below_high_rate = HIGH_RATE_THRESHOLD - Duration::from_nanos(1);
+
         assert_eq!(timer_intent(TimingMode::Standard, None), TimerIntent::None);
         assert_eq!(
             timer_intent(TimingMode::Precise, None),
@@ -246,8 +261,28 @@ mod tests {
             "dormant messages never hold timer resolution"
         );
         assert_eq!(
-            timer_intent(TimingMode::Standard, Some(Duration::from_millis(10))),
+            timer_intent(TimingMode::Standard, Some(just_below_high_rate)),
             TimerIntent::ContinuousHighRate
+        );
+        assert_eq!(
+            timer_intent(TimingMode::Precise, Some(just_below_high_rate)),
+            TimerIntent::ContinuousHighRate,
+            "automatic high-rate elevation applies in either configured mode"
+        );
+        assert_eq!(
+            timer_intent(TimingMode::Standard, Some(HIGH_RATE_THRESHOLD)),
+            TimerIntent::None,
+            "the high-rate threshold is exclusive"
+        );
+        assert_eq!(
+            timer_intent(TimingMode::Precise, Some(HIGH_RATE_THRESHOLD)),
+            TimerIntent::PrecisionWindow,
+            "Precise mode windows every interval at or above the threshold"
+        );
+        assert_eq!(
+            timer_intent(TimingMode::Precise, Some(Duration::from_millis(50))),
+            TimerIntent::PrecisionWindow,
+            "near-threshold Precise intervals remain windowed"
         );
         assert_eq!(
             timer_intent(TimingMode::Precise, Some(Duration::from_secs(1))),
@@ -289,29 +324,29 @@ mod tests {
 
     #[test]
     fn timer_status_explains_standard_high_rate_and_windowed_waits() {
-        let standard = timer_status(
-            TimingMode::Standard,
-            TimerIntent::None,
-            Some(HIGH_RATE_THRESHOLD),
-            None,
-            TimerMode::Standard,
-            CadenceAlignment::Immediate,
-            0,
-        );
+        let standard = timer_status(TimerStatusInput {
+            timing_mode: TimingMode::Standard,
+            intent: TimerIntent::None,
+            shortest_active_interval: Some(HIGH_RATE_THRESHOLD),
+            guard: None,
+            previous_mode: TimerMode::Standard,
+            cadence_alignment: CadenceAlignment::Immediate,
+            clock_realignments: 0,
+        });
         assert_eq!(standard.mode, TimerMode::Standard);
         assert_eq!(standard.reason, TimerReason::None);
         assert_eq!(standard.shortest_active_interval, Some(HIGH_RATE_THRESHOLD));
 
         let guard = high_resolution();
-        let fast = timer_status(
-            TimingMode::Standard,
-            TimerIntent::ContinuousHighRate,
-            Some(Duration::from_millis(1)),
-            Some(&guard),
-            TimerMode::Standard,
-            CadenceAlignment::Immediate,
-            0,
-        );
+        let fast = timer_status(TimerStatusInput {
+            timing_mode: TimingMode::Standard,
+            intent: TimerIntent::ContinuousHighRate,
+            shortest_active_interval: Some(Duration::from_millis(1)),
+            guard: Some(&guard),
+            previous_mode: TimerMode::Standard,
+            cadence_alignment: CadenceAlignment::Immediate,
+            clock_realignments: 0,
+        });
         assert_eq!(fast.reason, TimerReason::HighRate);
         #[cfg(windows)]
         assert_eq!(
@@ -325,15 +360,15 @@ mod tests {
         #[cfg(not(windows))]
         assert_eq!(fast.mode, TimerMode::NativeDeadlineWaits);
 
-        let retained = timer_status(
-            TimingMode::Precise,
-            TimerIntent::PrecisionWindow,
-            Some(Duration::from_secs(1)),
-            None,
-            TimerMode::WindowsOneMillisecond,
-            CadenceAlignment::UtcPhase,
-            2,
-        );
+        let retained = timer_status(TimerStatusInput {
+            timing_mode: TimingMode::Precise,
+            intent: TimerIntent::PrecisionWindow,
+            shortest_active_interval: Some(Duration::from_secs(1)),
+            guard: None,
+            previous_mode: TimerMode::WindowsOneMillisecond,
+            cadence_alignment: CadenceAlignment::UtcPhase,
+            clock_realignments: 2,
+        });
         assert_eq!(retained.timing_mode, TimingMode::Precise);
         assert_eq!(retained.reason, TimerReason::PrecisionWindow);
         assert_eq!(retained.cadence_alignment, CadenceAlignment::UtcPhase);

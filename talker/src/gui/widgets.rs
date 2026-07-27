@@ -1835,38 +1835,44 @@ fn output_layout_job(
 }
 
 /// Render a channel's real-time outbound display pane (spec §5.7).
-pub(super) fn show_display_pane(ui: &mut egui::Ui, display: &mut ChannelDisplay, send_rate: f32) {
+pub(super) fn show_display_pane(
+    ui: &mut egui::Ui,
+    display: &mut ChannelDisplay,
+    accepted_total: u64,
+) {
     ui.collapsing("Output", |ui| {
-        // Sub-sampling badge (ADR-018): above the sample cadence the pane shows
-        // a rate-limited live sample, not every message — say so, with the
-        // numbers, so it isn't misread as a complete log. The Sent count and
-        // byte totals in the header stay exact regardless of this. The badge is
-        // latched (hysteresis) so the throughput estimator's jitter across the
-        // cadence threshold doesn't flicker it.
+        // The payload observer is rate-limited independently of cumulative
+        // counters. Drive the badge from proven accepted-vs-sampled omission
+        // so a throughput estimate can neither conceal nor invent sampling.
         let sample_hz = 1.0
             / crate::core::runner::ObserverPolicy::sampled()
                 .sample_interval
                 .as_secs_f32();
-        if let Some(rate) = display.sampling_badge(send_rate > sample_hz, send_rate) {
+        if display.payload_samples_omitted(accepted_total) {
             let pal = wiredata_ui::palette::active(ui);
             ui.label(
                 egui::RichText::new(format!(
-                    "sampled · showing ~{sample_hz:.0}/s of ~{rate:.0}/s"
+                    "sampled output · not every accepted payload is shown · limit ~{sample_hz:.0}/s"
                 ))
                 .small()
                 .color(pal.info_grey),
             )
             .on_hover_text(format!(
                 "Above ~{sample_hz:.0} messages/s the Output pane shows a \
-                 rate-limited live sample (ADR-018), not every message, so its \
-                 render cost stays constant at any send rate. Only the payloads \
-                 shown here are sampled — the Sent count and byte totals are exact."
+                 rate-limited live sample, not every message, so its \
+                 render cost stays constant at any send rate. This badge appears \
+                 only after the locally accepted total proves that one or more \
+                 payload updates were omitted; display-queue pressure can also omit \
+                 an update. The fact remains visible for the rest of this run. \
+                 Runner-owned cumulative totals remain exact; live readouts can lag \
+                 until a later update, and the final run snapshot is exact. None of \
+                 these values proves physical-wire or peer delivery."
             ));
             ui.separator();
         }
         ui.horizontal(|ui| {
             ui.label("View:").on_hover_text(
-                "These are display modes — the bytes on the wire are the \
+                "These are display modes — the prepared output bytes are the \
                  same regardless of which view is selected. The view only \
                  changes how the buffered bytes are rendered here.",
             );

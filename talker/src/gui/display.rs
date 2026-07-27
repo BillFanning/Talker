@@ -4,18 +4,7 @@
 //! them on demand in the chosen view mode. This is GUI-only state and is never
 //! saved to a profile.
 
-use std::{
-    collections::VecDeque,
-    fmt::Write as _,
-    ops::Range,
-    time::{Duration, Instant},
-};
-
-/// How long the sub-sampling badge stays lit after the last frame the send rate
-/// exceeded the sample cadence. The throughput estimator updates only ~once a
-/// second, so its value jitters across the cadence threshold; latching past the
-/// last above-threshold reading stops the badge flickering (hysteresis).
-const SAMPLING_BADGE_HOLD: Duration = Duration::from_secs(2);
+use std::{collections::VecDeque, fmt::Write as _, ops::Range};
 
 /// How a channel's outgoing data is shown in its display pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -57,10 +46,14 @@ pub struct ChannelDisplay {
     /// Memoized whole-pane render, keyed by (generation, mode, style) so the
     /// pane re-renders only when the buffer or view settings change.
     cache: Option<(u64, DisplayMode, ControlStyle, RenderedOutput)>,
-    /// Sub-sampling badge latch: the last time the send rate was above the
-    /// sample cadence, and that rate. Smooths the throughput estimator's
-    /// jitter so the badge doesn't flicker near the threshold.
-    sampling_latch: Option<(Instant, f32)>,
+    /// Payload-bearing observer updates received during the current runner
+    /// lifetime. Compared with the cumulative locally accepted total so the
+    /// Output badge is driven by proven omission, not an inferred send rate.
+    run_payload_samples: u64,
+    /// Once cumulative accepted totals prove an omitted payload update, keep
+    /// that fact visible for the rest of the run. Separate best-effort payload
+    /// and counter updates can otherwise momentarily appear in either order.
+    payload_omission_seen: bool,
 }
 
 struct DisplaySample {
@@ -89,7 +82,8 @@ impl Default for ChannelDisplay {
             control_style: ControlStyle::Pictures,
             generation: 0,
             cache: None,
-            sampling_latch: None,
+            run_payload_samples: 0,
+            payload_omission_seen: false,
         }
     }
 }
@@ -107,6 +101,7 @@ impl ChannelDisplay {
             payload,
             replacement_wire_offsets,
         });
+        self.run_payload_samples = self.run_payload_samples.saturating_add(1);
         if self.buffer.len() > CAPACITY {
             self.buffer.pop_front();
         }
@@ -121,7 +116,17 @@ impl ChannelDisplay {
     /// Reset state that belongs to one runner lifetime without discarding the
     /// retained Output history or the user's view choices.
     pub(super) fn reset_run_state(&mut self) {
-        self.sampling_latch = None;
+        self.run_payload_samples = 0;
+        self.payload_omission_seen = false;
+    }
+
+    /// Whether at least one locally accepted message from this run did not
+    /// arrive as a payload-bearing Output update. The retained buffer is
+    /// deliberately irrelevant: clearing or evicting old visible entries does
+    /// not change whether the runner sampled its payload-observer lane.
+    pub(super) fn payload_samples_omitted(&mut self, accepted_total: u64) -> bool {
+        self.payload_omission_seen |= accepted_total > self.run_payload_samples;
+        self.payload_omission_seen
     }
 
     /// The whole pane's text in the current view, memoized.
@@ -152,25 +157,6 @@ impl ChannelDisplay {
         }
         let output = &self.cache.as_ref().expect("cache was just filled").3;
         (&output.text, &output.replacement_ranges)
-    }
-
-    /// Whether to show the sub-sampling badge, and at what rate. `active` = the
-    /// send rate is currently above the sample cadence. The badge stays lit for
-    /// [`SAMPLING_BADGE_HOLD`] past the last `active` frame and reports the rate
-    /// from that frame, so the throughput estimator's ~1 Hz jitter across the
-    /// threshold can't flicker it (hysteresis).
-    pub(super) fn sampling_badge(&mut self, active: bool, rate: f32) -> Option<f32> {
-        self.sampling_badge_at(active, rate, Instant::now())
-    }
-
-    /// [`sampling_badge`](Self::sampling_badge) with an injectable clock, for tests.
-    fn sampling_badge_at(&mut self, active: bool, rate: f32, now: Instant) -> Option<f32> {
-        if active {
-            self.sampling_latch = Some((now, rate));
-        }
-        self.sampling_latch
-            .filter(|(t, _)| now.saturating_duration_since(*t) < SAMPLING_BADGE_HOLD)
-            .map(|(_, r)| r)
     }
 }
 
@@ -477,24 +463,20 @@ mod tests {
     }
 
     #[test]
-    fn sampling_badge_latches_past_a_rate_dip() {
-        // The throughput estimator jitters across the cadence threshold ~1 Hz;
-        // the latch keeps the badge lit (and its rate stable) through a dip so
-        // it doesn't flicker, and clears only after the hold with no activity.
+    fn payload_omission_uses_current_run_samples_not_rate_or_retained_buffer() {
         let mut d = ChannelDisplay::default();
-        let t0 = Instant::now();
-        // Above the cadence → badge shows that rate.
-        assert_eq!(d.sampling_badge_at(true, 500.0, t0), Some(500.0));
-        // A dip to below-cadence shortly after still shows (latched), keeping
-        // the last rate — no flicker.
-        let t1 = t0 + Duration::from_millis(500);
-        assert_eq!(d.sampling_badge_at(false, 0.0, t1), Some(500.0));
-        // Well past the hold with no new activity → badge clears.
-        let t2 = t0 + Duration::from_secs(3);
-        assert_eq!(d.sampling_badge_at(false, 0.0, t2), None);
-        // A fresh above-cadence reading re-latches with the new rate.
-        assert_eq!(d.sampling_badge_at(true, 300.0, t2), Some(300.0));
+        d.push(b"A".to_vec(), Vec::new());
+
+        assert!(!d.payload_samples_omitted(1));
+        assert!(d.payload_samples_omitted(2));
+
+        // Later observer ordering cannot erase a proven omission.
+        d.push(b"B".to_vec(), Vec::new());
+        assert!(d.payload_samples_omitted(2));
+
+        let retained = d.rendered().0.to_owned();
         d.reset_run_state();
-        assert_eq!(d.sampling_badge_at(false, 0.0, t2), None);
+        assert_eq!(d.rendered().0, retained);
+        assert!(!d.payload_samples_omitted(0));
     }
 }

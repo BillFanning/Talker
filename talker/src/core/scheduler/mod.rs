@@ -108,6 +108,10 @@ impl Schedule {
     }
 
     /// Select the cadence phase policy before the runner arms this schedule.
+    ///
+    /// [`CadenceAlignment::UtcPhase`] uses exact interval multiples from the
+    /// Unix epoch, not rounded civil-time subdivisions. For example, a 1.5 s
+    /// interval alternates between whole- and half-second wall-clock phases.
     pub fn with_alignment(mut self, alignment: CadenceAlignment) -> Self {
         self.alignment = alignment;
         self
@@ -347,6 +351,11 @@ impl Schedule {
     }
 }
 
+/// Delay to the strict next Unix-epoch multiple of `interval`.
+///
+/// The interval need not divide a second, minute, or day. This deliberately
+/// preserves the interval's epoch grid instead of rounding it to a nearby
+/// civil-time boundary.
 fn next_phase_delay(wall_clock: SystemTime, interval: Duration) -> Option<Duration> {
     if interval.is_zero() {
         return None;
@@ -650,6 +659,24 @@ mod tests {
             Tick::Wait(t0 + ms(1_000)),
             "an exact boundary waits for the next boundary rather than firing immediately"
         );
+    }
+
+    #[test]
+    fn utc_alignment_keeps_epoch_phase_for_intervals_that_do_not_divide_a_second() {
+        let t0 = Instant::now();
+        let mut schedule = Schedule::compile_unarmed(&[msg("AB", 1_500)])
+            .unwrap()
+            .with_alignment(CadenceAlignment::UtcPhase);
+
+        // Epoch multiples of 1.5 s alternate between whole- and half-second
+        // wall-clock positions; this mode does not round to a civil-time unit.
+        schedule.arm_at(t0, SystemTime::UNIX_EPOCH + ms(10_100));
+        assert_eq!(schedule.poll(t0), Tick::Wait(t0 + ms(400)));
+        assert!(matches!(
+            schedule.poll(t0 + ms(400)),
+            Tick::Due { scheduled_for, .. } if scheduled_for == t0 + ms(400)
+        ));
+        assert_eq!(schedule.poll(t0 + ms(400)), Tick::Wait(t0 + ms(1_900)));
     }
 
     #[test]

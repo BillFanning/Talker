@@ -13,10 +13,12 @@ use crate::core::{
     channel::InterfaceConfig,
     message::NmeaChecksumMode,
     run_summary::RunSummary,
+    telemetry::{recent_snapshot_state, RecentSnapshotState, SendTimingTelemetry},
     timing::{CadenceAlignment, TimerMode, TimerReason, TimerStatus, TimingMode},
 };
 
 use wiredata_ui::{
+    diagnostics::{attention_callout, decision_card, signal_grid, signal_row, SignalTone},
     fonts::bold,
     format::{compact_duration, human_bytes},
     glyphs,
@@ -32,6 +34,57 @@ use super::widgets::{
 };
 use super::{MessageAnalysisCache, MessageDraftAnalysis, MessagePreview, TalkerApp};
 use wiredata_ui::palette::active as theme_palette;
+
+const TIMING_WARMUP_SAMPLES: u64 = 20;
+
+const LOCAL_ACCEPTANCE_TOOLTIP: &str = "Accepted means the configured-interface write returned \
+success. It does not confirm that serial bits reached the wire, a network packet left the host, \
+or a peer received the data.";
+
+const THROUGHPUT_TOOLTIP: &str = "Rolling five-second average of messages and bytes whose \
+configured-interface writes were accepted locally. Failed, retry-suppressed, and missed \
+occurrences are excluded. The fixed five-second denominator makes the value ramp during startup \
+and decay after traffic stops; it is not instantaneous line rate or proof of physical-wire or \
+peer delivery.";
+
+const TIMING_TOOLTIP: &str = "Each recent snapshot merges up to approximately ten seconds of \
+fixed one-second segments ending when the runner captured its latest counter update. A slow or \
+dormant schedule can therefore leave the displayed snapshot unchanged; its “as of” age is the \
+snapshot compute time, not necessarily the newest sample time. While running, a snapshot is no \
+longer used as recent evidence once that age reaches ten seconds. After a normal run end, the \
+channel retains its exact final snapshot; an abnormal exit can leave the last non-final snapshot \
+instead. Deadline lateness runs from a message's monotonic cadence deadline \
+until the runner handles that occurrence; handled retry-suppressed occurrences are included, while \
+cadence points counted as Missed are not sampled. Render covers payload and timestamp construction. \
+Send call ends when the configured-interface write returns and includes failed attempts; it does \
+not prove physical-wire or peer delivery. Each boundary has its own sample count and warm-up. \
+Percentiles are histogram-bucket upper bounds.";
+
+const TIMER_TOOLTIP: &str = "The shortest active interval selects the deadline-wait policy. On \
+Windows, intervals below 32 ms hold the shared process-wide 1 ms timer-resolution request in \
+either mode. At 32 ms or longer, Standard uses ordinary deadline waits; Precise requests 1 ms \
+only for the final 32 ms before a waited deadline. An Immediate schedule's first occurrence has \
+no preceding precision window. This channel releases a bounded-window request before rendering \
+and writing, although another channel may keep the process-wide request active. Commands interrupt \
+both wait stages. Other platforms use native deadline waits. This affects wake timing, not \
+timestamp accuracy or physical-wire arrival.";
+
+const ALIGNMENT_TOOLTIP: &str = "Immediate makes every active message due when the interface \
+opens. UTC phase places each first application deadline on the strict next Unix-epoch multiple of \
+its interval, then advances on monotonic deadlines. For example, 1000 ms aligns to whole UTC \
+seconds, while 1500 ms alternates between whole- and half-second phases. When the runner loops, it \
+compares wall clock with its elapsed-time projection no more often than once per second; a \
+displacement of at least 250 ms rebuilds future deadlines without replaying bypassed points or \
+adding scheduler misses. This aligns application deadlines, not completion of an interface write \
+or physical-wire arrival.";
+
+const DISPLAY_QUEUE_TOOLTIP: &str = "The current value was sampled immediately before the UI's \
+last drain of the runner-to-UI diagnostic queue; it is not the post-drain depth. Peak is the \
+largest such UI sample, not an exact queue high-water mark. A dropped update may be a payload \
+sample, counter snapshot, timer change, or interface error/recovery notice. The runner never waits \
+for this queue, so display pressure cannot delay sending. Live readouts can lag until a later \
+cumulative update; the final run snapshot remains exact. Reliable command results use a separate \
+queue.";
 
 fn analyzed_channel_demand(
     message_count: usize,
@@ -71,6 +124,267 @@ fn compact_factor(factor: f64) -> String {
     }
 }
 
+fn recent_snapshot_label(state: RecentSnapshotState) -> String {
+    match state {
+        RecentSnapshotState::Pending => "recent snapshot pending".to_owned(),
+        RecentSnapshotState::Current(age) if age < std::time::Duration::from_secs(1) => {
+            "recent snapshot".to_owned()
+        }
+        RecentSnapshotState::Current(age) => {
+            format!("recent snapshot · as of {} ago", compact_duration(age))
+        }
+        RecentSnapshotState::Expired(age) => {
+            format!(
+                "recent snapshot expired · as of {} ago",
+                compact_duration(age)
+            )
+        }
+        RecentSnapshotState::Final => "final recent snapshot · at run end".to_owned(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServiceTimingSource {
+    Recent,
+    Run,
+}
+
+fn select_service_timing(
+    state: RecentSnapshotState,
+    recent: SendTimingTelemetry,
+    cumulative: SendTimingTelemetry,
+) -> (ServiceTimingSource, SendTimingTelemetry) {
+    let recent_is_live = matches!(
+        state,
+        RecentSnapshotState::Current(_) | RecentSnapshotState::Final
+    );
+    if recent_is_live && service_sample_count(recent) >= MIN_SERVICE_SAMPLES {
+        (ServiceTimingSource::Recent, recent)
+    } else {
+        (ServiceTimingSource::Run, cumulative)
+    }
+}
+
+fn service_timing_source_label(source: ServiceTimingSource, state: RecentSnapshotState) -> String {
+    match source {
+        ServiceTimingSource::Recent => recent_snapshot_label(state),
+        ServiceTimingSource::Run if matches!(state, RecentSnapshotState::Expired(_)) => {
+            format!("run-wide fallback; {}", recent_snapshot_label(state))
+        }
+        ServiceTimingSource::Run => "run-wide".to_owned(),
+    }
+}
+
+fn recent_timing_metric(
+    label: &str,
+    histogram: crate::core::telemetry::DurationHistogram,
+) -> String {
+    let samples = histogram.sample_count();
+    if samples == 0 {
+        return format!("{label} no samples");
+    }
+    if samples < TIMING_WARMUP_SAMPLES {
+        return format!(
+            "{label} warming {samples}/{TIMING_WARMUP_SAMPLES} (max {})",
+            compact_duration(histogram.max().unwrap_or_default())
+        );
+    }
+    format!(
+        "{label} p99 ≤ {}",
+        compact_duration(histogram.percentile_upper_bound(99).unwrap_or_default())
+    )
+}
+
+fn unavailable_line_capacity_label(kind: ConnKind) -> &'static str {
+    match kind {
+        ConnKind::Serial => "complete Serial setup",
+        ConnKind::Udp | ConnKind::Tcp => "network line unmeasured",
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DecisionSignal {
+    text: String,
+    tone: SignalTone,
+}
+
+fn diagnostic_card_tone(
+    delivery: SignalTone,
+    capacity: SignalTone,
+    timer_request_failed: bool,
+    dropped_updates: u64,
+    running: bool,
+) -> SignalTone {
+    if delivery == SignalTone::Fault || capacity == SignalTone::Fault {
+        SignalTone::Fault
+    } else if delivery == SignalTone::Warning
+        || capacity == SignalTone::Warning
+        || timer_request_failed
+        || dropped_updates > 0
+    {
+        SignalTone::Warning
+    } else if running {
+        SignalTone::Healthy
+    } else {
+        SignalTone::Neutral
+    }
+}
+
+fn delivery_decision(sent: u64, failed: u64, suppressed: u64, missed: u64) -> DecisionSignal {
+    let unsent = failed.saturating_add(suppressed).saturating_add(missed);
+    let scheduled = sent.saturating_add(unsent);
+    if scheduled == 0 {
+        return DecisionSignal {
+            text: "No scheduled sends yet".to_owned(),
+            tone: SignalTone::Neutral,
+        };
+    }
+
+    let unsent_pct = unsent as f64 / scheduled as f64 * 100.0;
+    DecisionSignal {
+        text: if unsent == 0 {
+            format!("{sent} / {scheduled} accepted · none unsent")
+        } else {
+            format!("{sent} / {scheduled} accepted · {unsent} unsent ({unsent_pct:.1}%)")
+        },
+        tone: if failed > 0 {
+            SignalTone::Fault
+        } else if unsent > 0 {
+            SignalTone::Warning
+        } else {
+            SignalTone::Healthy
+        },
+    }
+}
+
+fn relative_to_shortest(
+    duration: std::time::Duration,
+    shortest: std::time::Duration,
+    upper_bound: bool,
+) -> String {
+    if shortest.is_zero() {
+        return String::new();
+    }
+    let percentage = duration.as_secs_f64() / shortest.as_secs_f64() * 100.0;
+    let bound = if upper_bound { "≤" } else { "" };
+    format!(
+        " ({bound}{percentage:.1}% of shortest {})",
+        compact_duration(shortest)
+    )
+}
+
+fn cadence_decision(
+    recent: SendTimingTelemetry,
+    cumulative: SendTimingTelemetry,
+    shortest: Option<std::time::Duration>,
+    snapshot_state: RecentSnapshotState,
+) -> DecisionSignal {
+    let recent_samples = recent.deadline_lateness.sample_count();
+    let run_samples = cumulative.deadline_lateness.sample_count();
+    let snapshot_label = recent_snapshot_label(snapshot_state);
+    let shortest_text = shortest
+        .map(|interval| format!(" · shortest {}", compact_duration(interval)))
+        .unwrap_or_default();
+
+    let text = if let RecentSnapshotState::Expired(_) = snapshot_state {
+        let run_max = cumulative.deadline_lateness.max().unwrap_or_default();
+        if run_samples == 0 {
+            format!(
+                "{} · no deadline samples in run",
+                title_case(snapshot_label)
+            )
+        } else {
+            format!(
+                "{} · run max late {}{}",
+                title_case(snapshot_label),
+                compact_duration(run_max),
+                shortest
+                    .map(|interval| relative_to_shortest(run_max, interval, false))
+                    .unwrap_or_default(),
+            )
+        }
+    } else if run_samples == 0 {
+        format!("Awaiting first deadline{shortest_text}")
+    } else if recent_samples == 0 {
+        let run_max = cumulative.deadline_lateness.max().unwrap_or_default();
+        format!(
+            "No fires in {snapshot_label} · run max late {}{}",
+            compact_duration(run_max),
+            shortest
+                .map(|interval| relative_to_shortest(run_max, interval, false))
+                .unwrap_or_default(),
+        )
+    } else if recent_samples < 20 {
+        let recent_max = recent.deadline_lateness.max().unwrap_or_default();
+        format!(
+            "Warming up ({recent_samples} due) · max late {}{} · {snapshot_label}",
+            compact_duration(recent_max),
+            shortest
+                .map(|interval| relative_to_shortest(recent_max, interval, false))
+                .unwrap_or_default(),
+        )
+    } else {
+        let recent_p99 = recent
+            .deadline_lateness
+            .percentile_upper_bound(99)
+            .unwrap_or_default();
+        let relative = shortest
+            .map(|interval| relative_to_shortest(recent_p99, interval, true))
+            .unwrap_or_default();
+        format!(
+            "Deadline lateness p99 ≤ {}{relative} · {snapshot_label}",
+            compact_duration(recent_p99),
+        )
+    };
+
+    DecisionSignal {
+        text,
+        // Lateness has no universal good/bad threshold. Keep it neutral and
+        // let the exact value, normalized to the schedule, support the decision.
+        tone: SignalTone::Neutral,
+    }
+}
+
+fn title_case(mut text: String) -> String {
+    if let Some(first) = text.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    text
+}
+
+fn timing_detail_text(
+    recent: SendTimingTelemetry,
+    cumulative: SendTimingTelemetry,
+    snapshot_state: RecentSnapshotState,
+) -> String {
+    let run_samples = cumulative.deadline_lateness.sample_count();
+    if run_samples == 0 {
+        return "Timing: awaiting first deadline".to_owned();
+    }
+
+    let run_max = cumulative
+        .deadline_lateness
+        .max()
+        .map(compact_duration)
+        .unwrap_or_else(|| "n/a".to_owned());
+    match snapshot_state {
+        RecentSnapshotState::Expired(_) => format!(
+            "Timing: {} · run max deadline lateness {run_max}",
+            recent_snapshot_label(snapshot_state)
+        ),
+        RecentSnapshotState::Pending => {
+            format!("Timing: recent snapshot pending · run max deadline lateness {run_max}")
+        }
+        RecentSnapshotState::Current(_) | RecentSnapshotState::Final => format!(
+            "Timing ({}): {} · {} · {} · run max deadline lateness {run_max}",
+            recent_snapshot_label(snapshot_state),
+            recent_timing_metric("deadline", recent.deadline_lateness),
+            recent_timing_metric("render", recent.render_duration),
+            recent_timing_metric("send call", recent.send_duration),
+        ),
+    }
+}
+
 fn timer_status_detail(status: TimerStatus) -> (String, bool) {
     let shortest = status
         .shortest_active_interval
@@ -106,23 +420,34 @@ fn timer_status_detail(status: TimerStatus) -> (String, bool) {
             false,
         ),
         (TimerReason::PrecisionWindow, TimerMode::Standard) => (
-            format!("Precise armed · first deadline window pending · shortest {shortest}"),
+            format!(
+                "Precise selected · first waited deadline window pending · shortest {shortest}"
+            ),
             false,
         ),
-        (TimerReason::None, _) if status.timing_mode == TimingMode::Precise => {
-            (format!("Precise armed · {shortest}"), false)
+        (TimerReason::None, _)
+            if status.timing_mode == TimingMode::Precise
+                && status.shortest_active_interval.is_none() =>
+        {
+            (
+                "idle · Precise selected; no timer request".to_owned(),
+                false,
+            )
         }
         (TimerReason::None, _) if status.shortest_active_interval.is_some() => {
             (format!("standard deadline waits · {shortest}"), false)
         }
-        (TimerReason::None, _) => ("stopped · no active messages".to_owned(), false),
+        (TimerReason::None, _) => (
+            "idle · no active messages; no timer request".to_owned(),
+            false,
+        ),
     }
 }
 
 fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
     let unsent = summary.unsent_sends();
     let heading = format!(
-        "Last completed run · {} · {} sent · {unsent} unsent",
+        "Last completed run · {} · {} accepted locally · {unsent} unsent",
         compact_duration(summary.elapsed),
         summary.total_count,
     );
@@ -151,21 +476,23 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
                 summary.finished_utc(),
             ));
             ui.weak(format!(
-                "Sent: {} · {} msgs · Unsent: {} ({} failed · {} suppressed · {} missed)",
+                "Accepted locally: {} · {} msgs · Unsent: {} ({} failed · {} suppressed · {} missed)",
                 human_bytes(summary.total_bytes),
                 summary.total_count,
                 unsent,
                 summary.failed_sends,
                 summary.suppressed_sends,
                 summary.missed_sends,
-            ));
+            ))
+            .on_hover_text(LOCAL_ACCEPTANCE_TOOLTIP);
             let (timer_detail, timer_hot) = timer_status_detail(summary.timer);
             let timer = egui::RichText::new(format!("Timer: {timer_detail}")).weak();
             ui.label(if timer_hot {
                 timer.color(theme_palette(ui).warning_amber)
             } else {
                 timer
-            });
+            })
+            .on_hover_text(TIMER_TOOLTIP);
 
             let timing = summary.timing.cumulative;
             let p99 = |histogram: crate::core::telemetry::DurationHistogram| {
@@ -178,7 +505,7 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
                 "Timing: no deadline samples".to_owned()
             } else {
                 format!(
-                    "Timing (run): late p99 <= {} · render p99 <= {} · send call p99 <= {} · max late {}",
+                    "Timing (run): late p99 ≤ {} · render p99 ≤ {} · send call p99 ≤ {} · max late {}",
                     p99(timing.deadline_lateness),
                     p99(timing.render_duration),
                     p99(timing.send_duration),
@@ -189,7 +516,7 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
                         .unwrap_or_else(|| "n/a".to_owned()),
                 )
             };
-            ui.weak(timing_text);
+            ui.weak(timing_text).on_hover_text(TIMING_TOOLTIP);
         });
 }
 
@@ -214,9 +541,14 @@ impl TalkerApp {
                 ui.separator();
                 self.show_channel_body(ui, i, running);
                 ui.separator();
-                // The send rate drives the Output pane's sub-sampling badge.
-                let send_rate = self.rates.get(i).map(|r| r.per_sec).unwrap_or(0.0);
-                show_display_pane(ui, &mut self.displays[i], send_rate);
+                // The accepted total proves whether Output payload updates
+                // were omitted; retained Output history is a separate concern.
+                let accepted_total = self
+                    .sup
+                    .telemetry_ref(i)
+                    .map(|telemetry| telemetry.total_count)
+                    .unwrap_or_default();
+                show_display_pane(ui, &mut self.displays[i], accepted_total);
             });
         });
     }
@@ -232,8 +564,14 @@ impl TalkerApp {
         // Owned snapshot of the channel's telemetry (ADR-019): the readouts
         // are rendered across several `&mut self` widget closures.
         let telemetry = self.sup.telemetry(i);
+        let recent_snapshot_state = recent_snapshot_state(
+            telemetry.recent_timing_captured_at,
+            std::time::Instant::now(),
+            telemetry.recent_timing_is_final,
+        );
         let error: Option<String> = telemetry.banner_error().map(str::to_owned);
         let (glyph, glyph_color, status_word) = lifecycle_indicator(running, error.is_some(), pal);
+        let draft_kind = self.conn_drafts[i].kind();
         let draft_interface = self.conn_drafts.get(i).and_then(|draft| draft.to_config());
         let (iface_drift, run_drift) = self.detect_drift(i, draft_interface.as_ref());
 
@@ -289,18 +627,14 @@ impl TalkerApp {
             });
         });
 
-        // One weak readout line per signal (listener's queue-readout pattern),
-        // amber once its pressure threshold trips. Always rendered so the header
-        // doesn't jump when a value appears.
-        let perf_line = |ui: &mut egui::Ui, text: String, hot: bool, tip: &str| {
+        // Decision-level diagnostics stay compact; the evidence and caveats
+        // remain one click away in the card's details section.
+        let detail_line = |ui: &mut egui::Ui, text: String, hot: bool, tip: &str| {
             let rt = egui::RichText::new(text).weak();
             ui.label(if hot { rt.color(pal.warning_amber) } else { rt })
                 .on_hover_text(tip);
         };
 
-        // ── Wire facts: what actually went out, how fast, and the cadence
-        // shortfall — grouped together because they are all about the wire.
-        // Sent and unsent totals share the primary wire-accounting line.
         let msgs = telemetry.total_count;
         let bytes = telemetry.total_bytes;
         let (mps, bps) = self
@@ -313,37 +647,14 @@ impl TalkerApp {
         let suppressed = telemetry.suppressed_sends;
         let unsent = missed.saturating_add(failed).saturating_add(suppressed);
         let scheduled = msgs.saturating_add(unsent);
-        let unsent_pct = if scheduled > 0 {
-            unsent as f64 / scheduled as f64 * 100.0
-        } else {
-            0.0
-        };
+        let delivery = delivery_decision(msgs, failed, suppressed, missed);
         let unsent_tip = format!(
-            "Scheduled sends that did not reach the wire: {failed} interface \
-                 attempts failed, {suppressed} due fires were suppressed during \
-                 retry backoff, and {missed} cadence points were skipped after a \
-                 stall or machine sleep. Sent + these three cumulative outcomes \
-                 equals the scheduled total shown here."
-        );
-        ui.horizontal(|ui| {
-            ui.label(format!("Sent: {} · {msgs} msgs", human_bytes(bytes)));
-            let unsent_text = egui::RichText::new(format!(
-                "Unsent: {unsent} ({unsent_pct:.1}% of {scheduled} scheduled)"
-            ));
-            ui.label(if unsent > 0 {
-                unsent_text.color(pal.warning_amber)
-            } else {
-                unsent_text
-            })
-            .on_hover_text(&unsent_tip);
-        });
-
-        // Rolling throughput now occupies the secondary wire-health line.
-        perf_line(
-            ui,
-            format!("Throughput: {:.1} kB/s · {:.1} msg/s", bps / 1000.0, mps),
-            false,
-            "Rolling observed rate calculated from cumulative successful sends.",
+            "Run-to-date scheduler outcomes. Accepted means {msgs} configured-interface writes \
+             returned success; it does not confirm physical-wire or peer delivery. Failed means \
+             {failed} attempted writes returned an error. Suppressed means {suppressed} handled \
+             occurrences were skipped during retry backoff. Missed means {missed} cadence-grid \
+             points were skipped because the runner was more than one interval behind. Accepted, \
+             failed, suppressed, and missed add up to the scheduled total."
         );
 
         // Capacity is computed from the current draft's memoized wire lengths,
@@ -353,150 +664,98 @@ impl TalkerApp {
             .get(i)
             .zip(self.message_analysis.get(i))
             .and_then(|(messages, analyses)| analyzed_channel_demand(messages.len(), analyses));
-        match demand {
-            None => perf_line(
-                ui,
-                "Capacity: complete all messages to calculate".to_owned(),
-                false,
-                "Capacity uses exact compiled wire lengths and active message intervals. Fix the message validation errors first.",
-            ),
-            Some(demand) if !demand.is_active() => perf_line(
-                ui,
-                "Capacity: no active messages".to_owned(),
-                false,
-                "Messages with interval 0 are dormant and create no scheduled wire demand.",
-            ),
-            Some(demand) => {
-                let requested = format!(
-                    "{} · {}",
-                    compact_rate(demand.messages_per_second, "msg/s"),
-                    compact_rate(demand.bytes_per_second, "B/s")
-                );
-                let serial = draft_interface.as_ref().and_then(|interface| {
-                    let InterfaceConfig::Serial(config) = interface else {
-                        return None;
-                    };
-                    serial_line_estimate(demand, config)
-                });
-                if let Some(line) = serial {
-                    let percentage = line.utilization * 100.0;
-                    let (text, hot) = if line.is_oversubscribed() {
-                        (
-                            format!(
-                                "Capacity: {requested} · serial OVER CAPACITY {percentage:.1}% · needs {} (baud {})",
-                                compact_rate(line.required_bits_per_second, "bit/s"),
-                                line.minimum_baud(),
-                            ),
-                            true,
-                        )
-                    } else if let Some(headroom) = line.headroom_factor() {
-                        (
-                            format!(
-                                "Capacity: {requested} · serial {percentage:.1}% · {} line headroom",
-                                compact_factor(headroom)
-                            ),
-                            line.utilization >= 0.8,
-                        )
-                    } else {
-                        (
-                            format!("Capacity: {requested} · serial idle"),
-                            false,
-                        )
-                    };
-                    perf_line(
-                        ui,
-                        text,
-                        hot,
-                        "Static draft estimate. Each compiled wire byte uses one UART frame: 1 start bit plus the configured data, parity, and stop bits. Above 100%, the sustained requested payload cannot physically fit at the configured baud. At or below 100% is not a real-time guarantee: flow control, adapter/driver buffering, operating-system delays, and same-deadline message bursts can reduce effective headroom. This warning is advisory so deliberate overload tests remain possible.",
-                    );
-                } else {
-                    perf_line(
-                        ui,
-                        format!("Capacity: requested {requested}"),
-                        false,
-                        "Static draft demand from exact compiled wire lengths and active intervals. Network link capacity is unknown, so Talker reports requested load without inventing a physical headroom figure.",
-                    );
-                }
+        let serial = demand.and_then(|demand| {
+            if !demand.is_active() {
+                return None;
+            }
+            let InterfaceConfig::Serial(config) = draft_interface.as_ref()? else {
+                return None;
+            };
+            serial_line_estimate(demand, config)
+        });
+        let (service_source, service_timing) = select_service_timing(
+            recent_snapshot_state,
+            telemetry.recent_timing,
+            telemetry.timing,
+        );
+        let service_source_label =
+            service_timing_source_label(service_source, recent_snapshot_state);
+        let service_estimate = demand
+            .filter(|demand| demand.is_active())
+            .and_then(|demand| measured_service_estimate(demand, service_timing));
+        let service_samples = service_sample_count(service_timing);
+        let draft_projection = running && (iface_drift || run_drift);
+        let app_label = if draft_projection { "draft app" } else { "app" };
 
-                let recent_samples = service_sample_count(telemetry.recent_timing);
-                let run_samples = service_sample_count(telemetry.timing);
-                let (source, source_timing) = if recent_samples >= MIN_SERVICE_SAMPLES {
-                    (if running { "last 10s" } else { "final 10s" }, telemetry.recent_timing)
+        let app_capacity = if let Some(estimate) = service_estimate {
+            let mut text = format!(
+                "{app_label} ~{} headroom",
+                compact_factor(estimate.headroom_factor())
+            );
+            if service_source == ServiceTimingSource::Run
+                && matches!(recent_snapshot_state, RecentSnapshotState::Expired(_))
+            {
+                text.push_str(" · run-wide timing (recent expired)");
+            }
+            text
+        } else if service_samples == 0 {
+            format!("{app_label} unmeasured")
+        } else if service_samples < MIN_SERVICE_SAMPLES {
+            format!("{app_label} warming {service_samples}/{MIN_SERVICE_SAMPLES}")
+        } else {
+            format!("{app_label} estimate unavailable")
+        };
+        let capacity = match demand {
+            None => DecisionSignal {
+                text: format!(
+                    "Complete message setup to calculate · {} accepted (~5 s)",
+                    compact_rate(f64::from(mps), "msg/s")
+                ),
+                tone: SignalTone::Neutral,
+            },
+            Some(demand) if !demand.is_active() => DecisionSignal {
+                text: format!(
+                    "No active messages · {} accepted (~5 s)",
+                    compact_rate(f64::from(mps), "msg/s")
+                ),
+                tone: SignalTone::Neutral,
+            },
+            Some(demand) => {
+                let line_capacity = if let Some(line) = serial {
+                    format!("serial {:.1}%", line.utilization * 100.0)
                 } else {
-                    ("run", telemetry.timing)
+                    unavailable_line_capacity_label(draft_kind).to_owned()
                 };
-                if let Some(estimate) = measured_service_estimate(demand, source_timing) {
-                    let headroom = estimate.headroom_factor();
-                    perf_line(
-                        ui,
-                        format!(
-                            "Estimated app headroom ({source}): {} · summed p99 bounds <= {} · capacity ~{}",
-                            compact_factor(headroom),
-                            compact_duration(estimate.summed_p99_upper_bounds),
-                            compact_rate(estimate.capacity_messages_per_second, "msg/s"),
-                        ),
-                        estimate.utilization >= 0.8,
-                        "Advisory estimate: the separate render and synchronous send-call p99 histogram upper bounds are added, then compared with the current draft's aggregate requested message rate. Recent data is preferred after 20 paired samples; otherwise the run-wide histogram is used after it warms up. This is not a joint p99 or a hard capacity promise. A send call may return after driver/kernel buffering, coincident due messages still serialize, and a retained run may describe an older draft.",
-                    );
-                } else {
-                    let samples = recent_samples.max(run_samples);
-                    let text = if samples == 0 {
-                        "Estimated app headroom: run channel to measure".to_owned()
+                DecisionSignal {
+                    text: format!(
+                        "{} requested / {} accepted (~5 s) · {line_capacity} · {app_capacity}",
+                        compact_rate(demand.messages_per_second, "msg/s"),
+                        compact_rate(f64::from(mps), "msg/s"),
+                    ),
+                    tone: if serial.is_some_and(|line| line.is_oversubscribed()) {
+                        SignalTone::Fault
+                    } else if serial.is_some_and(|line| line.utilization >= 0.8)
+                        || service_estimate.is_some_and(|estimate| estimate.utilization >= 0.8)
+                    {
+                        SignalTone::Warning
                     } else {
-                        format!(
-                            "Estimated app headroom: warming up ({samples}/{MIN_SERVICE_SAMPLES} send attempts)"
-                        )
-                    };
-                    perf_line(
-                        ui,
-                        text,
-                        false,
-                        "At least 20 paired render/send-call observations are required before estimating application-service headroom. Slow schedules can use the cumulative run once enough samples exist.",
-                    );
+                        SignalTone::Neutral
+                    },
                 }
             }
-        }
+        };
 
-        // Fixed-size recent histograms answer "how is it behaving now?";
-        // the cumulative maximum preserves one-off stalls from earlier in the run.
         let cumulative_timing = telemetry.timing;
         let timing = telemetry.recent_timing;
-        let deadline_samples = timing.deadline_lateness.sample_count();
-        let window = if running { "last 10s" } else { "final 10s" };
-        let run_samples = cumulative_timing.deadline_lateness.sample_count();
-        let run_max = cumulative_timing
-            .deadline_lateness
-            .max()
-            .map(compact_duration)
-            .unwrap_or_else(|| "n/a".to_owned());
-        let p99 = |histogram: crate::core::telemetry::DurationHistogram| {
-            histogram
-                .percentile_upper_bound(99)
-                .map(compact_duration)
-                .unwrap_or_else(|| "n/a".to_owned())
-        };
-        let timing_text = if run_samples == 0 {
-            "Timing: awaiting first deadline".to_owned()
-        } else if deadline_samples == 0 {
-            format!("Timing ({window}): no deadline fires · run max late {run_max}")
-        } else if deadline_samples < 20 {
-            format!(
-                "Timing ({window}): warming up ({deadline_samples} due) · max late {} · run max {run_max}",
-                compact_duration(timing.deadline_lateness.max().unwrap_or_default()),
-            )
-        } else {
-            format!(
-                "Timing ({window}): late p99 <= {} · render p99 <= {} · send call p99 <= {} · run max late {run_max}",
-                p99(timing.deadline_lateness),
-                p99(timing.render_duration),
-                p99(timing.send_duration),
-            )
-        };
-        perf_line(
-            ui,
-            timing_text,
-            false,
-            "Recent timing uses ten fixed one-second segments; the run maximum is cumulative. 'Late' is monotonic elapsed time from a message's cadence deadline until the runner handled it. 'Render' covers per-send payload and timestamp construction. 'Send call' ends when the application/driver call returns; it does not claim that serial bits reached the wire or that a network peer received them. Percentiles are bounded histogram estimates shown as upper limits.",
+        let timing_text = timing_detail_text(timing, cumulative_timing, recent_snapshot_state);
+        let cadence_decision = cadence_decision(
+            timing,
+            cumulative_timing,
+            telemetry
+                .timer
+                .shortest_active_interval
+                .or_else(|| demand.and_then(|demand| demand.shortest_interval)),
+            recent_snapshot_state,
         );
 
         let timer_prefix = if running {
@@ -509,52 +768,263 @@ impl TalkerApp {
             "Timer"
         };
         let (timer_detail, timer_hot) = timer_status_detail(telemetry.timer);
-        perf_line(
-            ui,
-            format!("{timer_prefix}: {timer_detail}"),
-            timer_hot,
-            "Standard automatically requests Windows 1 ms timer resolution for active intervals below 32 ms. Precise also requests it only during the final 32 ms before slower send deadlines; commands interrupt both wait stages normally. Other platforms keep native deadline waits. This affects cadence wake precision only and does not guarantee timestamp or wire-arrival accuracy.",
-        );
         let cadence = match telemetry.timer.cadence_alignment {
             CadenceAlignment::Immediate => "immediate start".to_owned(),
             CadenceAlignment::UtcPhase if telemetry.timer.clock_realignments == 0 => {
                 "UTC phase".to_owned()
             }
             CadenceAlignment::UtcPhase => format!(
-                "UTC phase · {} clock-step rebases",
+                "UTC phase · {} wall-clock rebases",
                 telemetry.timer.clock_realignments
             ),
         };
-        perf_line(
-            ui,
-            format!("Cadence: {cadence}"),
-            false,
-            "Immediate preserves the original behavior: all active messages fire when the interface opens. UTC phase waits for each message's next Unix-epoch interval boundary, then keeps a monotonic cadence. Talker checks the wall-clock mapping once per second; a step of at least 250 ms rebases future deadlines without replaying past sends. This aligns application deadlines, not physical wire arrival.",
-        );
-
-        // ── Observer-path health: the runner→UI queue. A separate subsystem
-        // from the wire above — pressure here never delays a send. The drop
-        // count is folded in: the peak is the graduated headroom gauge (how
-        // close the queue came to full), the drop count the alarm (whether it
-        // ever ran out).
         let qlen = telemetry.queue_len;
         let qpeak = telemetry.queue_peak;
         let drops = telemetry.dropped_statuses;
-        perf_line(
-            ui,
-            format!(
-                "Display backlog: {qlen}/{} (peak {qpeak}, {drops} dropped)",
-                super::STATUS_QUEUE_CAP
-            ),
-            qpeak * 2 >= super::STATUS_QUEUE_CAP || drops > 0,
-            "The runner→UI update queue behind the readouts and Output pane: \
-             rate-limited counters, payload samples, and immediate send errors, \
-             drained every frame. The peak is how close it came to full; \
-             'dropped' counts updates discarded while it was full — the Output \
-             pane is sampled and the tallies stay exact regardless (each counter \
-             update is cumulative). Sends are never delayed for this; reliable \
-             command results use a separate queue.",
-        );
+        let card_tone =
+            diagnostic_card_tone(delivery.tone, capacity.tone, timer_hot, drops, running);
+        let card_status = match card_tone {
+            SignalTone::Fault => "ISSUE",
+            SignalTone::Warning => "ATTENTION",
+            SignalTone::Healthy => "LIVE",
+            SignalTone::Neutral => "IDLE",
+        };
+
+        decision_card(ui, "Send health", card_status, card_tone, |ui| {
+            signal_grid(ui, "send_decisions", |ui| {
+                signal_row(
+                    ui,
+                    "Interface outcomes",
+                    &delivery.text,
+                    delivery.tone,
+                    &unsent_tip,
+                );
+                signal_row(
+                        ui,
+                        "Cadence",
+                        &cadence_decision.text,
+                        cadence_decision.tone,
+                        "Deadline lateness is aggregated across all messages. Every handled due occurrence, including one suppressed during retry backoff, contributes a sample; cadence points counted as Missed do not. Faster messages therefore contribute more samples. p99 is a histogram-bucket upper bound. Any percentage compares the aggregate value with the displayed shortest active interval for schedule context; it is not a per-message percentage. The “as of” age tells you when the snapshot was computed. Once a running snapshot reaches ten seconds old, this row labels it expired instead of presenting its retained samples as current.",
+                    );
+                signal_row(
+                        ui,
+                        "Capacity",
+                        &capacity.text,
+                        capacity.tone,
+                        "Requested load comes from the draft currently shown and may differ from the running configuration until Apply & Restart. Accepted rate is the rolling five-second average of configured-interface writes that returned success. Serial utilization is a theoretical UART line estimate. Application headroom compares the current draft with separate render and interface-write p99 bounds. A warmed recent snapshot is preferred while it is current; an expired snapshot is discarded and a clearly labelled run-wide fallback is used when available. This is an advisory projection, not a hard capacity promise.",
+                    );
+            });
+
+            if unsent > 0 {
+                ui.add_space(6.0);
+                attention_callout(
+                        ui,
+                        "unsent_attention",
+                        format!(
+                            "{unsent} unsent · {failed} failed · {suppressed} suppressed · {missed} missed"
+                        ),
+                        if failed > 0 {
+                            SignalTone::Fault
+                        } else {
+                            SignalTone::Warning
+                        },
+                        &unsent_tip,
+                    );
+            }
+            if let Some(line) = serial.filter(|line| line.is_oversubscribed()) {
+                ui.add_space(4.0);
+                attention_callout(
+                        ui,
+                        "serial_capacity_attention",
+                        format!(
+                            "Serial demand is {:.1}% of line capacity · needs {} (baud {})",
+                            line.utilization * 100.0,
+                            compact_rate(line.required_bits_per_second, "bit/s"),
+                            line.minimum_baud(),
+                        ),
+                        SignalTone::Fault,
+                        "The sustained requested payload cannot physically fit at the configured baud. The warning remains advisory so deliberate overload tests are still possible.",
+                    );
+            }
+            if timer_hot {
+                ui.add_space(4.0);
+                attention_callout(
+                        ui,
+                        "timer_request_attention",
+                        "Windows 1 ms timer request failed; cadence waits are using the fallback",
+                        SignalTone::Warning,
+                        "The channel continues with ordinary deadline waits. The failed request does not prove that any occurrence was late; inspect measured deadline lateness and Missed cadence points for the observed effect.",
+                    );
+            }
+            if drops > 0 {
+                ui.add_space(4.0);
+                attention_callout(
+                    ui,
+                    "display_drop_attention",
+                    format!("{drops} diagnostic updates dropped; live readouts may lag"),
+                    SignalTone::Warning,
+                    DISPLAY_QUEUE_TOOLTIP,
+                );
+            }
+
+            ui.add_space(5.0);
+            egui::CollapsingHeader::new("Timing & runtime details")
+                    .id_salt("timing_runtime_details")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        detail_line(
+                            ui,
+                            format!(
+                                "Interface outcomes: {} accepted locally · {msgs}/{scheduled} scheduled accepted · {unsent} unsent",
+                                human_bytes(bytes)
+                            ),
+                            unsent > 0,
+                            &unsent_tip,
+                        );
+                        detail_line(
+                            ui,
+                            format!(
+                                "Accepted rate (~5 s): {:.1} kB/s · {:.1} msg/s",
+                                bps / 1000.0,
+                                mps
+                            ),
+                            false,
+                            THROUGHPUT_TOOLTIP,
+                        );
+
+                        match demand {
+                            None => detail_line(
+                                ui,
+                                "Capacity: complete all messages to calculate".to_owned(),
+                                false,
+                                "Capacity uses exact compiled wire lengths and active message intervals. Fix the message validation errors first.",
+                            ),
+                            Some(demand) if !demand.is_active() => detail_line(
+                                ui,
+                                "Capacity: no active messages".to_owned(),
+                                false,
+                                "Messages with interval 0 are dormant and create no scheduled wire demand.",
+                            ),
+                            Some(demand) => {
+                                let requested = format!(
+                                    "{} · {}",
+                                    compact_rate(demand.messages_per_second, "msg/s"),
+                                    compact_rate(demand.bytes_per_second, "B/s")
+                                );
+                                if let Some(line) = serial {
+                                    let percentage = line.utilization * 100.0;
+                                    let (text, hot) = if line.is_oversubscribed() {
+                                        (
+                                            format!(
+                                                "Capacity: {requested} · serial OVER CAPACITY {percentage:.1}% · needs {} (baud {})",
+                                                compact_rate(line.required_bits_per_second, "bit/s"),
+                                                line.minimum_baud(),
+                                            ),
+                                            true,
+                                        )
+                                    } else if let Some(headroom) = line.headroom_factor() {
+                                        (
+                                            format!(
+                                                "Capacity: {requested} · serial {percentage:.1}% · {} line headroom",
+                                                compact_factor(headroom)
+                                            ),
+                                            line.utilization >= 0.8,
+                                        )
+                                    } else {
+                                        (format!("Capacity: {requested} · serial idle"), false)
+                                    };
+                                    detail_line(
+                                        ui,
+                                        text,
+                                        hot,
+                                        "Static draft estimate. Each compiled wire byte uses one UART frame: 1 start bit plus the configured data, parity, and stop bits. Above 100%, the sustained requested payload cannot physically fit at the configured baud. At or below 100% is not a real-time guarantee: flow control, adapter/driver buffering, operating-system delays, and same-deadline message bursts can reduce effective headroom. This warning is advisory so deliberate overload tests remain possible.",
+                                    );
+                                } else if draft_kind == ConnKind::Serial {
+                                    detail_line(
+                                        ui,
+                                        format!(
+                                            "Capacity: requested {requested} · complete Serial setup"
+                                        ),
+                                        false,
+                                        "Complete the Serial port and line settings before Talker can calculate UART utilization. The requested message and byte rates still come from exact compiled wire lengths and active intervals.",
+                                    );
+                                } else {
+                                    detail_line(
+                                        ui,
+                                        format!("Capacity: requested {requested}"),
+                                        false,
+                                        "Static draft demand from exact compiled wire lengths and active intervals. Network link capacity is unknown, so Talker reports requested load without inventing a physical headroom figure.",
+                                    );
+                                }
+
+                                if let Some(estimate) = service_estimate {
+                                    let estimate_kind = if !running {
+                                        "draft projection from retained timing"
+                                    } else if draft_projection {
+                                        "draft projection"
+                                    } else {
+                                        "running estimate"
+                                    };
+                                    detail_line(
+                                        ui,
+                                        format!(
+                                            "Application headroom ({estimate_kind}; {service_source_label}): {} · summed p99 bounds ≤ {} · capacity ~{}",
+                                            compact_factor(estimate.headroom_factor()),
+                                            compact_duration(estimate.summed_p99_upper_bounds),
+                                            compact_rate(estimate.capacity_messages_per_second, "msg/s"),
+                                        ),
+                                        estimate.utilization >= 0.8,
+                                        "Advisory projection: the separate render and configured-interface write p99 histogram upper bounds are added, then compared with the current on-screen draft's aggregate requested message rate. A current recent snapshot is preferred after 20 paired observations. Otherwise the run-wide histogram is used after it warms up; a running recent snapshot is always discarded once its capture age reaches ten seconds. If unapplied edits exist, this deliberately projects the draft using timing retained from the running or previous configuration. It is not a joint p99 or hard capacity promise. A write may return after driver/kernel buffering, and coincident due messages still serialize.",
+                                    );
+                                } else {
+                                    let text = if service_samples == 0 {
+                                        "Estimated app headroom: run channel to measure".to_owned()
+                                    } else if service_samples < MIN_SERVICE_SAMPLES {
+                                        format!(
+                                            "Estimated app headroom: warming up ({service_samples}/{MIN_SERVICE_SAMPLES} send attempts)"
+                                        )
+                                    } else {
+                                        "Estimated app headroom: unavailable from the observed bounds".to_owned()
+                                    };
+                                    detail_line(
+                                        ui,
+                                        text,
+                                        false,
+                                        "At least 20 paired render/send-call observations are required before estimating application-service headroom. Slow schedules can use the cumulative run once enough samples exist.",
+                                    );
+                                }
+                            }
+                        }
+
+                        detail_line(
+                            ui,
+                            timing_text,
+                            false,
+                            TIMING_TOOLTIP,
+                        );
+                        detail_line(
+                            ui,
+                            format!("{timer_prefix}: {timer_detail}"),
+                            timer_hot,
+                            TIMER_TOOLTIP,
+                        );
+                        detail_line(
+                            ui,
+                            format!("Cadence alignment: {cadence}"),
+                            false,
+                            ALIGNMENT_TOOLTIP,
+                        );
+                        detail_line(
+                            ui,
+                            format!(
+                                "Display update queue before last drain: {qlen}/{} (sampled peak {qpeak}, {drops} dropped)",
+                                super::STATUS_QUEUE_CAP
+                            ),
+                            qpeak * 2 >= super::STATUS_QUEUE_CAP || drops > 0,
+                            DISPLAY_QUEUE_TOOLTIP,
+                        );
+                    });
+        });
 
         if let Some(err) = &error {
             ui.colored_label(pal.fault_red, format!("\u{26A0} {err}"));
@@ -675,16 +1145,14 @@ impl TalkerApp {
                         "Standard",
                     )
                     .on_hover_text(
-                        "Uses native deadline waits. On Windows, Talker still enables 1 ms timer resolution automatically for active intervals below 32 ms.",
+                        "Uses ordinary platform deadline waits at intervals of 32 ms or longer. On Windows, Talker still requests the shared process-wide 1 ms timer resolution continuously when the shortest active interval is below 32 ms. This affects deadline wake timing, not cadence phase, timestamp accuracy, or physical-wire arrival. Requires Apply & Restart.",
                     );
                     ui.radio_value(
                         &mut self.conn_drafts[i].timing_mode,
                         TimingMode::Precise,
                         "Precise",
                     )
-                    .on_hover_text(
-                        "For slower schedules on Windows, enables 1 ms timer resolution only during the final 32 ms before each send deadline. This tightens the deadline wake and costs some power. It does not choose cadence phase; use the separate UTC alignment option for that. Other platforms keep their native deadline waits.",
-                    );
+                    .on_hover_text(format!("{TIMER_TOOLTIP} Requires Apply & Restart."));
                     if self.conn_drafts[i].timing_mode != before {
                         self.dirty = true;
                     }
@@ -693,9 +1161,9 @@ impl TalkerApp {
                     self.conn_drafts[i].cadence_alignment == CadenceAlignment::UtcPhase;
                 if ui
                     .checkbox(&mut utc_aligned, "Align sends to UTC interval boundaries")
-                    .on_hover_text(
-                        "Wait for each message's next UTC/Unix-epoch interval boundary before its first send. Cadence then uses monotonic deadlines. Wall-clock steps of at least 250 ms rebase future sends without replaying missed history. Interval 1000 ms aligns to whole UTC seconds; 60000 ms aligns to whole UTC minutes. Requires Apply & Restart.",
-                    )
+                    .on_hover_text(format!(
+                        "{ALIGNMENT_TOOLTIP} Requires Apply & Restart."
+                    ))
                     .changed()
                 {
                     self.conn_drafts[i].cadence_alignment = if utc_aligned {
@@ -1442,7 +1910,7 @@ fn show_message_preview(ui: &mut egui::Ui, analysis: &MessageDraftAnalysis) {
 }
 
 /// Per-message status line at the bottom of each message group:
-/// a coloured state dot plus the message's running send count.
+/// a coloured state dot plus the message's running local-acceptance count.
 ///
 /// State follows the channel — messages aren't independently scheduled
 /// from the user's perspective. "Active" = channel is running and this
@@ -1450,7 +1918,7 @@ fn show_message_preview(ui: &mut egui::Ui, analysis: &MessageDraftAnalysis) {
 /// the count is the last value seen.
 fn show_message_status(ui: &mut egui::Ui, channel_running: bool, sent: u64) {
     // Footer bar: separator above to split it from the message body, then
-    // a tinted Frame so the "Active / Sent: N" line reads as a status
+    // a tinted Frame so the "Active / Accepted: N" line reads as a status
     // strip rather than just another row of widgets. Inner margin
     // matches the channel-summary chrome so all the framed bits in the
     // GUI feel like the same component.
@@ -1485,10 +1953,11 @@ fn show_message_status(ui: &mut egui::Ui, channel_running: bool, sent: u64) {
                 ui.label(egui::RichText::new(state).strong());
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(format!("Sent: {sent}"))
+                    egui::RichText::new(format!("Accepted: {sent}"))
                         .strong()
                         .monospace(),
-                );
+                )
+                .on_hover_text(LOCAL_ACCEPTANCE_TOOLTIP);
             });
         });
 }
@@ -1571,11 +2040,184 @@ fn show_checksum_editor(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{analyzed_channel_demand, top_aligned_grid_cell};
+    use std::time::Duration;
+
+    use super::{
+        analyzed_channel_demand, cadence_decision, delivery_decision, diagnostic_card_tone,
+        recent_timing_metric, select_service_timing, timer_status_detail, timing_detail_text,
+        top_aligned_grid_cell, unavailable_line_capacity_label, ServiceTimingSource,
+    };
+    use crate::core::telemetry::{RecentSnapshotState, SendTimingTelemetry};
+    use crate::core::timing::{CadenceAlignment, TimerMode, TimerReason, TimerStatus, TimingMode};
     use crate::gui::{
-        draft::{PayloadKind, ScheduleDraft},
+        draft::{ConnKind, PayloadKind, ScheduleDraft},
         MessageAnalysisCache,
     };
+    use wiredata_ui::diagnostics::SignalTone;
+
+    #[test]
+    fn delivery_decision_distinguishes_clean_shortfall_and_failure() {
+        let clean = delivery_decision(100, 0, 0, 0);
+        assert_eq!(clean.text, "100 / 100 accepted · none unsent");
+        assert_eq!(clean.tone, SignalTone::Healthy);
+
+        let missed = delivery_decision(98, 0, 1, 1);
+        assert_eq!(missed.text, "98 / 100 accepted · 2 unsent (2.0%)");
+        assert_eq!(missed.tone, SignalTone::Warning);
+
+        let failed = delivery_decision(98, 1, 0, 1);
+        assert_eq!(failed.text, "98 / 100 accepted · 2 unsent (2.0%)");
+        assert_eq!(failed.tone, SignalTone::Fault);
+    }
+
+    #[test]
+    fn delivery_decision_is_neutral_before_any_schedule_fires() {
+        let decision = delivery_decision(0, 0, 0, 0);
+        assert_eq!(decision.text, "No scheduled sends yet");
+        assert_eq!(decision.tone, SignalTone::Neutral);
+    }
+
+    #[test]
+    fn card_tone_surfaces_faults_warnings_and_clean_live_state() {
+        assert_eq!(
+            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Fault, false, 0, true),
+            SignalTone::Fault
+        );
+        assert_eq!(
+            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Neutral, true, 0, true),
+            SignalTone::Warning
+        );
+        assert_eq!(
+            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Neutral, false, 0, true),
+            SignalTone::Healthy
+        );
+        assert_eq!(
+            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Neutral, false, 0, false),
+            SignalTone::Neutral
+        );
+    }
+
+    #[test]
+    fn cadence_decision_switches_from_warmup_to_normalized_p99_at_twenty_samples() {
+        let mut recent = SendTimingTelemetry::default();
+        for _ in 0..19 {
+            recent.deadline_lateness.record(Duration::from_millis(1));
+        }
+
+        let warming = cadence_decision(
+            recent,
+            recent,
+            Some(Duration::from_millis(50)),
+            RecentSnapshotState::Current(Duration::ZERO),
+        );
+        assert_eq!(
+            warming.text,
+            "Warming up (19 due) · max late 1.00 ms (2.0% of shortest 50.0 ms) · recent snapshot"
+        );
+        assert_eq!(warming.tone, SignalTone::Neutral);
+
+        recent.deadline_lateness.record(Duration::from_millis(1));
+        let ready = cadence_decision(
+            recent,
+            recent,
+            Some(Duration::from_millis(50)),
+            RecentSnapshotState::Current(Duration::ZERO),
+        );
+        assert_eq!(
+            ready.text,
+            "Deadline lateness p99 ≤ 1.00 ms (≤2.0% of shortest 50.0 ms) · recent snapshot"
+        );
+        assert_eq!(ready.tone, SignalTone::Neutral);
+    }
+
+    #[test]
+    fn expired_snapshot_is_not_presented_as_current_cadence_or_timing() {
+        let mut timing = SendTimingTelemetry::default();
+        for _ in 0..20 {
+            timing.deadline_lateness.record(Duration::from_millis(1));
+        }
+        let state = RecentSnapshotState::Expired(Duration::from_secs(11));
+
+        let cadence = cadence_decision(timing, timing, Some(Duration::from_millis(50)), state);
+        assert_eq!(
+            cadence.text,
+            "Recent snapshot expired · as of 11.0 s ago · run max late 1.00 ms (2.0% of shortest 50.0 ms)"
+        );
+        assert_eq!(
+            timing_detail_text(timing, timing, state),
+            "Timing: recent snapshot expired · as of 11.0 s ago · run max deadline lateness 1.00 ms"
+        );
+    }
+
+    #[test]
+    fn service_timing_uses_recent_only_while_current_or_final_and_warmed() {
+        let mut recent = SendTimingTelemetry::default();
+        for _ in 0..20 {
+            recent.render_duration.record(Duration::from_micros(100));
+            recent.send_duration.record(Duration::from_micros(200));
+        }
+        let mut cumulative = recent;
+        cumulative.render_duration.record(Duration::from_millis(10));
+        cumulative.send_duration.record(Duration::from_millis(20));
+
+        assert_eq!(
+            select_service_timing(
+                RecentSnapshotState::Current(Duration::from_secs(9)),
+                recent,
+                cumulative,
+            )
+            .0,
+            ServiceTimingSource::Recent
+        );
+        assert_eq!(
+            select_service_timing(
+                RecentSnapshotState::Expired(Duration::from_secs(10)),
+                recent,
+                cumulative,
+            )
+            .0,
+            ServiceTimingSource::Run
+        );
+        assert_eq!(
+            select_service_timing(RecentSnapshotState::Final, recent, cumulative).0,
+            ServiceTimingSource::Recent
+        );
+    }
+
+    #[test]
+    fn timing_metrics_warm_up_independently() {
+        let mut timing = SendTimingTelemetry::default();
+        for _ in 0..20 {
+            timing.deadline_lateness.record(Duration::from_millis(1));
+        }
+        timing.render_duration.record(Duration::from_micros(100));
+        timing.send_duration.record(Duration::from_micros(200));
+
+        assert_eq!(
+            recent_timing_metric("deadline", timing.deadline_lateness),
+            "deadline p99 ≤ 1.00 ms"
+        );
+        assert_eq!(
+            recent_timing_metric("render", timing.render_duration),
+            "render warming 1/20 (max 100 us)"
+        );
+        assert_eq!(
+            recent_timing_metric("send call", timing.send_duration),
+            "send call warming 1/20 (max 200 us)"
+        );
+    }
+
+    #[test]
+    fn incomplete_serial_setup_is_not_described_as_network_capacity() {
+        assert_eq!(
+            unavailable_line_capacity_label(ConnKind::Serial),
+            "complete Serial setup"
+        );
+        assert_eq!(
+            unavailable_line_capacity_label(ConnKind::Udp),
+            "network line unmeasured"
+        );
+    }
 
     #[test]
     fn capacity_demand_reuses_exact_memoized_wire_lengths() {
@@ -1621,6 +2263,36 @@ mod tests {
         cache.refresh(&drafts[0]);
 
         assert_eq!(analyzed_channel_demand(drafts.len(), &[cache]), None);
+    }
+
+    #[test]
+    fn precise_near_threshold_status_names_the_deadline_window_policy() {
+        let (detail, hot) = timer_status_detail(TimerStatus {
+            mode: TimerMode::WindowsOneMillisecond,
+            timing_mode: TimingMode::Precise,
+            reason: TimerReason::PrecisionWindow,
+            shortest_active_interval: Some(Duration::from_millis(50)),
+            cadence_alignment: CadenceAlignment::Immediate,
+            clock_realignments: 0,
+        });
+
+        assert!(detail.contains("deadline windows"), "{detail}");
+        assert!(!detail.contains("continuous"), "{detail}");
+        assert!(!hot);
+    }
+
+    #[test]
+    fn dormant_timer_status_names_idle_state_and_no_request() {
+        let (precise, hot) = timer_status_detail(TimerStatus {
+            timing_mode: TimingMode::Precise,
+            ..TimerStatus::default()
+        });
+        assert_eq!(precise, "idle · Precise selected; no timer request");
+        assert!(!hot);
+
+        let (standard, hot) = timer_status_detail(TimerStatus::default());
+        assert_eq!(standard, "idle · no active messages; no timer request");
+        assert!(!hot);
     }
 
     #[test]

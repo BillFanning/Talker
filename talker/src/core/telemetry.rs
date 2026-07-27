@@ -4,155 +4,50 @@
 //! keeps recording allocation-free and makes a cumulative snapshot cheap to
 //! copy through the existing observer lane.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const BUCKET_UPPER_US: [u64; 15] = [
-    50, 100, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000,
-    512_000, 1_000_000,
-];
-const BUCKET_COUNT: usize = BUCKET_UPPER_US.len() + 1;
-const RECENT_SEGMENTS: usize = 10;
-const RECENT_SEGMENT: Duration = Duration::from_secs(1);
-pub const RECENT_WINDOW: Duration = Duration::from_secs(RECENT_SEGMENTS as u64);
+pub(crate) use wiredata_telemetry::RecentDurationHistogram;
+pub use wiredata_telemetry::{DurationHistogram, RECENT_WINDOW};
 
-/// A fixed-size cumulative histogram of non-negative durations.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DurationHistogram {
-    samples: u64,
-    buckets: [u64; BUCKET_COUNT],
-    total_nanos: u128,
-    max_nanos: u64,
+/// Whether the observer's last collapsed recent-window snapshot is suitable
+/// for live decisions.
+///
+/// A running snapshot expires once its capture age reaches the window it
+/// summarized. A stopped channel retains its last exact-at-stop snapshot as
+/// final evidence rather than aging it as though the runner were still live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecentSnapshotState {
+    Pending,
+    Current(Duration),
+    Expired(Duration),
+    Final,
 }
 
-impl DurationHistogram {
-    /// Record one duration without allocation.
-    pub fn record(&mut self, duration: Duration) {
-        let full_nanos = duration.as_nanos();
-        let nanos = full_nanos.min(u64::MAX as u128) as u64;
-        let bucket =
-            BUCKET_UPPER_US.partition_point(|upper| full_nanos > u128::from(*upper) * 1_000);
-
-        self.samples = self.samples.saturating_add(1);
-        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
-        self.total_nanos = self.total_nanos.saturating_add(full_nanos);
-        self.max_nanos = self.max_nanos.max(nanos);
+/// Classify a collapsed recent-window snapshot from its exact compute instant.
+///
+/// `observed_at` can precede `captured_at` only through a caller race or a
+/// synthetic test; saturating that age to zero keeps presentation robust.
+/// `final_snapshot` is provenance carried by the runner's exact-at-rest
+/// counter update; it is not inferred from thread or UI lifecycle.
+pub fn recent_snapshot_state(
+    captured_at: Option<Instant>,
+    observed_at: Instant,
+    final_snapshot: bool,
+) -> RecentSnapshotState {
+    let Some(captured_at) = captured_at else {
+        return RecentSnapshotState::Pending;
+    };
+    if final_snapshot {
+        return RecentSnapshotState::Final;
     }
 
-    pub fn sample_count(&self) -> u64 {
-        self.samples
-    }
-
-    pub fn mean(&self) -> Option<Duration> {
-        (self.samples > 0).then(|| {
-            Duration::from_nanos(
-                (self.total_nanos / self.samples as u128).min(u64::MAX as u128) as u64,
-            )
-        })
-    }
-
-    pub fn max(&self) -> Option<Duration> {
-        (self.samples > 0).then(|| Duration::from_nanos(self.max_nanos))
-    }
-
-    /// Return the upper bound of the bucket containing `percentile`.
-    ///
-    /// The overflow bucket has no fixed upper edge, so its observed maximum
-    /// is returned. Callers should present this as an estimate (for example,
-    /// `p99 <= 4 ms`) rather than an exact percentile value.
-    pub fn percentile_upper_bound(&self, percentile: u8) -> Option<Duration> {
-        if self.samples == 0 {
-            return None;
-        }
-
-        let percentile = u128::from(percentile.clamp(1, 100));
-        let rank = (u128::from(self.samples) * percentile).div_ceil(100);
-        let mut cumulative = 0u128;
-        for (index, count) in self.buckets.iter().enumerate() {
-            cumulative += u128::from(*count);
-            if cumulative >= rank {
-                return Some(if index < BUCKET_UPPER_US.len() {
-                    Duration::from_micros(BUCKET_UPPER_US[index])
-                } else {
-                    Duration::from_nanos(self.max_nanos)
-                });
-            }
-        }
-
-        // Counts only diverge after u64 saturation. The maximum remains the
-        // most useful bounded answer in that unreachable-in-practice case.
-        Some(Duration::from_nanos(self.max_nanos))
-    }
-
-    fn merge(&mut self, other: &Self) {
-        self.samples = self.samples.saturating_add(other.samples);
-        for (count, other_count) in self.buckets.iter_mut().zip(other.buckets) {
-            *count = count.saturating_add(other_count);
-        }
-        self.total_nanos = self.total_nanos.saturating_add(other.total_nanos);
-        self.max_nanos = self.max_nanos.max(other.max_nanos);
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct TimedHistogram {
-    started_at: Option<std::time::Instant>,
-    histogram: DurationHistogram,
-}
-
-/// A fixed-memory approximation of the last [`RECENT_WINDOW`] of samples.
-#[derive(Debug, Default)]
-pub(crate) struct RecentDurationHistogram {
-    segments: [TimedHistogram; RECENT_SEGMENTS],
-    current: usize,
-    current_started: Option<std::time::Instant>,
-}
-
-impl RecentDurationHistogram {
-    pub(crate) fn record_at(&mut self, now: std::time::Instant, duration: Duration) {
-        self.advance(now);
-        self.segments[self.current].histogram.record(duration);
-    }
-
-    pub(crate) fn snapshot_at(&self, now: std::time::Instant) -> DurationHistogram {
-        let mut snapshot = DurationHistogram::default();
-        for segment in &self.segments {
-            if segment
-                .started_at
-                .is_some_and(|start| now.saturating_duration_since(start) < RECENT_WINDOW)
-            {
-                snapshot.merge(&segment.histogram);
-            }
-        }
-        snapshot
-    }
-
-    fn advance(&mut self, now: std::time::Instant) {
-        let Some(started) = self.current_started else {
-            self.current_started = Some(now);
-            self.segments[self.current].started_at = Some(now);
-            return;
-        };
-        let elapsed = now.saturating_duration_since(started);
-        let steps = elapsed.as_nanos() / RECENT_SEGMENT.as_nanos();
-        if steps == 0 {
-            return;
-        }
-
-        let remainder = elapsed.as_nanos() % RECENT_SEGMENT.as_nanos();
-        let aligned_start = now
-            .checked_sub(Duration::from_nanos(remainder as u64))
-            .unwrap_or(now);
-        if steps >= RECENT_SEGMENTS as u128 {
-            self.segments.fill(TimedHistogram::default());
-            self.current = 0;
-        } else {
-            for _ in 0..steps as usize {
-                self.current = (self.current + 1) % RECENT_SEGMENTS;
-                self.segments[self.current] = TimedHistogram::default();
-            }
-        }
-        self.current_started = Some(aligned_start);
-        self.segments[self.current].started_at = Some(aligned_start);
+    let age = observed_at
+        .checked_duration_since(captured_at)
+        .unwrap_or_default();
+    if age >= RECENT_WINDOW {
+        RecentSnapshotState::Expired(age)
+    } else {
+        RecentSnapshotState::Current(age)
     }
 }
 
@@ -216,89 +111,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_histogram_has_no_summary() {
-        let histogram = DurationHistogram::default();
-        assert_eq!(histogram.sample_count(), 0);
-        assert_eq!(histogram.mean(), None);
-        assert_eq!(histogram.max(), None);
-        assert_eq!(histogram.percentile_upper_bound(99), None);
-    }
+    fn recent_snapshot_state_has_an_exact_window_boundary() {
+        let captured_at = std::time::Instant::now();
 
-    #[test]
-    fn records_mean_max_and_bucket_upper_bounds() {
-        let mut histogram = DurationHistogram::default();
-        histogram.record(Duration::from_micros(1));
-        histogram.record(Duration::from_micros(100));
-        histogram.record(Duration::from_micros(900));
-        histogram.record(Duration::from_secs(2));
-
-        assert_eq!(histogram.sample_count(), 4);
-        assert_eq!(histogram.mean(), Some(Duration::from_nanos(500_250_250)));
-        assert_eq!(histogram.max(), Some(Duration::from_secs(2)));
         assert_eq!(
-            histogram.percentile_upper_bound(50),
-            Some(Duration::from_micros(100))
+            recent_snapshot_state(None, captured_at, false),
+            RecentSnapshotState::Pending
         );
         assert_eq!(
-            histogram.percentile_upper_bound(75),
-            Some(Duration::from_millis(1))
+            recent_snapshot_state(
+                Some(captured_at),
+                captured_at + RECENT_WINDOW - Duration::from_nanos(1),
+                false,
+            ),
+            RecentSnapshotState::Current(RECENT_WINDOW - Duration::from_nanos(1))
         );
         assert_eq!(
-            histogram.percentile_upper_bound(99),
-            Some(Duration::from_secs(2))
+            recent_snapshot_state(Some(captured_at), captured_at + RECENT_WINDOW, false,),
+            RecentSnapshotState::Expired(RECENT_WINDOW)
         );
     }
 
     #[test]
-    fn percentile_input_is_clamped_to_a_valid_rank() {
-        let mut histogram = DurationHistogram::default();
-        histogram.record(Duration::from_micros(50));
-        histogram.record(Duration::from_micros(500));
+    fn final_snapshot_does_not_expire_and_future_capture_saturates() {
+        let captured_at = std::time::Instant::now();
 
         assert_eq!(
-            histogram.percentile_upper_bound(0),
-            Some(Duration::from_micros(50))
+            recent_snapshot_state(
+                Some(captured_at),
+                captured_at + RECENT_WINDOW + Duration::from_secs(1),
+                true,
+            ),
+            RecentSnapshotState::Final
         );
         assert_eq!(
-            histogram.percentile_upper_bound(255),
-            Some(Duration::from_micros(500))
+            recent_snapshot_state(
+                Some(captured_at + Duration::from_secs(1)),
+                captured_at,
+                false,
+            ),
+            RecentSnapshotState::Current(Duration::ZERO)
         );
     }
 
     #[test]
-    fn recent_window_ages_out_whole_fixed_segments() {
+    fn recorder_keeps_cumulative_truth_after_recent_samples_age_out() {
         let t0 = std::time::Instant::now();
-        let mut recent = RecentDurationHistogram::default();
-        recent.record_at(t0, Duration::from_micros(100));
-        recent.record_at(t0 + Duration::from_secs(9), Duration::from_micros(900));
+        let mut recorder = SendTimingRecorder::default();
+        recorder.record_deadline_lateness(t0, Duration::from_micros(100));
+        recorder.record_render_duration(t0, Duration::from_micros(200));
+        recorder.record_send_duration(t0, Duration::from_micros(300));
 
-        assert_eq!(
-            recent
-                .snapshot_at(t0 + Duration::from_secs(9))
-                .sample_count(),
-            2
-        );
-        let later = recent.snapshot_at(t0 + Duration::from_secs(10));
-        assert_eq!(later.sample_count(), 1, "the oldest segment aged out");
-        assert_eq!(later.max(), Some(Duration::from_micros(900)));
-        assert_eq!(
-            recent
-                .snapshot_at(t0 + Duration::from_secs(20))
-                .sample_count(),
-            0,
-            "an idle window contains no stale samples"
-        );
-    }
+        let live = recorder.snapshot_at(t0 + Duration::from_secs(9));
+        assert_eq!(live.cumulative.deadline_lateness.sample_count(), 1);
+        assert_eq!(live.cumulative.render_duration.sample_count(), 1);
+        assert_eq!(live.cumulative.send_duration.sample_count(), 1);
+        assert_eq!(live.recent.deadline_lateness.sample_count(), 1);
+        assert_eq!(live.recent.render_duration.sample_count(), 1);
+        assert_eq!(live.recent.send_duration.sample_count(), 1);
 
-    #[test]
-    fn a_gap_larger_than_the_window_reuses_bounded_storage() {
-        let t0 = std::time::Instant::now();
-        let mut recent = RecentDurationHistogram::default();
-        recent.record_at(t0, Duration::from_millis(1));
-        recent.record_at(t0 + Duration::from_secs(30), Duration::from_millis(2));
-
-        let snapshot = recent.snapshot_at(t0 + Duration::from_secs(30));
-        assert_eq!(snapshot.sample_count(), 1);
-        assert_eq!(snapshot.max(), Some(Duration::from_millis(2)));
+        let aged = recorder.snapshot_at(t0 + RECENT_WINDOW);
+        assert_eq!(aged.cumulative.deadline_lateness.sample_count(), 1);
+        assert_eq!(aged.cumulative.render_duration.sample_count(), 1);
+        assert_eq!(aged.cumulative.send_duration.sample_count(), 1);
+        assert_eq!(aged.recent, SendTimingTelemetry::default());
     }
 }

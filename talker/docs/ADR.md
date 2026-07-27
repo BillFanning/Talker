@@ -1,8 +1,16 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.5  
-**Date:** 2026-05-22  
+**Version:** 1.6
+**Date:** 2026-07-27
 **Status:** Accepted
+
+Revision note (truthful pushed-snapshot freshness):
+
+- **ADR-042** records the runner-supplied capture instant and explicit final
+  provenance that distinguish current, expired, and final timing evidence without
+  adding a dormant telemetry heartbeat. Capacity, Cadence, and detailed Timing now
+  consume one freshness classification, and expired recent timing cannot silently
+  drive measured headroom.
 
 ---
 
@@ -1069,6 +1077,204 @@ paired with an end call.
 lifetimes, and Windows feature dependencies have one owner. The crate is intentionally
 not a home for histogram helpers, schedulers, wall-clock alignment, or GUI state.
 macOS App Nap is a separate activity-policy question, not a timer-resolution analog.
+
+## ADR-039 — Bounded duration telemetry primitives live in `wiredata-telemetry`
+
+**Status:** Accepted 2026-07-20.
+
+**Context:** Talker's send telemetry and Listener's receive telemetry came to use
+byte-identical duration buckets, cumulative histogram arithmetic, and ten rotating
+one-second recent-window segments. ADR-027 in Listener originally kept that helper
+local because there was not yet enough reuse to justify another crate. Once both
+applications became durable consumers, retaining two copies made numeric fixes and
+segment-aging corrections liable to drift silently. `wiredata-timing` remains the
+wrong owner because its scope is process-wide OS timing mechanics, not measurements.
+
+**Decision:** Add the internal, non-published, dependency-free
+`wiredata-telemetry` crate. It owns `DurationHistogram`, the fixed duration bucket
+boundaries, `RecentDurationHistogram`, its private timed segments, and the bounded
+ten-second aging/merge algorithm. Talker and Listener re-export the cumulative type
+through their existing telemetry modules so their application-facing paths do not
+change.
+
+Only generic numeric storage and aging are shared. Talker retains
+`SendTimingTelemetry`, `SendTimingReport`, its recorder and measurement boundaries.
+Listener retains byte/chunk histograms, transport and timer summaries, pipeline
+measurement boundaries, completed-run retention, and presentation. Timer-resolution
+mechanics remain solely in `wiredata-timing`.
+
+**Consequences:** Bucket-boundary and recent-window fixes now have one implementation
+and one focused test suite, while recording remains allocation-free and constant
+space. The extra crate does not create a general shared runtime or shared application
+telemetry schema. This decision supersedes only ADR-038's exclusion of histogram
+helpers and the local-implementation portion of Listener ADR-027; their remaining
+scope and measurement decisions stand. No profile or wire format changes.
+
+## ADR-040 — Timer lifecycle is explicit; Precise windows stay bounded
+
+**Status:** Accepted 2026-07-20.
+
+**Context:** A review questioned whether ADR-034's final-window policy changes
+`timeBeginPeriod`/`timeEndPeriod` too often near the 32 ms high-rate threshold: a
+50 ms cadence stages for 18 ms and can make about twenty matched request/release
+pairs per second. The proposed remedy was to hold resolution continuously whenever
+the 32 ms window occupied at least half the interval. That would replace known time
+outside the higher-resolution policy with an unmeasured reduction in API-call churn.
+Microsoft documents that multiple matched calls are supported and advises requesting
+resolution immediately before timer use and releasing it immediately afterward
+([`timeBeginPeriod`](https://learn.microsoft.com/en-us/windows/win32/api/timeapi/nf-timeapi-timebeginperiod));
+its
+[energy guidance](https://learn.microsoft.com/en-us/windows-hardware/test/assessments/results-for-the-idle-energy-efficiency-assessment)
+likewise says to restore the lower frequency when the precise task completes. The
+runner separately spread guard acquisition, staging, due-time release, final release,
+status derivation, notification, counter invalidation, and observer-drop accounting
+across a large send loop and positional helper calls.
+
+**Decision:** Retain ADR-034's bounded policy. Any schedule whose shortest active
+interval is strictly below `HIGH_RATE_THRESHOLD` (32 ms) holds the shared request
+continuously in either timing mode. A Precise schedule at or above that threshold
+uses the final `PRECISION_WINDOW`; Standard uses its native wait. The process-wide
+refcount means an overlapping holder naturally prevents redundant underlying OS
+transitions. Expanding continuous holding without measured evidence is rejected.
+
+Independently, the runner encapsulates timer lifecycle in a `TimerReconciler`. It
+owns the current intent, guard, derived status, timer-edge notification endpoints,
+counter refresh instant, and observer-drop count. Schedule reconciliation, wait
+preparation, bounded-window due release, and final release are explicit methods. An
+interrupted precision-window wait retains its guard until the recomputed wait plan
+decides whether the deadline is still inside the window; a transition from continuous
+to windowed releases immediately. The guard is always dropped before rendering and
+sending for a windowed cadence and before final blocking status delivery. A named
+`TimerStatusInput` groups the status derivation context instead of another positional
+argument list.
+
+**Consequences:** A 50 ms Precise run deliberately releases its guard for the first
+18 ms and holds it for the final 32 ms of each interval when no other runner holds the
+process request. This minimizes known high-resolution duty time; API-call overhead can
+be revisited only with timing or energy evidence. Dormant schedules still release
+before their indefinite wait. Linux and macOS still use one native deadline wait and
+make no platform timer request. Isolated tests pin high-rate continuous retention,
+near-threshold staging, due/idle release, timer-edge notification, counter
+invalidation, and drop accounting. The Talker specification now incorporates the
+reconciler without changing profiles, wire formats, or ADR-034's wake policy.
+
+## ADR-041 — Diagnostics lead with decisions without hiding telemetry
+
+**Status:** Accepted 2026-07-20.
+
+**Context:** The selected-channel header exposes exact delivery outcomes, cadence
+timing, timer policy, draft capacity, measured service estimates, throughput, and
+observer pressure. That evidence is useful for investigation and support reports,
+but its flat density makes the first operational question—whether anything currently
+needs attention—slower to answer. Replacing the readouts with a generic health score
+would be worse: it would conceal which boundary was measured, collapse unavailable
+and warm-up states into a number, and overstate what buffered host-side measurements
+can prove.
+
+**Decision:** Add a compact, decision-oriented diagnostics summary with three
+Talker-owned rows: **Send outcomes**, **Cadence**, and **Capacity**. Each row presents
+a short assessment and the most relevant existing evidence. Send outcomes derive from
+scheduled, locally accepted, failed, suppressed, and missed outcomes, and explicitly
+do not claim physical-wire or peer delivery; Cadence derives from the existing
+deadline/timer observations; Capacity derives from the current draft demand, serial
+utilization where applicable, and measured service estimate when warmed up. Unknown,
+unavailable, stale, and warm-up states remain explicit rather than being treated as
+healthy.
+
+An **Attention** callout appears only for derived exceptions that merit operator
+notice. It is a presentation of existing state, not a persistent green status and not
+an opaque composite health score. Row severity and callout selection may prioritize
+the most actionable evidence, but the application owns those rules and their
+thresholds, and the absence of a callout means only that no configured exception was
+derived from the available evidence. Complete telemetry, measurement boundaries, and
+caveats remain available under collapsed details; the compact rows do not replace or
+weaken them.
+
+`wiredata-ui` may own only the identical egui card, row, and callout
+chrome shared with Listener. Talker owns the row labels, evidence selection,
+wording, severity mapping, and thresholds. This is a view-model and layout change
+only: runtime behavior, telemetry collection and types, retained summaries, clipboard
+reports, wire output, and profiles are unchanged. Listener makes the paired but
+receive-specific decision in listener ADR-033.
+
+**Consequences:** The default view answers the three common send-side decisions with
+less scanning while every underlying fact remains inspectable and exportable. The
+design stays auditable because an operator can expand the evidence behind a derived
+exception, and it cannot imply an all-clear from missing data. Pure application-side
+classification tests can pin row and attention behavior without coupling shared
+chrome to Talker semantics or adding work to the send path.
+
+## ADR-042 — Pushed timing snapshots carry freshness and final provenance
+
+**Status:** Accepted 2026-07-27.
+
+**Context:** Talker's counter lane is deliberately push-based and send-path driven.
+At a slow or dormant cadence, the latest collapsed recent-window histogram can remain
+unchanged long after its samples would have aged out had the runner computed another
+snapshot. The GUI nevertheless preferred a recent histogram after warm-up for
+application headroom and displayed it in Cadence and detailed Timing. A retained
+sample count alone cannot establish that this evidence is current.
+
+Adding a periodic telemetry heartbeat would refresh aging, but it would also discard
+the runner's intentional zero-wakeup dormant behavior. Inferring finality from
+whether the UI considered a runner stopped was also insufficient: a final snapshot
+can arrive before its thread is reaped, while an abnormal exit can stop without
+delivering the mandatory final update.
+
+**Decision:** Every `TalkerStatus::Counters` update carries the exact monotonic
+`captured_at` instant passed to the timing snapshot computation. Periodic updates
+carry `final_snapshot = false`; the mandatory exact-at-rest update uses the run's
+existing final monotonic instant for both snapshot computation and `captured_at` and
+carries `final_snapshot = true`. The supervisor retains both values beside the
+collapsed recent timing. Apply & Restart resets this telemetry and drops the
+predecessor's sampled-status receiver, so an old run's final counter tail cannot
+overwrite its replacement; the predecessor's self-contained completion summary
+continues on the separate reliable control lane.
+
+Talker classifies the retained pushed snapshot once for all GUI consumers:
+
+- no capture instant is **Pending**;
+- a non-final snapshot younger than `RECENT_WINDOW` is **Current**, with its capture
+  age available for presentation;
+- a non-final snapshot whose age is greater than or equal to `RECENT_WINDOW` is
+  **Expired**; and
+- an explicitly provenance-marked snapshot is **Final**, regardless of later
+  display age.
+
+Capacity, Cadence, and detailed Timing consume that same classification. Expired
+recent histograms are neither presented as current nor used for measured application
+headroom. Capacity may fall back to sufficiently warmed cumulative run-wide timing
+and labels that source explicitly. Final snapshots remain exact-at-run-end evidence.
+If a runner exits abnormally before sending its final update, its last periodic
+snapshot remains non-final and can expire rather than being misrepresented as exact
+at rest.
+
+No heartbeat is added. Periodic Counters remain rate-limited emissions on the send
+path, plus the one mandatory final update. An all-dormant schedule continues to
+block indefinitely on its command receiver and performs no telemetry wake.
+
+**Alternatives considered:**
+
+- **Emit a periodic snapshot heartbeat:** rejected because it introduces runner
+  wakeups solely for presentation and weakens the dormant zero-wakeup contract.
+- **Treat every retained recent histogram as usable until another update arrives:**
+  rejected because sample count does not encode freshness and can overstate or
+  understate headroom.
+- **Infer finality from stopped/draining thread state:** rejected because observer
+  lifecycle and measurement provenance can transition at different instants and an
+  abnormal exit may have no exact final snapshot.
+- **Treat partially aged snapshots as predictably conservative:** rejected because
+  retained older samples may raise or lower a percentile; the bias has no guaranteed
+  direction. `RECENT_WINDOW` is used only as the exact full-expiry boundary.
+
+**Consequences:** Slow and dormant schedules retain zero-wakeup operation while the
+GUI can distinguish current evidence, fully expired pushed evidence, and exact final
+evidence. All three timing-driven diagnostic areas agree on the source and state;
+run-wide fallback remains historical evidence and is labelled as such. The added
+fields change Talker's public Rust observer-protocol shape, although they remain
+process-local metadata. There is no persisted or serialized telemetry schema,
+profile schema, clipboard-report format, wire-data, cadence, or interface behavior
+change.
 
 ---
 

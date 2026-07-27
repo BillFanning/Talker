@@ -1,7 +1,33 @@
 # Talker — Program Specification
-**Version:** 2.4.2
+**Version:** 2.4.4
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
+
+Revision note (truthful pushed-snapshot freshness):
+
+- **§3.2 / §8.1 timing snapshot provenance (ADR-042)** — every pushed
+  counter/timing snapshot now carries its exact monotonic compute instant and
+  whether it is the runner's mandatory final snapshot. Capacity, Cadence, and
+  detailed Timing share one freshness classification: a non-final recent snapshot
+  expires once its age reaches the bounded recent window, while a final snapshot
+  remains final-at-run-end evidence. An expired recent snapshot cannot drive measured
+  headroom; a warmed run-wide fallback is labelled explicitly. Dormant runners
+  retain their indefinite zero-wakeup command wait—no telemetry heartbeat is added.
+  Profiles, clipboard-report format, and wire output are unchanged.
+
+Previous revision note (shared telemetry and explicit timer reconciliation):
+
+- **§2.1 / §3.2 / §8.1 bounded telemetry (ADR-039)** — the workspace adds the
+  dependency-free internal `wiredata-telemetry` crate for the fixed duration
+  buckets and bounded ten-segment recent-window engine shared by Talker and
+  Listener. Talker's send-specific aggregates, measurement boundaries, capacity
+  interpretation, completed-run retention, and presentation remain local.
+- **§3.2 / §8.1 timer reconciliation (ADR-040)** — a runner-local
+  `TimerReconciler` now owns guard transitions and timer-status reconciliation.
+  The established Windows policy remains unchanged: any interval below 32 ms holds
+  the shared 1 ms request continuously, while Precise uses final 32 ms windows at
+  32 ms or longer. Standard mode and non-Windows waits are unchanged. Profiles and
+  wire formats are unchanged.
 
 Revision v2.4.2 (optional UTC phase alignment and shared timer policy):
 
@@ -135,16 +161,22 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 
 ### 2.1 Crate Structure
 
-`wiredata` is a Cargo workspace with five crates:
+`wiredata` is a Cargo workspace with six crates:
 
 - **`talker`** — the binary crate containing the CLI, GUI, and all application logic
 - **`nmea0183`** — a standalone library crate containing all NMEA 0183 support, with no dependency on `talker`
 - **`listener`** — the receive-side stream counterpart to `talker`, with its own spec, ADR, and TODO
 - **`wiredata-ui`** — internal shared GUI chrome for the two apps (fonts, color palette, base widget style, formatting helpers); egui-only, never published (talker ADR-016 / listener ADR-019)
-- **`wiredata-timing`** — internal shared Windows timer-resolution mechanism; app-specific scheduling and telemetry remain in Talker and Listener (ADR-038)
+- **`wiredata-timing`** — internal shared OS timing mechanics: the refcounted
+  Windows 1 ms timer-resolution guard and minimized-window throttling opt-out;
+  cadence, scheduling, and timer policy remain in the applications (ADR-038)
+- **`wiredata-telemetry`** — internal dependency-free bounded telemetry primitives:
+  fixed duration-histogram buckets and the ten-segment recent-window engine;
+  application aggregates, measurement boundaries, policy, retention, and
+  presentation remain in Talker and Listener (ADR-039 / listener ADR-032)
 
 The application/library crates keep their own `docs/` folders (spec, ADR, TODO).
-The two small internal shared crates have no docs folder; their scope decisions live
+The three small internal shared crates have no docs folder; their scope decisions live
 in the app ADRs. There is no workspace-root docs directory.
 
 ```
@@ -195,7 +227,11 @@ wiredata/                        # workspace root
 │   ├── Cargo.toml
 │   └── src/
 │
-└── wiredata-timing/             # internal shared OS timing policy
+├── wiredata-timing/             # internal shared OS timing mechanics
+│   ├── Cargo.toml
+│   └── src/
+│
+└── wiredata-telemetry/          # internal shared bounded telemetry primitives
     ├── Cargo.toml
     └── src/
 ```
@@ -334,14 +370,18 @@ The **detail pane** (right) shows the selected channel:
   - *Throughput:* rolling `kB/s · msg/s` from cumulative successful sends.
   - *Capacity:* current-draft aggregate `msg/s` and wire `B/s`; for Serial, UART
     line utilization and headroom. A second line shows measured application
-    headroom after warm-up from the recent or cumulative render/send timing
-    histograms. Low margin and physical serial oversubscription are amber.
+    headroom after warm-up from an eligible recent or cumulative run-wide
+    render/send timing snapshot. An expired recent snapshot cannot supply this
+    estimate; a warmed run-wide fallback is labelled explicitly. Low margin and
+    physical serial oversubscription are amber.
   - *Timing health:* approximately last-ten-second deadline-lateness, render-time,
     and synchronous send-call p99 upper bounds plus maxima; the deadline row also
-    retains the cumulative run maximum. The timer readout names the configured
-    timing mode, active policy, shortest active interval, cadence alignment,
-    wall-clock re-alignment count, and any Windows 1 ms request failure
-    (ADR-032 through ADR-038).
+    retains the cumulative run maximum. Each pushed timing snapshot is classified
+    as pending, current (with capture age), expired, or final-at-run-end from
+    runner-supplied provenance; Capacity, Cadence, and detailed Timing use the same
+    classification. The timer readout names the configured timing mode, active
+    policy, shortest active interval, cadence alignment, wall-clock re-alignment
+    count, and any Windows 1 ms request failure (ADR-032 through ADR-042).
   - *Observer health:* `Display backlog: <len>/<cap> (peak <p>, <d> dropped)` —
     the runner→UI status-queue gauge (ADR-018/ADR-019); amber when the peak
     nears the cap or anything was dropped. Pressure here never delays a send;
@@ -762,14 +802,20 @@ the elapsed wall-clock grid as scheduler misses.
 - **Standard** preserves the automatic policy: on Windows, a shortest active
   interval below 32 ms holds the process's refcounted 1 ms timer-resolution request
   continuously. Slower schedules use the platform's normal deadline wait.
-- **Precise** uses the same continuous policy when the schedule is already below
-  32 ms. For a slower active schedule on Windows, the runner first waits normally
-  until 32 ms before the next send deadline, acquires the 1 ms request for the final
-  wait, and releases it before payload rendering and `Interface::send`. Closely
-  spaced deadlines may make these windows touch; making every message dormant
-  releases the request before the runner's indefinite command wait.
+- **Precise** uses the same continuous policy when the shortest active interval is
+  below 32 ms. At exactly 32 ms and for every slower active schedule, the runner
+  first waits normally until 32 ms before the next send deadline, acquires the 1 ms
+  request for the final wait, and releases it before payload rendering and
+  `Interface::send`. Closely spaced deadlines may make these windows touch; making
+  every message dormant releases any request before the runner's indefinite command
+  wait.
 - On macOS and Linux, Precise keeps one native deadline wait. It adds no staging
   wake and makes no Windows-style resolution request.
+
+The runner's `TimerReconciler` owns the current timer intent, resolution guard,
+derived status, edge notification, and observer-drop accounting. It reconciles
+schedule transitions, stages and releases bounded windows, and drops the guard
+before windowed rendering/sending and before final blocking status delivery.
 
 Timing mode controls deadline-wake policy, not timestamp formatting or cadence phase.
 Cadence alignment independently chooses Immediate or UTC-phase startup/rebase
@@ -778,6 +824,34 @@ interface time, or establishes when serial/network bytes physically leave the ho
 The timing telemetry in §3.2 exposes the configured alignment, wall-clock
 re-alignments, and measured application boundaries without claiming a hard real-time
 guarantee.
+
+The fixed duration buckets and bounded recent-window aging used by those measurements
+come from `wiredata-telemetry`. Talker retains its send-specific timing aggregates,
+recorder and measurement boundaries, capacity interpretation, completed-run
+retention, and GUI/report presentation; the shared crate defines no application
+telemetry schema or runtime policy.
+
+**Pushed timing snapshot freshness (ADR-042):**
+
+- Every periodic counter update carries the exact monotonic instant at which its
+  cumulative and recent histograms were computed and marks itself non-final. The
+  mandatory exact-at-rest counter update reuses the run's final monotonic instant
+  and carries explicit final provenance. Finality is never inferred from UI or
+  thread lifecycle.
+- A snapshot with no capture instant is **Pending**. A non-final snapshot is
+  **Current** while its capture age is less than `RECENT_WINDOW` and **Expired**
+  once its age is greater than or equal to that window. A provenance-marked final
+  snapshot is **Final** regardless of later display age. An abnormal exit that
+  omits the mandatory final update therefore cannot relabel an older periodic
+  snapshot as final.
+- Capacity, Cadence, and detailed Timing consume that one classification. Expired
+  recent histograms are not presented as current and cannot drive measured
+  application headroom. Capacity may use a sufficiently warmed cumulative
+  run-wide histogram instead and must identify that fallback.
+- Snapshot age does not create a runner wake. Counters remain send-path,
+  rate-limited updates plus the mandatory final update; an all-dormant schedule
+  continues to block indefinitely on its command receiver with zero telemetry
+  heartbeat.
 
 **Capacity preflight (ADR-035):**
 
@@ -792,10 +866,11 @@ guarantee.
   message bursts can reduce practical capacity even below 100%.
 - Measured application headroom adds the separate render-p99 and send-call-p99
   histogram upper bounds and compares that service estimate with aggregate draft
-  message rate. At least 20 paired samples are required; approximately last-ten-
-  second data is preferred, with cumulative run data as the slow-schedule fallback.
-  The sum is not a joint p99. A retained run can describe an older draft, and a
-  send call can return before bytes physically leave a driver or kernel buffer.
+  message rate. At least 20 paired samples are required; eligible approximately
+  last-ten-second data is preferred, with labelled cumulative run-wide data as the
+  slow-schedule or expired-snapshot fallback. The sum is not a joint p99. A
+  retained run can describe an older draft, and a send call can return before bytes
+  physically leave a driver or kernel buffer.
 
 All capacity findings are advisory. They do not disable Start because deliberately
 oversubscribed schedules are useful tests; actual deadline, unsent, and throughput
