@@ -1,10 +1,10 @@
 # AGENTS.md
 
 Working agreement and codebase guide for the **wiredata** workspace. Applies to all
-five crates (`talker`, `nmea0183`, `listener`, `wiredata-ui`, `wiredata-timing`) and to
-**any** contributor — human or coding agent (Claude Code, Codex, or otherwise). This
-is the tool-neutral source of truth; tool-specific files (e.g. `CLAUDE.md`) should
-import it rather than duplicate it.
+six crates (`talker`, `nmea0183`, `listener`, `wiredata-ui`, `wiredata-timing`,
+`wiredata-telemetry`) and to **any** contributor — human or coding agent (Claude Code,
+Codex, or otherwise). This is the tool-neutral source of truth; tool-specific files
+(e.g. `CLAUDE.md`) should import it rather than duplicate it.
 
 ---
 
@@ -35,6 +35,9 @@ Each crate owns a `docs/` folder:
   and small by design. Its decisions live in the app ADR series — talker ADR-016 and
   listener ADR-019 — and any chrome change that alters both apps' look should reference
   them.
+- `wiredata-timing` and `wiredata-telemetry` likewise have **no** `docs/` folders.
+  Their narrow cross-app scope is governed by the owning app ADRs (talker ADR-038/039
+  and listener ADR-030/032).
 - Record any non-trivial design choice as a **new ADR entry** in the owning crate's
   `ADR.md` (talker and nmea0183 share one ADR number series; listener has its own).
 - Track concrete implementation reminders in the owning crate's `TODO.md`.
@@ -106,7 +109,7 @@ toolchain.
 
 ### Workspace layout
 
-Five crates in a Cargo workspace:
+Six crates in a Cargo workspace:
 
 - **`nmea0183/`** — library crate; no dependency on `talker` or `listener`; intended for
   independent crates.io publication. Handles NMEA 0183 sentence construction, parsing,
@@ -129,8 +132,9 @@ Five crates in a Cargo workspace:
 - **`wiredata-ui/`** — internal (`publish = false`) shared GUI **chrome** for the two
   apps (talker ADR-016 / listener ADR-019): the bundled font stack + assets, the named
   color palette (`LIGHT`/`DARK`), the base widget visuals for both themes, shared style
-  tweaks, and pure formatting helpers. Depends **only on `egui`** — never on `talker`,
-  `listener`, `eframe`, or any runtime crate. A piece belongs here only if it is purely
+  tweaks, identical decision-card chrome (talker ADR-041 / listener ADR-033), and pure
+  formatting helpers. Depends **only on `egui`** — never on `talker`, `listener`,
+  `eframe`, or any runtime crate. A piece belongs here only if it is purely
   presentational, identical across both apps, and egui-only; app-specific widgets,
   layouts, and view-models stay in the apps.
 - **`wiredata-timing/`** — internal (`publish = false`) shared process-timing policy.
@@ -138,6 +142,10 @@ Five crates in a Cargo workspace:
   minimized-window throttling opt-out used by both applications. It is a narrow
   platform boundary, not a general shared runtime or scheduling crate; non-Windows
   calls preserve the same RAII shape but make no timer-resolution request.
+- **`wiredata-telemetry/`** — internal (`publish = false`) shared bounded telemetry
+  primitives. It owns the fixed duration-histogram buckets and the ten-segment recent
+  window used by both applications. Measurement boundaries, aggregate report types,
+  timer policy, chunk-shape telemetry, retention, and presentation stay in their apps.
 
 ```
 talker/src/
@@ -181,8 +189,11 @@ I/O shape (see talker ADR-002 vs listener ADR-001):
   `tokio`, etc.). It stays a pure, publishable library.
 - `wiredata-ui` imports only `egui`. It must never depend on `talker`, `listener`,
   `eframe`, or runtime crates — chrome only (talker ADR-016 / listener ADR-019).
-- `wiredata-timing` owns only cross-application OS timing policy. Cadence,
-  scheduling, telemetry, and application configuration remain in their owning apps.
+- `wiredata-timing` owns only cross-application OS timing mechanics. Cadence,
+  scheduling, telemetry policy, and application configuration remain in their apps.
+- `wiredata-telemetry` owns only the dependency-free duration histogram and bounded
+  recent-window engine. Application measurement boundaries, aggregate telemetry
+  types, and runtime/configuration policy remain in `talker` and `listener`.
 - UI threads never perform I/O and never block.
 - `cli/` and `gui/` are thin layers; business logic lives in `core/` (or the equivalent
   internal modules).
