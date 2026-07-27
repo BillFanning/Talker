@@ -35,7 +35,8 @@ use crate::core::{ChannelId, RuntimeEvent};
 use crate::display::{DisplayView, RenderedOutput};
 use crate::record::Recording;
 use crate::transport::{
-    DataTransportRunner, ReceivedData, TransportJoinHandle, TransportNotice, TransportOutcome,
+    DataTransportRunner, ReceivedData, SerialStallState, TransportJoinHandle, TransportNotice,
+    TransportOutcome,
 };
 
 use super::pipeline::{
@@ -134,12 +135,16 @@ pub(crate) fn spawn_channel_tasks<R: DataTransportRunner>(
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
     notices_rx: Receiver<TransportNotice>,
+    serial_stall_state: Option<SerialStallState>,
 ) -> ChannelTasks {
     // The bounded Transport→Pipeline queue — the only edge that may stall the
     // reader (§97.1, §99). No unbounded intermediate queue is introduced (§97.2).
     let (ingest_tx, ingest_rx) = mpsc::channel(caps.ingest);
 
     let mut pipeline = ChannelPipeline::new(channel_id, caps).with_event_sender(events);
+    if let Some(state) = serial_stall_state {
+        pipeline = pipeline.with_serial_stall_state(state);
+    }
     // Carry the previous run's diagnostics forward (§88) so a restart keeps its log,
     // before the pipeline records anything new.
     if !match_setup.prior_diagnostics.is_empty() {
@@ -346,6 +351,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
     caps: PipelineCapacities,
     events: Sender<RuntimeEvent>,
     faulted: Arc<AtomicBool>,
+    serial_stall_state: Option<SerialStallState>,
     // Both ends: the receiver feeds the pipeline; the monitor keeps the
     // sender so a spontaneous fault's CAUSE reaches the diagnostics log
     // (serial transports hold their own clone for stall notices).
@@ -372,6 +378,7 @@ pub(crate) fn spawn_monitored_channel<R: DataTransportRunner>(
         caps,
         events,
         notices_rx,
+        serial_stall_state,
     );
 
     let monitor = tokio::spawn(async move {
@@ -493,6 +500,7 @@ pub fn start_data_channel<R: DataTransportRunner>(
         caps,
         event_tx,
         faulted.clone(),
+        None,
         (notice_tx, notice_rx),
     );
     RunningChannel {

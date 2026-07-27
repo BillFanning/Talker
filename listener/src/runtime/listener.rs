@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 
 use crate::config::schema::InterfaceConfig;
 use crate::config::ChannelConfig;
-use crate::core::{ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
+use crate::core::{lock_recover, ChannelId, ChannelState, DisplayViewId, RuntimeEvent};
 use crate::display::{DisplayView, RenderedOutput};
 use crate::record::{
     start_display_recording, DisplayFileRecorder, FileRotationPolicy, Recording,
@@ -33,7 +33,7 @@ use crate::record::{
 };
 use crate::transport::{
     DataTransportRunner, SerialControlCommand, SerialControlHooks, SerialControlLines,
-    TransportNotice,
+    SerialStallState, TransportNotice,
 };
 
 use super::activity::ChannelActivity;
@@ -145,6 +145,21 @@ enum ChannelHandle {
 struct SerialControl {
     commands: mpsc::Sender<SerialControlCommand>,
     state: Arc<Mutex<SerialControlLines>>,
+}
+
+/// Resources assembled while opening a stream transport and consumed together
+/// when its monitored pipeline is spawned.
+struct DataSpawnContext {
+    display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
+    /// A setup failure retained in the new pipeline so Display recording faults
+    /// surface through the same diagnostic path as Raw recording faults.
+    display_diagnostic: Option<crate::diagnostics::Diagnostic>,
+    faulted: Arc<AtomicBool>,
+    serial_stall_state: Option<SerialStallState>,
+    notices: (
+        mpsc::Sender<TransportNotice>,
+        mpsc::Receiver<TransportNotice>,
+    ),
 }
 
 /// Auto-reconnect backoff state for one faulted Channel (§9.1, §162). Created when
@@ -589,9 +604,13 @@ impl Listener {
     /// The current serial control-line state of a running serial Channel (§161, the
     /// pull side of `ControlLinesChanged`); `None` if it is not a running serial
     /// Channel.
+    ///
+    /// `None` means exactly that — not a running serial Channel. A poisoned cell
+    /// recovers its last value (`core::sync`) rather than reporting `None`, which
+    /// the GUI would read as "no serial panel here" and hide the lines entirely.
     pub fn serial_control_lines(&self, id: ChannelId) -> Option<SerialControlLines> {
         let control = self.channels.get(&id)?.serial_control.as_ref()?;
-        control.state.lock().ok().map(|guard| *guard)
+        Some(*lock_recover(&control.state))
     }
 
     pub fn has_pending(&self, id: ChannelId) -> bool {
@@ -1147,6 +1166,7 @@ impl Listener {
                     .map_err(OrchestratorError::SerialOpen)?
                     .with_notice_sender(notice_tx.clone())
                     .with_control(hooks);
+                let serial_stall_state = opened.stall_state();
                 // "Record on start" is begun by the pipeline (auto_begin_recording), not
                 // pre-built here — so its failure surfaces like the live toggle.
                 let (display, display_diag) = self.build_display_recorder(id, config).await;
@@ -1154,10 +1174,13 @@ impl Listener {
                     id,
                     opened,
                     config,
-                    display,
-                    display_diag,
-                    faulted,
-                    (notice_tx, notice_rx),
+                    DataSpawnContext {
+                        display_recorder: display,
+                        display_diagnostic: display_diag,
+                        faulted,
+                        serial_stall_state: Some(serial_stall_state),
+                        notices: (notice_tx, notice_rx),
+                    },
                 ));
                 Ok((
                     handle,
@@ -1184,10 +1207,13 @@ impl Listener {
                     id,
                     bound,
                     config,
-                    display,
-                    display_diag,
-                    faulted,
-                    (notice_tx, notice_rx),
+                    DataSpawnContext {
+                        display_recorder: display,
+                        display_diagnostic: display_diag,
+                        faulted,
+                        serial_stall_state: None,
+                        notices: (notice_tx, notice_rx),
+                    },
                 ));
                 Ok((handle, None))
             }
@@ -1214,22 +1240,20 @@ impl Listener {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn spawn_data<R: DataTransportRunner>(
         &self,
         id: ChannelId,
         runner: R,
         config: &ChannelConfig,
-        display_recorder: Option<(DisplayView, Recording<RenderedOutput>)>,
-        // A diagnostic from building the display recorder (a setup failure) to seed into
-        // the new pipeline's log, so a display-recording start failure shows like raw's.
-        display_diag: Option<crate::diagnostics::Diagnostic>,
-        faulted: Arc<AtomicBool>,
-        notices: (
-            mpsc::Sender<TransportNotice>,
-            mpsc::Receiver<TransportNotice>,
-        ),
+        context: DataSpawnContext,
     ) -> MonitoredChannel {
+        let DataSpawnContext {
+            display_recorder,
+            display_diagnostic,
+            faulted,
+            serial_stall_state,
+            notices,
+        } = context;
         spawn_monitored_channel(
             id,
             runner,
@@ -1268,13 +1292,14 @@ impl Listener {
                 // recorded, so it lands in this run's log.
                 prior_diagnostics: {
                     let mut prior = self.prior_diagnostics(id);
-                    prior.extend(display_diag);
+                    prior.extend(display_diagnostic);
                     prior
                 },
             },
             self.channel_caps(config),
             self.events_tx.clone(),
             faulted,
+            serial_stall_state,
             notices,
         )
     }

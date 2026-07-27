@@ -67,7 +67,9 @@ Message-model removal). Everything below this block is verified done:
       material, avoiding a clock read around every minor operation by default.
 - [x] **Recent handoff-delay window (ADR-027).** Ten fixed one-second histogram
       segments feed the labeled recent p99 while the cumulative run maximum and final
-      recent state remain available at rest; no per-chunk event traffic.
+      recent state remain available at rest; no per-chunk event traffic. ADR-032 now
+      gives this bounded numeric primitive one shared implementation while Listener's
+      receive aggregates and measurement boundaries stay local.
 - [x] **Processing-window and chunk-shape telemetry (ADR-028).** Total ingest
       processing now has the same rotating recent window as handoff timing. Chunk
       count, size distribution, and inter-read gaps remain cumulative at-rest truth
@@ -85,6 +87,12 @@ Message-model removal). Everything below this block is verified done:
 - [x] **Run summary and export (ADR-031).** The newest completed run retains exact
       bytes/chunks, diagnostics, queue peaks, timing/timer policy, transport health,
       and platform/build facts in an on-click versioned clipboard report.
+- [x] **Decision-oriented diagnostics summary (ADR-033).** The selected-channel
+      view leads with compact Transport, Pressure, and Pipeline rows plus
+      exception-only Attention, while complete telemetry and caveats remain under
+      collapsed details. Unsupported never becomes zero, no row claims no loss,
+      and derived Attention creates no runtime `Diagnostic`; Listener owns all
+      classification policy while `wiredata-ui` supplies only shared egui chrome.
 
 - [x] Find & Triggers runtime: cross-chunk `BytePattern` scanner **with carry** —
       a pattern split across two reads now matches (`MatchRuleSet` keeps the prior

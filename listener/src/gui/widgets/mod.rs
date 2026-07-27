@@ -301,7 +301,7 @@ pub(super) fn edit_interface(
                     );
                     ui.checkbox(&mut udp.kernel_timestamps, "Kernel timestamp")
                         .on_hover_text(
-                            "Request a nanosecond-resolution software receive timestamp from the kernel. Linux uses SO_TIMESTAMPNS. Windows and macOS currently report the request as unavailable and continue with the normal post-read timestamp. This can reduce userland scheduling jitter, but it is still not hardware or per-byte wire timing.",
+                            "Request a kernel software timestamp for each UDP datagram. Linux SO_TIMESTAMPNS returns a software timestamp represented with nanosecond fields; that representation does not guarantee nanosecond accuracy. It removes post-receive userland scheduling delay from recorded wall-clock capture but does not change Handoff or Read gap. Windows and macOS report the request as unavailable and use post-read capture. This is not hardware, device, or per-byte wire timing.",
                         );
                     ui.end_row();
                 });

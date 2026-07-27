@@ -859,7 +859,7 @@ mod tests {
             episodes: 1,
             total: std::time::Duration::from_millis(8),
             max: std::time::Duration::from_millis(8),
-            active: false,
+            active_for: None,
         });
         snapshot
             .rule_timer_lateness

@@ -1,9 +1,35 @@
-# Listener Specification v2.2.1
+# Listener Specification v2.2.3
 
 Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
+
+Revision note (authoritative Serial stall snapshots):
+
+- **§91.2 / §97 / §99 / §101 / §104 / §128 Serial backpressure telemetry
+  (ADR-034).** Each successfully opened Serial run now owns reader-maintained
+  authoritative stall state. Runtime snapshots derive completed episode count, total,
+  and maximum directly from that state and expose any active episode's elapsed time
+  separately; warning delivery is not an accounting boundary.
+- **§137 / §152 / §157 advisory reporting and verification.** The established
+  threshold warning remains an at-most-once best-effort signal. A dropped transport
+  notice omits its diagnostic and event; a full event queue may omit only the event.
+  Neither changes polled metrics, and sub-threshold episodes are still counted.
+- The bounded queue, received bytes, warning threshold, profile and recording schemas,
+  and completed-run clipboard keys are unchanged.
+
+Previous revision note (shared bounded telemetry primitives):
+
+- **§91.2 / §102 / §127–§128 bounded duration telemetry (ADR-032).** The
+  internal, non-published, dependency-free `wiredata-telemetry` crate now owns the
+  fixed duration histogram and bounded ten-by-one-second recent-window engine shared
+  with Talker.
+- Listener keeps its measurement boundaries and application-specific aggregates,
+  including `ByteHistogram`, `ChunkShape`, transport/timer summaries,
+  stats/snapshots, completed-run retention, and GUI presentation.
+- This is an implementation extraction only: receive behavior, profile schema,
+  recording formats, and Listener's exact Idle-deadline timer policy are unchanged.
 
 Revision v2.2.1 (bounded receive timing, transport health, and completed-run reports):
 
@@ -1258,7 +1284,8 @@ is not draining fast enough (slow disk, etc.):
   terminal until the user re-enables recording, which begins a *new* artifact.
 - On fault, the recorder records the truncation point — total bytes written
   (raw) or last rendered line written (display), plus wall-clock and monotonic
-  time — finalizes the file, emits `RecordingFaulted(ChannelId)` (§137), and
+  time — finalizes the file, emits `RecordingFaulted(ChannelId, RecordingTap)`
+  (§137), and
   raises a diagnostic (§101) naming the channel, time, and estimated loss where
   practical.
 
@@ -1969,23 +1996,35 @@ spent without turning every chunk into an observer event:
   capacities. The Raw peak survives recorder retirement so Stop does not erase it.
 - **Rules:** cumulative and recent Idle firing lateness plus completed wait counts by
   native, successful Windows 1 ms, or failed Windows-request policy.
-- **Transport health:** cumulative Serial backpressure episodes/total/maximum,
-  platform-explicit UDP kernel drop availability/count, and configured/observed
-  arrival timestamp sources.
+- **Transport health:** completed Serial backpressure episode count/total/maximum plus
+  any active episode's elapsed time, platform-explicit UDP kernel drop
+  availability/count, and configured/observed arrival timestamp sources.
 
-Duration and byte percentiles are fixed-bucket estimates displayed as upper bounds.
-Recent windows use ten fixed one-second segments, retain no raw samples, and are an
-approximation rather than an exact sliding cutoff. Recording is constant-space and
-does not add per-chunk GUI events.
+The internal dependency-free `wiredata-telemetry` crate owns only the fixed-bucket
+duration histogram and the bounded ten-by-one-second recent-duration window engine.
+Listener owns the measurement boundaries that feed those primitives and all
+application-specific aggregates: byte and chunk-shape histograms, timer and transport
+summaries, stats/snapshots, completed-run retention, and presentation. Duration and
+byte percentiles are fixed-bucket estimates displayed as upper bounds. Recent windows
+retain no raw samples and approximate, rather than exactly implement, a sliding cutoff.
+Recording is constant-space and does not add per-chunk GUI events.
+
+For each successfully opened Serial run, the blocking reader owns one authoritative
+stall-state cell and the runtime holds a clone from which it derives live, stats, and
+final snapshots directly. Completed episode count, total, and maximum include only
+finalized episodes; current `active_for` elapsed time is separate. Episodes below the
+warning threshold still contribute when they complete.
 
 When a successfully opened Channel run ends, Listener retains one self-contained
 summary with exact bytes/chunks, diagnostics counts, queue peaks, bounded timing,
 timer policy, transport health, wall-clock start/finish, monotonic elapsed duration,
-end reason, and build/platform facts. If a task panic or shutdown grace limit prevents
-the final snapshot, the summary is marked incomplete rather than presenting zeroes as
-complete truth. **Copy summary** creates a versioned line-oriented clipboard report
-only on click. Process-unique run IDs prevent a late predecessor completion from
-replacing a newer run.
+end reason, and build/platform facts. A complete final snapshot after a normal Serial
+retry-loop exit contains finalized, inactive stall totals. If a pipeline-task panic or
+shutdown grace limit prevents the final snapshot, the summary is marked incomplete
+rather than presenting zeroes as complete truth. ADR-034 does not change the existing
+classification of transport task/thread panics. **Copy summary** creates a versioned
+line-oriented clipboard report only on click. Process-unique run IDs prevent a late
+predecessor completion from replacing a newer run.
 
 ## 92. Events
 
@@ -2069,17 +2108,18 @@ Listener uses a hybrid runtime model.
 - `tokio::task::spawn_blocking` is reserved for bounded blocking operations that
   complete in finite time (interface open/close, file create, file flush, port
   enumeration). It shall not host continuous receive loops.
-- Blocking transport threads send into bounded `tokio::sync::mpsc` channels using
-  `Sender::blocking_send`.
+- Blocking Serial reader threads send into bounded `tokio::sync::mpsc` channels using
+  `Sender::try_send`; on `Full`, they preserve the pending block and retry at a bounded
+  cadence while observing cancellation.
 - Transport abstractions are push-based. Data-bearing transports emit
   `ReceivedData`; TCP Listener transports emit `NewConnection`.
 - The runtime mints `ChannelId` values for accepted TCP connections.
 
 Consequences:
 
-- `blocking_send` backpressure on the Transport→Pipeline queue can stall the
-  serial reader, which can cause UART/driver overrun. This is the mechanism
-  behind "transport-specific loss" in §99 and shall be reported per §101.
+- A full Transport→Pipeline queue can stall the Serial reader during its bounded retry
+  loop, which can cause UART/driver overrun. This is the mechanism behind
+  "transport-specific loss" in §99 and shall be reported per §101.
 - Because every fan-out consumer downstream of the pipeline is non-blocking (drop,
   evict, or fault), the pipeline never stalls on a slow consumer; the only
   condition that can stall the reader is the CPU failing to keep up with the line
@@ -2093,11 +2133,15 @@ Consequences:
 
 ### 97.2 Blocking-to-Async Handoff
 
-Blocking producer threads shall hand received data to the async runtime using
-bounded `tokio::sync::mpsc` channels; the producer uses `Sender::blocking_send`.
-This channel is the Transport→Pipeline queue and participates in the §99
-backpressure policy. Implementations shall not introduce an unbounded
-intermediate queue between blocking transport threads and the async runtime.
+Blocking producer threads shall hand received data to the async runtime using bounded
+`tokio::sync::mpsc` channels. A Serial producer first uses `Sender::try_send`; on
+`Full`, it retains that same `ReceivedData` as the pending block and retries at a
+bounded cadence until the send succeeds, cancellation ends the run, or the receiver
+closes. While the run continues, the loop shall not drop or reorder the pending block;
+cancellation or receiver closure ends the run and the undelivered pending block cannot
+be forwarded. This channel is the Transport→Pipeline queue and participates in the
+§99 backpressure policy. Implementations shall not introduce an unbounded intermediate
+queue between blocking transport threads and the async runtime.
 
 ## 98. Channel Isolation
 
@@ -2112,7 +2156,7 @@ Each Channel shall maintain independent:
 
 | Queue | Bounded | Overflow Behavior |
 |---|---:|---|
-| Transport → Pipeline | Yes | `blocking_send`; may stall the reader (the only edge permitted to); transport-specific loss may occur and is reported (§101) |
+| Transport → Pipeline | Yes | Async transports await capacity; Serial uses `try_send` plus a bounded retry that preserves the pending block. This is the only edge permitted to stall the reader; transport-specific loss may occur, and its risk evidence is reported (§101). |
 | Fan-out → Raw Recording | Yes | `try_send`; Raw Recording faults on full; never stalls reception |
 | Fan-out → Display / scrollback | Yes | Drop oldest display items |
 | Fan-out → Display Recording | Yes | `try_send`; Display Recording faults on full; never stalls reception |
@@ -2131,7 +2175,8 @@ completed run rather than erasing the evidence during teardown.
 
 ```text
 transport reader
-  │  [bounded transport→pipeline queue; blocking_send — the only edge that may stall the reader]
+  │  [bounded transport→pipeline queue; async send or Serial try_send + bounded retry]
+  │  [the only edge that may stall the reader]
   ▼
 pipeline (per channel)
   │
@@ -2169,10 +2214,29 @@ When Listener discards data due to overflow, it shall report:
 Listener shall report detectable data loss. Linux UDP uses the socket's cumulative
 `SO_RXQ_OVFL` ancillary counter when available. Other platforms expose the counter as
 unsupported, not zero; Listener does not infer a per-socket count from host-wide
-statistics. Serial cannot know the byte count lost by an adapter or driver overrun,
-so it instead accumulates Transport→Pipeline backpressure episode count, total,
-maximum, and current-active state. These measurements provide context but do not
-guarantee detection of all loss.
+statistics.
+
+Serial cannot know the byte count lost by an adapter or driver overrun. Each
+successfully opened Serial run therefore owns one reader-maintained authoritative
+stall-state cell. The reader opens an episode immediately when a received block first
+finds the Transport→Pipeline queue full. It preserves that block through the bounded
+retry loop and completes the episode exactly once when a retry succeeds, cancellation
+ends the run, or the pipeline receiver closes.
+
+The cell records completed episode count, completed total, completed maximum, and the
+active episode's monotonic start separately. Runtime live, stats, and final snapshots
+read the cell directly: cumulative fields include completed episodes only, while
+`active_for` reports current elapsed time. Completion folds that duration into the
+cumulative fields once. This accounting starts at the first `Full`, so episodes below
+the warning threshold are still counted.
+
+At ADR-007's established threshold, the reader makes at most one best-effort
+`ReceptionStalled` notice attempt before its next retry, including a retry that
+succeeds. If that transport notice is dropped, its warning diagnostic and runtime
+event are omitted; if the notice arrives but runtime event delivery is full, only the
+event is omitted. These advisory omissions cannot change the authoritative metrics.
+The measurements provide risk context but do not guarantee detection or quantify lost
+bytes.
 
 ---
 
@@ -2201,7 +2265,9 @@ The pipeline records one total synchronous ingest duration around the stages abo
 plus post-read-to-entry handoff delay, cumulative chunk shape, and queue high-water
 marks (§91.2). It does not place separate clock reads around each minor stage unless
 the aggregate later demonstrates a need. Histogram updates are fixed-memory and no
-per-chunk timing event is emitted.
+per-chunk timing event is emitted. `wiredata-telemetry` supplies only the bounded
+duration histogram and recent-window primitives; these measurement boundaries and the
+enclosing Listener stats, snapshot, and completed-run report types remain local.
 
 ## 103. Ownership Principle
 
@@ -2220,10 +2286,14 @@ Transport owns:
 - TCP listener sockets
 - TCP connection sockets
 - Transport receive buffers
+- The per-open Serial stall-state cell and its episode begin/complete boundaries
 
 Transport outputs `ReceivedData` (defined in §138). Each chunk carries its
 payload and a `ChunkTime` capture (monotonic + wall clock) taken when the chunk
-was read.
+was read. Runtime may hold a read-only clone of the Serial stall-state cell to derive
+snapshots; production mutation remains owned by the blocking reader. Synchronization
+shall preserve the measured values if its lock is poisoned and shall never remain
+held across transport I/O, retry sleep, or queue waiting.
 
 ## 105. Extractor Ownership
 
@@ -2457,8 +2527,11 @@ ADR-010 removed Listener's decoder and its original dependency. v2.2 adds a narr
 scoped construction-only dependency for ZDA Mark presentation text (ADR-025); it does
 not restore decoding (§29).
 
-The sibling internal `wiredata-timing` crate owns only the refcounted Windows timer-
-resolution mechanism shared with Talker (ADR-030). Listener's deadlines, telemetry,
+The sibling internal crates stay narrow: `wiredata-ui` owns shared egui-only chrome
+(ADR-019), `wiredata-timing` owns the refcounted Windows timer-resolution mechanism
+(ADR-030), and the dependency-free `wiredata-telemetry` owns the fixed duration
+histogram plus bounded recent-window engine (ADR-032). Listener's GUI layouts and view
+models, deadline policy, telemetry measurement boundaries and application aggregates,
 configuration, and runtime remain in the `listener` crate.
 
 ```text
@@ -2482,6 +2555,9 @@ wiredata/                    # workspace root
       runtime/               # → listener-runtime
       cli/                   # → listener-cli (presentation only)
       gui/                   # → listener-gui (presentation only)
+  wiredata-ui/               # shared egui-only chrome
+  wiredata-timing/           # shared process timer-resolution mechanism
+  wiredata-telemetry/        # shared dependency-free duration primitives
 ```
 
 The `lib.rs` + thin-`main.rs` shape matches `talker`'s convention (talker ADR-014):
@@ -2499,7 +2575,7 @@ The boundaries below are normative regardless of whether each lives in its own c
 Owns:
 
 - Common types
-- `ReceivedData` / `ChunkTime`
+- `ChunkTime`
 - Channel IDs
 - State enums
 - Shared errors
@@ -2518,6 +2594,8 @@ Owns:
 - UDP transport
 - TCP listener transport
 - TCP connection transport
+- `ReceivedData`
+- Per-open Serial stall state and reader-side episode measurement boundaries
 
 Does not know about:
 
@@ -2588,6 +2666,12 @@ Owns orchestration:
 - Shutdown
 - Fan-out
 - Backpressure policy
+- Application-specific telemetry aggregates, pipeline/timer measurement boundaries,
+  snapshots of transport-owned scalar state, and completed-run summaries
+
+It uses `wiredata-telemetry` only for the fixed duration histogram and bounded recent-
+window engine, and `wiredata-timing` only for process timer-resolution mechanics.
+Runtime policy and schemas stay local.
 
 ### listener-cli and listener-gui  (`src/cli/`, `src/gui/`)
 
@@ -2595,7 +2679,8 @@ Presentation layers only.
 
 They issue commands and observe runtime state.
 
-They do not implement core behavior.
+They do not implement core behavior. Shared egui-only chrome comes from
+`wiredata-ui`; Listener-specific layouts and view models remain here.
 
 ---
 
@@ -2709,8 +2794,8 @@ pub enum RuntimeEvent {
     ChannelStarted(ChannelId),
     ChannelStopped(ChannelId),
     ChannelFaulted(ChannelId),
-    RecordingFaulted(ChannelId),
-    RecordingStarted(ChannelId),              // a Raw recording began OK (§50.2); lets observers clear a prior fault
+    RecordingFaulted(ChannelId, RecordingTap),
+    RecordingStarted(ChannelId, RecordingTap), // one recording lane began OK (§50.2); clears that lane's prior fault
     WarningRaised(ChannelId),
     TcpClientConnected(ChannelId),
     TcpClientDisconnected(ChannelId),
@@ -2725,6 +2810,14 @@ pub enum RuntimeEvent {
     RecordingStoppedLowDisk(ChannelId),
 }
 ```
+
+`ReceptionStalled` is advisory rather than authoritative state. The Serial reader
+makes at most one best-effort transport-notice attempt for a threshold-reaching
+episode. If that notice is dropped, neither its retained warning diagnostic nor this
+runtime event is created; if only event delivery is full, the diagnostic remains but
+the event is omitted. Observers shall poll the Channel snapshot for completed stall
+aggregates and separate active elapsed time. Notice or event loss shall not change
+those metrics.
 
 ---
 
@@ -2901,8 +2994,9 @@ Recommended `.vscode/settings.json`:
 
 Recommended implementation order (v2.0; for the v1→v2 strip, follow ADR-010's build order):
 
-1. `listener-core` (`ReceivedData`, `ChunkTime`, channel IDs/states)
-2. transport contracts + queue/backpressure tests (the single backpressure edge, §99)
+1. `listener-core` (`ChunkTime`, channel IDs/states)
+2. transport contracts + `ReceivedData` + queue/backpressure tests (the single
+   backpressure edge, §99)
 3. `listener-runtime` stream pipeline skeleton (fan-out, failure isolation)
 4. byte-bounded retention / stream scrollback
 5. UDP transport
@@ -2962,6 +3056,18 @@ _Removed in v2.0. There is no NMEA decoder to test (§29); NMEA data is exercise
 
 Backpressure tests shall verify:
 
+- A full Serial handoff preserves the pending block and stream order while bounded
+  retries observe cancellation.
+- Authoritative Serial stall state opens on the first `Full`, counts sub-threshold
+  episodes, reports active elapsed time separately from completed aggregates, and
+  completes exactly once on send success, cancellation, or receiver close.
+- Stall-state synchronization recovers measured values after lock poisoning and
+  never holds the state lock across retry sleep or transport I/O.
+- A threshold-reaching retry makes at most one best-effort warning attempt, including
+  when that retry succeeds; saturated notice or event queues may omit advisory output
+  without changing stall metrics.
+- Normal retry-loop exits finalize active state exactly once, and subsequent pipeline
+  snapshots expose the completed totals with no active episode.
 - Display/scrollback queue overflow does not stop reception.
 - Recording failure faults recording but not reception.
 - Stream-scrollback eviction is byte-bounded and preserves order.
@@ -3020,7 +3126,8 @@ Raw Display shall show actual data only and shall not insert structure of its ow
 - Rolling throughput and last-data time (§166)
 - Cumulative and recent handoff, ingest-processing, and Idle-lateness summaries
 - Chunk size/inter-read-gap shape and ingest/Raw-recorder queue peaks
-- Applicable Serial stall, UDP drop-counter, arrival-source, and Idle timer-policy facts
+- Applicable completed Serial stall episode count/total/maximum plus separate active
+  elapsed time, UDP drop-counter, arrival-source, and Idle timer-policy facts
 - One retained completed-run summary with an on-click clipboard report
 
 Recording timestamps (§57), when enabled, use the per-chunk arrival time (§26).

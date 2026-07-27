@@ -498,6 +498,24 @@ mod tests {
         };
         assert_eq!(received.received_at.wall_clock_source, expected_source);
 
+        #[cfg(target_os = "linux")]
+        {
+            // This deliberately checks only gross plausibility. SO_TIMESTAMPNS is
+            // software, datagram-granular wall-clock metadata, not an accuracy
+            // promise; a wide bound still catches an epoch/size/alignment decode
+            // error without making normal scheduler delay part of the contract.
+            let now = SystemTime::now();
+            let distance = received
+                .received_at
+                .wall_clock
+                .duration_since(now)
+                .unwrap_or_else(|before| before.duration());
+            assert!(
+                distance <= Duration::from_secs(60),
+                "kernel receive timestamp was implausibly far from now: {distance:?}"
+            );
+        }
+
         cancel.cancel();
         assert!(matches!(handle.join().await, TransportOutcome::Cancelled));
     }

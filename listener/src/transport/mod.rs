@@ -26,6 +26,7 @@ pub mod serial;
 pub mod tcp;
 pub mod udp;
 
+pub(crate) use serial::SerialStallState;
 pub use serial::{
     OpenSerialTransport, SerialControlCommand, SerialControlHooks, SerialControlLines,
     SerialTransport,
@@ -105,15 +106,6 @@ pub enum TransportOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TransportNotice {
-    /// Cumulative Serial Transport-to-Pipeline stall summary. A zero summary is
-    /// emitted when the receive loop starts so observers know the counter applies;
-    /// later summaries replace it and recover naturally if an advisory update drops.
-    SerialStallSummary {
-        channel_id: ChannelId,
-        episodes: u64,
-        total: Duration,
-        max: Duration,
-    },
     /// The reader stalled on the Transport→Pipeline edge — the only edge that may
     /// backpressure the reader (§97.1, §99) — for `stalled_for`. Long enough to
     /// risk a UART/driver overrun: possible transport-specific loss, unquantifiable
@@ -174,10 +166,10 @@ impl TransportJoinHandle {
 
 /// A data-bearing transport: Serial, UDP, or TCP connection (§138).
 ///
-/// Serial runs its body on a dedicated OS thread (sending via
-/// `Sender::blocking_send`); UDP/TCP run as Tokio tasks. `run` consumes the
-/// runner, so transports are dispatched by value (e.g. via an enum), not as
-/// `dyn` trait objects.
+/// Serial runs its body on a dedicated OS thread, preserving a pending block
+/// with bounded `try_send` retries while the queue is full; UDP/TCP run as
+/// Tokio tasks. `run` consumes the runner, so transports are dispatched by
+/// value (e.g. via an enum), not as `dyn` trait objects.
 pub trait DataTransportRunner {
     fn run(self, out: Sender<ReceivedData>, cancel: CancellationToken) -> TransportJoinHandle;
 }

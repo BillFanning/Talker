@@ -50,7 +50,7 @@ use crate::record::{
     OverwritePolicy, RawFileRecorder, Recording, RecordingStopReason, RotatingDisplayRecorder,
     RotatingRawRecorder,
 };
-use crate::transport::{ReceivedData, TransportNotice};
+use crate::transport::{ReceivedData, SerialStallState, TransportNotice};
 
 use super::queue::DropOldestQueue;
 
@@ -250,9 +250,8 @@ pub struct ChannelPipeline {
     chunk_shape: ChunkShape,
     last_read_completed_at: Option<Instant>,
     transport_health: TransportHealth,
-    /// Start inferred from a live Serial stall warning. The cumulative transport
-    /// summary replaces it when the queue accepts again.
-    serial_stall_active_since: Option<Instant>,
+    /// Reader-owned Serial stall truth. `None` for non-Serial transports.
+    serial_stall_state: Option<SerialStallState>,
     /// Idle-rule firing lateness against each rule's monotonic deadline.
     rule_timer_lateness: DurationHistogram,
     recent_rule_timer_lateness: RecentDurationHistogram,
@@ -371,7 +370,7 @@ impl ChannelPipeline {
             chunk_shape: ChunkShape::default(),
             last_read_completed_at: None,
             transport_health: TransportHealth::default(),
-            serial_stall_active_since: None,
+            serial_stall_state: None,
             rule_timer_lateness: DurationHistogram::default(),
             recent_rule_timer_lateness: RecentDurationHistogram::default(),
             idle_deadline_timer: IdleDeadlineTimerSummary::default(),
@@ -464,6 +463,12 @@ impl ChannelPipeline {
     /// lives in recording/diagnostics, not the event stream.
     pub fn with_event_sender(mut self, events: Sender<RuntimeEvent>) -> Self {
         self.events = Some(events);
+        self
+    }
+
+    /// Attach the Serial reader's per-run authoritative stall state.
+    pub(crate) fn with_serial_stall_state(mut self, state: SerialStallState) -> Self {
+        self.serial_stall_state = Some(state);
         self
     }
 
@@ -1180,7 +1185,8 @@ impl ChannelPipeline {
         let Some(settings) = self.display_recording_settings.clone() else {
             self.display_begin_faulted = true;
             self.diagnostics.record(Diagnostic::error(
-                "can't begin Display recording: no destination is set — set one in the                  Record Display setup, then press Record again",
+                "can't begin Display recording: no destination is set — set one in the \
+                 Record Display setup, then press Record again",
             ));
             if let Some(events) = &self.events {
                 let _ = events.try_send(RuntimeEvent::RecordingFaulted(
@@ -1265,30 +1271,10 @@ impl ChannelPipeline {
     /// §137 event paired in one place.
     pub fn record_notice(&mut self, notice: TransportNotice) {
         match notice {
-            TransportNotice::SerialStallSummary {
-                channel_id: _,
-                episodes,
-                total,
-                max,
-            } => {
-                self.transport_health.serial_stalls = Some(SerialStallSummary {
-                    episodes,
-                    total,
-                    max,
-                    active: false,
-                });
-                self.serial_stall_active_since = None;
-            }
             TransportNotice::ReceptionStalled {
                 channel_id,
                 stalled_for,
             } => {
-                self.transport_health.serial_stalls.get_or_insert_default();
-                self.serial_stall_active_since.get_or_insert_with(|| {
-                    Instant::now()
-                        .checked_sub(stalled_for)
-                        .unwrap_or_else(Instant::now)
-                });
                 self.diagnostics.record(Diagnostic::warning(format!(
                     "reception stalled {} ms on channel {channel_id}; possible transport-specific \
                      loss (UART/driver overrun) — lost byte count is not observable (§101)",
@@ -1331,13 +1317,16 @@ impl ChannelPipeline {
 
     fn transport_health_at(&self, now: Instant) -> TransportHealth {
         let mut health = self.transport_health;
-        if let Some(started) = self.serial_stall_active_since {
-            let elapsed = now.saturating_duration_since(started);
-            let summary = health.serial_stalls.get_or_insert_default();
-            summary.episodes = summary.episodes.saturating_add(1);
-            summary.total = summary.total.saturating_add(elapsed);
-            summary.max = summary.max.max(elapsed);
-            summary.active = true;
+        if let Some(state) = &self.serial_stall_state {
+            let stalls = state.snapshot();
+            health.serial_stalls = Some(SerialStallSummary {
+                episodes: stalls.completed_episodes,
+                total: stalls.completed_total,
+                max: stalls.completed_max,
+                active_for: stalls
+                    .active_since
+                    .map(|started| now.saturating_duration_since(started)),
+            });
         }
         health
     }
@@ -2421,37 +2410,70 @@ mod tests {
     }
 
     #[test]
-    fn transport_health_distinguishes_active_serial_stalls_and_udp_support() {
+    fn saturated_event_queue_omits_stall_event_but_keeps_diagnostic_and_metrics() {
         let cid = ChannelId::new();
-        let mut p = pipeline(cid, PipelineCapacities::default());
-        p.record_notice(TransportNotice::SerialStallSummary {
-            channel_id: cid,
-            episodes: 0,
-            total: Duration::ZERO,
-            max: Duration::ZERO,
-        });
-        assert_eq!(
-            p.snapshot().transport_health.serial_stalls,
-            Some(SerialStallSummary::default())
-        );
+        let stall_state = SerialStallState::default();
+        let started = Instant::now();
+        assert!(stall_state.begin_at(started));
+        assert!(stall_state.finish_at(started + Duration::from_millis(25)));
+
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(1);
+        events_tx
+            .try_send(RuntimeEvent::WarningRaised(cid))
+            .unwrap();
+        let mut p = pipeline(cid, PipelineCapacities::default())
+            .with_serial_stall_state(stall_state)
+            .with_event_sender(events_tx);
+        let before = p.stats().transport_health.serial_stalls;
 
         p.record_notice(TransportNotice::ReceptionStalled {
             channel_id: cid,
             stalled_for: Duration::from_millis(750),
         });
-        let active = p.snapshot().transport_health.serial_stalls.unwrap();
-        assert!(active.active);
-        assert_eq!(active.episodes, 1);
-        assert!(active.total >= Duration::from_millis(750));
 
-        p.record_notice(TransportNotice::SerialStallSummary {
-            channel_id: cid,
-            episodes: 1,
-            total: Duration::from_millis(800),
-            max: Duration::from_millis(800),
-        });
+        assert!(p
+            .snapshot()
+            .diagnostics
+            .warnings
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("reception stalled 750 ms")));
+        assert_eq!(
+            events_rx.try_recv(),
+            Ok(RuntimeEvent::WarningRaised(cid)),
+            "the pre-existing event should remain the only queued event"
+        );
+        assert!(
+            events_rx.try_recv().is_err(),
+            "the advisory stall event must drop rather than block on saturation"
+        );
+        assert_eq!(
+            p.stats().transport_health.serial_stalls,
+            before,
+            "advisory event loss must not alter authoritative stall metrics"
+        );
+    }
+
+    #[test]
+    fn transport_health_distinguishes_active_serial_stalls_and_udp_support() {
+        let cid = ChannelId::new();
+        let stall_state = SerialStallState::default();
+        let mut p = pipeline(cid, PipelineCapacities::default())
+            .with_serial_stall_state(stall_state.clone());
+        assert_eq!(
+            p.snapshot().transport_health.serial_stalls,
+            Some(SerialStallSummary::default())
+        );
+
+        let started = Instant::now();
+        assert!(stall_state.begin_at(started));
+        let active = p.snapshot().transport_health.serial_stalls.unwrap();
+        assert!(active.active_for.is_some());
+        assert_eq!(active.episodes, 0);
+        assert_eq!(active.total, Duration::ZERO);
+
+        assert!(stall_state.finish_at(started + Duration::from_millis(800)));
         let completed = p.snapshot().transport_health.serial_stalls.unwrap();
-        assert!(!completed.active);
+        assert_eq!(completed.active_for, None);
         assert_eq!(completed.episodes, 1);
         assert_eq!(completed.total, Duration::from_millis(800));
 
@@ -3333,6 +3355,25 @@ mod tests {
             "only the toggled span is recorded: {written:?}"
         );
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn display_begin_without_destination_reports_clean_setup_instruction() {
+        let cid = ChannelId::new();
+        let mut p = pipeline(cid, PipelineCapacities::default());
+
+        p.set_display_recording(true, None).await;
+
+        assert_eq!(p.display_recording_state(), Some(RecordingState::Faulted));
+        let error = p
+            .diagnostics()
+            .errors()
+            .last()
+            .expect("missing destination should report an error");
+        assert_eq!(
+            error.message,
+            "can't begin Display recording: no destination is set — set one in the Record Display setup, then press Record again"
+        );
     }
 
     #[tokio::test]

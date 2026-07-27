@@ -284,7 +284,7 @@ fn write_transport_health(out: &mut String, health: TransportHealth) {
         let _ = writeln!(out, "serial_stall_episodes={}", stalls.episodes);
         let _ = writeln!(out, "serial_stall_total_us={}", stalls.total.as_micros());
         let _ = writeln!(out, "serial_stall_max_us={}", stalls.max.as_micros());
-        let _ = writeln!(out, "serial_stall_active={}", stalls.active);
+        let _ = writeln!(out, "serial_stall_active={}", stalls.active_for.is_some());
     } else {
         let _ = writeln!(out, "serial_stall_episodes=not_applicable");
     }
@@ -353,7 +353,7 @@ mod tests {
                     episodes: 1,
                     total: Duration::from_millis(5),
                     max: Duration::from_millis(5),
-                    active: false,
+                    active_for: None,
                 }),
                 udp_kernel_drops: CounterAvailability::Available(4),
                 arrival_timestamps: arrivals,

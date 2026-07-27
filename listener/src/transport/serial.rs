@@ -30,7 +30,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::{ChannelId, ChunkTime, RuntimeEvent};
+use crate::core::{lock_recover, ChannelId, ChunkTime, RuntimeEvent};
 
 use super::{
     DataTransportRunner, ReceivedData, ReceivedPayload, TransportJoinHandle, TransportNotice,
@@ -51,6 +51,62 @@ pub struct SerialControlLines {
     pub ri: bool,
 }
 
+/// Authoritative Serial Transport-to-Pipeline backpressure for one channel run.
+///
+/// Completed totals and the active episode are deliberately separate: a snapshot
+/// can show the exact completed history alongside the elapsed time of the current
+/// stall without pretending that an unfinished episode has already completed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SerialStallStateSnapshot {
+    pub(crate) completed_episodes: u64,
+    pub(crate) completed_total: Duration,
+    pub(crate) completed_max: Duration,
+    pub(crate) active_since: Option<Instant>,
+}
+
+/// Shared reader-owned Serial stall state.
+///
+/// The blocking reader updates this cell only at stall boundaries. Runtime
+/// snapshots read it directly, so dropping an advisory warning cannot corrupt
+/// cumulative totals or leave an episode looking active forever.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SerialStallState {
+    inner: Arc<Mutex<SerialStallStateSnapshot>>,
+}
+
+impl SerialStallState {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SerialStallStateSnapshot> {
+        lock_recover(&self.inner)
+    }
+
+    /// Begin a stall if none is active. Returns whether this call opened it.
+    pub(crate) fn begin_at(&self, now: Instant) -> bool {
+        let mut state = self.lock();
+        if state.active_since.is_some() {
+            return false;
+        }
+        state.active_since = Some(now);
+        true
+    }
+
+    /// Complete the active stall exactly once. Returns whether one was active.
+    pub(crate) fn finish_at(&self, now: Instant) -> bool {
+        let mut state = self.lock();
+        let Some(started) = state.active_since.take() else {
+            return false;
+        };
+        let elapsed = now.saturating_duration_since(started);
+        state.completed_episodes = state.completed_episodes.saturating_add(1);
+        state.completed_total = state.completed_total.saturating_add(elapsed);
+        state.completed_max = state.completed_max.max(elapsed);
+        true
+    }
+
+    pub(crate) fn snapshot(&self) -> SerialStallStateSnapshot {
+        *self.lock()
+    }
+}
+
 /// A live control-line command to a running serial Channel (§161).
 #[derive(Clone, Copy, Debug)]
 pub enum SerialControlCommand {
@@ -66,6 +122,15 @@ pub struct SerialControlHooks {
     pub commands: Receiver<SerialControlCommand>,
     pub state: Arc<Mutex<SerialControlLines>>,
     pub events: Sender<RuntimeEvent>,
+}
+
+/// Reader-side observation and control hooks kept together so the receive loop's
+/// transport inputs stay distinct from its optional runtime integrations.
+#[derive(Default)]
+struct SerialReceiveHooks {
+    notices: Option<Sender<TransportNotice>>,
+    control: Option<SerialControlHooks>,
+    stall_state: SerialStallState,
 }
 
 /// Read buffer size for one blocking read. A serial read returns whatever bytes
@@ -211,6 +276,7 @@ impl SerialTransport {
             port,
             notices: None,
             control: None,
+            stall_state: SerialStallState::default(),
         })
     }
 }
@@ -227,6 +293,9 @@ pub struct OpenSerialTransport {
     /// Optional live control-line hooks (§161): command inbox + state cell + event
     /// sink. When set, the reader services RTS/DTR commands and polls input lines.
     control: Option<SerialControlHooks>,
+    /// Exact per-run Transport-to-Pipeline stall state. The reader owns updates;
+    /// runtime snapshots hold a clone and read it directly.
+    stall_state: SerialStallState,
 }
 
 impl OpenSerialTransport {
@@ -251,6 +320,11 @@ impl OpenSerialTransport {
         self.control = Some(control);
         self
     }
+
+    /// Clone the authoritative per-run stall-state cell for runtime snapshots.
+    pub(crate) fn stall_state(&self) -> SerialStallState {
+        self.stall_state.clone()
+    }
 }
 
 impl DataTransportRunner for OpenSerialTransport {
@@ -259,18 +333,23 @@ impl DataTransportRunner for OpenSerialTransport {
         let channel_id = self.channel_id;
         let notices = self.notices;
         let control = self.control;
+        let stall_state = self.stall_state;
         let reader = SerialReader { port: self.port };
         let spawned = std::thread::Builder::new()
             .name("serial-rx".to_string())
             .spawn(move || {
+                let receive_hooks = SerialReceiveHooks {
+                    notices,
+                    control,
+                    stall_state,
+                };
                 let outcome = run_blocking_receive_loop(
                     channel_id,
                     reader,
                     out,
                     cancel,
                     STALL_WARNING,
-                    notices,
-                    control,
+                    receive_hooks,
                 );
                 // Report the outcome to the async side (never blocks a worker).
                 let _ = done_tx.send(outcome);
@@ -364,20 +443,9 @@ fn run_blocking_receive_loop(
     out: Sender<ReceivedData>,
     cancel: CancellationToken,
     stall_warning: Duration,
-    notices: Option<Sender<TransportNotice>>,
-    mut control: Option<SerialControlHooks>,
+    mut hooks: SerialReceiveHooks,
 ) -> TransportOutcome {
     let mut buf = vec![0u8; READ_BUFFER];
-    let mut stall_episodes = 0u64;
-    let mut total_stalled = Duration::ZERO;
-    let mut max_stall = Duration::ZERO;
-    report_serial_stalls(
-        &notices,
-        channel_id,
-        stall_episodes,
-        total_stalled,
-        max_stall,
-    );
     // Live control-line state (§161), tracked across the session.
     let mut lines = SerialControlLines::default();
     // First input-line poll happens immediately (initial state), then throttled.
@@ -390,7 +458,7 @@ fn run_blocking_receive_loop(
         // Live control lines (§161): apply pending RTS/DTR commands every pass and
         // poll the input lines at a bounded cadence between reads, so this never
         // interferes with reception (§100) nor floods the driver with ioctls.
-        if let Some(ctl) = control.as_mut() {
+        if let Some(ctl) = hooks.control.as_mut() {
             service_control_lines(
                 &mut reader,
                 ctl,
@@ -420,67 +488,20 @@ fn run_blocking_receive_loop(
                     Ok(()) => {}
                     Err(TrySendError::Closed(_)) => return TransportOutcome::Completed,
                     Err(TrySendError::Full(data)) => {
-                        let stalled_at = Instant::now();
-                        let mut pending = data;
-                        let mut warned = false;
-                        loop {
-                            if cancel.is_cancelled() {
-                                finish_serial_stall(
-                                    &notices,
-                                    channel_id,
-                                    stalled_at,
-                                    &mut stall_episodes,
-                                    &mut total_stalled,
-                                    &mut max_stall,
-                                );
+                        match retry_stalled_send(
+                            channel_id,
+                            &out,
+                            &cancel,
+                            data,
+                            stall_warning,
+                            &hooks.notices,
+                            &hooks.stall_state,
+                        ) {
+                            StalledSendOutcome::Sent => {}
+                            StalledSendOutcome::Cancelled => {
                                 return TransportOutcome::Cancelled;
                             }
-                            std::thread::sleep(STALL_POLL);
-                            match out.try_send(pending) {
-                                Ok(()) => {
-                                    finish_serial_stall(
-                                        &notices,
-                                        channel_id,
-                                        stalled_at,
-                                        &mut stall_episodes,
-                                        &mut total_stalled,
-                                        &mut max_stall,
-                                    );
-                                    break;
-                                }
-                                Err(TrySendError::Closed(_)) => {
-                                    finish_serial_stall(
-                                        &notices,
-                                        channel_id,
-                                        stalled_at,
-                                        &mut stall_episodes,
-                                        &mut total_stalled,
-                                        &mut max_stall,
-                                    );
-                                    return TransportOutcome::Completed;
-                                }
-                                Err(TrySendError::Full(again)) => {
-                                    pending = again;
-                                    // A sustained stall risks a UART/driver overrun
-                                    // upstream of us — transport-specific loss we flag
-                                    // but cannot quantify (§101); once per episode,
-                                    // non-blocking (we never block the reader to
-                                    // deliver a stall warning). Momentary backpressure
-                                    // that drains fast never reaches the threshold.
-                                    let waited = stalled_at.elapsed();
-                                    if !warned && waited >= stall_warning {
-                                        if let Some(notices) = &notices {
-                                            let _ = notices.try_send(
-                                                TransportNotice::ReceptionStalled {
-                                                    channel_id,
-                                                    stalled_for: waited,
-                                                },
-                                            );
-                                        }
-                                        warned = true;
-                                    }
-                                }
-                            }
+                            StalledSendOutcome::Closed => return TransportOutcome::Completed,
                         }
                     }
                 }
@@ -492,36 +513,68 @@ fn run_blocking_receive_loop(
     }
 }
 
-fn finish_serial_stall(
-    notices: &Option<Sender<TransportNotice>>,
-    channel_id: ChannelId,
-    stalled_at: Instant,
-    episodes: &mut u64,
-    total: &mut Duration,
-    max: &mut Duration,
-) {
-    let elapsed = stalled_at.elapsed();
-    *episodes = episodes.saturating_add(1);
-    *total = total.saturating_add(elapsed);
-    *max = (*max).max(elapsed);
-    report_serial_stalls(notices, channel_id, *episodes, *total, *max);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StalledSendOutcome {
+    Sent,
+    Cancelled,
+    Closed,
 }
 
-fn report_serial_stalls(
-    notices: &Option<Sender<TransportNotice>>,
+/// Retry one block after the Transport-to-Pipeline queue first reports Full.
+///
+/// The state transition is centralized here: the episode becomes active before
+/// the first retry and is completed once after every exit from the retry loop.
+fn retry_stalled_send(
     channel_id: ChannelId,
-    episodes: u64,
-    total: Duration,
-    max: Duration,
-) {
-    if let Some(notices) = notices {
-        let _ = notices.try_send(TransportNotice::SerialStallSummary {
-            channel_id,
-            episodes,
-            total,
-            max,
-        });
-    }
+    out: &Sender<ReceivedData>,
+    cancel: &CancellationToken,
+    mut pending: ReceivedData,
+    stall_warning: Duration,
+    notices: &Option<Sender<TransportNotice>>,
+    stall_state: &SerialStallState,
+) -> StalledSendOutcome {
+    let stalled_at = Instant::now();
+    let opened = stall_state.begin_at(stalled_at);
+    debug_assert!(opened, "serial reader opened a nested stall episode");
+    let mut warned = false;
+    let outcome = loop {
+        if cancel.is_cancelled() {
+            break StalledSendOutcome::Cancelled;
+        }
+        std::thread::sleep(STALL_POLL);
+        if cancel.is_cancelled() {
+            break StalledSendOutcome::Cancelled;
+        }
+
+        // Test the threshold before the retry. If this retry succeeds just
+        // after the threshold, the episode still lasted long enough to
+        // warrant the advisory warning.
+        let waited = stalled_at.elapsed();
+        if !warned && waited >= stall_warning {
+            if let Some(notices) = notices {
+                let _ = notices.try_send(TransportNotice::ReceptionStalled {
+                    channel_id,
+                    stalled_for: waited,
+                });
+            }
+            warned = true;
+        }
+
+        match out.try_send(pending) {
+            Ok(()) => break StalledSendOutcome::Sent,
+            Err(TrySendError::Closed(_)) => break StalledSendOutcome::Closed,
+            Err(TrySendError::Full(again)) => {
+                pending = again;
+                // A sustained stall risks a UART/driver overrun upstream of us —
+                // transport-specific loss we flag but cannot quantify (§101).
+                // The shared state remains authoritative even if this
+                // once-per-episode, non-blocking notice attempt is dropped.
+            }
+        }
+    };
+    let completed = stall_state.finish_at(Instant::now());
+    debug_assert!(completed, "serial reader lost its active stall episode");
+    outcome
 }
 
 /// Apply any pending RTS/DTR commands and poll the input lines (§161). On any
@@ -565,9 +618,9 @@ fn service_control_lines(
         }
     }
     if changed {
-        if let Ok(mut guard) = ctl.state.lock() {
-            *guard = *lines;
-        }
+        // Recover a poisoned cell rather than skipping the write: dropping a
+        // live line change would freeze the panel on stale values (`core::sync`).
+        *lock_recover(&ctl.state) = *lines;
         let _ = ctl
             .events
             .try_send(RuntimeEvent::ControlLinesChanged(channel_id));
@@ -578,7 +631,108 @@ fn service_control_lines(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use tokio::sync::mpsc;
+
+    async fn wait_for_active_stall(state: &SerialStallState) -> SerialStallStateSnapshot {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = state.snapshot();
+                if snapshot.active_since.is_some() {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("serial stall should become active")
+    }
+
+    async fn wait_for_completed_stalls(
+        state: &SerialStallState,
+        episodes: u64,
+    ) -> SerialStallStateSnapshot {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = state.snapshot();
+                if snapshot.completed_episodes >= episodes && snapshot.active_since.is_none() {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("serial stall should complete")
+    }
+
+    #[test]
+    fn stall_state_keeps_active_episode_separate_until_completion() {
+        let state = SerialStallState::default();
+        let started = Instant::now();
+
+        assert!(state.begin_at(started));
+        assert!(!state.begin_at(started + Duration::from_millis(1)));
+        assert_eq!(
+            state.snapshot(),
+            SerialStallStateSnapshot {
+                completed_episodes: 0,
+                completed_total: Duration::ZERO,
+                completed_max: Duration::ZERO,
+                active_since: Some(started),
+            }
+        );
+
+        assert!(state.finish_at(started + Duration::from_millis(7)));
+        assert!(!state.finish_at(started + Duration::from_millis(9)));
+        assert_eq!(
+            state.snapshot(),
+            SerialStallStateSnapshot {
+                completed_episodes: 1,
+                completed_total: Duration::from_millis(7),
+                completed_max: Duration::from_millis(7),
+                active_since: None,
+            }
+        );
+    }
+
+    #[test]
+    fn stall_state_accumulates_multiple_including_subthreshold_episodes() {
+        let state = SerialStallState::default();
+        let started = Instant::now();
+
+        assert!(state.begin_at(started));
+        assert!(state.finish_at(started + Duration::from_millis(2)));
+        assert!(state.begin_at(started + Duration::from_millis(10)));
+        assert!(state.finish_at(started + Duration::from_millis(15)));
+
+        assert_eq!(
+            state.snapshot(),
+            SerialStallStateSnapshot {
+                completed_episodes: 2,
+                completed_total: Duration::from_millis(7),
+                completed_max: Duration::from_millis(5),
+                active_since: None,
+            }
+        );
+    }
+
+    #[test]
+    fn stall_state_recovers_authoritative_values_after_mutex_poisoning() {
+        let state = SerialStallState::default();
+        let started = Instant::now();
+        assert!(state.begin_at(started));
+
+        let poisoned = state.clone();
+        let _ = catch_unwind(AssertUnwindSafe(move || {
+            let _guard = poisoned.inner.lock().unwrap();
+            panic!("poison the serial stall state");
+        }));
+
+        assert!(state.finish_at(started + Duration::from_millis(3)));
+        assert_eq!(state.snapshot().completed_episodes, 1);
+        assert_eq!(state.snapshot().completed_total, Duration::from_millis(3));
+        assert_eq!(state.snapshot().active_since, None);
+    }
 
     /// A [`BlockingReader`] that replays a script of reads, then behaves like an
     /// idle port: a brief sleep + `Ok(0)` (timeout) so the loop polls cancel.
@@ -664,8 +818,10 @@ mod tests {
                 tx,
                 loop_cancel,
                 STALL_WARNING,
-                None,
-                Some(hooks),
+                SerialReceiveHooks {
+                    control: Some(hooks),
+                    ..SerialReceiveHooks::default()
+                },
             )
         });
 
@@ -744,8 +900,10 @@ mod tests {
                 tx,
                 loop_cancel,
                 STALL_WARNING,
-                None,
-                Some(hooks),
+                SerialReceiveHooks {
+                    control: Some(hooks),
+                    ..SerialReceiveHooks::default()
+                },
             )
         });
 
@@ -771,8 +929,14 @@ mod tests {
         let (done_tx, done_rx) = oneshot::channel();
         let loop_cancel = cancel.clone();
         std::thread::spawn(move || {
-            let outcome =
-                run_blocking_receive_loop(cid, reader, tx, loop_cancel, STALL_WARNING, None, None);
+            let outcome = run_blocking_receive_loop(
+                cid,
+                reader,
+                tx,
+                loop_cancel,
+                STALL_WARNING,
+                SerialReceiveHooks::default(),
+            );
             let _ = done_tx.send(outcome);
         });
 
@@ -805,8 +969,7 @@ mod tests {
                 tx,
                 CancellationToken::new(),
                 STALL_WARNING,
-                None,
-                None,
+                SerialReceiveHooks::default(),
             );
             let _ = done_tx.send(outcome);
         });
@@ -818,14 +981,21 @@ mod tests {
 
     #[tokio::test]
     async fn full_queue_stalls_reader_and_preserves_order() {
-        // Capacity 1 forces `blocking_send` to stall after each chunk.
+        // Capacity 1 forces the bounded retry path to stall after each chunk.
         let (tx, mut rx) = mpsc::channel(1);
         let cancel = CancellationToken::new();
         let cid = ChannelId::new();
         let reader = ScriptedReader::new(vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()]);
         let loop_cancel = cancel.clone();
         std::thread::spawn(move || {
-            run_blocking_receive_loop(cid, reader, tx, loop_cancel, STALL_WARNING, None, None)
+            run_blocking_receive_loop(
+                cid,
+                reader,
+                tx,
+                loop_cancel,
+                STALL_WARNING,
+                SerialReceiveHooks::default(),
+            )
         });
 
         // The reader stalls rather than dropping: all three arrive, in order
@@ -853,6 +1023,8 @@ mod tests {
         let reader = ScriptedReader::new(vec![b"1".to_vec(), b"2".to_vec()]);
         let loop_cancel = cancel.clone();
         let threshold = Duration::from_millis(20);
+        let stall_state = SerialStallState::default();
+        let reader_stall_state = stall_state.clone();
         std::thread::spawn(move || {
             run_blocking_receive_loop(
                 cid,
@@ -860,25 +1032,23 @@ mod tests {
                 tx,
                 loop_cancel,
                 threshold,
-                Some(notice_tx),
-                None,
+                SerialReceiveHooks {
+                    notices: Some(notice_tx),
+                    stall_state: reader_stall_state,
+                    ..SerialReceiveHooks::default()
+                },
             )
         });
 
-        assert!(matches!(
-            notice_rx.recv().await.unwrap(),
-            TransportNotice::SerialStallSummary { episodes: 0, .. }
-        ));
-
-        // Let the reader fill the queue and then stall on the second chunk for
-        // well over the threshold before we start draining.
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");
-        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"2");
-
-        // One warning surfaces while stalled, then a cumulative summary replaces
-        // the zero baseline once the queue accepts again.
-        match notice_rx.recv().await.unwrap() {
+        // Confirm the stall before waiting for its advisory threshold. Keeping
+        // the queue full until the notice arrives avoids scheduler-dependent
+        // sleeps and proves the notice is raised while the episode is active.
+        wait_for_active_stall(&stall_state).await;
+        let notice = tokio::time::timeout(Duration::from_secs(5), notice_rx.recv())
+            .await
+            .expect("sustained stall should raise its advisory notice")
+            .expect("notice sender should remain open");
+        match notice {
             TransportNotice::ReceptionStalled {
                 channel_id,
                 stalled_for,
@@ -888,20 +1058,17 @@ mod tests {
             }
             other => panic!("expected ReceptionStalled, got {other:?}"),
         }
-        match notice_rx.recv().await.unwrap() {
-            TransportNotice::SerialStallSummary {
-                channel_id,
-                episodes,
-                total,
-                max,
-            } => {
-                assert_eq!(channel_id, cid);
-                assert_eq!(episodes, 1);
-                assert!(total >= threshold);
-                assert!(max >= threshold);
-            }
-            other => panic!("expected SerialStallSummary, got {other:?}"),
-        }
+
+        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");
+        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"2");
+
+        // Exact completion comes from the shared state, independently of
+        // notice delivery.
+        let completed = wait_for_completed_stalls(&stall_state, 1).await;
+        assert_eq!(completed.completed_episodes, 1);
+        assert!(completed.completed_total >= threshold);
+        assert_eq!(completed.completed_max, completed.completed_total);
+        assert!(notice_rx.try_recv().is_err());
 
         cancel.cancel();
     }
@@ -921,6 +1088,8 @@ mod tests {
         let threshold = Duration::from_millis(20);
         let (done_tx, done_rx) = oneshot::channel();
         let loop_cancel = cancel.clone();
+        let stall_state = SerialStallState::default();
+        let reader_stall_state = stall_state.clone();
         std::thread::spawn(move || {
             let outcome = run_blocking_receive_loop(
                 cid,
@@ -928,16 +1097,14 @@ mod tests {
                 tx,
                 loop_cancel,
                 threshold,
-                Some(notice_tx),
-                None,
+                SerialReceiveHooks {
+                    notices: Some(notice_tx),
+                    stall_state: reader_stall_state,
+                    ..SerialReceiveHooks::default()
+                },
             );
             let _ = done_tx.send(outcome);
         });
-
-        assert!(matches!(
-            notice_rx.recv().await.unwrap(),
-            TransportNotice::SerialStallSummary { episodes: 0, .. }
-        ));
 
         // Without draining anything, the notice arrives mid-stall.
         let notice = tokio::time::timeout(Duration::from_secs(5), notice_rx.recv())
@@ -954,6 +1121,8 @@ mod tests {
             }
             other => panic!("expected ReceptionStalled, got {other:?}"),
         }
+        let active = wait_for_active_stall(&stall_state).await;
+        assert_eq!(active.completed_episodes, 0);
 
         // Cancel while still stalled: the loop ends as Cancelled, not hung.
         cancel.cancel();
@@ -962,11 +1131,141 @@ mod tests {
             .expect("cancellation must end a stalled reader")
             .unwrap();
         assert!(matches!(outcome, TransportOutcome::Cancelled));
-        assert!(matches!(
-            notice_rx.recv().await.unwrap(),
-            TransportNotice::SerialStallSummary { episodes: 1, .. }
-        ));
+        let completed = wait_for_completed_stalls(&stall_state, 1).await;
+        assert_eq!(completed.completed_episodes, 1);
+        assert!(completed.completed_total >= threshold);
+        assert!(notice_rx.try_recv().is_err());
         drop(rx);
+    }
+
+    #[tokio::test]
+    async fn closing_pipeline_while_stalled_finalizes_the_episode() {
+        let (tx, rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let cid = ChannelId::new();
+        let reader = ScriptedReader::new(vec![b"1".to_vec(), b"2".to_vec()]);
+        let stall_state = SerialStallState::default();
+        let reader_stall_state = stall_state.clone();
+        let (done_tx, done_rx) = oneshot::channel();
+        std::thread::spawn(move || {
+            let outcome = run_blocking_receive_loop(
+                cid,
+                reader,
+                tx,
+                cancel,
+                STALL_WARNING,
+                SerialReceiveHooks {
+                    stall_state: reader_stall_state,
+                    ..SerialReceiveHooks::default()
+                },
+            );
+            let _ = done_tx.send(outcome);
+        });
+
+        wait_for_active_stall(&stall_state).await;
+        drop(rx);
+        assert!(matches!(
+            done_rx.await.unwrap(),
+            TransportOutcome::Completed
+        ));
+        assert_eq!(
+            wait_for_completed_stalls(&stall_state, 1)
+                .await
+                .completed_episodes,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_stall_warning_does_not_affect_authoritative_totals() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (notice_tx, mut notice_rx) = mpsc::channel(1);
+        let cid = ChannelId::new();
+        notice_tx
+            .try_send(TransportNotice::UdpKernelDrops {
+                channel_id: cid,
+                dropped: Some(0),
+            })
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let reader = ScriptedReader::new(vec![b"1".to_vec(), b"2".to_vec()]);
+        let stall_state = SerialStallState::default();
+        let reader_stall_state = stall_state.clone();
+        let loop_cancel = cancel.clone();
+        std::thread::spawn(move || {
+            run_blocking_receive_loop(
+                cid,
+                reader,
+                tx,
+                loop_cancel,
+                Duration::from_millis(10),
+                SerialReceiveHooks {
+                    notices: Some(notice_tx),
+                    stall_state: reader_stall_state,
+                    ..SerialReceiveHooks::default()
+                },
+            )
+        });
+
+        wait_for_active_stall(&stall_state).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");
+        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"2");
+        let completed = wait_for_completed_stalls(&stall_state, 1).await;
+        assert_eq!(completed.completed_episodes, 1);
+        assert!(completed.completed_total >= Duration::from_millis(10));
+        assert!(matches!(
+            notice_rx.try_recv(),
+            Ok(TransportNotice::UdpKernelDrops { .. })
+        ));
+        assert!(notice_rx.try_recv().is_err());
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn read_error_after_completed_stall_preserves_exact_totals() {
+        struct TwoChunksThenError(u8);
+        impl BlockingReader for TwoChunksThenError {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0 < 2 {
+                    buf[0] = b'1' + self.0;
+                    self.0 += 1;
+                    Ok(1)
+                } else {
+                    Err(io::Error::other("device gone"))
+                }
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let stall_state = SerialStallState::default();
+        let reader_stall_state = stall_state.clone();
+        let (done_tx, done_rx) = oneshot::channel();
+        std::thread::spawn(move || {
+            let outcome = run_blocking_receive_loop(
+                ChannelId::new(),
+                TwoChunksThenError(0),
+                tx,
+                CancellationToken::new(),
+                STALL_WARNING,
+                SerialReceiveHooks {
+                    stall_state: reader_stall_state,
+                    ..SerialReceiveHooks::default()
+                },
+            );
+            let _ = done_tx.send(outcome);
+        });
+
+        wait_for_active_stall(&stall_state).await;
+        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"1");
+        assert_eq!(rx.recv().await.unwrap().payload.bytes(), b"2");
+        assert!(matches!(
+            done_rx.await.unwrap(),
+            TransportOutcome::Faulted(_)
+        ));
+        let completed = wait_for_completed_stalls(&stall_state, 1).await;
+        assert_eq!(completed.completed_episodes, 1);
+        assert!(completed.completed_total > Duration::ZERO);
     }
 
     #[tokio::test]
@@ -981,6 +1280,8 @@ mod tests {
         let loop_cancel = cancel.clone();
         // A high threshold the brisk draining below never crosses.
         let threshold = Duration::from_secs(10);
+        let stall_state = SerialStallState::default();
+        let reader_stall_state = stall_state.clone();
         std::thread::spawn(move || {
             run_blocking_receive_loop(
                 cid,
@@ -988,27 +1289,76 @@ mod tests {
                 tx,
                 loop_cancel,
                 threshold,
-                Some(notice_tx),
-                None,
+                SerialReceiveHooks {
+                    notices: Some(notice_tx),
+                    stall_state: reader_stall_state,
+                    ..SerialReceiveHooks::default()
+                },
             )
         });
 
-        assert!(matches!(
-            notice_rx.recv().await.unwrap(),
-            TransportNotice::SerialStallSummary { episodes: 0, .. }
-        ));
-
+        // Synchronize on the reader-owned state so this test cannot
+        // accidentally drain fast enough to avoid backpressure altogether.
+        wait_for_active_stall(&stall_state).await;
         for expected in [b"1", b"2", b"3"] {
             assert_eq!(rx.recv().await.unwrap().payload.bytes(), expected);
         }
+        let completed = wait_for_completed_stalls(&stall_state, 1).await;
+        assert!(completed.completed_episodes >= 1);
+        assert!(completed.completed_total > Duration::ZERO);
         cancel.cancel();
 
         tokio::time::sleep(Duration::from_millis(20)).await;
-        while let Ok(notice) = notice_rx.try_recv() {
-            assert!(
-                matches!(notice, TransportNotice::SerialStallSummary { .. }),
-                "brief backpressure must not raise a warning: {notice:?}"
-            );
-        }
+        assert!(
+            notice_rx.try_recv().is_err(),
+            "brief backpressure must not raise a warning"
+        );
+    }
+
+    #[test]
+    fn first_successful_retry_at_threshold_still_attempts_warning() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let channel_id = ChannelId::new();
+        tx.try_send(ReceivedData {
+            channel_id,
+            received_at: ChunkTime::now(),
+            payload: ReceivedPayload::Bytes(b"first".to_vec()),
+        })
+        .unwrap();
+        let pending = match tx.try_send(ReceivedData {
+            channel_id,
+            received_at: ChunkTime::now(),
+            payload: ReceivedPayload::Bytes(b"pending".to_vec()),
+        }) {
+            Err(TrySendError::Full(pending)) => pending,
+            other => panic!("capacity-one queue should initially be full: {other:?}"),
+        };
+
+        // The consumer frees capacity before the first retry. With a zero
+        // threshold, that successful retry is itself the threshold edge.
+        assert_eq!(rx.try_recv().unwrap().payload.bytes(), b"first");
+        let (notice_tx, mut notice_rx) = mpsc::channel(1);
+        let stall_state = SerialStallState::default();
+        assert_eq!(
+            retry_stalled_send(
+                channel_id,
+                &tx,
+                &CancellationToken::new(),
+                pending,
+                Duration::ZERO,
+                &Some(notice_tx),
+                &stall_state,
+            ),
+            StalledSendOutcome::Sent
+        );
+
+        assert!(matches!(
+            notice_rx.try_recv(),
+            Ok(TransportNotice::ReceptionStalled { .. })
+        ));
+        assert_eq!(rx.try_recv().unwrap().payload.bytes(), b"pending");
+        let snapshot = stall_state.snapshot();
+        assert_eq!(snapshot.completed_episodes, 1);
+        assert!(snapshot.active_since.is_none());
     }
 }

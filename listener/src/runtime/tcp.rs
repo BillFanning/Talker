@@ -134,6 +134,7 @@ pub fn start_tcp_listener(
                             caps,
                             events.clone(),
                             notice_rx,
+                            None,
                         );
                         let ChannelTasks {
                             transport: transport_join,

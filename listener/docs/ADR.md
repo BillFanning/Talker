@@ -1039,6 +1039,130 @@ memory. Wall-clock start/finish may reflect clock changes, while elapsed duratio
 monotonic. An incomplete final snapshot is visible as incomplete rather than silently
 zero. Retention is process-local and clears with fresh Channel slots/profile load.
 
+## ADR-032 — Bounded duration telemetry primitives live in `wiredata-telemetry`
+
+**Status:** Accepted 2026-07-20.
+
+**Context:** ADR-027 kept Listener's ten-segment recent-duration helper local when a
+new crate would have served only one small consumer. Talker now has the same durable
+consumer and its duration histogram, fixed buckets, timed segments, and aging logic
+are byte-identical. Keeping numeric code duplicated risks silent divergence when a
+bucket edge or rollover rule is corrected in only one application.
+
+**Decision:** Adopt workspace ADR-039 and add the internal, non-published,
+dependency-free `wiredata-telemetry` crate. It owns the cumulative duration histogram
+and bounded ten-by-one-second recent-window engine. Listener continues to expose the
+cumulative type through `runtime::telemetry` and keeps all application aggregates and
+measurement policy local: `ByteHistogram`, `ChunkShape`, transport/timer summaries,
+pipeline boundaries, stats/snapshots, completed-run retention, and GUI presentation.
+The separate `wiredata-timing` crate continues to own only process timer-resolution
+mechanics.
+
+**Consequences:** Listener and Talker share one tested implementation of the numeric
+primitive without sharing runtime architecture or telemetry schemas. Hot-path memory,
+allocation, measurement boundaries, retained summaries, profiles, and received bytes
+are unchanged. This decision supersedes ADR-027's local-implementation paragraph;
+its window semantics and all other consequences remain in force.
+
+## ADR-033 — Diagnostics lead with decisions without overstating receive health
+
+**Status:** Accepted 2026-07-20.
+
+**Context:** Listener exposes transport-specific counters, queue pressure, handoff
+and pipeline timing, chunk shape, timer policy, recorder state, and retained-run
+facts. Keeping that evidence visible is essential, but presenting it as one flat set
+of readouts makes operators synthesize the likely fault domain before deciding where
+to look. A generic health score would erase important availability semantics: an
+unsupported UDP drop counter is not a measured zero, a supported zero does not prove
+that no bytes were lost elsewhere, and Serial backpressure duration establishes risk
+rather than a lost-byte count.
+
+**Decision:** Add a compact, decision-oriented diagnostics summary with three
+Listener-owned rows: **Transport**, **Pressure**, and **Pipeline**. Transport
+preserves each transport's supported, unsupported, fallback, observed, and
+inapplicable states and uses bounded claims such as no kernel drops *observed* when
+that is the actual evidence; it never claims no loss or maps unsupported to zero.
+Pressure summarizes existing ingest/recorder queue and backpressure evidence without
+inventing missing counts. Pipeline summarizes existing handoff and processing timing
+while retaining warm-up, incomplete-final-snapshot, and measurement-boundary caveats.
+The card badge distinguishes live monitoring, retained last-run evidence, and a
+channel that has not produced run telemetry; it does not turn absent evidence into a
+healthy state.
+
+An **Attention** callout appears only when existing state derives an operator-relevant
+exception. It is GUI presentation, not a runtime `Diagnostic`: it creates no event,
+does not consume diagnostic retention, and does not change diagnostic or completed-run
+counts. There is no persistent green callout and no opaque composite health score.
+The absence of Attention means only that no configured exception was derived from the
+available evidence. Complete transport, pressure, timing, chunk, timer, recorder, and
+run telemetry and their caveats remain available under collapsed details.
+
+`wiredata-ui` may own only the identical egui card, row, and callout
+chrome shared with Talker. Listener owns the row labels, evidence selection,
+wording, severity mapping, thresholds, and the distinctions among unsupported,
+zero, fallback, risk, and observed loss. This is a view-model and layout change only:
+receive/runtime behavior, telemetry collection and types, retained snapshots and
+summaries, clipboard reports, recording, diagnostics, and profiles are unchanged.
+Talker makes the paired send-specific decision in ADR-041.
+
+**Consequences:** The default view points first to the likely receive-side fault
+domain without discarding the evidence needed to verify that interpretation. Derived
+attention cannot pollute the event history or be mistaken for an observed runtime
+incident, and unavailable counters cannot masquerade as clean measurements. Pure
+Listener-side classification tests can pin these semantics while shared chrome stays
+free of transport and pipeline policy.
+
+## ADR-034 — Serial stall snapshots read authoritative reader state
+
+**Status:** Accepted 2026-07-27.
+
+**Context:** ADR-007 correctly keeps `ReceptionStalled` notices bounded and
+non-blocking, because blocking a Serial reader to report backpressure would worsen the
+condition being reported. ADR-029 subsequently added cumulative stall telemetry, but
+the reader kept its exact episode count, total, and maximum only in loop-local
+variables and published completion summaries through the same best-effort notice
+queue. The pipeline also inferred an active episode from the threshold warning. A
+dropped warning could hide an active stall, while a dropped completion summary could
+leave the display accruing an inferred active duration after the reader had resumed.
+Advisory delivery had therefore become the accidental authority for snapshot state.
+
+**Decision:** Each successfully opened Serial run owns one shared, transport-local
+stall-state cell. The blocking reader opens an episode immediately when a received
+block first finds the Transport-to-Pipeline queue full and completes it exactly once
+when the retry succeeds, cancellation ends the run, or the pipeline receiver closes.
+The cell keeps completed episode count, completed total, completed maximum, and the
+active episode's monotonic start separately. It is locked only at those episode edges
+and for a small scalar snapshot; retry sleeps and transport I/O never hold the lock.
+Poison recovery retains the measured values rather than making authoritative
+telemetry disappear.
+
+`ChannelPipeline` holds a clone and derives `SerialStallSummary` directly when it
+builds live, stats, or final snapshots. Public cumulative values cover completed
+episodes only; `active_for` reports the current episode separately. Completion moves
+that elapsed duration into the cumulative fields once. This refines ADR-029's Serial
+aggregate semantics to completed-only cumulative values plus separate active elapsed
+time. The best-effort
+`SerialStallSummary` transport notice and the pipeline's warning-based reconstruction
+are removed.
+
+`ReceptionStalled` remains an advisory, non-blocking notice. Once an ongoing episode
+reaches ADR-007's established warning threshold, the reader makes at most one
+best-effort delivery attempt before its next retry, including a retry that succeeds.
+If the transport notice is dropped, its retained warning diagnostic is omitted; if
+the notice arrives but the event queue is full, the matching runtime event is
+omitted. Neither omission changes authoritative snapshot truth. Complete final
+snapshots contain finalized inactive totals after every normal retry-loop exit. The
+existing incomplete-summary marker remains the honest boundary when a pipeline-task
+panic or shutdown grace limit prevents its final snapshot. This decision does not
+change the pre-existing classification of transport task/thread panics.
+
+**Consequences:** Serial backpressure totals and active state now self-correct through
+the polled snapshot surface and do not depend on observer capacity. Short episodes
+below the warning threshold are still counted without creating warning diagnostics.
+The mutex is off the per-chunk hot path and preserves a consistent multi-field
+snapshot. No received bytes, queue policy, warning threshold, profile, recording
+format, or completed-run clipboard keys change.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_
