@@ -24,6 +24,7 @@ path = "src/bin/talker-gui.rs"
 nmea0183 = { path = "../nmea0183" }
 wiredata-ui = { path = "../wiredata-ui" }   # shared GUI chrome (ADR-016)
 wiredata-timing = { path = "../wiredata-timing" }
+wiredata-telemetry = { path = "../wiredata-telemetry" }
 
 # Serial
 serialport = { workspace = true }

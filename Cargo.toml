@@ -5,6 +5,7 @@ members = [
     "listener",
     "wiredata-ui",
     "wiredata-timing",
+    "wiredata-telemetry",
 ]
 resolver = "2"
 

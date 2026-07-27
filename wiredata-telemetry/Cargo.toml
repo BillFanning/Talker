@@ -1,0 +1,10 @@
+[package]
+name = "wiredata-telemetry"
+description = "Internal bounded telemetry primitives for wiredata applications"
+publish = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
