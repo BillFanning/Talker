@@ -1,11 +1,31 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.6
+**Version:** 1.7
 **Date:** 2026-07-27
 **Status:** Accepted
 
-Revision note (truthful pushed-snapshot freshness):
+Revision note (telemetry ownership across the two applications):
 
+- **ADR-043** records why only Talker's timing telemetry carries a capture instant.
+  Talker pushes collapsed snapshots from its send path, so they age between
+  emissions; Listener collapses each recent window when a snapshot request is
+  served, so a capture instant there would always read "now". The rule is that
+  whichever application retains a collapsed snapshot across time owns proving its
+  age, and neither mechanism is ported to the other — a Listener capture instant
+  would be dead weight, and compute-on-demand on Talker would have to wake a dormant
+  runner. The two panels stay consistent in vocabulary rather than mechanism. See
+  listener ADR-035 for the same decision from Listener's side.
+
+Revision note for 1.6 (truthful pushed-snapshot freshness), which introduced
+ADR-039 through ADR-042:
+
+- **ADR-039** moves the bounded duration-histogram buckets and the ten-segment
+  recent window into `wiredata-telemetry`, so the two applications cannot drift
+  apart on the numbers they present.
+- **ADR-040** makes the timer-resolution guard lifecycle explicit and keeps Precise
+  deadline windows bounded.
+- **ADR-041** lets the diagnostics surface lead with decisions without hiding the
+  telemetry behind them.
 - **ADR-042** records the runner-supplied capture instant and explicit final
   provenance that distinguish current, expired, and final timing evidence without
   adding a dormant telemetry heartbeat. Capacity, Cadence, and detailed Timing now
