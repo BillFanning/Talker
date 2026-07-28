@@ -520,10 +520,36 @@ enum StalledSendOutcome {
     Closed,
 }
 
+/// One open stall episode, completed when this guard drops.
+///
+/// The reader is the only writer of the shared stall state, and a snapshot
+/// derives the live elapsed time from `active_since` — so an episode left open
+/// does not merely lose a total, it reports a stall that grows forever. Tying
+/// completion to the guard's scope makes every exit from the retry loop close
+/// it exactly once, including an unwind out of the reader thread.
+struct StallEpisode<'a> {
+    state: &'a SerialStallState,
+}
+
+impl<'a> StallEpisode<'a> {
+    fn begin(state: &'a SerialStallState, at: Instant) -> Self {
+        let opened = state.begin_at(at);
+        debug_assert!(opened, "serial reader opened a nested stall episode");
+        Self { state }
+    }
+}
+
+impl Drop for StallEpisode<'_> {
+    fn drop(&mut self) {
+        let completed = self.state.finish_at(Instant::now());
+        debug_assert!(completed, "serial reader lost its active stall episode");
+    }
+}
+
 /// Retry one block after the Transport-to-Pipeline queue first reports Full.
 ///
 /// The state transition is centralized here: the episode becomes active before
-/// the first retry and is completed once after every exit from the retry loop.
+/// the first retry and is completed by [`StallEpisode`]'s guard on every exit.
 fn retry_stalled_send(
     channel_id: ChannelId,
     out: &Sender<ReceivedData>,
@@ -534,10 +560,9 @@ fn retry_stalled_send(
     stall_state: &SerialStallState,
 ) -> StalledSendOutcome {
     let stalled_at = Instant::now();
-    let opened = stall_state.begin_at(stalled_at);
-    debug_assert!(opened, "serial reader opened a nested stall episode");
+    let _episode = StallEpisode::begin(stall_state, stalled_at);
     let mut warned = false;
-    let outcome = loop {
+    loop {
         if cancel.is_cancelled() {
             break StalledSendOutcome::Cancelled;
         }
@@ -571,10 +596,7 @@ fn retry_stalled_send(
                 // once-per-episode, non-blocking notice attempt is dropped.
             }
         }
-    };
-    let completed = stall_state.finish_at(Instant::now());
-    debug_assert!(completed, "serial reader lost its active stall episode");
-    outcome
+    }
 }
 
 /// Apply any pending RTS/DTR commands and poll the input lines (§161). On any
@@ -732,6 +754,26 @@ mod tests {
         assert_eq!(state.snapshot().completed_episodes, 1);
         assert_eq!(state.snapshot().completed_total, Duration::from_millis(3));
         assert_eq!(state.snapshot().active_since, None);
+    }
+
+    #[test]
+    fn an_unwind_mid_stall_still_completes_the_episode() {
+        // An episode left open would not just lose a total: a snapshot derives the
+        // live elapsed time from `active_since`, so the panel would report a stall
+        // growing forever on a reader that is already gone.
+        let state = SerialStallState::default();
+        let started = Instant::now();
+
+        let panicking = state.clone();
+        let unwound = catch_unwind(AssertUnwindSafe(move || {
+            let _episode = StallEpisode::begin(&panicking, started);
+            panic!("reader thread died mid-stall");
+        }));
+
+        assert!(unwound.is_err(), "the panic propagated");
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.active_since, None, "no episode is left active");
+        assert_eq!(snapshot.completed_episodes, 1, "the episode was completed");
     }
 
     /// A [`BlockingReader`] that replays a script of reads, then behaves like an
