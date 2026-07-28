@@ -266,6 +266,26 @@ Cross off items as they are completed. Add new ones inline as they come up.
   - Still open (needs an injectable slow writer, not just a real disk):
     **slow-disk recording with rotation** — fold into whatever next touches
     the recorder task's writer seam.
+  - [ ] **Soak the Serial stall cell under sustained backpressure** (listener
+    `SerialStallState` / `retry_stalled_send`, ADR-034). Unit tests cover the
+    episode edges, poison recovery, and the unwind guard, but nothing drives a
+    real reader against a Transport→Pipeline queue that stays full for a whole
+    window. Hold a bounded ingest receiver without draining it, run the
+    `BlockingReader` seam at rate, and assert: `completed_episodes` only ever
+    grows, `completed_total` never exceeds wall time, `active_for` is `Some`
+    while stalled and `None` within one snapshot of resuming, and the final
+    snapshot has no active episode. This is the path where a missed edge shows
+    up as a stall duration that grows forever, so a long window is the point.
+  - [ ] **Soak the fast-then-dormant snapshot expiry** (talker
+    `RecentSnapshotState` / `recent_snapshot_state`, ADR-042). The
+    classification is unit-tested and the GUI's consumption is tested against
+    synthetic states, but nothing exercises the real transition end to end:
+    run a channel fast enough to warm the recent window past
+    `MIN_SERVICE_SAMPLES`, make every message dormant, then hold past
+    `RECENT_WINDOW` and assert the supervisor's retained snapshot classifies
+    Expired, that measured headroom stops consuming it and falls back to
+    labelled run-wide timing, and — the reason the heartbeat was rejected —
+    that the dormant runner emitted no further `Counters` in that window.
 - [ ] **`wiredata-display` extraction — only together with talker adopting the
   incremental renderer** (row-ring item above): the protocol-neutral
   Raw/Rendered/Hex stream machinery could move to an egui-free shared crate so

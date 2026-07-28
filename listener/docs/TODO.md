@@ -357,6 +357,13 @@ Message-model removal). Everything below this block is verified done:
 - [ ] **Frame-time items** (with the talker row-ring methodology): mark-string
       hashing per repaint and repeated `make_contiguous` in
       `gui/detail/stream_view.rs` — generation/dirty-offset tracking instead.
+- [ ] **Soak the Serial stall cell under sustained backpressure**
+      (`SerialStallState` / `retry_stalled_send`, ADR-034). The episode edges,
+      poison recovery, and the unwind guard have unit tests; a full window with
+      the Transport→Pipeline queue held full does not. Tracked with the rest of
+      the soak suite in
+      [`talker/docs/TODO.md`](../../talker/docs/TODO.md) — the `#[ignore]`d
+      tests in `listener/tests/soak.rs` are its home.
 
 ## Future work — deferred (spec Appendix A)
 
