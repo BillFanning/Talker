@@ -76,6 +76,7 @@ pub struct DiagnosticLog {
     events: CountBounded<Diagnostic>,
     warnings: CountBounded<Diagnostic>,
     errors: CountBounded<Diagnostic>,
+    revision: u64,
 }
 
 impl DiagnosticLog {
@@ -89,7 +90,18 @@ impl DiagnosticLog {
             events: CountBounded::new(cap(event_limit)),
             warnings: CountBounded::new(cap(warning_limit)),
             errors: CountBounded::new(cap(error_limit)),
+            revision: 0,
         }
+    }
+
+    /// How many times this log's contents have changed.
+    ///
+    /// A poll-driven consumer rebuilds its view only when this moves. The log is
+    /// polled far more often than it is written — a quiet channel is still polled
+    /// several times a second — so the cheap comparison saves cloning every
+    /// retained entry on every poll (§124).
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Record a diagnostic into the store for its severity (§88).
@@ -99,6 +111,8 @@ impl DiagnosticLog {
             DiagnosticSeverity::Warning => self.warnings.push(diagnostic),
             DiagnosticSeverity::Error => self.errors.push(diagnostic),
         }
+        // Eviction changes the contents too, so every push is a new revision.
+        self.revision = self.revision.saturating_add(1);
     }
 
     pub fn events(&self) -> impl Iterator<Item = &Diagnostic> {
@@ -118,6 +132,7 @@ impl DiagnosticLog {
         self.events.clear();
         self.warnings.clear();
         self.errors.clear();
+        self.revision = self.revision.saturating_add(1);
     }
 
     /// Seed this (fresh) log with prior diagnostics, so a restarted Channel keeps the

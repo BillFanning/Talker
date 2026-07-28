@@ -210,6 +210,9 @@ pub struct ChannelPipeline {
     display_views: Vec<PipelineDisplayView>,
     /// Retained diagnostics, count-limited per type (§88).
     diagnostics: DiagnosticLog,
+    /// Last shared diagnostics snapshot and the log revision it was built from,
+    /// so repeated polls of an unchanged log cost an `Arc` clone (§124).
+    diagnostics_cache: Option<(u64, Arc<DiagnosticsSnapshot>)>,
     /// Raw Recording handle (§53). `None` when recording is disabled or its
     /// enable failed (§55). Faults non-blockingly on overflow (§56.1).
     raw_recorder: Option<Recording<Arc<ReceivedData>>>,
@@ -353,6 +356,7 @@ impl ChannelPipeline {
                 caps.warning_retention,
                 caps.error_retention,
             ),
+            diagnostics_cache: None,
             raw_recorder: None,
             raw_recording_queue_history: None,
             recording_fault_reported: false,
@@ -1592,8 +1596,32 @@ impl ChannelPipeline {
     /// state, liveness, and the stream's end offset. The scrollback bytes are **not**
     /// included — they are fetched incrementally via [`stream_delta`](Self::stream_delta)
     /// so this stays cheap at high throughput.
-    pub fn snapshot(&self) -> ChannelSnapshot {
+    /// The retained diagnostics as a shared snapshot, rebuilt only when the log
+    /// has actually changed (§88, §124).
+    ///
+    /// The GUI polls this several times a second for the selected Channel, for the
+    /// life of a run that may last weeks, while the log itself changes rarely. The
+    /// revision check turns that steady state into an `Arc` clone instead of a deep
+    /// copy of every retained entry and its message string.
+    fn diagnostics_snapshot(&mut self) -> Arc<DiagnosticsSnapshot> {
+        let revision = self.diagnostics.revision();
+        if let Some((cached_revision, cached)) = &self.diagnostics_cache {
+            if *cached_revision == revision {
+                return Arc::clone(cached);
+            }
+        }
+        let rebuilt = Arc::new(DiagnosticsSnapshot {
+            events: self.diagnostics.events().cloned().collect(),
+            warnings: self.diagnostics.warnings().cloned().collect(),
+            errors: self.diagnostics.errors().cloned().collect(),
+        });
+        self.diagnostics_cache = Some((revision, Arc::clone(&rebuilt)));
+        rebuilt
+    }
+
+    pub fn snapshot(&mut self) -> ChannelSnapshot {
         let now = Instant::now();
+        let diagnostics = self.diagnostics_snapshot();
         ChannelSnapshot {
             channel_id: self.channel_id,
             // Placeholders — the orchestrator stamps the effective lifecycle state
@@ -1609,11 +1637,7 @@ impl ChannelPipeline {
                     paused: v.handle.is_paused(),
                 })
                 .collect(),
-            diagnostics: DiagnosticsSnapshot {
-                events: self.diagnostics.events().cloned().collect(),
-                warnings: self.diagnostics.warnings().cloned().collect(),
-                errors: self.diagnostics.errors().cloned().collect(),
-            },
+            diagnostics,
             raw_recording: self.raw_recording_state(),
             display_recording: self.display_recording_state(),
             activity: self.activity.snapshot(now),
@@ -2080,6 +2104,54 @@ mod tests {
             p.diagnostics.record(Diagnostic::warning(format!("w{i}")));
         }
         assert_eq!(p.diagnostics().warnings().count(), DIAGNOSTIC_RETENTION);
+    }
+
+    #[test]
+    fn repeated_polls_of_an_unchanged_log_reuse_one_shared_snapshot() {
+        // §124: the selected channel is polled several times a second for the life
+        // of a run, while the log itself changes rarely. An unchanged log must cost
+        // a pointer clone, not a deep copy of every retained entry.
+        let cid = ChannelId::new();
+        let mut p = pipeline(cid, PipelineCapacities::default());
+        p.diagnostics.record(Diagnostic::warning("first"));
+
+        let first = p.snapshot().diagnostics;
+        let second = p.snapshot().diagnostics;
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged log must not be rebuilt"
+        );
+
+        // A new diagnostic invalidates the cache, and the rebuilt snapshot carries
+        // it — the reuse must never serve a stale log.
+        p.diagnostics.record(Diagnostic::error("second"));
+        let third = p.snapshot().diagnostics;
+        assert!(!Arc::ptr_eq(&second, &third), "a changed log is rebuilt");
+        assert_eq!(third.warnings.len(), 1);
+        assert_eq!(third.errors.len(), 1);
+        // The previously handed-out snapshot is unaffected by the rebuild.
+        assert_eq!(first.errors.len(), 0);
+    }
+
+    #[test]
+    fn evicting_a_diagnostic_still_counts_as_a_change() {
+        // The retained count is unchanged when a push evicts the oldest entry, so
+        // the revision — not the length — is what the cache keys on.
+        let cid = ChannelId::new();
+        let caps = PipelineCapacities {
+            warning_retention: Some(1),
+            ..PipelineCapacities::default()
+        };
+        let mut p = pipeline(cid, caps);
+        p.diagnostics.record(Diagnostic::warning("oldest"));
+        let before = p.snapshot().diagnostics;
+
+        p.diagnostics.record(Diagnostic::warning("newest"));
+        let after = p.snapshot().diagnostics;
+
+        assert!(!Arc::ptr_eq(&before, &after), "eviction is a change");
+        assert_eq!(after.warnings.len(), 1);
+        assert!(after.warnings[0].message.contains("newest"));
     }
 
     #[test]

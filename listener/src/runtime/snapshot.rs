@@ -185,7 +185,10 @@ pub struct ChannelSnapshot {
     /// One entry per Display View (§48), in creation order (default view first).
     pub display_views: Vec<DisplayViewSnapshot>,
     /// Retained diagnostics, separated by severity (§88).
-    pub diagnostics: DiagnosticsSnapshot,
+    ///
+    /// Shared rather than owned: the producer rebuilds it only when the log
+    /// changes, so a poll of an unchanged log costs a pointer clone (§124).
+    pub diagnostics: Arc<DiagnosticsSnapshot>,
     /// Raw-recording state, or `None` when raw recording isn't attached (§53).
     pub raw_recording: Option<RecordingState>,
     /// Display-recording state (§54), or `None` when it isn't attached.
@@ -316,6 +319,20 @@ impl DiagnosticsSnapshot {
             .into_iter()
             .chain(self.warnings)
             .chain(self.errors)
+            .collect();
+        all.sort_by_key(|d| d.timestamp);
+        all
+    }
+
+    /// [`into_sorted_vec`](Self::into_sorted_vec) for a shared snapshot, which a
+    /// consumer holds behind an `Arc` and cannot consume.
+    pub fn to_sorted_vec(&self) -> Vec<Diagnostic> {
+        let mut all: Vec<_> = self
+            .events
+            .iter()
+            .chain(&self.warnings)
+            .chain(&self.errors)
+            .cloned()
             .collect();
         all.sort_by_key(|d| d.timestamp);
         all

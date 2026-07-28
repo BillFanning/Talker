@@ -21,8 +21,9 @@ use listener::config::{MatchAction, MatchCondition, MatchRule};
 use listener::core::{ChannelId, ChunkTime};
 use listener::diagnostics::{Diagnostic, DiagnosticSeverity};
 use listener::runtime::{ChannelPipeline, PipelineCapacities};
-use listener::transport::{ReceivedData, ReceivedPayload};
+use listener::transport::{ReceivedData, ReceivedPayload, TransportNotice};
 use std::hint::black_box;
+use std::sync::Arc;
 
 /// A 64-byte NMEA-shaped line: the common serial read-chunk size (§147).
 fn payload_64b() -> Vec<u8> {
@@ -183,20 +184,34 @@ fn bench_snapshot_at_diagnostics_cap(c: &mut Criterion) {
             }
         })
         .collect();
-    let pipeline =
+    let mut pipeline =
         ChannelPipeline::new(cid, PipelineCapacities::default()).with_prior_diagnostics(seed);
 
+    // The steady state: the log is unchanged between polls, so the shared
+    // snapshot is reused rather than rebuilt from every retained entry.
     c.bench_function("snapshot/full-at-diagnostics-cap", |b| {
         b.iter(|| black_box(pipeline.snapshot()))
     });
 
-    // The GUI's per-arrival step, isolated: clone the snapshot's diagnostics
-    // and flatten+sort them chronologically (gui::state fold).
+    // The same poll when a diagnostic has just landed, which is what actually
+    // pays for the rebuild. A stall notice is the public path that records one.
+    c.bench_function("snapshot/full-at-diagnostics-cap-after-change", |b| {
+        b.iter(|| {
+            pipeline.record_notice(TransportNotice::ReceptionStalled {
+                channel_id: cid,
+                stalled_for: std::time::Duration::from_millis(250),
+            });
+            black_box(pipeline.snapshot())
+        })
+    });
+
+    // The GUI's per-arrival step, isolated: flatten+sort the snapshot's
+    // diagnostics chronologically (gui::state fold).
     let snap = pipeline.snapshot();
     c.bench_function("snapshot/sorted-timeline-at-cap", |b| {
         b.iter_batched(
-            || snap.diagnostics.clone(),
-            |d| black_box(d.into_sorted_vec()),
+            || Arc::clone(&snap.diagnostics),
+            |d| black_box(d.to_sorted_vec()),
             BatchSize::SmallInput,
         )
     });

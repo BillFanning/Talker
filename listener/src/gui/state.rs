@@ -482,8 +482,7 @@ impl AppState {
                     // replaced — the snapshot's matches roll over, the pins stay.
                     view.merge_marks(&snapshot.matches);
                     // Flatten+sort once per poll; the detail pane reads per frame.
-                    view.sorted_diagnostics =
-                        Rc::new(snapshot.diagnostics.clone().into_sorted_vec());
+                    view.sorted_diagnostics = Rc::new(snapshot.diagnostics.to_sorted_vec());
                     view.snapshot = Some(*snapshot);
                     clear_error_if_recording_ok(view);
                 }
@@ -745,10 +744,10 @@ mod tests {
             reconnect_pending: false,
             last_run_summary: None,
             display_views: vec![],
-            diagnostics: DiagnosticsSnapshot {
+            diagnostics: std::sync::Arc::new(DiagnosticsSnapshot {
                 warnings: vec![crate::diagnostics::Diagnostic::warning("w"); warnings],
                 ..DiagnosticsSnapshot::default()
-            },
+            }),
             raw_recording: None,
             display_recording: None,
             activity: ChannelActivity {

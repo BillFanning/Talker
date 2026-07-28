@@ -613,7 +613,7 @@ mod tests {
         })
         .await
         .expect("datagrams did not arrive");
-        let pipeline = tokio::time::timeout(Duration::from_secs(5), running.stop())
+        let mut pipeline = tokio::time::timeout(Duration::from_secs(5), running.stop())
             .await
             .expect("graceful stop hung")
             .expect("pipeline task panicked");
@@ -632,7 +632,7 @@ mod tests {
         };
         let running = start_data_channel(cid, transport, PipelineCapacities::default(), None);
 
-        let pipeline = tokio::time::timeout(Duration::from_secs(5), running.abort())
+        let mut pipeline = tokio::time::timeout(Duration::from_secs(5), running.abort())
             .await
             .expect("forced abort hung");
         // It terminated; it cannot have received more than was produced.
@@ -668,7 +668,7 @@ mod tests {
         assert!(running.is_faulted());
         // The fault's CAUSE reaches the diagnostics (review round 2: the
         // outcome string used to die unread in the monitor).
-        let pipeline = running.stop().await.expect("pipeline returns");
+        let mut pipeline = running.stop().await.expect("pipeline returns");
         let snap = pipeline.snapshot();
         assert!(
             snap.diagnostics

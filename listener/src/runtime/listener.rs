@@ -64,9 +64,7 @@ fn retained_snapshot(id: ChannelId, channel: &ManagedChannel) -> ChannelSnapshot
         reconnect_pending: false,
         last_run_summary: None,
         display_views: Vec::new(),
-        diagnostics: DiagnosticsSnapshot::from_diagnostics(
-            channel.retained_diagnostics.iter().cloned(),
-        ),
+        diagnostics: Arc::clone(&channel.retained_diagnostics_snapshot),
         raw_recording: None,
         display_recording: None,
         // The last run's liveness facts, exact at rest (`finish_stop` zeroed
@@ -233,6 +231,11 @@ struct ManagedChannel {
     /// the log of a stopped/faulted Channel) and replayed into the next run's pipeline by
     /// [`prior_diagnostics`](Listener::prior_diagnostics). Bounded on use.
     retained_diagnostics: Vec<crate::diagnostics::Diagnostic>,
+    /// The same retained log in the form [`snapshot`](Listener::snapshot) serves,
+    /// rebuilt only when the retained entries change (§124). A stopped Channel is
+    /// polled just as often as a running one, so regrouping per poll would keep
+    /// paying for a log that by definition can no longer change on its own.
+    retained_diagnostics_snapshot: Arc<DiagnosticsSnapshot>,
     /// The last run's liveness facts, retained across Stop like the
     /// diagnostics — a stopped channel keeps reading its exact byte total at
     /// rest (the natural moment to cross-check against the sender). Replaced
@@ -267,6 +270,17 @@ impl ManagedChannel {
         } else {
             self.state
         }
+    }
+
+    /// Retain one diagnostic that never reached a pipeline log — a start-time
+    /// fault such as a bind conflict (§88). Rebuilds the served snapshot in the
+    /// same step, so the retained list and the form `snapshot` hands out cannot
+    /// drift apart. Start faults are rare, so the rebuild is not a poll cost.
+    fn retain_diagnostic(&mut self, diagnostic: crate::diagnostics::Diagnostic) {
+        self.retained_diagnostics.push(diagnostic);
+        self.retained_diagnostics_snapshot = Arc::new(DiagnosticsSnapshot::from_diagnostics(
+            self.retained_diagnostics.iter().cloned(),
+        ));
     }
 
     /// Whether an auto-reconnect is armed or in progress (§9.1) — the poll-lane
@@ -349,6 +363,7 @@ impl Listener {
                 serial_control: None,
                 reconnect_state: None,
                 retained_diagnostics: Vec::new(),
+                retained_diagnostics_snapshot: Arc::new(DiagnosticsSnapshot::default()),
                 retained_activity: ChannelActivity {
                     last_data_at: None,
                     bytes_per_sec: 0.0,
@@ -735,11 +750,8 @@ impl Listener {
                 // Named for the channel, matching how the GUI labels it.
                 if let Some(channel) = self.channels.get_mut(&id) {
                     let name = channel.config.name.as_str();
-                    channel
-                        .retained_diagnostics
-                        .push(crate::diagnostics::Diagnostic::error(format!(
-                            "{name}: {err}"
-                        )));
+                    let message = format!("{name}: {err}");
+                    channel.retain_diagnostic(crate::diagnostics::Diagnostic::error(message));
                 }
                 let _ = self.events_tx.try_send(RuntimeEvent::ChannelFaulted(id));
                 Err(err)
@@ -841,7 +853,10 @@ impl Listener {
                 channel.retained_rule_timer_lateness = snap.rule_timer_lateness;
                 channel.retained_recent_rule_timer_lateness = snap.recent_rule_timer_lateness;
                 channel.retained_idle_deadline_timer = snap.idle_deadline_timer;
-                channel.retained_diagnostics = snap.diagnostics.into_sorted_vec();
+                channel.retained_diagnostics = snap.diagnostics.to_sorted_vec();
+                // The stopped channel is polled at the same cadence as a live one,
+                // so keep the served form ready rather than regrouping per poll.
+                channel.retained_diagnostics_snapshot = Arc::clone(&snap.diagnostics);
             }
         }
         let _ = self.events_tx.try_send(RuntimeEvent::ChannelStopped(id));
@@ -1453,7 +1468,7 @@ async fn drain_handle(handle: Option<ChannelHandle>) -> Option<ChannelSnapshot> 
         Some(ChannelHandle::Data(tasks)) => {
             // `None` if the pipeline task panicked — no final snapshot then,
             // which callers already tolerate (same as a TCP listener).
-            tasks.stop().await.map(|pipeline| pipeline.snapshot())
+            tasks.stop().await.map(|mut pipeline| pipeline.snapshot())
         }
         Some(ChannelHandle::TcpListener(listener)) => {
             listener.stop().await;
