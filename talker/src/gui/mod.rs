@@ -1,5 +1,6 @@
 mod channels;
 mod detail;
+mod diagnostics;
 mod display;
 mod draft;
 mod widgets;
