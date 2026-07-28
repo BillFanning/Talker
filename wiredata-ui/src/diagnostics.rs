@@ -97,7 +97,7 @@ fn card_frame(ui: &Ui) -> egui::Frame {
         .blend(translucent(visuals.widgets.noninteractive.weak_bg_fill, 90));
     egui::Frame::group(ui.style())
         .fill(fill)
-        .stroke(egui::Stroke::new(1.0, stroke))
+        .stroke(egui::Stroke::new(1.0_f32, stroke))
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::same(11))
 }
@@ -108,7 +108,7 @@ fn status_badge(ui: &mut Ui, text: WidgetText, tone: SignalTone) -> Response {
     let fill = ui.visuals().panel_fill.blend(translucent(accent, 38));
     egui::Frame::new()
         .fill(fill)
-        .stroke(egui::Stroke::new(1.0, translucent(accent, 145)))
+        .stroke(egui::Stroke::new(1.0_f32, translucent(accent, 145)))
         .corner_radius(egui::CornerRadius::same(12))
         .inner_margin(egui::Margin::symmetric(8, 2))
         .show(ui, |ui| {
@@ -197,7 +197,7 @@ pub fn attention_callout(
         .push_id(id_source, |ui| {
             egui::Frame::new()
                 .fill(fill)
-                .stroke(egui::Stroke::new(1.0, translucent(accent, 115)))
+                .stroke(egui::Stroke::new(1.0_f32, translucent(accent, 115)))
                 .corner_radius(egui::CornerRadius::same(5))
                 .inner_margin(egui::Margin::symmetric(8, 5))
                 .show(ui, |ui| {
