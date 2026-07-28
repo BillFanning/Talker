@@ -137,6 +137,11 @@ Six crates in a Cargo workspace:
   `eframe`, or any runtime crate. A piece belongs here only if it is purely
   presentational, identical across both apps, and egui-only; app-specific widgets,
   layouts, and view-models stay in the apps.
+  Its `diagnostics` module documents the **shared readout vocabulary** — the state
+  names (awaiting / warming up / live / expired / final), the `≤` percentile
+  notation, the 20-sample warm-up gate, and the window-vs-run labelling. Read it
+  before adding a telemetry readout to either app, so the two panels keep
+  describing the same state the same way.
 - **`wiredata-timing/`** — internal (`publish = false`) shared process-timing policy.
   It owns the refcounted Windows 1 ms timer-resolution guard and the one-time
   minimized-window throttling opt-out used by both applications. It is a narrow
