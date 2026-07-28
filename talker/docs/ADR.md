@@ -1278,6 +1278,47 @@ change.
 
 ---
 
+## ADR-043 — Telemetry freshness follows the observation model, not the app
+
+**Status:** Accepted 2026-07-27.
+
+**Context:** ADR-042 gives Talker's pushed counter lane an explicit capture instant
+and freshness classification. Listener surfaces comparable timing telemetry built on
+the same bounded primitives (ADR-039; listener ADR-032) and carries no such instant.
+The difference is deliberate, but nothing recorded it, so it reads as an omission on
+one side or the other.
+
+It follows from the two runtime models (ADR-002 versus listener ADR-001). Talker has
+no async runtime: its runner owns the send loop and **pushes** collapsed snapshots
+from the send path, so a retained snapshot ages between emissions — indefinitely on a
+dormant schedule. Listener is Tokio-hybrid: a snapshot request is answered inside the
+channel's own task, and every recent window is collapsed at the moment it is served,
+so a served window always ends at the request.
+
+**Decision:** Freshness handling belongs to the observation model, not to the
+telemetry. Talker retains snapshots across time, so Talker proves their age
+(ADR-042). Listener computes on demand, so Listener adds no capture instant — under
+pull, a stale window is not representable and the field would always read "now".
+
+Neither mechanism is ported across. In particular, Talker does not adopt
+compute-on-demand for its counter lane: answering a poll would require waking a
+dormant runner, which is precisely the zero-wakeup contract ADR-042 preserves by
+rejecting a heartbeat.
+
+The two panels stay consistent in **vocabulary** rather than mechanism — shared
+warm-up wording, bounded-percentile notation, and `RECENT_WINDOW`. Talker names an
+*expired* state because it can have one; Listener does not.
+
+The general rule, for any lane added later in either app: whichever side retains a
+collapsed snapshot across time owns proving its age.
+
+**Consequences:** The asymmetry is recorded on both sides, so neither app acquires an
+always-"now" capture instant nor a telemetry heartbeat by analogy with the other. No
+profile schema, clipboard-report format, wire-data, cadence, or interface behavior
+changes. See listener ADR-035 for the same decision from Listener's side.
+
+---
+
 ## Open questions
 
 The following decisions are deferred until the relevant module is written. They are recorded here so they are not forgotten and so the eventual decision (in a future ADR or commit) can reference the context.

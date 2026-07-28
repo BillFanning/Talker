@@ -1163,6 +1163,55 @@ The mutex is off the per-chunk hot path and preserves a consistent multi-field
 snapshot. No received bytes, queue policy, warning threshold, profile, recording
 format, or completed-run clipboard keys change.
 
+## ADR-035 — Telemetry freshness follows the observation model, not the app
+
+**Status:** Accepted 2026-07-27.
+
+**Context:** Talker and Listener now expose comparable receive/send timing telemetry
+built on the same bounded primitives (ADR-032; talker ADR-039), and a technician may
+well read both panels in one session. The two apps nevertheless observe that
+telemetry through opposite mechanisms, which is a direct consequence of their
+opposite runtime models (ADR-001 versus talker ADR-002):
+
+- Listener **pulls**. `PipelineRequest::Snapshot` is answered inside the channel's
+  own task, and every recent-window histogram is collapsed with
+  `snapshot_at(Instant::now())` at the moment the request is served. A served
+  "last 10 s" therefore always describes the 10 s ending at the request.
+- Talker **pushes**. The runner emits a collapsed snapshot from its send path, and
+  the supervisor retains the most recent one. Between emissions — including
+  indefinitely, on a dormant schedule — the retained copy ages while its sample
+  count does not, which is exactly the hazard talker ADR-042 addresses with an
+  explicit capture instant and freshness classification.
+
+Because the surfaces look alike, each app's mechanism invites being ported to the
+other. Both ports would be wrong, and neither would be obviously wrong to a reader
+looking at one crate.
+
+**Decision:** Freshness handling is a property of the observation model, not of the
+telemetry, and is decided per app:
+
+- Listener does **not** carry a capture instant on `ChannelSnapshot`, `ChannelStats`,
+  or any histogram it serves. Under pull, a stale window is not representable, so a
+  capture instant would be a field that is always "now" — dead weight that implies a
+  hazard this app does not have.
+- Talker does not adopt Listener's compute-on-demand shape for its counter lane.
+  Doing so would require waking a dormant runner to answer a poll, discarding the
+  zero-wakeup dormant contract that talker ADR-042 explicitly preserves.
+
+The two panels are kept consistent in **vocabulary**, not in mechanism: both use the
+same warm-up wording, the same bounded-percentile notation, and the same
+`RECENT_WINDOW`. Listener simply has no *expired* state to name.
+
+If Listener ever gains a pushed or cached telemetry lane — a cross-channel overview
+served from retained copies rather than live tasks, say — that lane acquires the
+freshness problem and should adopt talker ADR-042's treatment for that lane only.
+The rule is that whichever side retains a collapsed snapshot across time owns
+proving its age.
+
+**Consequences:** A reader comparing the two crates finds the asymmetry recorded
+rather than looking like an omission on one side. No wire, profile, recording, or
+snapshot schema changes. See talker ADR-043 for the same decision from talker's side.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_
