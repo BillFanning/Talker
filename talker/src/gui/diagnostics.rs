@@ -6,7 +6,7 @@
 //! wording and escalation rule is unit-testable without an egui context. Nothing
 //! here draws; nothing here decides layout.
 //!
-//! Two boundaries run through the whole surface. Accepted means the interface
+//! Two boundaries run through the whole surface. Sent means the interface
 //! write returned success, never that a peer received anything. And there is no
 //! universal good/bad latency threshold, so timing is reported as measured fact
 //! against the channel's own cadence rather than scored against an invented
@@ -25,17 +25,16 @@ use super::MessageAnalysisCache;
 
 pub(super) const TIMING_WARMUP_SAMPLES: u64 = 20;
 
-pub(super) const LOCAL_ACCEPTANCE_TOOLTIP: &str =
-    "Accepted means the configured-interface write returned \
-success. It does not confirm that serial bits reached the wire, a network packet left the host, \
-or a peer received the data.";
+pub(super) const SENT_MEANING_TOOLTIP: &str =
+    "Sent means the configured-interface write returned success. It does not confirm that serial \
+bits reached the wire, a network packet left the host, or a peer received the data.";
 
 pub(super) const THROUGHPUT_TOOLTIP: &str =
-    "Total is every byte accepted since Start and is retained after Stop. The two rates are a \
-rolling five-second average of accepted messages and bytes. Failed, retry-suppressed, and missed \
+    "Total is every byte sent since Start and is retained after Stop. The two rates are a \
+rolling five-second average of sent messages and bytes. Failed, retry-suppressed, and missed \
 sends are excluded from all three. The fixed five-second denominator makes the rates ramp during \
 startup and decay to zero after traffic stops, while the total stands still; they are not \
-instantaneous line rate. Accepted means the interface write returned success, not that any peer \
+instantaneous line rate. Sent means the interface write returned success, not that any peer \
 received the data.";
 
 pub(super) const TIMING_TOOLTIP: &str = "Each recent snapshot merges up to approximately ten seconds of \
@@ -229,18 +228,20 @@ pub(super) fn diagnostic_card_tone(
 
 /// The run's counted send outcomes as one always-visible line.
 ///
-/// `unsent` is the aggregate of `failed + suppressed + missed`, so its three
-/// components are shown parenthetically rather than as siblings: rendering them
-/// as peers separated by the same divider invited reading `unsent` and `missed`
-/// as competing names for one quantity.
+/// Written as visible arithmetic — the schedule's own cadence points, less each
+/// way a send can fail to go out — because every alternative required naming the
+/// successful remainder in isolation, and no such name survived scrutiny:
+/// *accepted* never says accepted by what, *sent* alone reads as delivery, and
+/// *unaccepted* is false for the two categories the interface never saw. Stating
+/// the subtraction removes the need: the line defines its own final term.
 pub(super) fn send_outcomes(
-    accepted: u64,
+    sent: u64,
     failed: u64,
     suppressed: u64,
     missed: u64,
 ) -> DecisionSignal {
     let unsent = failed.saturating_add(suppressed).saturating_add(missed);
-    let scheduled = accepted.saturating_add(unsent);
+    let scheduled = sent.saturating_add(unsent);
     if scheduled == 0 {
         return DecisionSignal {
             text: "Send outcomes: no scheduled sends yet".to_owned(),
@@ -249,14 +250,10 @@ pub(super) fn send_outcomes(
     }
 
     DecisionSignal {
-        text: if unsent == 0 {
-            format!("Send outcomes: {accepted} / {scheduled} accepted · none unsent")
-        } else {
-            format!(
-                "Send outcomes: {accepted} / {scheduled} accepted · {unsent} unsent \
-                 ({failed} failed · {suppressed} suppressed · {missed} missed)"
-            )
-        },
+        text: format!(
+            "Send outcomes: {scheduled} scheduled - {failed} failed - {suppressed} suppressed \
+             - {missed} missed = {sent} sent"
+        ),
         tone: if failed > 0 {
             SignalTone::Fault
         } else if unsent > 0 {
@@ -267,24 +264,27 @@ pub(super) fn send_outcomes(
     }
 }
 
-/// The one tooltip for the send-outcomes line: what each counter counts, and
-/// the equation that ties them together.
+/// The one tooltip for the send-outcomes line: what each term counts, and where
+/// in the send path each deduction happened.
 pub(super) fn send_outcomes_tooltip(
-    accepted: u64,
+    sent: u64,
     failed: u64,
     suppressed: u64,
     missed: u64,
 ) -> String {
-    let unsent = failed.saturating_add(suppressed).saturating_add(missed);
-    let scheduled = accepted.saturating_add(unsent);
+    let scheduled = sent
+        .saturating_add(failed)
+        .saturating_add(suppressed)
+        .saturating_add(missed);
     format!(
-        "Run-to-date outcomes for every scheduled send. Accepted means {accepted} interface \
-         writes returned success; it does not confirm physical-wire or peer delivery. Unsent \
-         is the aggregate {unsent}, never a fourth category alongside its parts: {failed} \
-         failed means the write was attempted and returned an error, {suppressed} suppressed \
-         means the send was skipped during retry backoff, and {missed} missed means a cadence \
-         grid point was skipped because the runner was more than one interval behind. \
-         Accepted + unsent = {scheduled} scheduled."
+        "{scheduled} scheduled counts every cadence point this run's schedule produced, less \
+         the three ways a send does not go out. {failed} failed: the interface write was \
+         attempted and returned an error. {suppressed} suppressed: after a failure, the send \
+         was withheld during retry backoff and never attempted — these follow failures and \
+         cannot occur without one. {missed} missed: the runner fell more than one interval \
+         behind, so the cadence point was skipped before any send existed. The remaining \
+         {sent} sent means the interface write returned success; it does not confirm that \
+         bytes reached the wire or that any peer received them."
     )
 }
 
@@ -496,16 +496,16 @@ mod tests {
         let clean = send_outcomes(100, 0, 0, 0);
         assert_eq!(
             clean.text,
-            "Send outcomes: 100 / 100 accepted · none unsent"
+            "Send outcomes: 100 scheduled - 0 failed - 0 suppressed - 0 missed = 100 sent"
         );
         assert_eq!(clean.tone, SignalTone::Healthy);
 
-        // The aggregate is followed by its parts in parentheses, never as
-        // siblings — `unsent` contains `missed`, it does not sit beside it.
+        // Stated as arithmetic: the schedule's own cadence points, less each
+        // way a send fails to go out. Nothing has to name the remainder.
         let shortfall = send_outcomes(98, 0, 1, 1);
         assert_eq!(
             shortfall.text,
-            "Send outcomes: 98 / 100 accepted · 2 unsent (0 failed · 1 suppressed · 1 missed)"
+            "Send outcomes: 100 scheduled - 0 failed - 1 suppressed - 1 missed = 98 sent"
         );
         assert_eq!(shortfall.tone, SignalTone::Warning);
 
@@ -514,7 +514,7 @@ mod tests {
         let failed = send_outcomes(98, 1, 0, 1);
         assert_eq!(
             failed.text,
-            "Send outcomes: 98 / 100 accepted · 2 unsent (1 failed · 0 suppressed · 1 missed)"
+            "Send outcomes: 100 scheduled - 1 failed - 0 suppressed - 1 missed = 98 sent"
         );
         assert_eq!(failed.tone, SignalTone::Fault);
     }
@@ -551,13 +551,15 @@ mod tests {
     }
 
     #[test]
-    fn send_outcomes_tooltip_states_the_scheduled_equation() {
+    fn send_outcomes_tooltip_defines_each_term_and_its_limit() {
         let tip = send_outcomes_tooltip(98, 1, 0, 1);
-        assert!(tip.contains("Accepted + unsent = 100 scheduled"));
-        // The aggregate must be named as such, so a reader never takes
-        // `unsent` for a fourth peer category alongside its own parts.
-        assert!(tip.contains("never a fourth category"));
-        assert!(tip.contains("does not confirm physical-wire or peer delivery"));
+        assert!(tip.contains("100 scheduled counts every cadence point"));
+        // Suppressions are downstream of a failure, never an independent
+        // fault — the tooltip has to say so or the two read as peers.
+        assert!(tip.contains("cannot occur without one"));
+        // The remainder is defined by the equation, but its limit still needs
+        // stating: a successful write is not proof of delivery.
+        assert!(tip.contains("does not confirm that bytes reached the wire"));
     }
 
     #[test]

@@ -1852,7 +1852,7 @@ pub(super) fn show_display_pane(
             let pal = wiredata_ui::palette::active(ui);
             ui.label(
                 egui::RichText::new(format!(
-                    "sampled output · not every accepted payload is shown · limit ~{sample_hz:.0}/s"
+                    "sampled output · not every sent payload is shown · limit ~{sample_hz:.0}/s"
                 ))
                 .small()
                 .color(pal.info_grey),

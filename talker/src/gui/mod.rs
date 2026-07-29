@@ -1411,11 +1411,10 @@ impl TalkerApp {
                     .fold((0u64, 0u64), |(s, e), t| {
                         (s + t.total_count, e + t.errors_total)
                     });
-                ui.label(format!("Accepted locally: {total_sent}"))
-                    .on_hover_text(
-                        "Configured-interface writes that returned success across all channels. \
+                ui.label(format!("Sent: {total_sent}")).on_hover_text(
+                    "Configured-interface writes that returned success across all channels. \
                          This does not confirm physical-wire or peer delivery.",
-                    );
+                );
                 ui.separator();
                 // Per-run errors: each channel's tally resets when it starts,
                 // like the send counts and log tallies.

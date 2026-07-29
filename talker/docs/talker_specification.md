@@ -383,20 +383,25 @@ The **detail pane** (right) shows the selected channel:
 
 - **Header** — status glyph + editable name (duplicates allowed but hinted);
   a `status · interface summary` row; then the readouts, grouped by subsystem:
-  - *Send outcomes:* `Send outcomes: <accepted> / <scheduled> accepted ·
-    <n> unsent (<f> failed · <s> suppressed · <m> missed)`, shown **always** and
-    directly beneath the `status · interface` row — amber when unsent is nonzero,
-    red when any write failed. `unsent` is the aggregate of the three
-    parenthesised components, never a fourth category beside them; accepted +
-    unsent = scheduled, always. One tooltip defines each counter and states that
-    equation (§8.1). The outcomes are rendered in exactly one place: the
-    diagnostics card neither repeats them nor raises a separate unsent callout,
-    though their tone still escalates its badge.
-  - *Accepted:* `Accepted: <total> total · <byte rate> · <msg/s> (~5 s)` — the
-    cumulative byte total, retained after Stop, beside the rolling five-second
-    rates, which decay to `0.0` at rest while the total stands still. Byte
-    values scale by SI unit (kB → MB → GB) rather than carrying digit
-    separators.
+  - *Send outcomes:* `Send outcomes: <scheduled> scheduled - <f> failed -
+    <s> suppressed - <m> missed = <sent> sent`, shown **always** and directly
+    beneath the `status · interface` row — amber when any deduction is nonzero,
+    red when any write failed. The line is stated as visible arithmetic over the
+    schedule's own cadence points, so the successful remainder is defined by the
+    equation rather than by a noun asserting something the application cannot
+    observe. One tooltip defines each term and where in the send path its
+    deduction happened (§8.1). The outcomes are rendered in exactly one place:
+    the diagnostics card neither repeats them nor raises a separate unsent
+    callout, though their tone still escalates its badge.
+  - *Sent:* `Sent: <total> total · <byte rate> · <msg/s> (~5 s)` — the cumulative
+    byte total, retained after Stop, beside the rolling five-second rates, which
+    decay to `0.0` at rest while the total stands still. Byte values scale by SI
+    unit (kB → MB → GB) rather than carrying digit separators.
+  - **Sent** throughout the GUI means the configured-interface write returned
+    success. It never asserts that bytes reached the wire or that a peer received
+    them; the tooltips carry that boundary. The aggregate `unsent`
+    (`failed + suppressed + missed`) remains in the completed-run summary and in
+    `RunSummary::unsent_sends`, where a single shortfall number is still useful.
   - *Capacity:* current-draft aggregate `msg/s` and wire `B/s`; for Serial, UART
     line utilization and headroom. A second line shows measured application
     headroom after warm-up from an eligible recent or cumulative run-wide

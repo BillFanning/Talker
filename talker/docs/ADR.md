@@ -11,9 +11,11 @@ Revision note (one vocabulary, each counted fact rendered once):
   renames the send readout to **Send outcomes** because it counts scheduled sends
   rather than the interface. The counted outcomes now render in exactly one place
   above the diagnostics card, which keeps only the readouts that need
-  interpretation; `unsent` is presented as the aggregate of its three
-  parenthesised components. The shared row chrome tooltips its label as well as
-  its value. No profile schema, clipboard-report keys, wire output, or cadence
+  interpretation, and the outcome line is stated as visible arithmetic
+  (`scheduled - failed - suppressed - missed = sent`) so the successful
+  remainder is defined by the equation rather than by a noun claiming more than
+  the application can observe. The shared row chrome tooltips its label as well
+  as its value. No profile schema, clipboard-report keys, wire output, or cadence
   behavior changes.
 
 Revision note for 1.7 (telemetry ownership across the two applications):
@@ -1381,16 +1383,34 @@ The editor section is **Configure interface** in both applications.
 
 The outcome readout is **Send outcomes**, and the counted facts it reports are
 rendered in exactly **one** place: an always-visible line directly beneath the
-`status · interface` row, followed by an `Accepted:` line carrying the cumulative
+`status · interface` row, followed by a `Sent:` line carrying the cumulative
 byte total and the rolling rates. The diagnostics card keeps only readouts that
 require interpretation — Cadence and Capacity — and raises no unsent callout. The
 send-outcome tone still feeds the card badge, so a failing interface escalates it
 while the adjacent line supplies the reason.
 
-`unsent` is presented as the aggregate of `failed + suppressed + missed`, with
-its components in parentheses rather than as siblings, and one tooltip states the
-`accepted + unsent = scheduled` equation. The three components keep their names:
-they are load-bearing in `RunSummary`, the clipboard report keys, and §8.1.
+The line is written as **visible arithmetic** rather than as a total with a
+name for the successful remainder:
+
+```
+Send outcomes: 100 scheduled - 1 failed - 0 suppressed - 1 missed = 98 sent
+```
+
+Every candidate noun for that remainder failed review. *Accepted* never says
+accepted by what, and is ambiguous about which of the four gates — generated,
+handled, rendered, written — did the accepting; a failed send was accepted by
+three of them. *Unaccepted* is worse as the complement, because suppressed and
+missed were never offered to the interface at all. *Sent* alone invites reading a
+successful write as delivery. Stating the subtraction removes the need to choose:
+the schedule's own cadence points are the anchor, each deduction names the stage
+it happened at, and the remainder is defined by the equation. Because the line
+defines its own final term, that term can be the plain word **sent** without
+carrying the claim on its own.
+
+The three deductions keep their names — they are load-bearing in `RunSummary`,
+the clipboard report keys, and §8.1 — and the aggregate `unsent` remains in the
+completed-run summary and `RunSummary::unsent_sends`, where one shortfall number
+still earns its place. It is simply not needed on a line that shows the parts.
 
 The shared `signal_row` chrome attaches its tooltip to the **label as well as
 the value**, because a reader who does not know what a row measures hovers its

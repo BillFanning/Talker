@@ -41,7 +41,7 @@ use super::diagnostics::*;
 fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
     let unsent = summary.unsent_sends();
     let heading = format!(
-        "Last completed run · {} · {} accepted · {unsent} unsent",
+        "Last completed run · {} · {} sent · {unsent} unsent",
         compact_duration(summary.elapsed),
         summary.total_count,
     );
@@ -72,7 +72,7 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
             // Same shape as the live send-outcomes line: the aggregate, then
             // its parts in parentheses.
             ui.weak(format!(
-                "Accepted: {} · {} messages · {} unsent ({} failed · {} suppressed · {} missed)",
+                "Sent: {} · {} messages · {} unsent ({} failed · {} suppressed · {} missed)",
                 human_bytes(summary.total_bytes),
                 summary.total_count,
                 unsent,
@@ -80,7 +80,7 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
                 summary.suppressed_sends,
                 summary.missed_sends,
             ))
-            .on_hover_text(LOCAL_ACCEPTANCE_TOOLTIP);
+            .on_hover_text(SENT_MEANING_TOOLTIP);
             let (timer_detail, timer_hot) = timer_status_detail(summary.timer);
             let timer = egui::RichText::new(format!("Timer: {timer_detail}")).weak();
             ui.label(if timer_hot {
@@ -137,14 +137,14 @@ impl TalkerApp {
                 ui.separator();
                 self.show_channel_body(ui, i, running);
                 ui.separator();
-                // The accepted total proves whether Output payload updates
+                // The sent total proves whether Output payload updates
                 // were omitted; retained Output history is a separate concern.
-                let accepted_total = self
+                let sent_total = self
                     .sup
                     .telemetry_ref(i)
                     .map(|telemetry| telemetry.total_count)
                     .unwrap_or_default();
-                show_display_pane(ui, &mut self.displays[i], accepted_total);
+                show_display_pane(ui, &mut self.displays[i], sent_total);
             });
         });
     }
@@ -295,14 +295,14 @@ impl TalkerApp {
         let capacity = match demand {
             None => DecisionSignal {
                 text: format!(
-                    "Complete message setup to calculate · {} accepted (~5 s)",
+                    "Complete message setup to calculate · {} sent (~5 s)",
                     compact_rate(f64::from(mps), "msg/s")
                 ),
                 tone: SignalTone::Neutral,
             },
             Some(demand) if !demand.is_active() => DecisionSignal {
                 text: format!(
-                    "No active messages · {} accepted (~5 s)",
+                    "No active messages · {} sent (~5 s)",
                     compact_rate(f64::from(mps), "msg/s")
                 ),
                 tone: SignalTone::Neutral,
@@ -315,7 +315,7 @@ impl TalkerApp {
                 };
                 DecisionSignal {
                     text: format!(
-                        "{} requested / {} accepted (~5 s) · {line_capacity} · {app_capacity}",
+                        "{} requested / {} sent (~5 s) · {line_capacity} · {app_capacity}",
                         compact_rate(demand.messages_per_second, "msg/s"),
                         compact_rate(f64::from(mps), "msg/s"),
                     ),
@@ -381,7 +381,7 @@ impl TalkerApp {
         };
 
         // Counted facts sit directly beneath the status · interface row, in
-        // exactly one place: the run's send outcomes, then what was accepted.
+        // exactly one place: the run's send outcomes, then what was sent.
         // The card below holds only the readouts that need interpretation.
         ui.add(
             egui::Label::new(
@@ -398,7 +398,7 @@ impl TalkerApp {
         detail_line(
             ui,
             format!(
-                "Accepted: {} total · {} · {:.1} msg/s (~5 s)",
+                "Sent: {} total · {} · {:.1} msg/s (~5 s)",
                 human_bytes(bytes),
                 human_byte_rate(f64::from(bps)),
                 mps
@@ -421,7 +421,7 @@ impl TalkerApp {
                         "Capacity",
                         &capacity.text,
                         capacity.tone,
-                        "Requested load comes from the draft currently shown and may differ from the running configuration until Apply & Restart. Accepted rate is the rolling five-second average of configured-interface writes that returned success. Serial utilization is a theoretical UART line estimate. Application headroom compares the current draft with separate render and interface-write p99 bounds. A warmed recent snapshot is preferred while it is current; an expired snapshot is discarded and a clearly labelled run-wide fallback is used when available. This is an advisory projection, not a hard capacity promise.",
+                        "Requested load comes from the draft currently shown and may differ from the running configuration until Apply & Restart. Sent rate is the rolling five-second average of configured-interface writes that returned success. Serial utilization is a theoretical UART line estimate. Application headroom compares the current draft with separate render and interface-write p99 bounds. A warmed recent snapshot is preferred while it is current; an expired snapshot is discarded and a clearly labelled run-wide fallback is used when available. This is an advisory projection, not a hard capacity promise.",
                     );
             });
 
@@ -470,7 +470,7 @@ impl TalkerApp {
                     .id_salt("timing_runtime_details")
                     .default_open(false)
                     .show(ui, |ui| {
-                        // Send outcomes and accepted totals/rates are not
+                        // Send outcomes and sent totals/rates are not
                         // repeated here — they are always visible above the
                         // card, so this section carries only what the compact
                         // readouts leave out.
@@ -1500,7 +1500,7 @@ fn show_message_preview(ui: &mut egui::Ui, analysis: &MessageDraftAnalysis) {
 /// the count is the last value seen.
 fn show_message_status(ui: &mut egui::Ui, channel_running: bool, sent: u64) {
     // Footer bar: separator above to split it from the message body, then
-    // a tinted Frame so the "Active / Accepted: N" line reads as a status
+    // a tinted Frame so the "Active / Sent: N" line reads as a status
     // strip rather than just another row of widgets. Inner margin
     // matches the channel-summary chrome so all the framed bits in the
     // GUI feel like the same component.
@@ -1535,11 +1535,11 @@ fn show_message_status(ui: &mut egui::Ui, channel_running: bool, sent: u64) {
                 ui.label(egui::RichText::new(state).strong());
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(format!("Accepted: {sent}"))
+                    egui::RichText::new(format!("Sent: {sent}"))
                         .strong()
                         .monospace(),
                 )
-                .on_hover_text(LOCAL_ACCEPTANCE_TOOLTIP);
+                .on_hover_text(SENT_MEANING_TOOLTIP);
             });
         });
 }

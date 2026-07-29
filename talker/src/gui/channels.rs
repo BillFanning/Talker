@@ -262,7 +262,7 @@ impl TalkerApp {
                             String::new()
                         };
                         ui.label(
-                            egui::RichText::new(format!("Accepted: {}{rate}", row.sent)).weak(),
+                            egui::RichText::new(format!("Sent: {}{rate}", row.sent)).weak(),
                         )
                         .on_hover_text(
                             "Accepted means the configured-interface write returned success; it \
