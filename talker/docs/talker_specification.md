@@ -1,9 +1,29 @@
 # Talker — Program Specification
-**Version:** 2.4.4
+**Version:** 2.4.5
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (truthful pushed-snapshot freshness):
+Revision note (send vocabulary and single-rendering outcomes):
+
+- **§3.2 detail-pane wording (ADR-044)** — *interface* is the term for a
+  configured serial/UDP/TCP endpoint, so the editor section is **Configure
+  interface**; *connection* is reserved for Listener's accepted TCP peer
+  sessions. The send readout is **Send outcomes**, since it counts scheduled
+  sends rather than the interface itself.
+- **§3.2 detail-pane layout (ADR-044)** — the counted outcomes render in exactly
+  one place, on an always-visible line beneath the `status · interface` row,
+  followed by an `Accepted:` line carrying the cumulative byte total and the
+  rolling five-second rates. The diagnostics card keeps only Cadence and
+  Capacity and raises no unsent callout, though the send-outcome tone still
+  escalates its badge. `unsent` is shown as the aggregate of `failed +
+  suppressed + missed` with its components parenthesised. This corrects a §3.2
+  bullet that still described a *Wire facts* grouping the GUI had already
+  replaced.
+- Byte rates scale by SI unit and read `0.0 B/s` at rest. Profiles, profile
+  schema `version` 2, clipboard-report keys, wire output, and cadence are
+  unchanged.
+
+Previous revision note (truthful pushed-snapshot freshness):
 
 - **§3.2 / §8.1 timing snapshot provenance (ADR-042)** — every pushed
   counter/timing snapshot now carries its exact monotonic compute instant and
@@ -15,7 +35,7 @@ Revision note (truthful pushed-snapshot freshness):
   retain their indefinite zero-wakeup command wait—no telemetry heartbeat is added.
   Profiles, clipboard-report format, and wire output are unchanged.
 
-Previous revision note (shared telemetry and explicit timer reconciliation):
+Revision v2.4.3 (shared telemetry and explicit timer reconciliation):
 
 - **§2.1 / §3.2 / §8.1 bounded telemetry (ADR-039)** — the workspace adds the
   dependency-free internal `wiredata-telemetry` crate for the fixed duration

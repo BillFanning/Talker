@@ -312,9 +312,10 @@ Channel types:
 - TCP Connection Channel
 
 For user-created Serial, UDP, and TCP Listener Channels, the `+ Add` template chooses
-the transport kind. Configure Connection edits that kind's parameters but does not
+the transport kind. Configure Interface edits that kind's parameters but does not
 replace it with another transport. TCP Connection Channels remain runtime-created
-children of a TCP Listener Channel.
+children of a TCP Listener Channel — *Connection* names an accepted peer session,
+never the configured endpoint, which is why the editor is Configure Interface.
 
 ### 4.2 Byte Stream
 

@@ -240,18 +240,18 @@ pub(super) fn edit_interface(
                     // in every mode (accept on any local interface), but *why* differs.
                     let bind_hint = match udp.mode {
                         UdpMode::Broadcast => {
-                            "The local interface(s) to receive on. 0.0.0.0 means \"any \
-                             interface\" — the usual choice for broadcast, since the \
+                            "The local network interface(s) to receive on. 0.0.0.0 means \"any \
+                             network interface\" — the usual choice for broadcast, since the \
                              sender targets the subnet, not a specific host."
                         }
                         UdpMode::Unicast => {
-                            "The local interface(s) to receive on. 0.0.0.0 means \"any \
-                             interface\" (accept on all NICs); use a specific local IP \
-                             to receive only on that interface."
+                            "The local network interface(s) to receive on. 0.0.0.0 means \"any \
+                             network interface\" (accept on all NICs); use a specific local IP \
+                             to receive only on that NIC."
                         }
                         UdpMode::Multicast => {
-                            "The local interface to join the group on. 0.0.0.0 means \
-                             \"any interface\" — fine for most setups; use a specific \
+                            "The local network interface to join the group on. 0.0.0.0 means \
+                             \"any network interface\" — fine for most setups; use a specific \
                              local IP to join on just that NIC."
                         }
                     };

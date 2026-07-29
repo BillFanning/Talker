@@ -1212,6 +1212,38 @@ proving its age.
 rather than looking like an omission on one side. No wire, profile, recording, or
 snapshot schema changes. See talker ADR-043 for the same decision from talker's side.
 
+## ADR-036 — *Connection* names an accepted peer session, not a configured endpoint
+
+**Status:** Accepted 2026-07-28.
+
+**Context:** Listener's editor section was titled *Configure connection*, matching
+Talker's. In Listener that title is actively wrong: **Connection** is already a
+first-class runtime concept here — an accepted TCP peer session with its own
+lifecycle, its own Channel, and a `max_connections` limit (§16.2). The spec
+paragraph introducing the editor sat three lines below "TCP Connection Channel",
+so one page used the same word for a live peer session and for the parameters of
+a serial port.
+
+The word was also doing a third job. The UDP bind-address help described
+`0.0.0.0` as "any interface", meaning the host NIC — so *interface* named both
+the thing being configured and the adapter it binds to.
+
+**Decision:** *Connection* is reserved for an accepted TCP peer session. The
+editor is **Configure interface**, matching Talker (talker ADR-044) and the
+`InterfaceConfig` type both applications already use. Host-adapter references say
+**network interface** or **NIC** explicitly, so the bind help cannot be read as
+describing the channel's configured endpoint.
+
+Byte rates use the shared `human_byte_rate` helper rather than a hardcoded
+`kB/s`, so a fast channel reads `1.2 MB/s` and a stopped one reads `0.0 B/s`,
+matching how byte totals already scale.
+
+**Consequences:** The two applications name the same thing the same way while
+Listener keeps the distinct concept it genuinely needs. No transport behavior,
+profile schema, recording format, or snapshot surface changes. The shared
+diagnostics-row chrome now attaches its tooltip to a row's label as well as its
+value (talker ADR-044), which reaches Listener's card automatically.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

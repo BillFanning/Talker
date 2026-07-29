@@ -1,6 +1,7 @@
 //! The channel-list (tabs) panel and its row snapshot, split out of `mod.rs`.
 
 use crate::core::ChannelId;
+use wiredata_ui::format::human_byte_rate;
 use wiredata_ui::selection;
 
 use super::bridge::UiCommand;
@@ -182,9 +183,9 @@ impl ListenerApp {
                         // Line 3: live stats.
                         ui.label(
                             egui::RichText::new(format!(
-                                "{}  ·  {:.1} kB/s",
+                                "{}  ·  {}",
                                 human_bytes(row.bytes_total),
-                                row.bytes_per_sec / 1000.0
+                                human_byte_rate(row.bytes_per_sec)
                             ))
                             .weak(),
                         );

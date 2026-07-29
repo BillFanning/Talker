@@ -1,10 +1,22 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.7
-**Date:** 2026-07-27
+**Version:** 1.8
+**Date:** 2026-07-28
 **Status:** Accepted
 
-Revision note (telemetry ownership across the two applications):
+Revision note (one vocabulary, each counted fact rendered once):
+
+- **ADR-044** settles *interface* as the term for a configured serial/UDP/TCP
+  endpoint, reserving *connection* for Listener's accepted TCP peer sessions, and
+  renames the send readout to **Send outcomes** because it counts scheduled sends
+  rather than the interface. The counted outcomes now render in exactly one place
+  above the diagnostics card, which keeps only the readouts that need
+  interpretation; `unsent` is presented as the aggregate of its three
+  parenthesised components. The shared row chrome tooltips its label as well as
+  its value. No profile schema, clipboard-report keys, wire output, or cadence
+  behavior changes.
+
+Revision note for 1.7 (telemetry ownership across the two applications):
 
 - **ADR-043** records why only Talker's timing telemetry carries a capture instant.
   Talker pushes collapsed snapshots from its send path, so they age between

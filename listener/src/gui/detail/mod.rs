@@ -19,7 +19,7 @@ use super::widgets::{
 };
 use super::ListenerApp;
 use wiredata_ui::fonts::bold;
-use wiredata_ui::format::compact_duration;
+use wiredata_ui::format::{compact_duration, human_byte_rate};
 use wiredata_ui::palette::active as palette;
 
 /// Uniform size for the lifecycle / recording control buttons. Text wider than the
@@ -30,7 +30,7 @@ const THROUGHPUT_TOOLTIP: &str = concat!(
     "Received is the cumulative byte count processed by Listener since Start and is ",
     "retained after Stop. Throughput uses bytes whose post-read arrival times fall in ",
     "the current and previous four one-second buckets, divided by five seconds and ",
-    "shown in decimal kB/s. It is an approximate five-second application receive rate ",
+    "scaled by SI unit. It is an approximate five-second application receive rate ",
     "from the latest status snapshot, not instantaneous line rate, link utilization, ",
     "or device-buffer occupancy. During the first five seconds it still uses the full ",
     "five-second denominator; after Stop the rate is zero while Received remains."
@@ -194,9 +194,9 @@ impl ListenerApp {
         // Configure is edit-only: there's no Apply button here. Edits commit via the
         // Start / Apply & Restart button at the top, which applies the pending draft.
         if let Some((_, config)) = &mut self.edit_draft {
-            // "Configure connection" — the shared section title in both apps
-            // (talker's Connection editor uses the same words).
-            egui::CollapsingHeader::new(bold("Configure connection"))
+            // "Configure interface" — the shared section title in both apps
+            // (talker's interface editor uses the same words).
+            egui::CollapsingHeader::new(bold("Configure interface"))
                 // A STABLE id (not per-channel) so switching channels doesn't create a
                 // "new" header each time — that re-triggered a focus/animation highlight
                 // that flashed a rectangle around the label on every channel switch. The
@@ -472,9 +472,9 @@ impl ListenerApp {
         });
         // Byte-based liveness (§18): total received + rolling throughput.
         ui.label(format!(
-            "Received: {}    Throughput: {:.1} kB/s",
+            "Received: {}    Throughput: {}",
             human_bytes(bytes_total),
-            bps / 1000.0
+            human_byte_rate(bps)
         ))
         .on_hover_text(THROUGHPUT_TOOLTIP);
         ui.add_space(12.0); // a blank line between the readouts and the buttons
