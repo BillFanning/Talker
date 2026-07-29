@@ -27,7 +27,7 @@ Cross off items as they are completed. Add new ones inline as they come up.
   (2026-07-16): §3.2 now describes the shipped master–detail pane (wire-facts /
   throughput / observer-health readout grouping post-ADR-018, lifecycle button
   pair, list-row contents, Profile menu in the list header, ✕ removal,
-  "Configure connection" / "Configure messages" titles). The original item's
+  "Configure interface" / "Configure messages" titles). The original item's
   `TalkerStatus::Sent` field references had gone stale (ADR-018 replaced `Sent`
   with counters + samples); the spec text was written from the current
   `show_channel_header`. (GUI-merge harmonization, 2026-07-10.)

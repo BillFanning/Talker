@@ -31,11 +31,12 @@ success. It does not confirm that serial bits reached the wire, a network packet
 or a peer received the data.";
 
 pub(super) const THROUGHPUT_TOOLTIP: &str =
-    "Rolling five-second average of messages and bytes whose \
-configured-interface writes were accepted locally. Failed, retry-suppressed, and missed \
-occurrences are excluded. The fixed five-second denominator makes the value ramp during startup \
-and decay after traffic stops; it is not instantaneous line rate or proof of physical-wire or \
-peer delivery.";
+    "Total is every byte accepted since Start and is retained after Stop. The two rates are a \
+rolling five-second average of accepted messages and bytes. Failed, retry-suppressed, and missed \
+sends are excluded from all three. The fixed five-second denominator makes the rates ramp during \
+startup and decay to zero after traffic stops, while the total stands still; they are not \
+instantaneous line rate. Accepted means the interface write returned success, not that any peer \
+received the data.";
 
 pub(super) const TIMING_TOOLTIP: &str = "Each recent snapshot merges up to approximately ten seconds of \
 fixed one-second segments ending when the runner captured its latest counter update. A slow or \
@@ -44,7 +45,7 @@ snapshot compute time, not necessarily the newest sample time. While running, a 
 longer used as recent evidence once that age reaches ten seconds. After a normal run end, the \
 channel retains its exact final snapshot; an abnormal exit can leave the last non-final snapshot \
 instead. Deadline lateness runs from a message's monotonic cadence deadline \
-until the runner handles that occurrence; handled retry-suppressed occurrences are included, while \
+until the runner handles that send; handled retry-suppressed sends are included, while \
 cadence points counted as Missed are not sampled. Render covers payload and timestamp construction. \
 Send call ends when the configured-interface write returns and includes failed attempts; it does \
 not prove physical-wire or peer delivery. Each boundary has its own sample count and warm-up. \
@@ -54,7 +55,7 @@ pub(super) const TIMER_TOOLTIP: &str =
     "The shortest active interval selects the deadline-wait policy. On \
 Windows, intervals below 32 ms hold the shared process-wide 1 ms timer-resolution request in \
 either mode. At 32 ms or longer, Standard uses ordinary deadline waits; Precise requests 1 ms \
-only for the final 32 ms before a waited deadline. An Immediate schedule's first occurrence has \
+only for the final 32 ms before a waited deadline. An Immediate schedule's first send has \
 no preceding precision window. This channel releases a bounded-window request before rendering \
 and writing, although another channel may keep the process-wide request active. Commands interrupt \
 both wait stages. Other platforms use native deadline waits. This affects wake timing, not \
@@ -226,27 +227,35 @@ pub(super) fn diagnostic_card_tone(
     }
 }
 
-pub(super) fn delivery_decision(
-    sent: u64,
+/// The run's counted send outcomes as one always-visible line.
+///
+/// `unsent` is the aggregate of `failed + suppressed + missed`, so its three
+/// components are shown parenthetically rather than as siblings: rendering them
+/// as peers separated by the same divider invited reading `unsent` and `missed`
+/// as competing names for one quantity.
+pub(super) fn send_outcomes(
+    accepted: u64,
     failed: u64,
     suppressed: u64,
     missed: u64,
 ) -> DecisionSignal {
     let unsent = failed.saturating_add(suppressed).saturating_add(missed);
-    let scheduled = sent.saturating_add(unsent);
+    let scheduled = accepted.saturating_add(unsent);
     if scheduled == 0 {
         return DecisionSignal {
-            text: "No scheduled sends yet".to_owned(),
+            text: "Send outcomes: no scheduled sends yet".to_owned(),
             tone: SignalTone::Neutral,
         };
     }
 
-    let unsent_pct = unsent as f64 / scheduled as f64 * 100.0;
     DecisionSignal {
         text: if unsent == 0 {
-            format!("{sent} / {scheduled} accepted · none unsent")
+            format!("Send outcomes: {accepted} / {scheduled} accepted · none unsent")
         } else {
-            format!("{sent} / {scheduled} accepted · {unsent} unsent ({unsent_pct:.1}%)")
+            format!(
+                "Send outcomes: {accepted} / {scheduled} accepted · {unsent} unsent \
+                 ({failed} failed · {suppressed} suppressed · {missed} missed)"
+            )
         },
         tone: if failed > 0 {
             SignalTone::Fault
@@ -256,6 +265,27 @@ pub(super) fn delivery_decision(
             SignalTone::Healthy
         },
     }
+}
+
+/// The one tooltip for the send-outcomes line: what each counter counts, and
+/// the equation that ties them together.
+pub(super) fn send_outcomes_tooltip(
+    accepted: u64,
+    failed: u64,
+    suppressed: u64,
+    missed: u64,
+) -> String {
+    let unsent = failed.saturating_add(suppressed).saturating_add(missed);
+    let scheduled = accepted.saturating_add(unsent);
+    format!(
+        "Run-to-date outcomes for every scheduled send. Accepted means {accepted} interface \
+         writes returned success; it does not confirm physical-wire or peer delivery. Unsent \
+         is the aggregate {unsent}, never a fourth category alongside its parts: {failed} \
+         failed means the write was attempted and returned an error, {suppressed} suppressed \
+         means the send was skipped during retry backoff, and {missed} missed means a cadence \
+         grid point was skipped because the runner was more than one interval behind. \
+         Accepted + unsent = {scheduled} scheduled."
+    )
 }
 
 pub(super) fn relative_to_shortest(
@@ -309,7 +339,7 @@ pub(super) fn cadence_decision(
     } else if recent_samples == 0 {
         let run_max = cumulative.deadline_lateness.max().unwrap_or_default();
         format!(
-            "No fires in {snapshot_label} · run max late {}{}",
+            "No sends in {snapshot_label} · run max late {}{}",
             compact_duration(run_max),
             shortest
                 .map(|interval| relative_to_shortest(run_max, interval, false))
@@ -450,9 +480,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        analyzed_channel_demand, cadence_decision, delivery_decision, diagnostic_card_tone,
-        recent_timing_metric, select_service_timing, timer_status_detail, timing_detail_text,
-        unavailable_line_capacity_label, ServiceTimingSource,
+        analyzed_channel_demand, cadence_decision, diagnostic_card_tone, recent_timing_metric,
+        select_service_timing, send_outcomes, send_outcomes_tooltip, timer_status_detail,
+        timing_detail_text, unavailable_line_capacity_label, ServiceTimingSource,
     };
     use crate::core::telemetry::{RecentSnapshotState, SendTimingTelemetry};
     use crate::core::timing::{CadenceAlignment, TimerMode, TimerReason, TimerStatus, TimingMode};
@@ -462,25 +492,72 @@ mod tests {
     };
     use wiredata_ui::diagnostics::SignalTone;
     #[test]
-    fn delivery_decision_distinguishes_clean_shortfall_and_failure() {
-        let clean = delivery_decision(100, 0, 0, 0);
-        assert_eq!(clean.text, "100 / 100 accepted · none unsent");
+    fn send_outcomes_distinguish_clean_shortfall_and_failure() {
+        let clean = send_outcomes(100, 0, 0, 0);
+        assert_eq!(
+            clean.text,
+            "Send outcomes: 100 / 100 accepted · none unsent"
+        );
         assert_eq!(clean.tone, SignalTone::Healthy);
 
-        let missed = delivery_decision(98, 0, 1, 1);
-        assert_eq!(missed.text, "98 / 100 accepted · 2 unsent (2.0%)");
-        assert_eq!(missed.tone, SignalTone::Warning);
+        // The aggregate is followed by its parts in parentheses, never as
+        // siblings — `unsent` contains `missed`, it does not sit beside it.
+        let shortfall = send_outcomes(98, 0, 1, 1);
+        assert_eq!(
+            shortfall.text,
+            "Send outcomes: 98 / 100 accepted · 2 unsent (0 failed · 1 suppressed · 1 missed)"
+        );
+        assert_eq!(shortfall.tone, SignalTone::Warning);
 
-        let failed = delivery_decision(98, 1, 0, 1);
-        assert_eq!(failed.text, "98 / 100 accepted · 2 unsent (2.0%)");
+        // Same totals, but an attempted write returned an error: that is the
+        // only component that escalates to a fault.
+        let failed = send_outcomes(98, 1, 0, 1);
+        assert_eq!(
+            failed.text,
+            "Send outcomes: 98 / 100 accepted · 2 unsent (1 failed · 0 suppressed · 1 missed)"
+        );
         assert_eq!(failed.tone, SignalTone::Fault);
     }
 
     #[test]
-    fn delivery_decision_is_neutral_before_any_schedule_fires() {
-        let decision = delivery_decision(0, 0, 0, 0);
-        assert_eq!(decision.text, "No scheduled sends yet");
+    fn send_outcomes_are_neutral_before_any_schedule_fires() {
+        let decision = send_outcomes(0, 0, 0, 0);
+        assert_eq!(decision.text, "Send outcomes: no scheduled sends yet");
         assert_eq!(decision.tone, SignalTone::Neutral);
+    }
+
+    /// The send-outcome counts moved out of the card and above it, but their
+    /// tone still has to reach the badge — otherwise a failing interface reads
+    /// as a calm card. This pins the coupling that survived that move.
+    #[test]
+    fn send_outcome_tone_still_escalates_the_card_badge() {
+        let failing = send_outcomes(98, 1, 0, 1);
+        assert_eq!(
+            diagnostic_card_tone(failing.tone, SignalTone::Neutral, false, 0, true),
+            SignalTone::Fault
+        );
+
+        let shortfall = send_outcomes(98, 0, 1, 1);
+        assert_eq!(
+            diagnostic_card_tone(shortfall.tone, SignalTone::Neutral, false, 0, true),
+            SignalTone::Warning
+        );
+
+        let clean = send_outcomes(100, 0, 0, 0);
+        assert_eq!(
+            diagnostic_card_tone(clean.tone, SignalTone::Neutral, false, 0, true),
+            SignalTone::Healthy
+        );
+    }
+
+    #[test]
+    fn send_outcomes_tooltip_states_the_scheduled_equation() {
+        let tip = send_outcomes_tooltip(98, 1, 0, 1);
+        assert!(tip.contains("Accepted + unsent = 100 scheduled"));
+        // The aggregate must be named as such, so a reader never takes
+        // `unsent` for a fourth peer category alongside its own parts.
+        assert!(tip.contains("never a fourth category"));
+        assert!(tip.contains("does not confirm physical-wire or peer delivery"));
     }
 
     #[test]

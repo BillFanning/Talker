@@ -19,7 +19,7 @@ use crate::core::{
 use wiredata_ui::{
     diagnostics::{attention_callout, decision_card, signal_grid, signal_row, SignalTone},
     fonts::bold,
-    format::{compact_duration, human_bytes},
+    format::{compact_duration, human_byte_rate, human_bytes},
     glyphs,
 };
 
@@ -41,7 +41,7 @@ use super::diagnostics::*;
 fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
     let unsent = summary.unsent_sends();
     let heading = format!(
-        "Last completed run · {} · {} accepted locally · {unsent} unsent",
+        "Last completed run · {} · {} accepted · {unsent} unsent",
         compact_duration(summary.elapsed),
         summary.total_count,
     );
@@ -69,8 +69,10 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
                 summary.started_utc(),
                 summary.finished_utc(),
             ));
+            // Same shape as the live send-outcomes line: the aggregate, then
+            // its parts in parentheses.
             ui.weak(format!(
-                "Accepted locally: {} · {} msgs · Unsent: {} ({} failed · {} suppressed · {} missed)",
+                "Accepted: {} · {} messages · {} unsent ({} failed · {} suppressed · {} missed)",
                 human_bytes(summary.total_bytes),
                 summary.total_count,
                 unsent,
@@ -239,17 +241,8 @@ impl TalkerApp {
         let missed = telemetry.missed_sends;
         let failed = telemetry.failed_sends;
         let suppressed = telemetry.suppressed_sends;
-        let unsent = missed.saturating_add(failed).saturating_add(suppressed);
-        let scheduled = msgs.saturating_add(unsent);
-        let delivery = delivery_decision(msgs, failed, suppressed, missed);
-        let unsent_tip = format!(
-            "Run-to-date scheduler outcomes. Accepted means {msgs} configured-interface writes \
-             returned success; it does not confirm physical-wire or peer delivery. Failed means \
-             {failed} attempted writes returned an error. Suppressed means {suppressed} handled \
-             occurrences were skipped during retry backoff. Missed means {missed} cadence-grid \
-             points were skipped because the runner was more than one interval behind. Accepted, \
-             failed, suppressed, and missed add up to the scheduled total."
-        );
+        let outcomes = send_outcomes(msgs, failed, suppressed, missed);
+        let outcomes_tip = send_outcomes_tooltip(msgs, failed, suppressed, missed);
 
         // Capacity is computed from the current draft's memoized wire lengths,
         // never by re-rendering payloads in this per-frame header path.
@@ -375,8 +368,11 @@ impl TalkerApp {
         let qlen = telemetry.queue_len;
         let qpeak = telemetry.queue_peak;
         let drops = telemetry.dropped_statuses;
+        // The send-outcome tone still escalates the card badge even though the
+        // counts themselves now live above the card: a failing interface must
+        // read as ISSUE there, and the adjacent line carries the reason.
         let card_tone =
-            diagnostic_card_tone(delivery.tone, capacity.tone, timer_hot, drops, running);
+            diagnostic_card_tone(outcomes.tone, capacity.tone, timer_hot, drops, running);
         let card_status = match card_tone {
             SignalTone::Fault => "ISSUE",
             SignalTone::Warning => "ATTENTION",
@@ -384,21 +380,41 @@ impl TalkerApp {
             SignalTone::Neutral => "IDLE",
         };
 
-        decision_card(ui, "Send health", card_status, card_tone, |ui| {
+        // Counted facts sit directly beneath the status · interface row, in
+        // exactly one place: the run's send outcomes, then what was accepted.
+        // The card below holds only the readouts that need interpretation.
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(&outcomes.text).color(match outcomes.tone {
+                    SignalTone::Fault => pal.fault_red,
+                    SignalTone::Warning => pal.warning_amber,
+                    _ => ui.visuals().text_color(),
+                }),
+            )
+            .wrap()
+            .sense(egui::Sense::hover()),
+        )
+        .on_hover_text(&outcomes_tip);
+        detail_line(
+            ui,
+            format!(
+                "Accepted: {} total · {} · {:.1} msg/s (~5 s)",
+                human_bytes(bytes),
+                human_byte_rate(f64::from(bps)),
+                mps
+            ),
+            false,
+            THROUGHPUT_TOOLTIP,
+        );
+
+        decision_card(ui, "", card_status, card_tone, |ui| {
             signal_grid(ui, "send_decisions", |ui| {
-                signal_row(
-                    ui,
-                    "Interface outcomes",
-                    &delivery.text,
-                    delivery.tone,
-                    &unsent_tip,
-                );
                 signal_row(
                         ui,
                         "Cadence",
                         &cadence_decision.text,
                         cadence_decision.tone,
-                        "Deadline lateness is aggregated across all messages. Every handled due occurrence, including one suppressed during retry backoff, contributes a sample; cadence points counted as Missed do not. Faster messages therefore contribute more samples. p99 is a histogram-bucket upper bound. Any percentage compares the aggregate value with the displayed shortest active interval for schedule context; it is not a per-message percentage. The “as of” age tells you when the snapshot was computed. Once a running snapshot reaches ten seconds old, this row labels it expired instead of presenting its retained samples as current.",
+                        "Deadline lateness is aggregated across all messages. Every handled due send, including one suppressed during retry backoff, contributes a sample; cadence points counted as Missed do not. Faster messages therefore contribute more samples. p99 is a histogram-bucket upper bound. Any percentage compares the aggregate value with the displayed shortest active interval for schedule context; it is not a per-message percentage. The “as of” age tells you when the snapshot was computed. Once a running snapshot reaches ten seconds old, this row labels it expired instead of presenting its retained samples as current.",
                     );
                 signal_row(
                         ui,
@@ -409,22 +425,10 @@ impl TalkerApp {
                     );
             });
 
-            if unsent > 0 {
-                ui.add_space(6.0);
-                attention_callout(
-                        ui,
-                        "unsent_attention",
-                        format!(
-                            "{unsent} unsent · {failed} failed · {suppressed} suppressed · {missed} missed"
-                        ),
-                        if failed > 0 {
-                            SignalTone::Fault
-                        } else {
-                            SignalTone::Warning
-                        },
-                        &unsent_tip,
-                    );
-            }
+            // No unsent callout: the send-outcomes line above the card already
+            // carries the counts and its own tone, and the badge escalates from
+            // the same signal. Repeating it here was the third rendering of one
+            // fact.
             if let Some(line) = serial.filter(|line| line.is_oversubscribed()) {
                 ui.add_space(4.0);
                 attention_callout(
@@ -447,7 +451,7 @@ impl TalkerApp {
                         "timer_request_attention",
                         "Windows 1 ms timer request failed; cadence waits are using the fallback",
                         SignalTone::Warning,
-                        "The channel continues with ordinary deadline waits. The failed request does not prove that any occurrence was late; inspect measured deadline lateness and Missed cadence points for the observed effect.",
+                        "The channel continues with ordinary deadline waits. The failed request does not prove that any send was late; inspect measured deadline lateness and Missed cadence points for the observed effect.",
                     );
             }
             if drops > 0 {
@@ -466,26 +470,10 @@ impl TalkerApp {
                     .id_salt("timing_runtime_details")
                     .default_open(false)
                     .show(ui, |ui| {
-                        detail_line(
-                            ui,
-                            format!(
-                                "Interface outcomes: {} accepted locally · {msgs}/{scheduled} scheduled accepted · {unsent} unsent",
-                                human_bytes(bytes)
-                            ),
-                            unsent > 0,
-                            &unsent_tip,
-                        );
-                        detail_line(
-                            ui,
-                            format!(
-                                "Accepted rate (~5 s): {:.1} kB/s · {:.1} msg/s",
-                                bps / 1000.0,
-                                mps
-                            ),
-                            false,
-                            THROUGHPUT_TOOLTIP,
-                        );
-
+                        // Send outcomes and accepted totals/rates are not
+                        // repeated here — they are always visible above the
+                        // card, so this section carries only what the compact
+                        // readouts leave out.
                         match demand {
                             None => detail_line(
                                 ui,
@@ -695,13 +683,13 @@ impl TalkerApp {
     }
 
     fn show_channel_body(&mut self, ui: &mut egui::Ui, i: usize, running: bool) {
-        // "Configure connection" — the shared section title in both apps
+        // "Configure interface" — the shared section title in both apps
         // (listener's Configure section uses the same words). Stays a plain
         // collapsing section — it does NOT auto-collapse on run (you often
         // want the interface params visible while a channel is live).
         // Default open; the user's expand/collapse choice persists via the
         // stable id_salt.
-        let (changed, refresh) = egui::CollapsingHeader::new("Configure connection")
+        let (changed, refresh) = egui::CollapsingHeader::new("Configure interface")
             .id_salt(("conn_section", i))
             .default_open(true)
             .show(ui, |ui| {

@@ -19,6 +19,22 @@ pub fn human_bytes(n: u64) -> String {
     }
 }
 
+/// Format a byte-per-second rate in the same SI units as [`human_bytes`], so a
+/// readout showing a total beside a rate scales both the same way.
+///
+/// One decimal throughout, including zero: a stopped channel reads `0.0 B/s`
+/// rather than dropping the segment, so the row keeps its shape at rest.
+pub fn human_byte_rate(bytes_per_sec: f64) -> String {
+    const UNITS: [&str; 5] = ["B/s", "kB/s", "MB/s", "GB/s", "TB/s"];
+    let mut value = bytes_per_sec.max(0.0);
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 /// Format a duration compactly for timing telemetry readouts.
 pub fn compact_duration(duration: Duration) -> String {
     let nanos = duration.as_nanos();
@@ -59,6 +75,17 @@ mod tests {
         assert_eq!(human_bytes(1000), "1.000 kB");
         assert_eq!(human_bytes(1_500_000), "1.500 MB");
         assert_eq!(human_bytes(2_000_000_000), "2.000 GB");
+    }
+
+    #[test]
+    fn byte_rates_scale_like_totals_and_keep_a_decimal_at_rest() {
+        assert_eq!(human_byte_rate(0.0), "0.0 B/s");
+        assert_eq!(human_byte_rate(999.0), "999.0 B/s");
+        assert_eq!(human_byte_rate(1_000.0), "1.0 kB/s");
+        assert_eq!(human_byte_rate(12_400.0), "12.4 kB/s");
+        assert_eq!(human_byte_rate(1_500_000.0), "1.5 MB/s");
+        // A negative rate is not meaningful; clamp rather than print "-0.0".
+        assert_eq!(human_byte_rate(-5.0), "0.0 B/s");
     }
 
     #[test]

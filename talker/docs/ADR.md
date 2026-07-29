@@ -1339,6 +1339,63 @@ changes. See listener ADR-035 for the same decision from Listener's side.
 
 ---
 
+## ADR-044 — One vocabulary, and each counted fact rendered once
+
+**Status:** Accepted 2026-07-28.
+
+**Context:** The channel detail pane had accumulated two vocabulary problems and
+one structural one.
+
+The section that configures a serial port, UDP socket, or TCP peer was titled
+*Configure connection*, while the code type is `InterfaceConfig` and every other
+visible string said *interface*. Worse for the shared-chrome goal, Listener uses
+"connection" for a distinct first-class concept — an accepted TCP peer session
+with its own lifecycle and `max_connections` limit — so the title collided with a
+real domain term one pane away. "Connection" is also simply untrue of a
+connectionless UDP socket or a serial port.
+
+The send-outcome row was labelled *Interface outcomes*, but it counts scheduled
+sends; the interface is only where the write landed.
+
+Structurally, the same outcome counters rendered three times: a card row, an
+attention callout that repeated them with the breakdown, and a details line that
+repeated them again with the byte total. `unsent` and its component `missed` were
+also shown as peers separated by the same divider, which invited reading the
+aggregate as a fourth sibling category.
+
+**Decision:** *Interface* is the workspace term for a configured serial/UDP/TCP
+endpoint; *connection* is reserved for Listener's accepted TCP peer sessions.
+The editor section is **Configure interface** in both applications.
+
+The outcome readout is **Send outcomes**, and the counted facts it reports are
+rendered in exactly **one** place: an always-visible line directly beneath the
+`status · interface` row, followed by an `Accepted:` line carrying the cumulative
+byte total and the rolling rates. The diagnostics card keeps only readouts that
+require interpretation — Cadence and Capacity — and raises no unsent callout. The
+send-outcome tone still feeds the card badge, so a failing interface escalates it
+while the adjacent line supplies the reason.
+
+`unsent` is presented as the aggregate of `failed + suppressed + missed`, with
+its components in parentheses rather than as siblings, and one tooltip states the
+`accepted + unsent = scheduled` equation. The three components keep their names:
+they are load-bearing in `RunSummary`, the clipboard report keys, and §8.1.
+
+The shared `signal_row` chrome attaches its tooltip to the **label as well as
+the value**, because a reader who does not know what a row measures hovers its
+name first. `decision_card` accepts an empty title so a card whose rows name
+themselves does not carry a heading that merely repeats a nearby word.
+
+**Consequences:** Three renderings of one fact become one; the card shrinks to
+two interpretive rows. Byte rates scale by SI unit through a shared
+`human_byte_rate` helper, matching how totals already scale, and read `0.0 B/s`
+at rest rather than disappearing. The clipboard report's `key=value` field names
+are deliberately untouched — they are a machine-readable format, not prose.
+Listener's matching rename and vocabulary pass are a follow-up; the shared chrome
+changes already apply to it. No profile schema, wire output, cadence, or
+interface behavior changes.
+
+---
+
 ## Open questions
 
 The following decisions are deferred until the relevant module is written. They are recorded here so they are not forgotten and so the eventual decision (in a future ADR or commit) can reference the context.

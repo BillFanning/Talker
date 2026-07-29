@@ -363,11 +363,20 @@ The **detail pane** (right) shows the selected channel:
 
 - **Header** — status glyph + editable name (duplicates allowed but hinted);
   a `status · interface summary` row; then the readouts, grouped by subsystem:
-  - *Wire facts:* `Sent: <bytes> · <msgs> msgs`, and
-    `Unsent: <n> (<x>% of <scheduled>)` — amber when nonzero; its tooltip
-    decomposes the total into failed sends, backoff-suppressed fires, and
-    stall-skipped cadence points (§8.1). Sent + Unsent = scheduled, always.
-  - *Throughput:* rolling `kB/s · msg/s` from cumulative successful sends.
+  - *Send outcomes:* `Send outcomes: <accepted> / <scheduled> accepted ·
+    <n> unsent (<f> failed · <s> suppressed · <m> missed)`, shown **always** and
+    directly beneath the `status · interface` row — amber when unsent is nonzero,
+    red when any write failed. `unsent` is the aggregate of the three
+    parenthesised components, never a fourth category beside them; accepted +
+    unsent = scheduled, always. One tooltip defines each counter and states that
+    equation (§8.1). The outcomes are rendered in exactly one place: the
+    diagnostics card neither repeats them nor raises a separate unsent callout,
+    though their tone still escalates its badge.
+  - *Accepted:* `Accepted: <total> total · <byte rate> · <msg/s> (~5 s)` — the
+    cumulative byte total, retained after Stop, beside the rolling five-second
+    rates, which decay to `0.0` at rest while the total stands still. Byte
+    values scale by SI unit (kB → MB → GB) rather than carrying digit
+    separators.
   - *Capacity:* current-draft aggregate `msg/s` and wire `B/s`; for Serial, UART
     line utilization and headroom. A second line shows measured application
     headroom after warm-up from an eligible recent or cumulative run-wide
@@ -396,10 +405,10 @@ The **detail pane** (right) shows the selected channel:
   final timer/cadence policy, and build/platform facts. **Copy summary** places the
   versioned line-oriented report on the clipboard; formatting is performed only on
   click.
-- **Configure connection** / **Configure messages** sections (the editors), and
+- **Configure interface** / **Configure messages** sections (the editors), and
   the **Output** display pane (sampled at high rates, with a sub-sampling badge).
 
-Configure connection includes the channel's **Timing** choice (Standard / Precise)
+Configure interface includes the channel's **Timing** choice (Standard / Precise)
 and an independent **Align sends to UTC interval boundaries** choice. Both are part
 of the run configuration, so changing either on an active channel is applied by
 **Apply & Restart**, together with the rest of the prepared replacement.

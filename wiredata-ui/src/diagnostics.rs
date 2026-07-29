@@ -135,7 +135,12 @@ pub fn decision_card<R>(
     let status = status.into();
     card_frame(ui).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(bold(title.text()));
+            // An empty title leaves the badge alone on the row. A card whose
+            // rows already name themselves does not need a heading that only
+            // repeats a word from the readouts beside it.
+            if !title.text().is_empty() {
+                ui.label(bold(title.text()));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 status_badge(ui, status, tone);
             });
@@ -162,6 +167,10 @@ pub fn signal_grid<R>(
 /// calm values use the normal foreground so labels keep a stable hierarchy, healthy
 /// text remains legible in the light theme, and the card does not become a wall of
 /// status colors.
+///
+/// The same tooltip is attached to the label and the value. A reader who does
+/// not yet know what a row measures hovers its *name* first, so leaving the
+/// label inert hides the explanation exactly when it is most wanted.
 pub fn signal_row(
     ui: &mut Ui,
     label: impl Into<WidgetText>,
@@ -169,7 +178,11 @@ pub fn signal_row(
     tone: SignalTone,
     tooltip: impl Into<WidgetText>,
 ) {
-    ui.label(RichText::new(label.into().text()).strong());
+    let tooltip = tooltip.into();
+    ui.add(
+        egui::Label::new(RichText::new(label.into().text()).strong()).sense(egui::Sense::hover()),
+    )
+    .on_hover_text(tooltip.clone());
     let text_color = tone.text_color(ui);
     ui.add(
         egui::Label::new(RichText::new(value.into().text()).color(text_color))
