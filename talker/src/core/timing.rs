@@ -179,15 +179,46 @@ pub enum TimerReason {
     PrecisionWindow,
 }
 
+/// The independent send cadences a channel is currently running — one per
+/// non-dormant message.
+///
+/// A channel schedules each of its messages separately, so a running channel is
+/// several cadences at once, not one. Timing telemetry pools every message's
+/// deadlines into a single histogram, which is only readable if the reader also
+/// knows how many cadences fed that pool.
+///
+/// Deliberately just a count and the timer-policy input. The interval
+/// *distribution* is carried per message on the counters lane and rendered from
+/// there; a longest-interval field here duplicated it to serve one sub-second
+/// transient — the window between a channel's first `TimerStatus` and its first
+/// `Counters` — which is not worth a second source of the same fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveCadence {
+    /// Non-dormant messages in the running schedule.
+    pub messages: usize,
+    /// Shortest active interval. Also the timer-policy input, and the
+    /// denominator lateness is compared against.
+    pub shortest: Duration,
+}
+
 /// User-facing timer policy plus the schedule input that selected it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TimerStatus {
     pub mode: TimerMode,
     pub timing_mode: TimingMode,
     pub reason: TimerReason,
-    pub shortest_active_interval: Option<Duration>,
+    /// `None` when every message is dormant.
+    pub active_cadence: Option<ActiveCadence>,
     pub cadence_alignment: CadenceAlignment,
     pub clock_realignments: u64,
+}
+
+impl TimerStatus {
+    /// The interval that selected this timer policy, or `None` when every
+    /// message is dormant.
+    pub fn shortest_active_interval(self) -> Option<Duration> {
+        self.active_cadence.map(|cadence| cadence.shortest)
+    }
 }
 
 /// Describe the timer policy after the runner has reconciled its guard with
@@ -195,7 +226,7 @@ pub struct TimerStatus {
 pub(crate) struct TimerStatusInput<'a> {
     pub timing_mode: TimingMode,
     pub intent: TimerIntent,
-    pub shortest_active_interval: Option<Duration>,
+    pub active_cadence: Option<ActiveCadence>,
     pub guard: Option<&'a HighResolutionGuard>,
     pub previous_mode: TimerMode,
     pub cadence_alignment: CadenceAlignment,
@@ -206,7 +237,7 @@ pub(crate) fn timer_status(input: TimerStatusInput<'_>) -> TimerStatus {
     let TimerStatusInput {
         timing_mode,
         intent,
-        shortest_active_interval,
+        active_cadence,
         guard,
         previous_mode,
         cadence_alignment,
@@ -240,7 +271,7 @@ pub(crate) fn timer_status(input: TimerStatusInput<'_>) -> TimerStatus {
         mode,
         timing_mode,
         reason: intent.reason(),
-        shortest_active_interval,
+        active_cadence,
         cadence_alignment,
         clock_realignments,
     }
@@ -249,6 +280,15 @@ pub(crate) fn timer_status(input: TimerStatusInput<'_>) -> TimerStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One active message. Timer policy reads only the shortest interval, so
+    /// the span is irrelevant to every assertion in this module.
+    fn uniform_cadence(interval: Duration) -> Option<ActiveCadence> {
+        Some(ActiveCadence {
+            messages: 1,
+            shortest: interval,
+        })
+    }
 
     #[test]
     fn intent_preserves_automatic_high_rate_and_adds_explicit_precision() {
@@ -327,7 +367,7 @@ mod tests {
         let standard = timer_status(TimerStatusInput {
             timing_mode: TimingMode::Standard,
             intent: TimerIntent::None,
-            shortest_active_interval: Some(HIGH_RATE_THRESHOLD),
+            active_cadence: uniform_cadence(HIGH_RATE_THRESHOLD),
             guard: None,
             previous_mode: TimerMode::Standard,
             cadence_alignment: CadenceAlignment::Immediate,
@@ -335,13 +375,16 @@ mod tests {
         });
         assert_eq!(standard.mode, TimerMode::Standard);
         assert_eq!(standard.reason, TimerReason::None);
-        assert_eq!(standard.shortest_active_interval, Some(HIGH_RATE_THRESHOLD));
+        assert_eq!(
+            standard.shortest_active_interval(),
+            Some(HIGH_RATE_THRESHOLD)
+        );
 
         let guard = high_resolution();
         let fast = timer_status(TimerStatusInput {
             timing_mode: TimingMode::Standard,
             intent: TimerIntent::ContinuousHighRate,
-            shortest_active_interval: Some(Duration::from_millis(1)),
+            active_cadence: uniform_cadence(Duration::from_millis(1)),
             guard: Some(&guard),
             previous_mode: TimerMode::Standard,
             cadence_alignment: CadenceAlignment::Immediate,
@@ -363,7 +406,7 @@ mod tests {
         let retained = timer_status(TimerStatusInput {
             timing_mode: TimingMode::Precise,
             intent: TimerIntent::PrecisionWindow,
-            shortest_active_interval: Some(Duration::from_secs(1)),
+            active_cadence: uniform_cadence(Duration::from_secs(1)),
             guard: None,
             previous_mode: TimerMode::WindowsOneMillisecond,
             cadence_alignment: CadenceAlignment::UtcPhase,

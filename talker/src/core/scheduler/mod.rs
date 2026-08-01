@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Context;
 
 use crate::core::message::{CompiledMessage, MessageConfig};
-use crate::core::timing::CadenceAlignment;
+use crate::core::timing::{ActiveCadence, CadenceAlignment};
 
 const CLOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CLOCK_STEP_THRESHOLD: Duration = Duration::from_millis(250);
@@ -306,16 +306,36 @@ impl Schedule {
             .map_or(&[], |message| message.compiled.replacement_wire_offsets())
     }
 
+    /// The independent cadences this schedule is running: how many messages are
+    /// active and the span of their intervals. `None` when every message is
+    /// dormant.
+    ///
+    /// One pass, no allocation — the runner calls this every loop pass to
+    /// re-check timer policy, so [`Schedule::set_interval`] changes take effect
+    /// immediately.
+    pub fn active_cadence(&self) -> Option<ActiveCadence> {
+        let mut active = self.messages.iter().filter(|m| m.is_active());
+        let mut cadence = ActiveCadence {
+            messages: 1,
+            shortest: active.next()?.interval,
+        };
+        for message in active {
+            cadence.messages += 1;
+            cadence.shortest = cadence.shortest.min(message.interval);
+        }
+        Some(cadence)
+    }
+
     /// The shortest **active** interval, or `None` when every message is
     /// dormant. Drives the runner's high-resolution-timer decision
-    /// (`core::timing`, ADR-017): re-checked each loop pass, so
-    /// [`Schedule::set_interval`] changes take effect immediately.
+    /// (`core::timing`, ADR-017).
     pub fn min_active_interval(&self) -> Option<Duration> {
-        self.messages
-            .iter()
-            .filter(|m| m.is_active())
-            .map(|m| m.interval)
-            .min()
+        self.active_cadence().map(|cadence| cadence.shortest)
+    }
+
+    /// Each message's current interval in schedule order. Zero means dormant.
+    pub fn intervals(&self) -> impl Iterator<Item = Duration> + '_ {
+        self.messages.iter().map(|message| message.interval)
     }
 
     /// Change message `index`'s send interval, effective immediately.
@@ -536,6 +556,36 @@ mod tests {
         let s = Schedule::compile(&[msg("AB", 100), msg("CD", 0)], Instant::now()).unwrap();
         assert_eq!(s.len(), 2);
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn active_cadence_counts_messages_and_reports_the_tightest_interval() {
+        let t0 = Instant::now();
+        let s = Schedule::compile(&[msg("AB", 100), msg("CD", 10), msg("EF", 0)], t0).unwrap();
+        let cadence = s.active_cadence().expect("two messages are active");
+        // The dormant message is excluded from the count and from the minimum.
+        assert_eq!(cadence.messages, 2);
+        assert_eq!(cadence.shortest, ms(10));
+    }
+
+    #[test]
+    fn active_cadence_is_absent_when_every_message_is_dormant() {
+        let s = Schedule::compile(&[msg("AB", 0), msg("CD", 0)], Instant::now()).unwrap();
+        assert_eq!(s.active_cadence(), None);
+    }
+
+    #[test]
+    fn active_cadence_follows_set_interval() {
+        let t0 = Instant::now();
+        let mut s = Schedule::compile(&[msg("AB", 100), msg("CD", 40)], t0).unwrap();
+        assert_eq!(s.active_cadence().map(|c| c.messages), Some(2));
+
+        // Making the fast message dormant shrinks the count and moves the
+        // minimum up to the remaining message's interval.
+        s.set_interval(1, 0, t0);
+        let cadence = s.active_cadence().expect("one message is still active");
+        assert_eq!(cadence.messages, 1);
+        assert_eq!(cadence.shortest, ms(100));
     }
 
     #[test]

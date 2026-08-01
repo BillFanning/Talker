@@ -1,9 +1,34 @@
 # Talker — Program Specification
-**Version:** 2.4.5
+**Version:** 2.4.7
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (send vocabulary and single-rendering outcomes):
+Revision note (no warm-up state; skipped sends name a cause):
+
+- **§3.2 Cadence (ADR-046)** — the twenty-sample warm-up state is removed. Below
+  a hundred samples the p99 bucket *is* the maximum's bucket, so the gate only
+  relabelled the same number. One measured form now serves every sample count:
+  the worst delay with its sample count, plus a percentile where that differs.
+  The percentage no longer restates the shortest interval the same line already
+  names.
+- **§3.2 missed-send routing (ADR-045)** — skipped cadence points get one callout
+  naming where the cause lies, in decisiveness order, rather than restating a
+  count already on the send-outcomes line.
+
+Previous revision note (per-message cadence and measured blame):
+
+- **§3.2 Cadence (ADR-045)** — the row leads with the schedule, grouped by
+  distinct interval, so a pooled lateness figure is never read as one message's
+  behaviour. Wording is stated for a reader who has not seen the source.
+- **§3.2 per-message timing (ADR-045)** — a new collapsed table places what each
+  message suffered beside what its own sends cost the others. The blame column
+  is measured, not inferred from send duration. Per-message miss counts are
+  deliberately not offered, since skips concentrate on the shortest interval and
+  would name the victim.
+- **§3.2 clipboard report (ADR-045)** — new `per_message_*` keys, positionally
+  aligned with the existing `per_message_sent` lane.
+
+Revision v2.4.5 (send vocabulary and single-rendering outcomes):
 
 - **§3.2 detail-pane wording (ADR-044)** — *interface* is the term for a
   configured serial/UDP/TCP endpoint, so the editor section is **Configure
@@ -23,7 +48,7 @@ Revision note (send vocabulary and single-rendering outcomes):
   schema `version` 2, clipboard-report keys, wire output, and cadence are
   unchanged.
 
-Previous revision note (truthful pushed-snapshot freshness):
+Revision v2.4.4 (truthful pushed-snapshot freshness):
 
 - **§3.2 / §8.1 timing snapshot provenance (ADR-042)** — every pushed
   counter/timing snapshot now carries its exact monotonic compute instant and
@@ -408,6 +433,39 @@ The **detail pane** (right) shows the selected channel:
     render/send timing snapshot. An expired recent snapshot cannot supply this
     estimate; a warmed run-wide fallback is labelled explicitly. Low margin and
     physical serial oversubscription are amber.
+  - *Cadence:* leads with the schedule — how many messages are sending and at
+    which intervals, grouped by distinct interval (`3 messages: 2 at 50 ms, 1 at
+    15 s`) and summarized past three groups. A lateness figure never appears
+    without that count beside it, because the measurement pools every active
+    message's deadlines and reads as one message's behaviour otherwise. The
+    measurement itself is stated in plain terms — the worst delay with the number
+    of sends behind it (`worst send started 1.4 ms late … of 4,300 sends`), plus
+    `99% of sends started ≤ X late` where that is a different figure, keeping the
+    `≤` glyph that marks a histogram-bucket bound. There is **no warm-up state**
+    (ADR-046): one measured form serves every sample count. Any percentage scales
+    against the shortest interval without restating it, since the schedule phrase
+    already names it on the same line. Interval detail comes from the running
+    schedule's own per-message intervals once the channel has reported any, and
+    from the on-screen draft otherwise — never both in one render.
+  - *Missed-send routing (ADR-045):* when any cadence point has been skipped, one
+    callout names where the cause lies rather than restating the count — an
+    erroring interface first (retry backoff withholds sends), then a serial line
+    that physically cannot carry the schedule, then the message whose sends
+    blocked the others, then application headroom, and otherwise the render and
+    send-call timing. It adds no measurement of its own except the blocking
+    message's, whose table is collapsed by default.
+  - *Per-message timing (ADR-045):* a collapsed table, one row per message
+    numbered as in the Messages editor, carrying interval, sends, deadline-lateness
+    p99, send-call p99, and **blocked others** — the delay that message's own
+    sends imposed on the rest of the channel, measured by charging each deadline
+    to whichever send was holding the thread when it passed. Because every
+    message on a channel shares one thread, the message recording the lateness
+    and the message causing it are routinely different rows; the table exists so
+    that comparison is a single read across a row. Per-message **miss** counts are
+    deliberately not offered at any granularity: skips accrue as
+    `late / interval + 1`, so they concentrate on the shortest interval — the
+    victim — and would misidentify the cause. Per-message histograms are
+    cumulative-only; the rolling window stays channel-wide.
   - *Timing health:* approximately last-ten-second deadline-lateness, render-time,
     and synchronous send-call p99 upper bounds plus maxima; the deadline row also
     retains the cumulative run maximum. Each pushed timing snapshot is classified
@@ -429,7 +487,11 @@ The **detail pane** (right) shows the selected channel:
   expansion shows wall-clock start/finish, exact final outcomes, cumulative timing,
   final timer/cadence policy, and build/platform facts. **Copy summary** places the
   versioned line-oriented report on the clipboard; formatting is performed only on
-  click.
+  click. The report carries one flat `per_message_<name>=` line per fact —
+  interval, lateness p99/max, render p99, send p99, `blocked_others_us`, and
+  `blocking_sends` — each positionally aligned with `per_message_sent`, so
+  column *N* of every line describes the same message and one fact can be diffed
+  across runs without re-assembling a block per message.
 - **Configure interface** / **Configure messages** sections (the editors), and
   the **Output** display pane (sampled at high rates, with a sub-sampling badge).
 

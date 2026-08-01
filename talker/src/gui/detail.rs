@@ -13,13 +13,13 @@ use crate::core::{
     message::NmeaChecksumMode,
     run_summary::RunSummary,
     telemetry::{recent_snapshot_state, RecentSnapshotState},
-    timing::{CadenceAlignment, TimerReason, TimingMode},
+    timing::{ActiveCadence, CadenceAlignment, TimerReason, TimingMode},
 };
 
 use wiredata_ui::{
     diagnostics::{attention_callout, decision_card, signal_grid, signal_row, SignalTone},
     fonts::bold,
-    format::{compact_duration, human_byte_rate, human_bytes},
+    format::{compact_duration, human_byte_rate, human_bytes, percent},
     glyphs,
 };
 
@@ -37,6 +37,47 @@ use wiredata_ui::palette::active as theme_palette;
 // `diagnostics` exists to be shown here, and the two stay in step as signals
 // are added.
 use super::diagnostics::*;
+
+/// The per-message breakdown: one row per message, with what it suffered and
+/// what it cost the others side by side (ADR-045).
+fn show_per_message_table(ui: &mut egui::Ui, rows: &[MessageRow]) {
+    let pal = theme_palette(ui);
+    egui::Grid::new("per_message_grid")
+        .num_columns(6)
+        .spacing(egui::vec2(14.0, 4.0))
+        .striped(true)
+        .show(ui, |ui| {
+            for heading in [
+                "Msg",
+                "Interval",
+                "Sends",
+                "Late p99",
+                "Send p99",
+                "Blocked others",
+            ] {
+                ui.label(bold(heading).size(12.0));
+            }
+            ui.end_row();
+
+            for row in rows {
+                ui.label(egui::RichText::new(&row.label).size(12.0));
+                ui.label(egui::RichText::new(&row.interval).size(12.0));
+                ui.label(egui::RichText::new(&row.sends).size(12.0));
+                ui.label(egui::RichText::new(&row.late_p99).size(12.0));
+                ui.label(egui::RichText::new(&row.send_p99).size(12.0));
+                // Only the culprit column is toned. Lateness is not scored
+                // against an invented budget, so a late row stays neutral;
+                // having delayed another message is an attributable fact.
+                let blocked = egui::RichText::new(&row.blocked_others).size(12.0);
+                ui.label(if row.blocks_others {
+                    blocked.color(pal.warning_amber)
+                } else {
+                    blocked
+                });
+                ui.end_row();
+            }
+        });
+}
 
 fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
     let unsent = summary.unsent_sends();
@@ -309,7 +350,7 @@ impl TalkerApp {
             },
             Some(demand) => {
                 let line_capacity = if let Some(line) = serial {
-                    format!("serial {:.1}%", line.utilization * 100.0)
+                    format!("serial {}", percent(line.utilization * 100.0))
                 } else {
                     unavailable_line_capacity_label(draft_kind).to_owned()
                 };
@@ -335,19 +376,47 @@ impl TalkerApp {
         let cumulative_timing = telemetry.timing;
         let timing = telemetry.recent_timing;
         let timing_text = timing_detail_text(timing, cumulative_timing, recent_snapshot_state);
+        // Runtime truth first: the running schedule's own active cadences. The
+        // draft's shortest interval is only a fallback for a channel that has
+        // not run yet, and carries no message count, so a draft-only channel
+        // says how often it will send without claiming how many messages did.
+        let active_cadence = telemetry.timer.active_cadence.or_else(|| {
+            let demand = demand?;
+            let shortest = demand.shortest_interval?;
+            Some(ActiveCadence {
+                messages: demand.active_messages,
+                shortest,
+            })
+        });
+        // Interval detail for the schedule phrase, from exactly one source: the
+        // running schedule's own per-message intervals once the channel has
+        // reported any, the on-screen draft otherwise. Mixing them would let a
+        // stale draft interval appear inside a line of measured runtime facts.
+        let cadence_groups = if telemetry.per_message_timing.is_empty() {
+            self.message_analysis
+                .get(i)
+                .map(|analyses| draft_intervals(analyses))
+                .map(cadence_groups)
+                .unwrap_or_default()
+        } else {
+            cadence_groups(
+                telemetry
+                    .per_message_timing
+                    .iter()
+                    .map(|message| message.interval),
+            )
+        };
         let cadence_decision = cadence_decision(
             timing,
             cumulative_timing,
-            telemetry
-                .timer
-                .shortest_active_interval
-                .or_else(|| demand.and_then(|demand| demand.shortest_interval)),
+            active_cadence,
+            &cadence_groups,
             recent_snapshot_state,
         );
 
         let timer_prefix = if running {
             "Timer"
-        } else if telemetry.timer.shortest_active_interval.is_some()
+        } else if telemetry.timer.active_cadence.is_some()
             || telemetry.timer.reason != TimerReason::None
         {
             "Timer (last run)"
@@ -410,12 +479,12 @@ impl TalkerApp {
         decision_card(ui, "", card_status, card_tone, |ui| {
             signal_grid(ui, "send_decisions", |ui| {
                 signal_row(
-                        ui,
-                        "Cadence",
-                        &cadence_decision.text,
-                        cadence_decision.tone,
-                        "Deadline lateness is aggregated across all messages. Every handled due send, including one suppressed during retry backoff, contributes a sample; cadence points counted as Missed do not. Faster messages therefore contribute more samples. p99 is a histogram-bucket upper bound. Any percentage compares the aggregate value with the displayed shortest active interval for schedule context; it is not a per-message percentage. The “as of” age tells you when the snapshot was computed. Once a running snapshot reaches ten seconds old, this row labels it expired instead of presenting its retained samples as current.",
-                    );
+                    ui,
+                    "Cadence",
+                    &cadence_decision.text,
+                    cadence_decision.tone,
+                    cadence_tooltip(active_cadence, &cadence_groups),
+                );
                 signal_row(
                         ui,
                         "Capacity",
@@ -424,6 +493,26 @@ impl TalkerApp {
                         "Requested load comes from the draft currently shown and may differ from the running configuration until Apply & Restart. Sent rate is the rolling five-second average of configured-interface writes that returned success. Serial utilization is a theoretical UART line estimate. Application headroom compares the current draft with separate render and interface-write p99 bounds. A warmed recent snapshot is preferred while it is current; an expired snapshot is discarded and a clearly labelled run-wide fallback is used when available. This is an advisory projection, not a hard capacity promise.",
                     );
             });
+
+            // Skipped cadence points name a cause rather than a count: the
+            // count is already on the send-outcomes line above, and the message
+            // showing the misses is rarely the one causing them (ADR-045).
+            if let Some(routing) = missed_send_routing(
+                missed,
+                failed,
+                serial.is_some_and(|line| line.is_oversubscribed()),
+                service_estimate,
+                &telemetry.per_message_timing,
+            ) {
+                ui.add_space(4.0);
+                attention_callout(
+                    ui,
+                    "missed_send_routing",
+                    routing.text,
+                    routing.tone,
+                    MISSED_ROUTING_TOOLTIP,
+                );
+            }
 
             // No unsent callout: the send-outcomes line above the card already
             // carries the counts and its own tone, and the badge escalates from
@@ -435,8 +524,8 @@ impl TalkerApp {
                         ui,
                         "serial_capacity_attention",
                         format!(
-                            "Serial demand is {:.1}% of line capacity · needs {} (baud {})",
-                            line.utilization * 100.0,
+                            "Serial demand is {} of line capacity · needs {} (baud {})",
+                            percent(line.utilization * 100.0),
                             compact_rate(line.required_bits_per_second, "bit/s"),
                             line.minimum_baud(),
                         ),
@@ -494,11 +583,11 @@ impl TalkerApp {
                                     compact_rate(demand.bytes_per_second, "B/s")
                                 );
                                 if let Some(line) = serial {
-                                    let percentage = line.utilization * 100.0;
+                                    let percentage = percent(line.utilization * 100.0);
                                     let (text, hot) = if line.is_oversubscribed() {
                                         (
                                             format!(
-                                                "Capacity: {requested} · serial OVER CAPACITY {percentage:.1}% · needs {} (baud {})",
+                                                "Capacity: {requested} · serial OVER CAPACITY {percentage} · needs {} (baud {})",
                                                 compact_rate(line.required_bits_per_second, "bit/s"),
                                                 line.minimum_baud(),
                                             ),
@@ -507,7 +596,7 @@ impl TalkerApp {
                                     } else if let Some(headroom) = line.headroom_factor() {
                                         (
                                             format!(
-                                                "Capacity: {requested} · serial {percentage:.1}% · {} line headroom",
+                                                "Capacity: {requested} · serial {percentage} · {} line headroom",
                                                 compact_factor(headroom)
                                             ),
                                             line.utilization >= 0.8,
@@ -606,6 +695,23 @@ impl TalkerApp {
                             DISPLAY_QUEUE_TOOLTIP,
                         );
                     });
+
+            // Per-message breakdown (ADR-045). Collapsed by default: it answers
+            // "which message is responsible", which only matters once the
+            // channel-wide rows say something is wrong.
+            let rows =
+                per_message_rows(&telemetry.per_message_counts, &telemetry.per_message_timing);
+            if !rows.is_empty() {
+                ui.add_space(5.0);
+                egui::CollapsingHeader::new("Per-message timing")
+                    .id_salt("per_message_timing")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        show_per_message_table(ui, &rows);
+                    })
+                    .header_response
+                    .on_hover_text(PER_MESSAGE_TOOLTIP);
+            }
         });
 
         if let Some(err) = &error {

@@ -8,7 +8,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 
 use super::{
     channel::ChannelId,
-    telemetry::{DurationHistogram, SendTimingReport},
+    telemetry::{DurationHistogram, MessageTiming, SendTimingReport},
     timing::{CadenceAlignment, TimerMode, TimerReason, TimerStatus, TimingMode},
 };
 
@@ -54,6 +54,9 @@ pub struct RunSummary {
     pub total_count: u64,
     pub total_bytes: u64,
     pub per_message_counts: Vec<u64>,
+    /// Per-message cumulative timing on the same index basis, including the
+    /// delay each message's sends imposed on the others (ADR-045).
+    pub per_message_timing: Vec<MessageTiming>,
     pub dropped_statuses: u64,
     pub missed_sends: u64,
     pub failed_sends: u64,
@@ -118,6 +121,34 @@ impl RunSummary {
             .collect::<Vec<_>>()
             .join(",");
         let _ = writeln!(out, "per_message_sent={counts}");
+        // Per-message lanes stay flat and comma-separated, positionally aligned
+        // with `per_message_sent`, so a reader can diff one line per fact
+        // instead of re-assembling a block per message.
+        write_per_message(&mut out, "interval_us", &self.per_message_timing, |m| {
+            m.interval.as_micros().to_string()
+        });
+        write_per_message(&mut out, "late_p99_us", &self.per_message_timing, |m| {
+            optional_us(m.deadline_lateness.percentile_upper_bound(99))
+        });
+        write_per_message(&mut out, "late_max_us", &self.per_message_timing, |m| {
+            optional_us(m.deadline_lateness.max())
+        });
+        write_per_message(&mut out, "render_p99_us", &self.per_message_timing, |m| {
+            optional_us(m.render_duration.percentile_upper_bound(99))
+        });
+        write_per_message(&mut out, "send_p99_us", &self.per_message_timing, |m| {
+            optional_us(m.send_duration.percentile_upper_bound(99))
+        });
+        // The culprit lane: what each message's own sends cost the others.
+        write_per_message(
+            &mut out,
+            "blocked_others_us",
+            &self.per_message_timing,
+            |m| m.blocked_others.as_micros().to_string(),
+        );
+        write_per_message(&mut out, "blocking_sends", &self.per_message_timing, |m| {
+            m.blocking_sends.to_string()
+        });
         let _ = writeln!(out, "observer_updates_dropped={}", self.dropped_statuses);
         let _ = writeln!(
             out,
@@ -128,7 +159,7 @@ impl RunSummary {
         let _ = writeln!(out, "timer_reason={}", timer_reason_name(self.timer.reason));
         let shortest_us = self
             .timer
-            .shortest_active_interval
+            .shortest_active_interval()
             .map(|duration| duration.as_micros().to_string())
             .unwrap_or_else(|| "none".to_owned());
         let _ = writeln!(out, "shortest_active_interval_us={shortest_us}");
@@ -178,6 +209,23 @@ impl RunSummary {
 
 fn format_utc(time: SystemTime) -> String {
     DateTime::<Utc>::from(time).to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn optional_us(duration: Option<Duration>) -> String {
+    duration
+        .map(|value| value.as_micros().to_string())
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+/// One `per_message_<name>=` line, positionally aligned with the others.
+fn write_per_message(
+    out: &mut String,
+    name: &str,
+    messages: &[MessageTiming],
+    field: impl Fn(&MessageTiming) -> String,
+) {
+    let values = messages.iter().map(field).collect::<Vec<_>>().join(",");
+    let _ = writeln!(out, "per_message_{name}={values}");
 }
 
 fn write_histogram(out: &mut String, name: &str, histogram: DurationHistogram) {
@@ -238,6 +286,13 @@ const fn cadence_alignment_name(alignment: CadenceAlignment) -> &'static str {
 mod tests {
     use super::*;
     use crate::core::telemetry::SendTimingTelemetry;
+    use crate::core::timing::ActiveCadence;
+
+    fn histogram(sample: Duration) -> DurationHistogram {
+        let mut histogram = DurationHistogram::default();
+        histogram.record(sample);
+        histogram
+    }
 
     fn summary() -> RunSummary {
         let mut cumulative = SendTimingTelemetry::default();
@@ -257,6 +312,26 @@ mod tests {
             total_count: 100,
             total_bytes: 7_000,
             per_message_counts: vec![60, 40],
+            per_message_timing: vec![
+                // #0: the victim — fast cadence, late, blames nobody.
+                MessageTiming {
+                    interval: Duration::from_millis(50),
+                    deadline_lateness: histogram(Duration::from_millis(9)),
+                    render_duration: histogram(Duration::from_micros(40)),
+                    send_duration: histogram(Duration::from_micros(300)),
+                    blocked_others: Duration::ZERO,
+                    blocking_sends: 0,
+                },
+                // #1: the culprit — slow cadence, slow write, charged for it.
+                MessageTiming {
+                    interval: Duration::from_secs(2),
+                    deadline_lateness: histogram(Duration::from_micros(80)),
+                    render_duration: histogram(Duration::from_micros(90)),
+                    send_duration: histogram(Duration::from_millis(120)),
+                    blocked_others: Duration::from_millis(430),
+                    blocking_sends: 4,
+                },
+            ],
             dropped_statuses: 2,
             missed_sends: 3,
             failed_sends: 1,
@@ -269,7 +344,10 @@ mod tests {
                 mode: TimerMode::WindowsOneMillisecond,
                 timing_mode: TimingMode::Precise,
                 reason: TimerReason::HighRate,
-                shortest_active_interval: Some(Duration::from_millis(10)),
+                active_cadence: Some(ActiveCadence {
+                    messages: 1,
+                    shortest: Duration::from_millis(10),
+                }),
                 cadence_alignment: CadenceAlignment::UtcPhase,
                 clock_realignments: 1,
             },
@@ -292,6 +370,17 @@ mod tests {
         assert!(report.contains("elapsed_us=12345000\n"));
         assert!(report.contains("scheduled_sends=106\n"));
         assert!(report.contains("per_message_sent=60,40\n"));
+        // Every per-message lane is positionally aligned with per_message_sent,
+        // so column N of each line describes the same message.
+        assert!(report.contains("per_message_interval_us=50000,2000000\n"));
+        // Bucket upper bounds, not raw samples: 300 µs lands in the 500 µs
+        // bucket and 120 ms in the 128 ms one.
+        assert!(report.contains("per_message_send_p99_us=500,128000\n"));
+        // The pair that separates victim from culprit: #0 carries the lateness,
+        // #1 carries the blame for causing it.
+        assert!(report.contains("per_message_late_max_us=9000,80\n"));
+        assert!(report.contains("per_message_blocked_others_us=0,430000\n"));
+        assert!(report.contains("per_message_blocking_sends=0,4\n"));
         assert!(report.contains("timing_mode=precise\n"));
         assert!(report.contains("timer_policy=windows_1_ms\n"));
         assert!(report.contains("cadence_alignment=utc_phase\n"));

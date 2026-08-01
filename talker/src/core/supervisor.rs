@@ -33,7 +33,7 @@ use crate::core::runner::{
     RunnerIdentity, TalkerCommand, TalkerHandle, TalkerStatus,
 };
 use crate::core::scheduler::Schedule;
-use crate::core::telemetry::SendTimingTelemetry;
+use crate::core::telemetry::{MessageTiming, SendTimingTelemetry};
 use crate::core::timing::{CadenceAlignment, TimerStatus, TimingMode};
 
 /// Bound on each runner's status queue. Occupancy near this cap means
@@ -67,6 +67,10 @@ pub struct ChannelTelemetry {
     pub total_bytes: u64,
     /// Per-message running send counts, indexed by schedule position.
     pub per_message_counts: Vec<u64>,
+    /// Per-message cumulative timing on the same index basis. Carries both
+    /// halves of a cadence problem: what each message suffered
+    /// (`deadline_lateness`) and what it cost the others (`blocked_others`).
+    pub per_message_timing: Vec<MessageTiming>,
     /// Status updates the runner discarded because the queue was full.
     pub dropped_statuses: u64,
     /// Sends skipped under the scheduler's stall policy — cadence health.
@@ -960,6 +964,7 @@ fn drain_statuses(
                 total_count,
                 total_bytes,
                 per_message_counts,
+                per_message_timing,
                 dropped_statuses,
                 missed_sends,
                 failed_sends,
@@ -973,6 +978,7 @@ fn drain_statuses(
                 telemetry.total_count = total_count;
                 telemetry.total_bytes = total_bytes;
                 telemetry.per_message_counts = per_message_counts;
+                telemetry.per_message_timing = per_message_timing;
                 telemetry.dropped_statuses = dropped_statuses;
                 telemetry.missed_sends = missed_sends;
                 telemetry.failed_sends = failed_sends;
@@ -1188,6 +1194,7 @@ mod tests {
                 total_count,
                 total_bytes: total_count,
                 per_message_counts: vec![total_count],
+                per_message_timing: vec![MessageTiming::default()],
                 dropped_statuses: 0,
                 missed_sends: 0,
                 failed_sends: 0,

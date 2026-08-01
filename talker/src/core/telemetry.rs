@@ -69,6 +69,152 @@ pub struct SendTimingReport {
     pub recent: SendTimingTelemetry,
 }
 
+/// Cumulative timing for one message, plus what its own sends cost the others.
+///
+/// A channel runs every message on one thread, so a send holds that thread
+/// against every other message's deadline. Lateness alone therefore identifies
+/// only the *victim*: the message that suffers most is usually the one with the
+/// tightest interval, not the one responsible. [`MessageTiming::blocked_others`]
+/// is the other half of that pair — measured, not inferred.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MessageTiming {
+    /// The cadence this message was running at when the snapshot was taken.
+    /// Zero means dormant. Carried with the measurement so a reader never has
+    /// to pair run-time timing against a draft interval that may have moved.
+    pub interval: Duration,
+    /// Delay from this message's own deadlines until it was handled.
+    pub deadline_lateness: DurationHistogram,
+    /// Time spent rendering this message's payloads.
+    pub render_duration: DurationHistogram,
+    /// Time spent inside the interface `send` call for this message.
+    pub send_duration: DurationHistogram,
+    /// Total delay other messages incurred while this message's sends held the
+    /// channel thread. Zero for a message that never overran another's deadline.
+    pub blocked_others: Duration,
+    /// How many of this message's sends delayed at least one other message.
+    /// Counts sends, not victims: one long send that displaces four deadlines
+    /// increments this once.
+    pub blocking_sends: u64,
+}
+
+/// One completed send's occupancy of the channel thread.
+#[derive(Clone, Copy, Debug)]
+struct SendWindow {
+    index: usize,
+    started: Instant,
+    ended: Instant,
+    /// Whether this send has already been counted in `blocking_sends`.
+    counted: bool,
+}
+
+/// Runner-owned per-message timing, including deadline-delay attribution.
+///
+/// **Attribution rule.** A message is credited with another's delay only for
+/// the portion of that delay which elapsed while its own send held the thread.
+/// A deadline that passed during a send is charged to that send; once the
+/// runner starts working off a late backlog, the whole burst stays charged to
+/// the send that opened it, rather than to the quick catch-up sends that
+/// happen to precede each later victim. Lateness with no send spanning the
+/// deadline — an OS wake delay on an idle thread — is charged to nobody.
+#[derive(Debug, Default)]
+pub(crate) struct MessageTimingRecorder {
+    messages: Vec<MessageTiming>,
+    /// The most recent completed send.
+    last_send: Option<SendWindow>,
+    /// While a late backlog is being worked off, the send that opened it.
+    burst: Option<SendWindow>,
+}
+
+impl MessageTimingRecorder {
+    pub(crate) fn new(len: usize) -> Self {
+        Self {
+            messages: vec![MessageTiming::default(); len],
+            last_send: None,
+            burst: None,
+        }
+    }
+
+    fn entry(&mut self, index: usize) -> &mut MessageTiming {
+        if index >= self.messages.len() {
+            self.messages.resize(index + 1, MessageTiming::default());
+        }
+        &mut self.messages[index]
+    }
+
+    /// Record one due message's lateness and charge it to whichever send was
+    /// holding the thread when its deadline passed.
+    pub(crate) fn record_due(&mut self, index: usize, scheduled_for: Instant, handled_at: Instant) {
+        let lateness = handled_at.saturating_duration_since(scheduled_for);
+        self.entry(index).deadline_lateness.record(lateness);
+
+        // Still inside a backlog opened by an earlier send: that send keeps the
+        // charge, so a quick catch-up send is not blamed for a delay it
+        // inherited.
+        let blocker = match self.burst {
+            Some(burst) if scheduled_for < burst.ended => Some(burst),
+            _ => {
+                self.burst = None;
+                match self.last_send {
+                    Some(send) if scheduled_for >= send.started && scheduled_for < send.ended => {
+                        self.burst = Some(send);
+                        Some(send)
+                    }
+                    _ => None,
+                }
+            }
+        };
+
+        let Some(blocker) = blocker else { return };
+        // A send that overran its own next deadline is visible in its own
+        // send_duration; this column is what a message cost *others*.
+        if blocker.index == index {
+            return;
+        }
+        let attributable = lateness.min(blocker.ended.saturating_duration_since(scheduled_for));
+        if attributable.is_zero() {
+            return;
+        }
+        let first_victim = !self.burst.is_some_and(|burst| burst.counted);
+        if let Some(burst) = self.burst.as_mut() {
+            burst.counted = true;
+        }
+        let entry = self.entry(blocker.index);
+        entry.blocked_others = entry.blocked_others.saturating_add(attributable);
+        if first_victim {
+            entry.blocking_sends = entry.blocking_sends.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn record_render(&mut self, index: usize, duration: Duration) {
+        self.entry(index).render_duration.record(duration);
+    }
+
+    /// Record a completed send and the thread occupancy it represents.
+    pub(crate) fn record_send(&mut self, index: usize, started: Instant, ended: Instant) {
+        self.entry(index)
+            .send_duration
+            .record(ended.saturating_duration_since(started));
+        self.last_send = Some(SendWindow {
+            index,
+            started,
+            ended,
+            counted: false,
+        });
+    }
+
+    /// Record each message's current cadence, so the snapshot describes the
+    /// schedule the timing was actually measured against.
+    pub(crate) fn set_intervals(&mut self, intervals: impl IntoIterator<Item = Duration>) {
+        for (index, interval) in intervals.into_iter().enumerate() {
+            self.entry(index).interval = interval;
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<MessageTiming> {
+        self.messages.clone()
+    }
+}
+
 /// Runner-owned timing state. Only fixed-size recent segments are retained.
 #[derive(Debug, Default)]
 pub(crate) struct SendTimingRecorder {
@@ -109,6 +255,103 @@ impl SendTimingRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    /// The core inversion this measurement exists to prevent: the message that
+    /// records the lateness is not the message that caused it.
+    #[test]
+    fn a_long_send_is_charged_to_the_blocker_not_the_late_message() {
+        let t0 = Instant::now();
+        let mut recorder = MessageTimingRecorder::new(4);
+
+        // #3 holds the thread for 412 ms; #1's 100 ms deadline passes inside it.
+        recorder.record_send(3, t0, t0 + ms(412));
+        recorder.record_due(1, t0 + ms(100), t0 + ms(412));
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot[3].blocked_others, ms(312));
+        assert_eq!(snapshot[3].blocking_sends, 1);
+        // The victim records its own lateness and blames nobody.
+        assert_eq!(snapshot[1].deadline_lateness.max(), Some(ms(312)));
+        assert_eq!(snapshot[1].blocked_others, Duration::ZERO);
+        assert_eq!(snapshot[1].blocking_sends, 0);
+    }
+
+    /// Working off a backlog runs quick sends back to back. Each one precedes
+    /// the next victim, but none of them caused the delay they inherited.
+    #[test]
+    fn a_backlog_stays_charged_to_the_send_that_opened_it() {
+        let t0 = Instant::now();
+        let mut recorder = MessageTimingRecorder::new(4);
+
+        recorder.record_send(3, t0, t0 + ms(412));
+        recorder.record_due(1, t0 + ms(100), t0 + ms(412));
+        // #1's own send is fast, and immediately precedes #2 being handled.
+        let catch_up_end = t0 + ms(412) + Duration::from_micros(400);
+        recorder.record_send(1, t0 + ms(412), catch_up_end);
+        recorder.record_due(2, t0 + ms(150), catch_up_end);
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot[1].blocked_others,
+            Duration::ZERO,
+            "a catch-up send must not inherit blame for the backlog it is clearing"
+        );
+        // #3 is charged for both victims, but counted as one blocking send.
+        assert_eq!(snapshot[3].blocked_others, ms(312) + ms(262));
+        assert_eq!(snapshot[3].blocking_sends, 1);
+    }
+
+    #[test]
+    fn lateness_with_no_send_spanning_the_deadline_is_charged_to_nobody() {
+        let t0 = Instant::now();
+        let mut recorder = MessageTimingRecorder::new(4);
+
+        // The thread was idle when this deadline passed: an OS wake delay.
+        recorder.record_send(3, t0, t0 + ms(10));
+        recorder.record_due(1, t0 + ms(500), t0 + ms(520));
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot[1].deadline_lateness.max(), Some(ms(20)));
+        assert!(snapshot
+            .iter()
+            .all(|message| message.blocked_others.is_zero()));
+        assert!(snapshot.iter().all(|message| message.blocking_sends == 0));
+    }
+
+    #[test]
+    fn a_send_that_overruns_its_own_next_deadline_does_not_blame_others() {
+        let t0 = Instant::now();
+        let mut recorder = MessageTimingRecorder::new(2);
+
+        // #1 sends for 200 ms on a 50 ms interval: it delays only itself.
+        recorder.record_send(1, t0, t0 + ms(200));
+        recorder.record_due(1, t0 + ms(50), t0 + ms(200));
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot[1].deadline_lateness.max(), Some(ms(150)));
+        assert_eq!(snapshot[1].blocked_others, Duration::ZERO);
+        assert_eq!(snapshot[1].blocking_sends, 0);
+    }
+
+    #[test]
+    fn separate_blocking_sends_are_counted_separately() {
+        let t0 = Instant::now();
+        let mut recorder = MessageTimingRecorder::new(4);
+
+        recorder.record_send(3, t0, t0 + ms(400));
+        recorder.record_due(1, t0 + ms(100), t0 + ms(400));
+        // A second, unrelated block a long while later.
+        recorder.record_send(3, t0 + ms(2_000), t0 + ms(2_400));
+        recorder.record_due(1, t0 + ms(2_100), t0 + ms(2_400));
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot[3].blocking_sends, 2);
+        assert_eq!(snapshot[3].blocked_others, ms(300) + ms(300));
+    }
 
     #[test]
     fn recent_snapshot_state_has_an_exact_window_boundary() {

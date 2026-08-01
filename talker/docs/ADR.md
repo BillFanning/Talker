@@ -1,10 +1,36 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.8
-**Date:** 2026-07-28
+**Version:** 1.10
+**Date:** 2026-07-31
 **Status:** Accepted
 
-Revision note (one vocabulary, each counted fact rendered once):
+Revision note (the warm-up gate retires):
+
+- **ADR-046** removes the twenty-sample warm-up gate from Talker's readouts. It
+  never guarded a bad computation: the percentile rank is
+  `ceil(samples × 99 / 100)`, which equals `samples` for any count up to 99, so
+  below a hundred samples the p99 bucket *is* the maximum's bucket and the gate
+  only relabelled the same number — at 20, while the two statistics separate at
+  100. Readouts now state the maximum with its sample count and add a percentile
+  only when `p99 < max`, a data-derived test needing no constant. Long runs gain
+  a figure they lacked, since a percentile alone hid one-off stalls.
+  `MIN_SERVICE_SAMPLES` is a different gate — it guards the headroom projection —
+  and stays. Listener's migration is pending and recorded as deliberate.
+
+Revision note for 1.9 (measured blame for deadline delay):
+
+- **ADR-045** adds per-message timing and, with it, the missing half of every
+  cadence readout Talker had. Deadline lateness names only the *victim* — and
+  because the scheduler skips `late / interval + 1` grid points, the victim is
+  almost always the message with the tightest interval rather than the one
+  responsible. The runner now charges a message with another's delay for the
+  portion that elapsed while its own send held the channel thread, keeps a
+  backlog charged to the send that opened it, and charges nothing when no send
+  spanned the deadline. Per-message miss counts are deliberately not offered.
+  The clipboard report gains per-message timing keys; no profile schema, wire
+  output, or cadence behavior changes.
+
+Revision note for 1.8 (one vocabulary, each counted fact rendered once):
 
 - **ADR-044** settles *interface* as the term for a configured serial/UDP/TCP
   endpoint, reserving *connection* for Listener's accepted TCP peer sessions, and
@@ -1425,6 +1451,107 @@ are deliberately untouched — they are a machine-readable format, not prose.
 Listener's matching rename and vocabulary pass are a follow-up; the shared chrome
 changes already apply to it. No profile schema, wire output, cadence, or
 interface behavior changes.
+
+## ADR-045 — Deadline delay is charged to the send that caused it
+
+**Status:** Accepted 2026-07-31.
+
+**Context:** A channel runs every one of its messages on a single thread, so any
+send holds that thread against every other message's deadline. Every
+cadence measurement Talker had was therefore a *victim* measurement: deadline
+lateness records what a message suffered, never what it caused.
+
+The scheduler's own arithmetic makes this actively misleading. Skips are
+`late / interval + 1` (`Schedule::poll`), so one stall of length `S` costs a
+message with interval `I` about `S / I` grid points. A 500 ms block gives a
+10 ms message ~50 misses, a 100 ms message 5, and a 1 s message none at all —
+while the message that *caused* the block, precisely because it is slow and
+infrequent, records almost no misses of its own. Publishing per-message miss
+counts would have pointed a technician at the message with the tightest
+interval every time: the victim, essentially never the culprit.
+
+Inferring the culprit from per-message `send_duration` is better but still a
+guess — it shows which message *could* block, not which deadline it actually
+displaced.
+
+**Decision:** Measure the attribution instead. `MessageTiming` carries the
+victim's evidence (`deadline_lateness`) and the culprit's
+(`blocked_others`, `blocking_sends`) on the same per-message index basis the
+existing `per_message_counts` lane already uses.
+
+A message is charged with another's delay only for the portion of that delay
+which elapsed while its own send held the thread: a deadline that passed inside
+a send is charged to that send, capped at the overlap. Once the runner starts
+working off a late backlog, the charge stays with the send that *opened* the
+backlog rather than moving to the quick catch-up sends that happen to precede
+each later victim — those sends inherited the lateness, they did not cause it.
+Lateness with no send spanning the deadline (an OS wake delay on an idle thread)
+is charged to nobody, which keeps the counter honest about the difference
+between a blocked channel and a late wake. A send that overruns only its *own*
+next deadline is self-inflicted and already visible in its `send_duration`, so
+it is excluded from a column that means "cost the others". Failed sends are
+recorded: a write that blocked and then errored held the thread just as long.
+
+Per-message histograms are **cumulative-only** (~0.5 kB per message). The
+rolling ten-second window stays channel-wide, because "is this happening now" is
+the Cadence row's job while "who is responsible" is run-wide by nature. State
+is one `Option<SendWindow>` pair and one saturating add per send — no allocation
+and no work on the send path beyond the `Instant`s already taken.
+
+Per-message **miss** counts are deliberately not offered at any granularity.
+
+**Consequences:** A per-message readout can place what a message suffered next
+to what it cost the others, so the diagnosis is reading across one row rather
+than interpreting the single-thread model. The runner's counter lane and
+`ChannelTelemetry` widen by one vector; no profile schema, wire output, cadence,
+or interface behavior changes. `RunSummary` is not yet widened — whether the
+clipboard report should carry per-message blame is left open. Presentation is
+a separate decision; this ADR settles only the measurement and its rule.
+
+## ADR-046 — The warm-up gate is retired; a sample count says it better
+
+**Status:** Accepted 2026-07-31 (Talker; Listener migration pending).
+
+**Context:** Both applications gated percentile readouts on twenty samples in
+the recent window: below it, show the observed maximum and label the state
+*warming up*; at or above it, show `p99 ≤ X`.
+
+The gate does not do what it appears to. `DurationHistogram::percentile_upper_bound`
+computes `rank = ceil(samples × 99 / 100)` and walks to the bucket containing
+that rank. For any sample count up to 99, `rank == samples`, so the walk lands
+in the bucket holding the last sample — the maximum's own bucket. Below a
+hundred samples, p99 *is* the maximum rounded up to a bucket edge. Both branches
+of the gate were already showing the same number; only the label changed, and it
+changed at 20 while the two statistics actually separate at 100.
+
+A gate that switches labels on a threshold also forces a state into every
+readout, every tooltip, and the shared vocabulary — one more thing a technician
+must learn that describes the tool rather than the channel.
+
+**Decision:** State the maximum with its sample count, and add the percentile
+only when it is a different figure. The maximum is exact (`max_nanos`, not
+bucketed), meaningful at one sample, and needs no disclaimer; the count carries
+the weight the label used to imply, so `worst 3.1 ms of 4 sends` is honest
+without a warm-up state.
+
+`p99 < max` is exactly the test for "the percentile says something new": within
+one bucket the bound is `>=` the maximum, so the comparison is false; it becomes
+true only when the p99 bucket sits strictly below the maximum's. The condition is
+derived from the data and needs no constant, so it cannot drift out of step with
+the histogram it describes.
+
+This retires `TIMING_WARMUP_SAMPLES` in Talker. `MIN_SERVICE_SAMPLES` is
+**not** the same gate and stays: it guards the measured-headroom *projection*
+(ADR-035), which divides by summed p99 bounds and genuinely needs samples before
+it can project. It merely shares the value 20.
+
+**Consequences:** Cadence has one measured state instead of two, at every sample
+count, and long runs gain a figure they lacked — with real spread the row now
+shows the percentile *and* the outlier, where before the percentile alone hid a
+one-off stall. Listener still carries its own warm-up gate and `p99 ≤ X`
+phrasing; the shared vocabulary module records that divergence as deliberate and
+tracked rather than leaving it to drift. No measurement, wire output, profile
+schema, or cadence behavior changes — this is presentation only.
 
 ---
 

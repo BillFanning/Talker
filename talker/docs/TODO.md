@@ -240,6 +240,71 @@ Cross off items as they are completed. Add new ones inline as they come up.
   process-unique run per channel across ordinary restarts, and the selected-channel
   GUI offers a collapsed final readout plus an on-click, versioned clipboard report
   with times, outcomes, timer/timing, and platform/build facts.
+- [x] **Per-message timing and measured blame (ADR-045).** The runner records
+  per-message lateness, render, and send-call histograms beside the existing
+  `per_message_counts`, and charges each deadline's delay to whichever send held
+  the channel thread when it passed — a backlog stays charged to the send that
+  opened it, and an idle-thread wake delay is charged to nobody. Surfaced as a
+  collapsed per-message table and as positionally-aligned `per_message_*` keys in
+  the clipboard report. Per-message *miss* counts are refused by decision: skips
+  accrue as `late / interval + 1`, so they name the victim.
+
+## Cadence rework follow-ups (2026-07-31)
+
+Left behind by the ADR-045 per-message work and the Cadence rewording that
+preceded it. The first two are cross-crate consistency debts, not local cleanups.
+
+- [ ] **The shared readout vocabulary no longer describes Talker's Cadence row.**
+  `wiredata-ui/src/diagnostics.rs` documents the state names both apps must share
+  (`warm-up (N) · max X`, `p99 ≤ X`, `no recent <noun>s · run max X`,
+  `awaiting first <noun>`). `cadence_decision` in `talker/src/gui/diagnostics.rs`
+  now renders them in plain language instead — `worst send started X late of N
+  sends`, `nothing sent in <window> · worst this run X`, `awaiting the first
+  scheduled send`; the warm-up form is gone entirely (ADR-046). **Settled for
+  Talker:** the shared table in `wiredata-ui/src/diagnostics.rs` now documents the
+  plain-language forms, and Talker's own split is closed — `recent_timing_metric`
+  and the Cadence row share one `timing_summary`. What remains is carrying the
+  same forms into Listener, which is the item below; until that lands the shared
+  module records the divergence as deliberate.
+- [ ] **Retire Listener's warm-up gate (ADR-046).** Talker's is gone: below a
+  hundred samples the p99 bucket *is* the maximum's bucket, so the gate only
+  relabelled the same number. Listener still has `TIMING_WARMUP_SAMPLES = 20` in
+  `listener/src/gui/detail/diagnostics.rs`, driving `recent_timing`, the handoff
+  and processing rows, the idle-rule lateness row, and three tooltips that teach
+  the retired state ("Before 20 samples the display shows the maximum"). Port
+  `timing_summary` — state the worst value with its sample count, add `99% ≤ X`
+  only when `p99 < max`. Listener's noun is chunks/firings, not sends, so the
+  phrasing needs its own pass rather than a copy. Until this lands, the shared
+  vocabulary module documents the divergence as deliberate.
+  `MIN_SERVICE_SAMPLES` (`talker/src/core/capacity.rs`) is **not** part of this:
+  it gates the headroom projection, which genuinely needs samples, and merely
+  shares the value 20.
+  **Fold the vocabulary pass into the same edit.** ADR-036 carried the *interface*
+  rename and `human_byte_rate` into Listener but not the phrasing, so its readouts
+  still use the wording Talker's Send outcomes and Cadence rows moved away from.
+  Those are the same rows this item already rewrites; doing them separately would
+  reword Listener's diagnostics twice.
+- [x] **`ActiveCadence::longest` / `is_uniform` dropped.** They existed to render
+  an interval span that grouped per-message intervals now render better, leaving
+  them to serve only the sub-second window between a channel's first
+  `TimerStatus` and its first `Counters` — not worth a second source of the
+  distribution. `ChannelDemand::longest_interval` went with them; that fallback
+  now reads `N messages, shortest X`.
+- [x] **The Cadence line named the shortest interval twice.** `relative_to_shortest`
+  now reads `(2.0% of the shortest interval)`: the ratio stays, the restated
+  duration goes, since the schedule phrase leads the same line with its groups
+  sorted shortest-first. Its `upper_bound` flag went with it — once the warm-up
+  gate was retired (ADR-046) the percentage only ever qualifies an exact maximum,
+  never a bucket bound, so all three call sites passed `false`.
+- [x] **Missed-sends routing built** (`missed_send_routing`). One callout, shown
+  only when cadence points have been skipped, naming where the cause lies in
+  decisiveness order: an erroring interface, a physically oversubscribed serial
+  line, the message whose sends blocked the others, application headroom, then
+  the render/send-call timing. It routes rather than reports — the only figure it
+  restates is the blocking message's, whose table is collapsed by default.
+  *(Merged into the Listener migration item above: it and the vocabulary pass are
+  the same edit to the same rows, and splitting them would reword Listener's
+  diagnostics twice.)*
 
 ## Workspace items (external review, 2026-07-11)
 

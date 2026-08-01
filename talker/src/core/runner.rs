@@ -17,7 +17,7 @@ use crate::core::{
     channel::{ChannelId, Interface, InterfaceConfig},
     run_summary::{RunEndReason, RunId, RunSummary},
     scheduler::{Schedule, Tick},
-    telemetry::{SendTimingRecorder, SendTimingReport},
+    telemetry::{MessageTiming, MessageTimingRecorder, SendTimingRecorder, SendTimingReport},
     timing,
 };
 
@@ -123,6 +123,9 @@ pub enum TalkerStatus {
         /// Per-message running send counts, indexed by the message's
         /// position in the compiled schedule.
         per_message_counts: Vec<u64>,
+        /// Per-message cumulative timing on the same index basis, including
+        /// the delay each message's sends imposed on the others (ADR-045).
+        per_message_timing: Vec<MessageTiming>,
         /// Cumulative count of status updates this channel discarded because
         /// the receiver was full.
         dropped_statuses: u64,
@@ -400,7 +403,7 @@ struct TimerReconciler<'a> {
     notify: &'a Option<StatusNotify>,
     timing_mode: timing::TimingMode,
     intent: timing::TimerIntent,
-    shortest_interval: Option<Duration>,
+    active_cadence: Option<timing::ActiveCadence>,
     cadence_alignment: timing::CadenceAlignment,
     clock_realignments: u64,
     guard: Option<timing::HighResolutionGuard>,
@@ -426,7 +429,7 @@ impl<'a> TimerReconciler<'a> {
             notify,
             timing_mode,
             intent: timing::TimerIntent::None,
-            shortest_interval: None,
+            active_cadence: None,
             cadence_alignment: timing::CadenceAlignment::Immediate,
             clock_realignments: 0,
             guard: None,
@@ -446,10 +449,11 @@ impl<'a> TimerReconciler<'a> {
     /// whether the new deadline is still inside that window.
     fn reconcile_schedule(
         &mut self,
-        shortest_interval: Option<Duration>,
+        active_cadence: Option<timing::ActiveCadence>,
         cadence_alignment: timing::CadenceAlignment,
         clock_realignments: u64,
     ) {
+        let shortest_interval = active_cadence.map(|cadence| cadence.shortest);
         let next_intent = timing::timer_intent(self.timing_mode, shortest_interval);
         match next_intent {
             timing::TimerIntent::ContinuousHighRate => self.acquire(),
@@ -462,7 +466,7 @@ impl<'a> TimerReconciler<'a> {
             timing::TimerIntent::PrecisionWindow => {}
         }
         self.intent = next_intent;
-        self.shortest_interval = shortest_interval;
+        self.active_cadence = active_cadence;
         self.cadence_alignment = cadence_alignment;
         self.clock_realignments = clock_realignments;
         self.refresh_status();
@@ -521,7 +525,7 @@ impl<'a> TimerReconciler<'a> {
         let next = timing::timer_status(timing::TimerStatusInput {
             timing_mode: self.timing_mode,
             intent: self.intent,
-            shortest_active_interval: self.shortest_interval,
+            active_cadence: self.active_cadence,
             guard: self.guard.as_ref(),
             previous_mode: self.current.mode,
             cadence_alignment: self.cadence_alignment,
@@ -622,6 +626,9 @@ fn run_loop(
     // compiled schedule. The resize is defensive; the schedule's size is
     // fixed at compile time.
     let mut per_message_counts: Vec<u64> = vec![0; schedule.len()];
+    // Per-message timing on the same index basis, including which message's
+    // sends delayed the others (ADR-045).
+    let mut per_message_timing = MessageTimingRecorder::new(schedule.len());
 
     let handle = |cmd: TalkerCommand,
                   interface: &mut Box<dyn Interface>,
@@ -752,9 +759,8 @@ fn run_loop(
         // Reconcile continuous intent only after applying queued interval
         // changes. Windowed intent is finalized once `poll` supplies the next
         // deadline; dormant/ordinary schedules release before they block.
-        let shortest_interval = schedule.min_active_interval();
         timer.reconcile_schedule(
-            shortest_interval,
+            schedule.active_cadence(),
             schedule.cadence_alignment(),
             schedule.clock_realignments(),
         );
@@ -774,6 +780,7 @@ fn run_loop(
                     due_handled_at,
                     due_handled_at.saturating_duration_since(scheduled_for),
                 );
+                per_message_timing.record_due(index, scheduled_for, due_handled_at);
                 let suppressed = episode
                     .as_ref()
                     .is_some_and(|ep| due_handled_at < ep.next_attempt);
@@ -803,6 +810,10 @@ fn run_loop(
                         render_finished,
                         render_finished.saturating_duration_since(render_started),
                     );
+                    per_message_timing.record_render(
+                        index,
+                        render_finished.saturating_duration_since(render_started),
+                    );
 
                     let send_started = Instant::now();
                     let send_result = interface.send(&payload);
@@ -811,6 +822,9 @@ fn run_loop(
                         send_finished,
                         send_finished.saturating_duration_since(send_started),
                     );
+                    // Recorded for a failed send too: a write that blocked and
+                    // then errored held the thread just as long.
+                    per_message_timing.record_send(index, send_started, send_finished);
                     match send_result {
                         Ok(()) => {
                             if let Some(ep) = episode.take() {
@@ -903,11 +917,13 @@ fn run_loop(
                 let now = Instant::now();
                 if timer.counters_due(now, policy.counter_interval) {
                     let drops_so_far = timer.dropped_statuses();
+                    per_message_timing.set_intervals(schedule.intervals());
                     timer.emit(TalkerStatus::Counters {
                         channel: who.id,
                         total_count,
                         total_bytes,
                         per_message_counts: per_message_counts.clone(),
+                        per_message_timing: per_message_timing.snapshot(),
                         dropped_statuses: drops_so_far,
                         missed_sends: schedule.missed_sends(),
                         failed_sends,
@@ -978,11 +994,14 @@ fn run_loop(
     let finished_at = SystemTime::now();
     let missed_sends = schedule.missed_sends();
     let final_timing = send_timing.snapshot_at(finished_mono);
+    per_message_timing.set_intervals(schedule.intervals());
+    let final_per_message = per_message_timing.snapshot();
     let _ = status_tx.send(TalkerStatus::Counters {
         channel: who.id,
         total_count,
         total_bytes,
         per_message_counts: per_message_counts.clone(),
+        per_message_timing: final_per_message.clone(),
         dropped_statuses,
         missed_sends,
         failed_sends,
@@ -1011,6 +1030,7 @@ fn run_loop(
                 total_count,
                 total_bytes,
                 per_message_counts,
+                per_message_timing: final_per_message,
                 dropped_statuses,
                 missed_sends,
                 failed_sends,
@@ -1084,11 +1104,19 @@ mod tests {
     struct MockInterface {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
         fail: bool,
+        /// Hold the channel thread for this long when a payload starts with
+        /// the given byte, standing in for a slow write on one message only.
+        slow: Option<(u8, Duration)>,
     }
 
     impl Interface for MockInterface {
         fn send(&mut self, data: &[u8]) -> anyhow::Result<()> {
             anyhow::ensure!(!self.fail, "mock send failure");
+            if let Some((marker, block)) = self.slow {
+                if data.first() == Some(&marker) {
+                    std::thread::sleep(block);
+                }
+            }
             self.sent.lock().unwrap().push(data.to_vec());
             Ok(())
         }
@@ -1111,16 +1139,37 @@ mod tests {
         spawn_runner_with_mode(messages, fail, policy, timing::TimingMode::Standard)
     }
 
+    /// One active message at `interval_ms` — the schedule shape the timer
+    /// reconciler tests care about, since timer policy reads only the shortest.
+    fn one_cadence(interval_ms: u64) -> Option<timing::ActiveCadence> {
+        let interval = Duration::from_millis(interval_ms);
+        Some(timing::ActiveCadence {
+            messages: 1,
+            shortest: interval,
+        })
+    }
+
     fn spawn_runner_with_mode(
         messages: &[MessageConfig],
         fail: bool,
         policy: ObserverPolicy,
         timing_mode: timing::TimingMode,
     ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle, ChannelId) {
+        spawn_runner_full(messages, fail, policy, timing_mode, None)
+    }
+
+    fn spawn_runner_full(
+        messages: &[MessageConfig],
+        fail: bool,
+        policy: ObserverPolicy,
+        timing_mode: timing::TimingMode,
+        slow: Option<(u8, Duration)>,
+    ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle, ChannelId) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let interface = Box::new(MockInterface {
             sent: Arc::clone(&sent),
             fail,
+            slow,
         });
         let schedule = Schedule::compile(messages, Instant::now()).unwrap();
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
@@ -1169,6 +1218,65 @@ mod tests {
         MessageConfig::new(PayloadConfig::raw_hex(hex), interval_ms)
     }
 
+    /// End to end through the real send path: the message whose write holds the
+    /// thread is charged, and the fast message it delays is not — even though
+    /// the fast message is the one recording all the lateness.
+    #[test]
+    fn a_slow_message_is_charged_for_the_delay_it_imposes_on_a_fast_one() {
+        // #0 every 10 ms and instant; #1 every 200 ms and blocks for 120 ms.
+        let (_sent, handle, _id) = spawn_runner_full(
+            &[msg("AA", 10), msg("BB", 200)],
+            false,
+            ObserverPolicy::every_send(),
+            timing::TimingMode::Standard,
+            Some((0xBB, Duration::from_millis(120))),
+        );
+
+        std::thread::sleep(Duration::from_millis(700));
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+
+        let mut final_timing = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while final_timing.is_none() {
+            for status in handle.status_rx.try_iter() {
+                if let TalkerStatus::Counters {
+                    per_message_timing,
+                    final_snapshot: true,
+                    ..
+                } = status
+                {
+                    final_timing = Some(per_message_timing);
+                }
+            }
+            assert!(Instant::now() < deadline, "no final counter snapshot");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let timing = final_timing.unwrap();
+        join_within(handle, Duration::from_secs(5));
+
+        let fast = timing[0];
+        let slow = timing[1];
+        // The fast message is the victim: its 10 ms deadlines pass inside every
+        // 120 ms block, so it carries the lateness.
+        assert!(
+            fast.deadline_lateness.max().unwrap_or_default() >= Duration::from_millis(50),
+            "fast message should have recorded the delay it suffered: {fast:?}"
+        );
+        // The slow message is the culprit, and the counter says so.
+        assert!(
+            slow.blocking_sends >= 1,
+            "the blocking send was not counted: {slow:?}"
+        );
+        assert!(
+            slow.blocked_others > fast.blocked_others,
+            "blame landed on the victim rather than the blocker: fast={fast:?} slow={slow:?}"
+        );
+        assert!(
+            slow.blocked_others >= Duration::from_millis(50),
+            "attributed delay is implausibly small for a 120 ms block: {slow:?}"
+        );
+    }
+
     #[test]
     fn timer_reconciler_retains_high_rate_guard_and_windows_fifty_milliseconds() {
         let (status_tx, _status_rx) = crossbeam_channel::bounded(16);
@@ -1181,11 +1289,7 @@ mod tests {
         let mut timer =
             TimerReconciler::new(&who, &status_tx, &notify, timing::TimingMode::Precise);
 
-        timer.reconcile_schedule(
-            Some(Duration::from_millis(10)),
-            timing::CadenceAlignment::Immediate,
-            0,
-        );
+        timer.reconcile_schedule(one_cadence(10), timing::CadenceAlignment::Immediate, 0);
         assert_eq!(timer.intent, timing::TimerIntent::ContinuousHighRate);
         assert_eq!(timer.status().reason, timing::TimerReason::HighRate);
         assert!(timer.guard.is_some());
@@ -1210,11 +1314,7 @@ mod tests {
         assert_eq!(timer.status().mode, timing::TimerMode::Standard);
         assert_eq!((timer.guard_acquisitions, timer.guard_releases), (1, 1));
 
-        timer.reconcile_schedule(
-            Some(Duration::from_millis(50)),
-            timing::CadenceAlignment::Immediate,
-            0,
-        );
+        timer.reconcile_schedule(one_cadence(50), timing::CadenceAlignment::Immediate, 0);
         assert_eq!(timer.intent, timing::TimerIntent::PrecisionWindow);
         assert_eq!(timer.status().reason, timing::TimerReason::PrecisionWindow);
         assert!(timer.guard.is_none());
@@ -1376,7 +1476,7 @@ mod tests {
                 TalkerStatus::TimerStatus { channel, status } => {
                     assert_eq!(*channel, id, "timer status carries the stable id");
                     assert_eq!(
-                        status.shortest_active_interval,
+                        status.shortest_active_interval(),
                         Some(Duration::from_millis(10))
                     );
                     assert_ne!(status.mode, timing::TimerMode::Standard);
@@ -1664,7 +1764,7 @@ mod tests {
             for status in handle.status_rx.try_iter() {
                 if let TalkerStatus::TimerStatus { channel, status } = status {
                     assert_eq!(channel, id);
-                    saw_fast = status.shortest_active_interval == Some(Duration::from_millis(5));
+                    saw_fast = status.shortest_active_interval() == Some(Duration::from_millis(5));
                 }
             }
             assert!(Instant::now() < deadline, "fast timer status not reported");
@@ -1683,7 +1783,7 @@ mod tests {
         while dormant.is_none() {
             for status in handle.status_rx.try_iter() {
                 if let TalkerStatus::TimerStatus { status, .. } = status {
-                    if status.shortest_active_interval.is_none() {
+                    if status.shortest_active_interval().is_none() {
                         dormant = Some(status);
                     }
                 }
@@ -1757,7 +1857,7 @@ mod tests {
         while dormant.is_none() {
             for status in handle.status_rx.try_iter() {
                 if let TalkerStatus::TimerStatus { status, .. } = status {
-                    if status.shortest_active_interval.is_none() {
+                    if status.shortest_active_interval().is_none() {
                         dormant = Some(status);
                     }
                 }
