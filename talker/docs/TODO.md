@@ -59,7 +59,8 @@ Cross off items as they are completed. Add new ones inline as they come up.
   - `render_into`/reusable send buffer: KILLED. `poll` due-send is 130 ns @
     64 B and 136 ns @ 1 KiB — the per-send clone is a memcpy; ADR-018 already
     removed the expensive per-send observer copies.
-  - `min_active_interval` caching: KILLED. 761 ns @ 512 messages, ~25 ns at
+  - shortest-interval-scan caching (then `min_active_interval`, now
+    `active_cadence`): KILLED. 761 ns @ 512 messages, ~25 ns at
     realistic counts; 0.08% CPU at 1 kHz.
   - GUI output row ring/virtualization: KILLED and reverted. See below.
 - [x] **Output-pane virtualization experiment — REVERTED 2026-07-13.** The
@@ -249,6 +250,40 @@ Cross off items as they are completed. Add new ones inline as they come up.
   the clipboard report. Per-message *miss* counts are refused by decision: skips
   accrue as `late / interval + 1`, so they name the victim.
 
+## Review disposition — per-message blame and warm-up (2026-08-01)
+
+Applied: the two wording defects (combined victim waiting was presented as an
+elapsed hold; the lateness denominator was called "sends" while including sends
+withheld by retry backoff), the missed-send routing honesty pass, ADR-045's
+stale consequences, an unfinished edit no longer reported as "No messages
+sending", `>100%` above the serial limit, one timing model across the
+per-message table and the completed-run panel, a Render column, per-boundary
+sample counts and maxima in the clipboard report, an interval-change marker, the
+`Arc<[…]>` per-frame clone, and the mechanics-leaking half of the help text.
+
+Not applied, deliberately:
+
+- [ ] **Attribute misses at the moment they occur.** The deepest point in the
+  review: `blocked_others` is sampled when the channel *reaches* a deadline, so
+  it explains observed lateness directly and observed misses only by inference.
+  Worse, the two diverge exactly when it matters — under heavy overload fewer
+  deadlines are reached, so blame thins out as the problem grows. The routing
+  callout and ADR-045 now state this boundary rather than paper over it, but the
+  real fix is to attribute at the skip: `Schedule::poll` already computes
+  `skipped` per message and knows the interval it was skipping against, so the
+  runner could charge those points to the send that was in flight. That is a
+  measurement change, not a wording one, and wants its own ADR.
+- [ ] **Cache the Cadence grouping and its tooltip.** `cadence_groups` allocates
+  and `cadence_tooltip` builds a ~1 kB string every repaint, hovered or not.
+  Caching needs either app-side state keyed on the interval set, or a
+  `wiredata-ui` change so `signal_row` takes a tooltip closure evaluated only on
+  hover. The second is the better shape and touches shared chrome, so it belongs
+  with the next chrome pass rather than bolted on here.
+- [ ] **`percent` and `compact_duration` mark nothing as approximate.** Rejected
+  for `compact_duration` — the maximum is exact and hedging every rounded value
+  would put a qualifier on every number in the pane. Revisit only if a rounded
+  figure is ever shown next to a threshold that reads off it.
+
 ## Cadence rework follow-ups (2026-07-31)
 
 Left behind by the ADR-045 per-message work and the Cadence rewording that
@@ -310,7 +345,7 @@ preceded it. The first two are cross-crate consistency debts, not local cleanups
 
 - [x] **Criterion benchmark harness** — landed: `talker/benches/scheduler.rs`
   (poll idle-scan at 8/64/512 messages, due-and-render incl. the per-send payload
-  clone at 64 B/1 KiB, `min_active_interval`) and `listener/benches/pipeline.rs`
+  clone at 64 B/1 KiB, `active_cadence`) and `listener/benches/pipeline.rs`
   (64-byte ingest floor, steady-state at the scrollback cap, BytePattern rule
   scaling at 1/8/32). `cargo bench -p talker` / `-p listener`; smoke-tested via
   `cargo bench -- --test`; clippy covers them via `--all-targets`. These are

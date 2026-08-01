@@ -12,8 +12,9 @@ Revision note (the warm-up gate retires):
   below a hundred samples the p99 bucket *is* the maximum's bucket and the gate
   only relabelled the same number — at 20, while the two statistics separate at
   100. Readouts now state the maximum with its sample count and add a percentile
-  only when `p99 < max`, a data-derived test needing no constant. Long runs gain
-  a figure they lacked, since a percentile alone hid one-off stalls.
+  only when `p99 < max`, a data-derived test needing no constant. The count is
+  stated once per line rather than beside every figure on it. Long runs gain a
+  figure they lacked, since a percentile alone hid one-off stalls.
   `MIN_SERVICE_SAMPLES` is a different gate — it guards the headroom projection —
   and stays. Listener's migration is pending and recorded as deliberate.
 
@@ -412,7 +413,8 @@ the cross-application OS mechanism into `wiredata-timing`. A refcounted RAII gua
 `timeBeginPeriod(1)`/`timeEndPeriod(1)`: the first holder raises the request, the last
 drop releases it, and the count and OS call share one lock so concurrent
 acquire/release cannot reorder the pair. Each runner re-evaluates
-`Schedule::min_active_interval() < HIGH_RATE_THRESHOLD` (32 ms = two default ticks)
+`Schedule::active_cadence()`'s shortest interval against `HIGH_RATE_THRESHOLD`
+(32 ms = two default ticks)
 every loop pass, so `SetInterval` acquires/releases mid-run. Both entry points (GUI
 funnel, CLI run) additionally opt out of Windows 11's minimized-window timer
 throttling via `SetProcessInformation(ProcessPowerThrottling,
@@ -1500,13 +1502,28 @@ and no work on the send path beyond the `Instant`s already taken.
 
 Per-message **miss** counts are deliberately not offered at any granularity.
 
+Two quantities, not one. `blocked_others` sums the delay imposed on *every*
+message displaced, so a single 412 ms send that leaves four messages waiting
+contributes each of their waits and the total can exceed the send that caused
+it. It is therefore never presentable as an elapsed hold. `longest_block`
+records the longest blocking send and is the figure that may be described as
+holding the channel.
+
+**Scope of the claim.** Attribution is measured against deadlines the channel
+*reached*. A skipped cadence point is never sampled — the scheduler passes it
+before any measurement runs — so per-message blame explains observed **lateness**
+directly and observed **misses** only by inference. The two usually share a
+cause, but they are different populations, and under heavy overload fewer
+deadlines are reached, so blame is measured least well exactly when it matters
+most. Surfaces that use this evidence to explain misses must route rather than
+convict; see the missed-send guidance in spec §3.2.
+
 **Consequences:** A per-message readout can place what a message suffered next
 to what it cost the others, so the diagnosis is reading across one row rather
-than interpreting the single-thread model. The runner's counter lane and
-`ChannelTelemetry` widen by one vector; no profile schema, wire output, cadence,
-or interface behavior changes. `RunSummary` is not yet widened — whether the
-clipboard report should carry per-message blame is left open. Presentation is
-a separate decision; this ADR settles only the measurement and its rule.
+than interpreting the single-thread model. The runner's counter lane,
+`ChannelTelemetry`, and `RunSummary` each widen by one vector, and the clipboard
+report gains positionally-aligned `per_message_*` lanes. No profile schema, wire
+output, cadence, or interface behavior changes.
 
 ## ADR-046 — The warm-up gate is retired; a sample count says it better
 
@@ -1533,6 +1550,14 @@ only when it is a different figure. The maximum is exact (`max_nanos`, not
 bucketed), meaningful at one sample, and needs no disclaimer; the count carries
 the weight the label used to imply, so `worst 3.1 ms of 4 sends` is honest
 without a warm-up state.
+
+The count belongs to the **line**, not to every figure on it. Where a readout
+already names one — a table's own Sends column, or a line covering boundaries
+that are recorded in lockstep — repeating it beside each figure states the same
+number three or four times and crowds out what varies. A boundary states its own
+count only where its population differs from the line's, which is exactly where
+it carries information: lateness is sampled for sends that retry backoff then
+withheld, and the send call is timed for writes that failed.
 
 `p99 < max` is exactly the test for "the percentile says something new": within
 one bucket the bound is `>=` the maximum, so the comparison is false; it becomes

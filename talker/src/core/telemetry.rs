@@ -75,26 +75,47 @@ pub struct SendTimingReport {
 /// against every other message's deadline. Lateness alone therefore identifies
 /// only the *victim*: the message that suffers most is usually the one with the
 /// tightest interval, not the one responsible. [`MessageTiming::blocked_others`]
-/// is the other half of that pair — measured, not inferred.
+/// is the other half of that pair.
+///
+/// **What that pair does and does not establish.** Blame is measured against
+/// deadlines the channel *reached*, because a skipped cadence point is passed
+/// by the scheduler before any measurement runs. It therefore explains observed
+/// **lateness** directly and observed **misses** only by inference — and the two
+/// diverge worst under overload, when fewer deadlines are reached and blame
+/// thins out as the problem grows. Callers explaining misses must route rather
+/// than convict (ADR-045).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MessageTiming {
     /// The cadence this message was running at when the snapshot was taken.
     /// Zero means dormant. Carried with the measurement so a reader never has
     /// to pair run-time timing against a draft interval that may have moved.
     pub interval: Duration,
+    /// Whether this message's interval changed after it had started being
+    /// measured. The histograms below are cumulative for the whole run, so when
+    /// this is set they span more than one cadence and `interval` is only the
+    /// latest — a distinction a reader cannot recover from the numbers alone.
+    pub interval_changed: bool,
     /// Delay from this message's own deadlines until it was handled.
     pub deadline_lateness: DurationHistogram,
     /// Time spent rendering this message's payloads.
     pub render_duration: DurationHistogram,
     /// Time spent inside the interface `send` call for this message.
     pub send_duration: DurationHistogram,
-    /// Total delay other messages incurred while this message's sends held the
-    /// channel thread. Zero for a message that never overran another's deadline.
+    /// Total delay other messages incurred because of this message's sends,
+    /// **summed across every message delayed**.
+    ///
+    /// Not an elapsed time, and deliberately not presentable as one: a single
+    /// 412 ms send that leaves four messages waiting contributes each of their
+    /// waits, so this can exceed the duration of the send that caused it. The
+    /// figure that *is* an elapsed hold is [`Self::longest_block`].
     pub blocked_others: Duration,
     /// How many of this message's sends delayed at least one other message.
     /// Counts sends, not victims: one long send that displaces four deadlines
     /// increments this once.
     pub blocking_sends: u64,
+    /// The longest single send of this message that delayed another — the real
+    /// elapsed time the channel was held, which `blocked_others` is not.
+    pub longest_block: Duration,
 }
 
 /// One completed send's occupancy of the channel thread.
@@ -178,8 +199,10 @@ impl MessageTimingRecorder {
         if let Some(burst) = self.burst.as_mut() {
             burst.counted = true;
         }
+        let held = blocker.ended.saturating_duration_since(blocker.started);
         let entry = self.entry(blocker.index);
         entry.blocked_others = entry.blocked_others.saturating_add(attributable);
+        entry.longest_block = entry.longest_block.max(held);
         if first_victim {
             entry.blocking_sends = entry.blocking_sends.saturating_add(1);
         }
@@ -206,7 +229,14 @@ impl MessageTimingRecorder {
     /// schedule the timing was actually measured against.
     pub(crate) fn set_intervals(&mut self, intervals: impl IntoIterator<Item = Duration>) {
         for (index, interval) in intervals.into_iter().enumerate() {
-            self.entry(index).interval = interval;
+            let entry = self.entry(index);
+            // Only a change *away from* a cadence already in effect matters. The
+            // first stamp moves from the zero default, and waking a dormant
+            // message collected nothing to be misread.
+            if !entry.interval.is_zero() && entry.interval != interval {
+                entry.interval_changed = true;
+            }
+            entry.interval = interval;
         }
     }
 
@@ -303,6 +333,14 @@ mod tests {
         // #3 is charged for both victims, but counted as one blocking send.
         assert_eq!(snapshot[3].blocked_others, ms(312) + ms(262));
         assert_eq!(snapshot[3].blocking_sends, 1);
+        // The reason these are two different fields: summing across victims
+        // exceeds the send that caused it, so only `longest_block` is an
+        // elapsed hold time and only it may be presented as one.
+        assert_eq!(snapshot[3].longest_block, ms(412));
+        assert!(
+            snapshot[3].blocked_others > snapshot[3].longest_block,
+            "combined victim waiting is expected to exceed the blocking send"
+        );
     }
 
     #[test]
@@ -351,6 +389,34 @@ mod tests {
         let snapshot = recorder.snapshot();
         assert_eq!(snapshot[3].blocking_sends, 2);
         assert_eq!(snapshot[3].blocked_others, ms(300) + ms(300));
+    }
+
+    #[test]
+    fn an_interval_changed_mid_run_is_flagged_against_its_cumulative_timing() {
+        let t0 = Instant::now();
+        let mut recorder = MessageTimingRecorder::new(2);
+
+        // First stamp: moving off the zero default is not a change.
+        recorder.set_intervals([ms(50), Duration::ZERO]);
+        assert!(!recorder.snapshot()[0].interval_changed);
+
+        recorder.record_send(0, t0, t0 + ms(1));
+        recorder.set_intervals([ms(50), Duration::ZERO]);
+        assert!(
+            !recorder.snapshot()[0].interval_changed,
+            "no change, no flag"
+        );
+
+        // Waking a dormant message collected nothing that could be misread.
+        recorder.set_intervals([ms(50), ms(200)]);
+        assert!(!recorder.snapshot()[1].interval_changed);
+
+        // A real retune: the histograms now span two cadences and say so.
+        recorder.set_intervals([ms(1_000), ms(200)]);
+        let snapshot = recorder.snapshot();
+        assert!(snapshot[0].interval_changed);
+        assert_eq!(snapshot[0].interval, ms(1_000));
+        assert!(!snapshot[1].interval_changed);
     }
 
     #[test]

@@ -66,11 +66,16 @@ pub struct ChannelTelemetry {
     /// Cumulative wire bytes sent.
     pub total_bytes: u64,
     /// Per-message running send counts, indexed by schedule position.
-    pub per_message_counts: Vec<u64>,
+    ///
+    /// Shared rather than owned: the selected channel's telemetry is cloned
+    /// once per repaint, and these grow with the message count, so a refcount
+    /// bump keeps a wide schedule off the per-frame allocation path.
+    pub per_message_counts: Arc<[u64]>,
     /// Per-message cumulative timing on the same index basis. Carries both
     /// halves of a cadence problem: what each message suffered
     /// (`deadline_lateness`) and what it cost the others (`blocked_others`).
-    pub per_message_timing: Vec<MessageTiming>,
+    /// Shared for the same reason as `per_message_counts`, and larger.
+    pub per_message_timing: Arc<[MessageTiming]>,
     /// Status updates the runner discarded because the queue was full.
     pub dropped_statuses: u64,
     /// Sends skipped under the scheduler's stall policy — cadence health.
@@ -502,7 +507,7 @@ impl TalkerSupervisor {
         self.stop(i);
         if let Some(slot) = self.slots.get_mut(i) {
             slot.telemetry = ChannelTelemetry {
-                per_message_counts: vec![0; message_count],
+                per_message_counts: vec![0; message_count].into(),
                 ..ChannelTelemetry::default()
             };
             slot.applied_run = None;
@@ -636,7 +641,7 @@ impl TalkerSupervisor {
     ) {
         let why = match outcome {
             CommandOutcome::QueueFull => {
-                "the runner's command queue is full (it may be wedged in a blocking send)"
+                "the channel is not accepting commands — it may be stuck in a send that has not returned"
             }
             _ => "the runner has already exited",
         };
@@ -977,8 +982,8 @@ fn drain_statuses(
             } => {
                 telemetry.total_count = total_count;
                 telemetry.total_bytes = total_bytes;
-                telemetry.per_message_counts = per_message_counts;
-                telemetry.per_message_timing = per_message_timing;
+                telemetry.per_message_counts = per_message_counts.into();
+                telemetry.per_message_timing = per_message_timing.into();
                 telemetry.dropped_statuses = dropped_statuses;
                 telemetry.missed_sends = missed_sends;
                 telemetry.failed_sends = failed_sends;
@@ -1167,7 +1172,10 @@ mod tests {
         let summary = sup.last_run_summary(0).expect("completed run retained");
         assert_eq!(summary.total_count, wire, "summary is exact at rest");
         assert_eq!(summary.total_bytes, telemetry.total_bytes);
-        assert_eq!(summary.per_message_counts, telemetry.per_message_counts);
+        assert_eq!(
+            summary.per_message_counts.as_slice(),
+            &*telemetry.per_message_counts
+        );
         assert_eq!(
             summary.end_reason,
             crate::core::run_summary::RunEndReason::StopCommand

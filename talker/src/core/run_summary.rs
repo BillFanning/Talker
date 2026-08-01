@@ -127,17 +127,41 @@ impl RunSummary {
         write_per_message(&mut out, "interval_us", &self.per_message_timing, |m| {
             m.interval.as_micros().to_string()
         });
+        write_per_message(
+            &mut out,
+            "interval_changed",
+            &self.per_message_timing,
+            |m| u8::from(m.interval_changed).to_string(),
+        );
+        // Each boundary carries its own sample count and maximum, so a lane can
+        // be read without assuming the counts match `per_message_sent` — the
+        // lateness population includes sends withheld by retry backoff.
+        write_per_message(&mut out, "late_samples", &self.per_message_timing, |m| {
+            m.deadline_lateness.sample_count().to_string()
+        });
         write_per_message(&mut out, "late_p99_us", &self.per_message_timing, |m| {
             optional_us(m.deadline_lateness.percentile_upper_bound(99))
         });
         write_per_message(&mut out, "late_max_us", &self.per_message_timing, |m| {
             optional_us(m.deadline_lateness.max())
         });
+        write_per_message(&mut out, "render_samples", &self.per_message_timing, |m| {
+            m.render_duration.sample_count().to_string()
+        });
         write_per_message(&mut out, "render_p99_us", &self.per_message_timing, |m| {
             optional_us(m.render_duration.percentile_upper_bound(99))
         });
+        write_per_message(&mut out, "render_max_us", &self.per_message_timing, |m| {
+            optional_us(m.render_duration.max())
+        });
+        write_per_message(&mut out, "send_samples", &self.per_message_timing, |m| {
+            m.send_duration.sample_count().to_string()
+        });
         write_per_message(&mut out, "send_p99_us", &self.per_message_timing, |m| {
             optional_us(m.send_duration.percentile_upper_bound(99))
+        });
+        write_per_message(&mut out, "send_max_us", &self.per_message_timing, |m| {
+            optional_us(m.send_duration.max())
         });
         // The culprit lane: what each message's own sends cost the others.
         write_per_message(
@@ -149,6 +173,14 @@ impl RunSummary {
         write_per_message(&mut out, "blocking_sends", &self.per_message_timing, |m| {
             m.blocking_sends.to_string()
         });
+        // The elapsed hold, which `blocked_others_us` is not: that one sums
+        // every delayed message's wait and can exceed the send causing it.
+        write_per_message(
+            &mut out,
+            "longest_block_us",
+            &self.per_message_timing,
+            |m| m.longest_block.as_micros().to_string(),
+        );
         let _ = writeln!(out, "observer_updates_dropped={}", self.dropped_statuses);
         let _ = writeln!(
             out,
@@ -316,20 +348,24 @@ mod tests {
                 // #0: the victim — fast cadence, late, blames nobody.
                 MessageTiming {
                     interval: Duration::from_millis(50),
+                    interval_changed: false,
                     deadline_lateness: histogram(Duration::from_millis(9)),
                     render_duration: histogram(Duration::from_micros(40)),
                     send_duration: histogram(Duration::from_micros(300)),
                     blocked_others: Duration::ZERO,
                     blocking_sends: 0,
+                    longest_block: Duration::ZERO,
                 },
                 // #1: the culprit — slow cadence, slow write, charged for it.
                 MessageTiming {
                     interval: Duration::from_secs(2),
+                    interval_changed: true,
                     deadline_lateness: histogram(Duration::from_micros(80)),
                     render_duration: histogram(Duration::from_micros(90)),
                     send_duration: histogram(Duration::from_millis(120)),
                     blocked_others: Duration::from_millis(430),
                     blocking_sends: 4,
+                    longest_block: Duration::from_millis(120),
                 },
             ],
             dropped_statuses: 2,

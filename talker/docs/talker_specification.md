@@ -12,8 +12,29 @@ Revision note (no warm-up state; skipped sends name a cause):
   The percentage no longer restates the shortest interval the same line already
   names.
 - **§3.2 missed-send routing (ADR-045)** — skipped cadence points get one callout
-  naming where the cause lies, in decisiveness order, rather than restating a
-  count already on the send-outcomes line.
+  suggesting where to look, in decisiveness order, rather than restating a count
+  already on the send-outcomes line. It routes rather than convicts: run totals
+  are described in the past tense, findings drawn from unapplied settings say so,
+  and blocking evidence is qualified because it comes from deadlines the channel
+  reached rather than the ones it skipped.
+- **§3.2 per-message blame is two figures, not one (ADR-045)** — **longest
+  block** is an elapsed hold; **delay caused** sums the waiting imposed across
+  every message displaced and can exceed the send that caused it. Presenting the
+  sum as a hold time was arithmetically impossible.
+- **§3.2 one count per line** — a readout that already names a sample count does
+  not repeat it beside every figure; a boundary states its own only where its
+  population differs.
+- **§3.2 no render column** — payload construction sits below the first histogram
+  bucket that would report it, so it stays in the clipboard report and the
+  channel-wide work line.
+- **§3.2 Work per send** replaces the *Timing health* line, which duplicated the
+  Cadence row's deadline measurement; what remains is the only channel-wide view
+  of render and the send call as they are now.
+- **§3.2 an unfinished message edit** reads "Finish message setup to calculate
+  cadence" rather than "No messages sending", which contradicted the Capacity row
+  one line above.
+- **§3.2 percentages over a limit** read `>100%`, since flooring alone rendered
+  100.4% as "100%" beside an alert that fired for exceeding it.
 
 Previous revision note (per-message cadence and measured blame):
 
@@ -447,33 +468,59 @@ The **detail pane** (right) shows the selected channel:
     already names it on the same line. Interval detail comes from the running
     schedule's own per-message intervals once the channel has reported any, and
     from the on-screen draft otherwise — never both in one render.
-  - *Missed-send routing (ADR-045):* when any cadence point has been skipped, one
-    callout names where the cause lies rather than restating the count — an
-    erroring interface first (retry backoff withholds sends), then a serial line
-    that physically cannot carry the schedule, then the message whose sends
-    blocked the others, then application headroom, and otherwise the render and
-    send-call timing. It adds no measurement of its own except the blocking
-    message's, whose table is collapsed by default.
+  - *Missed-send routing (ADR-045):* when any scheduled send has been skipped,
+    one callout suggests where to look rather than restating the count — a
+    **live** interface fault first (retry backoff withholds sends), then a serial
+    line that cannot carry the schedule, then the message whose sends delayed the
+    others, then application headroom, and otherwise the render and send-call
+    timing. It **routes, it does not convict**: nothing available is measured at
+    the instant a send was skipped. Its counts are run totals, so a fault that
+    has since recovered is described in the past tense rather than the present;
+    a finding derived from the on-screen settings says so when those settings
+    are not what is running; and blocking evidence is qualified because it comes
+    from deadlines the channel reached, not from the ones it skipped.
   - *Per-message timing (ADR-045):* a collapsed table, one row per message
-    numbered as in the Messages editor, carrying interval, sends, deadline-lateness
-    p99, send-call p99, and **blocked others** — the delay that message's own
-    sends imposed on the rest of the channel, measured by charging each deadline
-    to whichever send was holding the thread when it passed. Because every
-    message on a channel shares one thread, the message recording the lateness
-    and the message causing it are routinely different rows; the table exists so
-    that comparison is a single read across a row. Per-message **miss** counts are
-    deliberately not offered at any granularity: skips accrue as
-    `late / interval + 1`, so they concentrate on the shortest interval — the
-    victim — and would misidentify the cause. Per-message histograms are
-    cumulative-only; the rolling window stays channel-wide.
-  - *Timing health:* approximately last-ten-second deadline-lateness, render-time,
-    and synchronous send-call p99 upper bounds plus maxima; the deadline row also
-    retains the cumulative run maximum. Each pushed timing snapshot is classified
-    as pending, current (with capture age), expired, or final-at-run-end from
-    runner-supplied provenance; Capacity, Cadence, and detailed Timing use the same
-    classification. The timer readout names the configured timing mode, active
-    policy, shortest active interval, cadence alignment, wall-clock re-alignment
-    count, and any Windows 1 ms request failure (ADR-032 through ADR-042).
+    numbered as in the Messages editor, with seven columns — **Msg**,
+    **Interval**, **Sends**, **Late**, **Send call**, **Longest block**, and
+    **Delay caused**. The last two are distinct quantities: longest block is the
+    longest single send of that message which delayed another, and is the only
+    one of the two that is an elapsed hold; delay caused sums the waiting it
+    imposed across every message displaced, so it can exceed the send that caused
+    it and must never be presented as a duration the channel was held. Both come
+    from charging each deadline to whichever send was holding the channel when it
+    passed. Because a channel handles its messages one at a time, the message
+    recording the lateness and the message causing it are routinely different
+    rows; the table exists so that comparison is a single read across a row. An
+    interval that changed mid-run is marked, because the timing beside it is
+    cumulative and therefore spans more than one cadence. There is deliberately
+    **no render column**: payload construction is a clock read, an allocation and
+    a memcpy — typically 1–3 µs, below the 50 µs first bucket of the histogram
+    that would report it — so it stays in the clipboard report and the
+    channel-wide work line rather than taking a column that reads the same
+    forever. Per-message **miss** counts are likewise not offered at any
+    granularity: skips accrue as `late / interval + 1`, so they concentrate on
+    the shortest interval — the victim — and would misidentify the cause.
+    Per-message histograms are cumulative-only; the rolling window stays
+    channel-wide.
+  - *Work per send:* the two stages of the work itself — render and the
+    synchronous send call — over the approximate last ten seconds, beside the
+    cumulative run maximum lateness. Deadline lateness is deliberately **absent**:
+    the Cadence row renders the same recent measurement with the schedule context
+    that makes it readable, so repeating it here was one fact in two places. This
+    line is the only channel-wide view of the two stages *as they are now*, since
+    the per-message table is cumulative — which makes it the "is it Talker or the
+    link" check. Each pushed timing snapshot is classified as pending, current
+    (with capture age), expired, or final-at-run-end from runner-supplied
+    provenance; Capacity, Cadence, and this line use the same classification. The
+    timer readout names the configured timing mode, active policy, shortest active
+    interval, cadence alignment, wall-clock re-alignment count, and any Windows
+    1 ms request failure (ADR-032 through ADR-042).
+  - *Sample counts are stated once per line.* A readout that already names a
+    count — the per-message table's Sends column, or the work line's own total —
+    does not repeat it beside every figure. A boundary states its own count only
+    where its population differs, which is exactly where it carries information:
+    lateness is sampled for sends that retry backoff then withheld, and the send
+    call is timed for writes that failed, so a gap is evidence rather than noise.
   - *Observer health:* `Display backlog: <len>/<cap> (peak <p>, <d> dropped)` —
     the runner→UI status-queue gauge (ADR-018/ADR-019); amber when the peak
     nears the cap or anything was dropped. Pressure here never delays a send;

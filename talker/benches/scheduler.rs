@@ -9,7 +9,7 @@
 //! - `poll` returning a due message followed by `render` — includes the
 //!   per-send wire-bytes clone the "observer-path allocations" TODO targets
 //!   (`render_into` candidate);
-//! - `min_active_interval` — re-scanned every loop pass for the ADR-017
+//! - `active_cadence` — re-scanned every loop pass for the ADR-017
 //!   high-resolution timer gate (caching candidate).
 //!
 //! Run with `cargo bench -p talker`.
@@ -126,12 +126,14 @@ fn bench_poll_due_send_rendered(c: &mut Criterion) {
     });
 }
 
-fn bench_min_active_interval(c: &mut Criterion) {
+/// The runner re-checks this on every loop pass to reconcile timer policy, so
+/// it is on the hot path at whatever the shortest interval is.
+fn bench_active_cadence(c: &mut Criterion) {
     let start = Instant::now();
     let messages: Vec<MessageConfig> = (0..512).map(|_| msg(32, 1_000)).collect();
     let schedule = Schedule::compile(&messages, start).unwrap();
-    c.bench_function("schedule/min-active-interval/512-messages", |b| {
-        b.iter(|| black_box(schedule.min_active_interval()))
+    c.bench_function("schedule/active-cadence/512-messages", |b| {
+        b.iter(|| black_box(schedule.active_cadence()))
     });
 }
 
@@ -140,6 +142,6 @@ criterion_group!(
     bench_poll_scan,
     bench_poll_due_send,
     bench_poll_due_send_rendered,
-    bench_min_active_interval
+    bench_active_cadence
 );
 criterion_main!(benches);

@@ -326,13 +326,6 @@ impl Schedule {
         Some(cadence)
     }
 
-    /// The shortest **active** interval, or `None` when every message is
-    /// dormant. Drives the runner's high-resolution-timer decision
-    /// (`core::timing`, ADR-017).
-    pub fn min_active_interval(&self) -> Option<Duration> {
-        self.active_cadence().map(|cadence| cadence.shortest)
-    }
-
     /// Each message's current interval in schedule order. Zero means dormant.
     pub fn intervals(&self) -> impl Iterator<Item = Duration> + '_ {
         self.messages.iter().map(|message| message.interval)
@@ -586,27 +579,6 @@ mod tests {
         let cadence = s.active_cadence().expect("one message is still active");
         assert_eq!(cadence.messages, 1);
         assert_eq!(cadence.shortest, ms(100));
-    }
-
-    #[test]
-    fn min_active_interval_ignores_dormant_messages() {
-        let t0 = Instant::now();
-        let s = Schedule::compile(&[msg("AB", 100), msg("CD", 10), msg("EF", 0)], t0).unwrap();
-        assert_eq!(s.min_active_interval(), Some(ms(10)));
-        // All dormant → no interval at all.
-        let s = Schedule::compile(&[msg("AB", 0)], t0).unwrap();
-        assert_eq!(s.min_active_interval(), None);
-    }
-
-    #[test]
-    fn min_active_interval_follows_set_interval() {
-        let t0 = Instant::now();
-        let mut s = Schedule::compile(&[msg("AB", 100)], t0).unwrap();
-        assert_eq!(s.min_active_interval(), Some(ms(100)));
-        s.set_interval(0, 5, t0);
-        assert_eq!(s.min_active_interval(), Some(ms(5)));
-        s.set_interval(0, 0, t0); // dormant
-        assert_eq!(s.min_active_interval(), None);
     }
 
     #[test]

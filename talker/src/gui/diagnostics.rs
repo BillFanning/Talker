@@ -97,21 +97,23 @@ pub(super) fn analyzed_channel_demand(
 }
 
 /// Each drafted message's interval, for a channel that has not reported any
-/// runtime timing yet. Returns nothing unless every message parses, matching
-/// [`analyzed_channel_demand`]: a partial schedule would understate the count.
-pub(super) fn draft_intervals(analyses: &[MessageAnalysisCache]) -> Vec<std::time::Duration> {
-    let mut intervals = Vec::with_capacity(analyses.len());
-    for cache in analyses {
-        let Some(config) = cache
-            .analysis
-            .as_ref()
-            .and_then(|analysis| analysis.config.as_ref())
-        else {
-            return Vec::new();
-        };
-        intervals.push(std::time::Duration::from_millis(config.interval_ms));
-    }
-    intervals
+/// runtime timing yet.
+///
+/// `None` when any message fails to parse, matching [`analyzed_channel_demand`]:
+/// a partial schedule would understate the count. That is distinct from
+/// `Some(empty)`, which means the schedule is valid and every message dormant —
+/// the caller must not collapse the two, because one is an unfinished edit the
+/// user can act on and the other is a deliberate state.
+pub(super) fn draft_intervals(
+    analyses: &[MessageAnalysisCache],
+) -> Option<Vec<std::time::Duration>> {
+    analyses
+        .iter()
+        .map(|cache| {
+            let config = cache.analysis.as_ref()?.config.as_ref()?;
+            Some(std::time::Duration::from_millis(config.interval_ms))
+        })
+        .collect()
 }
 
 pub(super) fn compact_rate(value: f64, unit: &str) -> String {
@@ -205,26 +207,40 @@ pub(super) fn service_timing_source_label(
 /// comparison is false; it becomes true only when the p99 bucket sits strictly
 /// below the maximum's. The sample count carries the weight the label used to
 /// imply, so nothing needs a warm-up disclaimer at any count.
-pub(super) fn timing_summary(histogram: DurationHistogram) -> Option<String> {
-    let samples = histogram.sample_count();
+pub(super) fn timing_figures(histogram: DurationHistogram) -> Option<String> {
     let max = histogram.max()?;
     let p99 = histogram.percentile_upper_bound(99)?;
     Some(if p99 < max {
         format!(
-            "99% ≤ {}, worst {} of {}",
+            "99% ≤ {}, worst {}",
             compact_duration(p99),
-            compact_duration(max),
-            thousands(samples)
+            compact_duration(max)
         )
     } else {
-        format!("worst {} of {}", compact_duration(max), thousands(samples))
+        format!("worst {}", compact_duration(max))
     })
 }
 
-pub(super) fn recent_timing_metric(label: &str, histogram: DurationHistogram) -> String {
-    match timing_summary(histogram) {
-        None => format!("{label} no samples"),
-        Some(summary) => format!("{label} {summary}"),
+/// One boundary's figures for a line that already states a sample count.
+///
+/// `line_samples` is that count, so this appends its own only when the two
+/// populations differ — the same rule the per-message cells use. Render and the
+/// send call are recorded in lockstep, so on a line carrying both, one shared
+/// count is exact; lateness is sampled for sends that retry backoff then
+/// withheld, so it states its own whenever that gap opens.
+pub(super) fn timing_metric(
+    label: &str,
+    histogram: DurationHistogram,
+    line_samples: u64,
+) -> String {
+    let Some(figures) = timing_figures(histogram) else {
+        return format!("{label} no samples");
+    };
+    let samples = histogram.sample_count();
+    if samples == line_samples {
+        format!("{label} {figures}")
+    } else {
+        format!("{label} {figures} of {}", thousands(samples))
     }
 }
 
@@ -389,8 +405,15 @@ pub(super) fn cadence_groups(
 fn cadence_schedule_phrase(
     cadence: Option<ActiveCadence>,
     groups: &[(std::time::Duration, usize)],
+    setup_incomplete: bool,
 ) -> String {
     if groups.is_empty() {
+        // An unfinished edit is not the same as a channel with nothing to send,
+        // and only one of them is actionable. Capacity already says this one
+        // line above; saying "No messages sending" here contradicted it.
+        if setup_incomplete && cadence.is_none() {
+            return "Finish message setup to calculate cadence".to_owned();
+        }
         // Only reachable in the gap between a channel's first TimerStatus and
         // its first Counters, so it states the count and the tightest cadence
         // and leaves the distribution to the per-message lane a moment later.
@@ -453,12 +476,13 @@ pub(super) fn cadence_decision(
     cumulative: SendTimingTelemetry,
     cadence: Option<ActiveCadence>,
     groups: &[(std::time::Duration, usize)],
+    setup_incomplete: bool,
     snapshot_state: RecentSnapshotState,
 ) -> DecisionSignal {
     let recent_samples = recent.deadline_lateness.sample_count();
     let run_samples = cumulative.deadline_lateness.sample_count();
     let snapshot_label = recent_snapshot_label(snapshot_state);
-    let schedule = cadence_schedule_phrase(cadence, groups);
+    let schedule = cadence_schedule_phrase(cadence, groups, setup_incomplete);
     // The percentage denominator comes from whichever source drew the schedule
     // above it, so the percentage always scales against an interval the reader
     // can see in the schedule phrase on the same line.
@@ -502,9 +526,14 @@ pub(super) fn cadence_decision(
             .deadline_lateness
             .percentile_upper_bound(99)
             .unwrap_or_default();
+        // "Sends" would be wrong here. Lateness is sampled when the channel
+        // reaches a scheduled point, which happens before retry backoff decides
+        // whether to attempt anything — so this population includes sends that
+        // were withheld and never transmitted, and excludes skipped points the
+        // channel never reached at all. "Reached" is exactly that set.
         let measured = if recent_p99 < recent_max {
             format!(
-                "99% of sends started ≤ {} late, worst {}{}",
+                "99% within {} of schedule, worst {} behind{}",
                 compact_duration(recent_p99),
                 compact_duration(recent_max),
                 shortest
@@ -513,7 +542,7 @@ pub(super) fn cadence_decision(
             )
         } else {
             format!(
-                "worst send started {} late{}",
+                "worst was {} behind schedule{}",
                 compact_duration(recent_max),
                 shortest
                     .map(|interval| relative_to_shortest(recent_max, interval))
@@ -521,7 +550,7 @@ pub(super) fn cadence_decision(
             )
         };
         format!(
-            "{schedule} · {measured} of {} sends · {snapshot_label}",
+            "{schedule} · {measured} · {} scheduled sends reached · {snapshot_label}",
             thousands(recent_samples)
         )
     };
@@ -545,88 +574,161 @@ pub(super) struct MessageRow {
     pub label: String,
     pub interval: String,
     pub sends: String,
-    pub late_p99: String,
-    pub send_p99: String,
-    pub blocked_others: String,
+    pub late: String,
+    pub send_call: String,
+    /// Longest single send of this message that delayed another: an elapsed
+    /// hold time, unlike [`Self::delay_caused`].
+    pub longest_block: String,
+    /// Combined waiting this message imposed, summed across every message it
+    /// delayed. Can exceed `longest_block`; never an elapsed time.
+    pub delay_caused: String,
     /// This message delayed others, so its row carries the attention tone.
     pub blocks_others: bool,
 }
 
 const NO_MEASUREMENT: &str = "—";
 
-fn optional_bound(histogram: DurationHistogram) -> String {
-    histogram
-        .percentile_upper_bound(99)
-        .map(|bound| format!("≤ {}", compact_duration(bound)))
-        .unwrap_or_else(|| NO_MEASUREMENT.to_owned())
+/// Per-message cells use the same model as every other timing readout
+/// (ADR-046) — but the row already carries a Sends column, so repeating an
+/// identical count in every cell just crowds out the figures.
+///
+/// The count appears only when this boundary's population differs from that
+/// column, which is exactly when it is worth reading: lateness is sampled for
+/// sends withheld by retry backoff, and the send call is timed for writes that
+/// failed, so a gap here is evidence rather than noise.
+fn cell_summary(histogram: DurationHistogram, sends: u64) -> String {
+    let Some(figures) = timing_figures(histogram) else {
+        return NO_MEASUREMENT.to_owned();
+    };
+    let samples = histogram.sample_count();
+    if samples == sends {
+        figures
+    } else {
+        format!("{figures} of {}", thousands(samples))
+    }
 }
 
 pub(super) fn per_message_rows(counts: &[u64], timing: &[MessageTiming]) -> Vec<MessageRow> {
     timing
         .iter()
         .enumerate()
-        .map(|(index, message)| MessageRow {
-            // Messages are identified by their position in the Messages
-            // editor, one-based to match what the editor shows.
-            label: format!("#{}", index + 1),
-            interval: if message.interval.is_zero() {
-                "dormant".to_owned()
-            } else {
-                format_interval(message.interval)
-            },
-            sends: thousands(counts.get(index).copied().unwrap_or(0)),
-            late_p99: optional_bound(message.deadline_lateness),
-            send_p99: optional_bound(message.send_duration),
-            blocked_others: if message.blocked_others.is_zero() {
-                NO_MEASUREMENT.to_owned()
-            } else {
-                format!(
-                    "{} over {} sends",
-                    compact_duration(message.blocked_others),
-                    thousands(message.blocking_sends)
-                )
-            },
-            blocks_others: !message.blocked_others.is_zero(),
+        .map(|(index, message)| {
+            let sends = counts.get(index).copied().unwrap_or(0);
+            MessageRow {
+                // Messages are identified by their position in the Messages
+                // editor, one-based to match what the editor shows.
+                label: format!("#{}", index + 1),
+                interval: if message.interval.is_zero() {
+                    "dormant".to_owned()
+                } else if message.interval_changed {
+                    // The histograms beside this are cumulative, so they span the
+                    // cadence this message used to run at as well as this one.
+                    format!("{} (changed)", format_interval(message.interval))
+                } else {
+                    format_interval(message.interval)
+                },
+                sends: thousands(sends),
+                late: cell_summary(message.deadline_lateness, sends),
+                // No render column: payload construction is a clock read, an
+                // allocation and a memcpy — typically 1-3 us, below the 50 us
+                // first bucket of the histogram that would report it. It stays
+                // in the clipboard report and in the channel-wide work line,
+                // where it costs nothing and still catches a pathological
+                // payload, rather than taking a column that reads the same
+                // forever.
+                send_call: cell_summary(message.send_duration, sends),
+                longest_block: if message.longest_block.is_zero() {
+                    NO_MEASUREMENT.to_owned()
+                } else {
+                    format!(
+                        "{} in {} sends",
+                        compact_duration(message.longest_block),
+                        thousands(message.blocking_sends)
+                    )
+                },
+                delay_caused: if message.blocked_others.is_zero() {
+                    NO_MEASUREMENT.to_owned()
+                } else {
+                    compact_duration(message.blocked_others)
+                },
+                blocks_others: !message.blocked_others.is_zero(),
+            }
         })
         .collect()
 }
 
 pub(super) const PER_MESSAGE_TOOLTIP: &str =
     "One row per message, numbered as in the Messages editor. Late is what that message \
-suffered: how long after its own scheduled moment the channel got to it. Blocked others is what \
-it cost everything else — the delay other messages incurred while this message's send held the \
-channel, measured rather than inferred. The two are usually on different rows, and that is the \
-normal shape of a cadence problem: every message on a channel shares one thread, so a slow \
-infrequent message can delay a fast one badly while recording almost no lateness itself. Read \
-across a row, not down a column. Percentiles are histogram-bucket upper bounds over the whole \
-run; the rolling ten-second window is channel-wide and appears in the Cadence row instead.";
+suffered: how long after its own scheduled moment the channel got to it. Longest block and Delay \
+caused are what it cost everything else — the longest single send of this message that held the \
+channel against another, and the waiting that imposed added up across every message delayed. \
+Those two are different quantities: the second sums several messages' waits, so it can exceed the \
+send that caused it and is not an elapsed time. Suffering and causing usually land on different \
+rows, and that is the normal shape of a cadence problem: a channel handles its messages one at a \
+time, so a slow infrequent message can delay a fast one badly while recording almost no lateness \
+itself. Read across a row, not down a column. Sends counts writes that succeeded; a timing figure \
+repeats a count only where its own differs — lateness is also sampled for sends that retry \
+backoff then withheld, and the send call is timed for writes that failed. Figures cover the whole \
+run, and a percentile appears only where it differs from the worst value; the rolling ten-second \
+view is channel-wide and appears in the Cadence row instead.";
 
 pub(super) const MISSED_ROUTING_TOOLTIP: &str =
-    "A missed send is a cadence point the runner skipped because it had fallen more than one \
-interval behind — no send was ever attempted, so no timing was recorded for it. This line does \
-not add a measurement; it names where the evidence already on this pane points, in the order \
-worth checking. Misses concentrate on whichever message has the tightest interval, because the \
-scheduler skips one grid point per interval of lateness, so the message showing the misses is \
-rarely the one causing them — that is why this points at a cause rather than at a count.";
+    "A missed send is a scheduled send the channel never reached, because it had fallen more than \
+one interval behind. Nothing was attempted and no timing exists for it, so nothing here is \
+measured at the moment a send was skipped. This line suggests where to look, in the order worth \
+checking; it does not prove a cause. Two limits are worth knowing. The counts it weighs are run \
+totals, so a fault that has since recovered still appears, and a finding drawn from the settings \
+on screen describes those settings rather than whatever is running. And the blocking evidence is \
+measured against scheduled sends the channel did reach, not against the ones it skipped — the two \
+usually share a cause, but they are different populations, and under heavy overload fewer sends \
+are reached, so blocking is measured least well exactly when it matters most. What is reliable is \
+the direction: misses concentrate on whichever message has the tightest interval, because one \
+grid point is skipped per interval of lateness, so the message showing the misses is rarely the \
+one causing them.";
 
-/// Where to look when sends are being skipped.
+/// Evidence available when scheduled sends are being skipped.
 ///
-/// Deliberately a router, not a readout: every input is already on the pane, so
-/// restating a figure here would be the third rendering of one fact. The one
-/// exception is the blocking message, whose evidence lives in a table that is
-/// collapsed by default.
+/// Grouped rather than passed loose because the honesty of the result depends
+/// on which of these is *current* and which is a run total — a distinction the
+/// caller has and a bare `u64` would lose.
+pub(super) struct MissedSendEvidence {
+    /// Run-total skipped sends.
+    pub missed: u64,
+    /// An interface error is showing **now**, not merely somewhere in the run.
+    pub interface_erroring: bool,
+    /// Run-total failed writes, which may all predate the current state.
+    pub failed: u64,
+    pub serial_oversubscribed: bool,
+    /// The settings on screen are the ones running, so a finding derived from
+    /// them describes this run rather than an unapplied edit.
+    pub settings_match_run: bool,
+    pub service: Option<ServiceEstimate>,
+}
+
+/// Where to look when scheduled sends are being skipped.
 ///
-/// Order is by decisiveness. An erroring interface comes first because retry
-/// backoff suppresses sends, which is a different failure wearing the same
+/// A router, not a verdict. Nothing here is measured at the instant a send was
+/// skipped: the counts are run totals and the blocking evidence comes from
+/// sends that *were* reached, so the strongest honest claim is where to start.
+/// The verbs carry that — "check", "start from" — and a finding drawn from
+/// unapplied settings says so rather than being asserted about the run.
+///
+/// Order is by decisiveness. A live interface fault comes first because retry
+/// backoff withholds sends, which is a different failure wearing the same
 /// symptom; a physically impossible schedule comes next because no amount of
 /// tuning elsewhere changes it.
 pub(super) fn missed_send_routing(
-    missed: u64,
-    failed: u64,
-    serial_oversubscribed: bool,
-    service: Option<ServiceEstimate>,
+    evidence: &MissedSendEvidence,
     per_message: &[MessageTiming],
 ) -> Option<DecisionSignal> {
+    let MissedSendEvidence {
+        missed,
+        interface_erroring,
+        failed,
+        serial_oversubscribed,
+        settings_match_run,
+        service,
+    } = *evidence;
     if missed == 0 {
         return None;
     }
@@ -637,24 +739,50 @@ pub(super) fn missed_send_routing(
         .filter(|(_, message)| !message.blocked_others.is_zero())
         .max_by_key(|(_, message)| message.blocked_others);
 
-    let text = if failed > 0 {
-        "Missed sends: the interface is failing, and retry backoff withholds sends while it \
-         recovers — start from Send outcomes above."
+    let text = if interface_erroring {
+        "Missed sends: the interface is failing right now, and retry backoff withholds sends while \
+         it recovers — start from Send outcomes above."
             .to_owned()
-    } else if serial_oversubscribed {
-        "Missed sends: the serial line cannot carry this schedule at all — see Capacity.".to_owned()
-    } else if let Some((index, message)) = blocker {
+    } else if failed > 0 {
+        // Cumulative, so this fault may have recovered long ago. Say when it
+        // happened rather than implying it is happening.
         format!(
-            "Missed sends: message #{} held the channel {} across {} sends — see Per-message \
-             timing.",
+            "Missed sends: {} sends failed earlier in this run. If the misses came from that \
+             period they follow the retry backoff, not the schedule — check Send outcomes above.",
+            thousands(failed)
+        )
+    } else if serial_oversubscribed && settings_match_run {
+        "Missed sends: the serial line cannot carry this schedule — see Capacity.".to_owned()
+    } else if serial_oversubscribed {
+        "Missed sends: the settings shown are over the serial line's capacity, but they are not \
+         what is running — Apply & Restart to compare, or see Capacity."
+            .to_owned()
+    } else if let Some((index, message)) = blocker {
+        // Two different quantities, and only one of them is an elapsed hold:
+        // the longest blocking send is what the channel actually spent, while
+        // the combined figure sums every delayed message's wait and can exceed
+        // it. Stating the hold first keeps the larger number from reading as
+        // one.
+        format!(
+            "Missed sends: check message #{} first — its longest send held the channel {}, causing \
+             {} of combined waiting across other messages in {} sends. See Per-message timing.",
             index + 1,
+            compact_duration(message.longest_block),
             compact_duration(message.blocked_others),
             thousands(message.blocking_sends),
         )
     } else if service.is_some_and(|estimate| estimate.headroom_factor() < 1.0) {
-        "Missed sends: rendering and the interface write together cannot service the requested \
-         rate — see Capacity."
-            .to_owned()
+        // An estimate built from the on-screen draft, so it projects rather
+        // than reports — "may not" is the strongest honest verb.
+        if settings_match_run {
+            "Missed sends: rendering and the interface write together may not service the \
+             requested rate — see Capacity."
+                .to_owned()
+        } else {
+            "Missed sends: the settings shown may be beyond what rendering and the interface write \
+             can service, but they are not what is running — see Capacity."
+                .to_owned()
+        }
     } else if per_message
         .iter()
         .filter(|message| !message.interval.is_zero())
@@ -700,8 +828,9 @@ pub(super) fn cadence_tooltip(
     let pooling = if active > 1 {
         format!(
             "This channel is sending {active} messages, each on its own repeating interval, and \
-             all of them share one interface. The figure above pools every active message's sends \
-             together — it is the channel's behaviour, not any single message's. Because a \
+             all of them go out through one interface, one at a time. The figure above pools \
+             every active message's sends together — it is the channel's behaviour, not any \
+             single message's. Because a \
              message that repeats more often contributes more sends, the fastest messages weigh \
              most heavily in it."
         )
@@ -712,18 +841,19 @@ pub(super) fn cadence_tooltip(
     };
 
     format!(
-        "{pooling} Late measures one thing: the gap between the moment a send was scheduled for \
-         and the moment the channel actually started work on it. It does not include how long the \
-         send itself took, and it never means the data arrived late at the far end. The worst \
-         delay is always shown, with the number of sends behind it, so a figure from four sends \
-         cannot be mistaken for one from four thousand. \"99% of sends started ≤ X late\" appears \
-         beside it only when that is a different figure from the worst — under a hundred sends it \
-         never is — and means at most one send in a hundred waited longer than X, rounded up to a \
-         histogram bucket edge, which is what ≤ marks. Any percentage compares the delay with the \
+        "{pooling} This measures one thing: the gap between the moment a send was scheduled for \
+         and the moment the channel actually got to it. It does not include how long the send \
+         itself took, and it never means the data arrived late at the far end. \"Reached\" is the \
+         exact population behind it — every scheduled send the channel got to, which includes any \
+         that were then withheld by retry backoff without being transmitted, and excludes points \
+         skipped entirely, which are counted as Missed on the Send outcomes line and never appear \
+         here. The worst delay is always shown with that count beside it, so a figure from four \
+         cannot be mistaken for one from four thousand. \"99% within X of schedule\" appears \
+         alongside only when that is a different figure from the worst — below a hundred it never \
+         is — and means at most one in a hundred waited longer than X, rounded up to a histogram \
+         bucket edge, which is what ≤ marks elsewhere. Any percentage compares the delay with the \
          shortest interval on the channel, to show whether it is a rounding error against the \
-         tightest schedule or a real part of it; it is not a per-message figure. Sends that were \
-         skipped entirely are counted as Missed on the Send outcomes line instead, and never \
-         appear here."
+         tightest schedule or a real part of it; it is not a per-message figure."
     )
 }
 
@@ -734,7 +864,7 @@ pub(super) fn timing_detail_text(
 ) -> String {
     let run_samples = cumulative.deadline_lateness.sample_count();
     if run_samples == 0 {
-        return "Timing: awaiting first deadline".to_owned();
+        return "Work per send: awaiting first send".to_owned();
     }
 
     let run_max = cumulative
@@ -744,19 +874,31 @@ pub(super) fn timing_detail_text(
         .unwrap_or_else(|| "n/a".to_owned());
     match snapshot_state {
         RecentSnapshotState::Expired(_) => format!(
-            "Timing: {} · run max deadline lateness {run_max}",
+            "Work per send: {} · run max late {run_max}",
             recent_snapshot_label(snapshot_state)
         ),
         RecentSnapshotState::Pending => {
-            format!("Timing: recent snapshot pending · run max deadline lateness {run_max}")
+            format!("Work per send: recent snapshot pending · run max late {run_max}")
         }
-        RecentSnapshotState::Current(_) | RecentSnapshotState::Final => format!(
-            "Timing ({}): {} · {} · {} · run max deadline lateness {run_max}",
-            recent_snapshot_label(snapshot_state),
-            recent_timing_metric("deadline", recent.deadline_lateness),
-            recent_timing_metric("render", recent.render_duration),
-            recent_timing_metric("send call", recent.send_duration),
-        ),
+        // Deadline lateness is deliberately absent: the Cadence row renders the
+        // same recent histogram with the schedule context that makes it
+        // readable, so repeating it here was one fact in two places. What is
+        // left is what nothing else shows — how long the two stages of the work
+        // itself took, channel-wide and recently, since the per-message table is
+        // cumulative — plus the run-wide lateness ceiling the Cadence row omits
+        // while a current window is available.
+        RecentSnapshotState::Current(_) | RecentSnapshotState::Final => {
+            // Both boundaries share one population, so the count belongs to the
+            // line rather than to each figure on it.
+            let samples = recent.send_duration.sample_count();
+            format!(
+                "Work per send ({}, {} sends): {} · {} · run max late {run_max}",
+                recent_snapshot_label(snapshot_state),
+                thousands(samples),
+                timing_metric("render", recent.render_duration, samples),
+                timing_metric("send call", recent.send_duration, samples),
+            )
+        }
     }
 }
 
@@ -824,9 +966,10 @@ mod tests {
 
     use super::{
         analyzed_channel_demand, cadence_decision, cadence_groups, cadence_tooltip,
-        diagnostic_card_tone, missed_send_routing, per_message_rows, recent_timing_metric,
-        select_service_timing, send_outcomes, send_outcomes_tooltip, timer_status_detail,
-        timing_detail_text, timing_summary, unavailable_line_capacity_label, ServiceTimingSource,
+        diagnostic_card_tone, missed_send_routing, per_message_rows, select_service_timing,
+        send_outcomes, send_outcomes_tooltip, timer_status_detail, timing_detail_text,
+        timing_figures, timing_metric, unavailable_line_capacity_label, MissedSendEvidence,
+        ServiceTimingSource,
     };
     use crate::core::telemetry::{
         DurationHistogram, MessageTiming, RecentSnapshotState, SendTimingTelemetry,
@@ -979,12 +1122,13 @@ mod tests {
             recent,
             mixed_cadence(),
             &mixed_groups(),
+            false,
             RecentSnapshotState::Current(Duration::ZERO),
         );
         assert_eq!(
             few.text,
-            "3 messages: 2 at 50 ms, 1 at 1,000 ms · worst send started 1.00 ms late \
-             (2% of the shortest interval) of 4 sends · recent snapshot"
+            "3 messages: 2 at 50 ms, 1 at 1,000 ms · worst was 1.00 ms behind schedule \
+             (2% of the shortest interval) · 4 scheduled sends reached · recent snapshot"
         );
         assert_eq!(few.tone, SignalTone::Neutral);
 
@@ -998,10 +1142,11 @@ mod tests {
             recent,
             mixed_cadence(),
             &mixed_groups(),
+            false,
             RecentSnapshotState::Current(Duration::ZERO),
         );
         assert!(
-            more.text.contains("worst send started 1.00 ms late") && !more.text.contains("99%"),
+            more.text.contains("worst was 1.00 ms behind schedule") && !more.text.contains("99%"),
             "twenty samples must not promote the same figure to a percentile: {}",
             more.text
         );
@@ -1017,26 +1162,27 @@ mod tests {
             recent,
             mixed_cadence(),
             &mixed_groups(),
+            false,
             RecentSnapshotState::Current(Duration::ZERO),
         );
         assert_eq!(
             spread.text,
-            "3 messages: 2 at 50 ms, 1 at 1,000 ms · 99% of sends started ≤ 1.00 ms late, \
-             worst 40 ms (80% of the shortest interval) of 201 sends · recent snapshot"
+            "3 messages: 2 at 50 ms, 1 at 1,000 ms · 99% within 1.00 ms of schedule, worst 40 ms \
+             behind (80% of the shortest interval) · 201 scheduled sends reached · recent snapshot"
         );
     }
 
     /// The rule that replaced the warm-up gate, stated directly: the percentile
     /// earns its place only when it differs from the maximum.
     #[test]
-    fn timing_summary_adds_a_percentile_only_when_it_differs_from_the_maximum() {
-        assert_eq!(timing_summary(DurationHistogram::default()), None);
+    fn timing_figures_add_a_percentile_only_when_it_differs_from_the_maximum() {
+        assert_eq!(timing_figures(DurationHistogram::default()), None);
 
         let mut single = DurationHistogram::default();
         single.record(Duration::from_millis(3));
         assert_eq!(
-            timing_summary(single).unwrap(),
-            "worst 3 ms of 1",
+            timing_figures(single).unwrap(),
+            "worst 3 ms",
             "one sample is reportable without a warm-up disclaimer"
         );
 
@@ -1046,7 +1192,7 @@ mod tests {
         for _ in 0..99 {
             identical.record(Duration::from_millis(1));
         }
-        assert_eq!(timing_summary(identical).unwrap(), "worst 1.00 ms of 99");
+        assert_eq!(timing_figures(identical).unwrap(), "worst 1.00 ms");
 
         let mut spread = identical;
         for _ in 99..200 {
@@ -1054,8 +1200,8 @@ mod tests {
         }
         spread.record(Duration::from_millis(40));
         assert_eq!(
-            timing_summary(spread).unwrap(),
-            "99% ≤ 1.00 ms, worst 40 ms of 201"
+            timing_figures(spread).unwrap(),
+            "99% ≤ 1.00 ms, worst 40 ms"
         );
     }
 
@@ -1081,8 +1227,15 @@ mod tests {
                 warmed,
             ),
         ] {
-            let text =
-                cadence_decision(recent, cumulative, mixed_cadence(), &mixed_groups(), state).text;
+            let text = cadence_decision(
+                recent,
+                cumulative,
+                mixed_cadence(),
+                &mixed_groups(),
+                false,
+                state,
+            )
+            .text;
             assert!(
                 text.starts_with("3 messages: 2 at 50 ms, 1 at 1,000 ms"),
                 "state left the message count off the line: {text}"
@@ -1098,7 +1251,7 @@ mod tests {
         let state = RecentSnapshotState::Current(Duration::ZERO);
 
         assert_eq!(
-            cadence_decision(empty, empty, mixed_cadence(), &mixed_groups(), state).text,
+            cadence_decision(empty, empty, mixed_cadence(), &mixed_groups(), false, state).text,
             "3 messages: 2 at 50 ms, 1 at 1,000 ms · awaiting the first scheduled send"
         );
     }
@@ -1118,6 +1271,7 @@ mod tests {
             interval: Duration::from_secs(2),
             blocked_others: Duration::from_millis(430),
             blocking_sends: 4,
+            longest_block: Duration::from_millis(120),
             ..MessageTiming::default()
         };
         culprit.deadline_lateness.record(Duration::from_micros(80));
@@ -1130,16 +1284,47 @@ mod tests {
         assert_eq!(rows[0].label, "#1");
         assert_eq!(rows[0].interval, "50 ms");
         assert_eq!(rows[0].sends, "600");
-        assert_eq!(rows[0].late_p99, "≤ 16 ms");
-        assert_eq!(rows[0].blocked_others, "—");
+        assert_eq!(rows[0].late, "worst 9 ms of 1");
+        assert_eq!(rows[0].longest_block, "—");
+        assert_eq!(rows[0].delay_caused, "—");
         assert!(!rows[0].blocks_others);
 
         // #2 is barely late itself, and is charged for the delay it caused.
         assert_eq!(rows[1].label, "#2");
-        assert_eq!(rows[1].late_p99, "≤ 100 us");
-        assert_eq!(rows[1].send_p99, "≤ 128 ms");
-        assert_eq!(rows[1].blocked_others, "430 ms over 4 sends");
+        assert_eq!(rows[1].late, "worst 80.0 us of 1");
+        assert_eq!(rows[1].send_call, "worst 120 ms of 1");
+        // The hold and the combined waiting are separate cells because the
+        // second is a sum across victims and is not an elapsed time.
+        assert_eq!(rows[1].longest_block, "120 ms in 4 sends");
+        assert_eq!(rows[1].delay_caused, "430 ms");
         assert!(rows[1].blocks_others);
+    }
+
+    /// The Sends column already carries the count, so repeating it in all three
+    /// timing cells said the same number four times per row. It survives only
+    /// where it differs — which is the case that carries information.
+    #[test]
+    fn per_message_cells_repeat_the_send_count_only_when_it_differs() {
+        let mut matching = MessageTiming::default();
+        for _ in 0..3 {
+            matching.deadline_lateness.record(Duration::from_millis(1));
+            matching.send_duration.record(Duration::from_micros(200));
+        }
+        let rows = per_message_rows(&[3], &[matching]);
+        assert_eq!(rows[0].sends, "3");
+        assert_eq!(rows[0].late, "worst 1.00 ms", "count is already a column");
+        assert_eq!(rows[0].send_call, "worst 200 us");
+
+        // Retry backoff samples lateness for sends it then withholds, so this
+        // population outruns the successful-send count — and that gap is the
+        // evidence, so it is stated.
+        let mut withheld = matching;
+        for _ in 0..9 {
+            withheld.deadline_lateness.record(Duration::from_millis(1));
+        }
+        let rows = per_message_rows(&[3], &[withheld]);
+        assert_eq!(rows[0].late, "worst 1.00 ms of 12");
+        assert_eq!(rows[0].send_call, "worst 200 us");
     }
 
     #[test]
@@ -1149,9 +1334,10 @@ mod tests {
         assert_eq!(rows[0].interval, "dormant");
         assert_eq!(rows[0].sends, "0");
         // No samples is not the same as a measured zero.
-        assert_eq!(rows[0].late_p99, "—");
-        assert_eq!(rows[0].send_p99, "—");
-        assert_eq!(rows[0].blocked_others, "—");
+        assert_eq!(rows[0].late, "—");
+        assert_eq!(rows[0].send_call, "—");
+        assert_eq!(rows[0].longest_block, "—");
+        assert_eq!(rows[0].delay_caused, "—");
     }
 
     /// The routing exists because the message showing the misses is rarely the
@@ -1162,36 +1348,65 @@ mod tests {
         let blocker = MessageTiming {
             blocked_others: Duration::from_millis(430),
             blocking_sends: 4,
+            longest_block: Duration::from_millis(120),
             ..MessageTiming::default()
         };
         let per_message = [MessageTiming::default(), blocker];
+        let evidence = |missed, interface_erroring, failed, oversubscribed, settings_match_run| {
+            MissedSendEvidence {
+                missed,
+                interface_erroring,
+                failed,
+                serial_oversubscribed: oversubscribed,
+                settings_match_run,
+                service: None,
+            }
+        };
 
         // Nothing skipped: no line at all.
-        assert!(missed_send_routing(0, 0, false, None, &per_message).is_none());
+        assert!(missed_send_routing(&evidence(0, false, 0, false, true), &per_message).is_none());
 
-        // A failing interface outranks everything: backoff suppression is a
-        // different failure wearing the same symptom.
-        let failing = missed_send_routing(12, 3, true, None, &per_message).unwrap();
-        assert!(
-            failing.text.contains("the interface is failing"),
-            "{failing:?}"
-        );
+        // A *live* interface fault outranks everything: backoff withholding
+        // sends is a different failure wearing the same symptom.
+        let failing =
+            missed_send_routing(&evidence(12, true, 3, true, true), &per_message).unwrap();
+        assert!(failing.text.contains("failing right now"), "{failing:?}");
         assert_eq!(failing.tone, SignalTone::Warning);
 
-        // Then a schedule the wire physically cannot carry.
-        let oversubscribed = missed_send_routing(12, 0, true, None, &per_message).unwrap();
+        // The same failure count with no current error is a run total that may
+        // long since have recovered, and must not be stated in the present.
+        let recovered =
+            missed_send_routing(&evidence(12, false, 3, false, true), &per_message).unwrap();
+        assert!(
+            recovered.text.contains("earlier in this run"),
+            "a recovered fault must not be reported as current: {recovered:?}"
+        );
+
+        // A schedule the wire cannot carry — but only asserted about this run
+        // when the settings on screen are the ones running.
+        let oversubscribed =
+            missed_send_routing(&evidence(12, false, 0, true, true), &per_message).unwrap();
         assert!(oversubscribed.text.contains("cannot carry this schedule"));
 
-        // Then the blocking message, named — the one figure this line restates,
-        // because its table is collapsed by default. Index is one-based.
-        let blocked = missed_send_routing(12, 0, false, None, &per_message).unwrap();
+        let unapplied =
+            missed_send_routing(&evidence(12, false, 0, true, false), &per_message).unwrap();
+        assert!(
+            unapplied.text.contains("not what is running"),
+            "an unapplied draft must not be blamed for this run's misses: {unapplied:?}"
+        );
+
+        // The blocking message: routed to, not convicted, and the elapsed hold
+        // is stated separately from the combined waiting it caused — the latter
+        // sums across victims and can exceed the send itself.
+        let blocked =
+            missed_send_routing(&evidence(12, false, 0, false, true), &per_message).unwrap();
         assert_eq!(
             blocked.text,
-            "Missed sends: message #2 held the channel 430 ms across 4 sends — see Per-message \
+            "Missed sends: check message #2 first — its longest send held the channel 120 ms, \
+             causing 430 ms of combined waiting across other messages in 4 sends. See Per-message \
              timing."
         );
 
-        // With no blocker and no capacity finding, it still points somewhere.
         // One active message cannot block another, so the blocking branch is
         // structurally unreachable. Reporting its absence as a finding is the
         // non-sequitur this branch exists to avoid.
@@ -1199,8 +1414,11 @@ mod tests {
             interval: Duration::from_millis(50),
             ..MessageTiming::default()
         };
-        let alone =
-            missed_send_routing(12, 0, false, None, &[active, MessageTiming::default()]).unwrap();
+        let alone = missed_send_routing(
+            &evidence(12, false, 0, false, true),
+            &[active, MessageTiming::default()],
+        )
+        .unwrap();
         assert!(
             alone.text.contains("one active message"),
             "a single-message channel must not be told no message stands out: {alone:?}"
@@ -1212,7 +1430,8 @@ mod tests {
             interval: Duration::from_millis(80),
             ..MessageTiming::default()
         };
-        let unexplained = missed_send_routing(12, 0, false, None, &[active, second]).unwrap();
+        let unexplained =
+            missed_send_routing(&evidence(12, false, 0, false, true), &[active, second]).unwrap();
         assert!(unexplained.text.contains("no message delayed another"));
     }
 
@@ -1246,7 +1465,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            cadence_decision(empty, empty, mixed_cadence(), &groups, state).text,
+            cadence_decision(empty, empty, mixed_cadence(), &groups, false, state).text,
             "5 messages: 1 at 10 ms, 1 at 20 ms, 1 at 50 ms, 2 slower · awaiting the \
              first scheduled send"
         );
@@ -1265,18 +1484,25 @@ mod tests {
 
         let same = |count| cadence_groups(std::iter::repeat_n(Duration::from_millis(250), count));
         assert_eq!(
-            cadence_decision(empty, empty, uniform(1), &same(1), state).text,
+            cadence_decision(empty, empty, uniform(1), &same(1), false, state).text,
             "1 message every 250 ms · awaiting the first scheduled send"
         );
         assert_eq!(
-            cadence_decision(empty, empty, uniform(4), &same(4), state).text,
+            cadence_decision(empty, empty, uniform(4), &same(4), false, state).text,
             "4 messages, each every 250 ms · awaiting the first scheduled send"
         );
         // Every message dormant and nothing ever sent: the row says only that,
         // with no promise of a send that nothing is scheduled to make.
         assert_eq!(
-            cadence_decision(empty, empty, None, &[], state).text,
+            cadence_decision(empty, empty, None, &[], false, state).text,
             "No messages sending"
+        );
+        // But an unfinished edit is a different, actionable state, and must not
+        // be reported as a channel that has nothing to send — Capacity says
+        // the same thing one line above.
+        assert_eq!(
+            cadence_decision(empty, empty, None, &[], true, state).text,
+            "Finish message setup to calculate cadence"
         );
     }
 
@@ -1288,7 +1514,14 @@ mod tests {
         }
         let state = RecentSnapshotState::Expired(Duration::from_secs(11));
 
-        let cadence = cadence_decision(timing, timing, mixed_cadence(), &mixed_groups(), state);
+        let cadence = cadence_decision(
+            timing,
+            timing,
+            mixed_cadence(),
+            &mixed_groups(),
+            false,
+            state,
+        );
         assert_eq!(
             cadence.text,
             "3 messages: 2 at 50 ms, 1 at 1,000 ms · recent snapshot expired · as \
@@ -1296,7 +1529,7 @@ mod tests {
         );
         assert_eq!(
             timing_detail_text(timing, timing, state),
-            "Timing: recent snapshot expired · as of 11.0 s ago · run max deadline lateness 1.00 ms"
+            "Work per send: recent snapshot expired · as of 11.0 s ago · run max late 1.00 ms"
         );
     }
 
@@ -1372,22 +1605,25 @@ mod tests {
         timing.render_duration.record(Duration::from_micros(100));
         timing.send_duration.record(Duration::from_micros(200));
 
-        // Each boundary states its own count rather than a shared readiness
-        // threshold, so a thinly sampled one is self-evidently thin.
+        // The line states one count; a boundary repeats it only where its own
+        // population differs. Render and the send call are recorded in
+        // lockstep, so they stay silent; lateness carries the suppressed sends
+        // that never reached a write, so it says so.
+        let line_samples = timing.send_duration.sample_count();
         assert_eq!(
-            recent_timing_metric("deadline", timing.deadline_lateness),
+            timing_metric("deadline", timing.deadline_lateness, line_samples),
             "deadline worst 1.00 ms of 20"
         );
         assert_eq!(
-            recent_timing_metric("render", timing.render_duration),
-            "render worst 100 us of 1"
+            timing_metric("render", timing.render_duration, line_samples),
+            "render worst 100 us"
         );
         assert_eq!(
-            recent_timing_metric("send call", timing.send_duration),
-            "send call worst 200 us of 1"
+            timing_metric("send call", timing.send_duration, line_samples),
+            "send call worst 200 us"
         );
         assert_eq!(
-            recent_timing_metric("render", DurationHistogram::default()),
+            timing_metric("render", DurationHistogram::default(), line_samples),
             "render no samples"
         );
     }

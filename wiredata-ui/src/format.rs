@@ -71,6 +71,12 @@ pub fn percent(value: f64) -> String {
     if value > 0.0 && value < 1.0 {
         return "<1%".to_owned();
     }
+    // Flooring alone would render 100.4% as "100%", which reads as *at* the
+    // limit next to an alert that fired for exceeding it. Over the limit says
+    // so; only an exact 100 reads as 100.
+    if value > 100.0 {
+        return ">100%".to_owned();
+    }
     format!("{}%", value.floor() as i64)
 }
 
@@ -137,7 +143,9 @@ mod tests {
         // it is. Only an actual 100% reads as 100%.
         assert_eq!(percent(99.6), "99%");
         assert_eq!(percent(100.0), "100%");
-        assert_eq!(percent(100.4), "100%");
+        // ...and the mirror of it: 100.4% is over the limit, and must not read
+        // as sitting on it beside an alert that fired for exceeding it.
+        assert_eq!(percent(100.4), ">100%");
         // A small non-zero share is not nothing.
         assert_eq!(percent(0.3), "<1%");
     }

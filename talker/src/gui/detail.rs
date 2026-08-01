@@ -19,7 +19,7 @@ use crate::core::{
 use wiredata_ui::{
     diagnostics::{attention_callout, decision_card, signal_grid, signal_row, SignalTone},
     fonts::bold,
-    format::{compact_duration, human_byte_rate, human_bytes, percent},
+    format::{compact_duration, human_byte_rate, human_bytes, percent, thousands},
     glyphs,
 };
 
@@ -43,7 +43,7 @@ use super::diagnostics::*;
 fn show_per_message_table(ui: &mut egui::Ui, rows: &[MessageRow]) {
     let pal = theme_palette(ui);
     egui::Grid::new("per_message_grid")
-        .num_columns(6)
+        .num_columns(7)
         .spacing(egui::vec2(14.0, 4.0))
         .striped(true)
         .show(ui, |ui| {
@@ -51,9 +51,10 @@ fn show_per_message_table(ui: &mut egui::Ui, rows: &[MessageRow]) {
                 "Msg",
                 "Interval",
                 "Sends",
-                "Late p99",
-                "Send p99",
-                "Blocked others",
+                "Late",
+                "Send call",
+                "Longest block",
+                "Delay caused",
             ] {
                 ui.label(bold(heading).size(12.0));
             }
@@ -63,16 +64,22 @@ fn show_per_message_table(ui: &mut egui::Ui, rows: &[MessageRow]) {
                 ui.label(egui::RichText::new(&row.label).size(12.0));
                 ui.label(egui::RichText::new(&row.interval).size(12.0));
                 ui.label(egui::RichText::new(&row.sends).size(12.0));
-                ui.label(egui::RichText::new(&row.late_p99).size(12.0));
-                ui.label(egui::RichText::new(&row.send_p99).size(12.0));
+                ui.label(egui::RichText::new(&row.late).size(12.0));
+                ui.label(egui::RichText::new(&row.send_call).size(12.0));
                 // Only the culprit column is toned. Lateness is not scored
                 // against an invented budget, so a late row stays neutral;
                 // having delayed another message is an attributable fact.
-                let blocked = egui::RichText::new(&row.blocked_others).size(12.0);
+                let hold = egui::RichText::new(&row.longest_block).size(12.0);
                 ui.label(if row.blocks_others {
-                    blocked.color(pal.warning_amber)
+                    hold.color(pal.warning_amber)
                 } else {
-                    blocked
+                    hold
+                });
+                let caused = egui::RichText::new(&row.delay_caused).size(12.0);
+                ui.label(if row.blocks_others {
+                    caused.color(pal.warning_amber)
+                } else {
+                    caused
                 });
                 ui.end_row();
             }
@@ -131,27 +138,24 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
             })
             .on_hover_text(TIMER_TOOLTIP);
 
+            // Same timing model as every live readout (ADR-046): the worst
+            // value with its sample count, and a percentile only where it
+            // differs. A completed run had its own p99-only form, which read as
+            // a different measurement of the same thing.
             let timing = summary.timing.cumulative;
-            let p99 = |histogram: crate::core::telemetry::DurationHistogram| {
-                histogram
-                    .percentile_upper_bound(99)
-                    .map(compact_duration)
-                    .unwrap_or_else(|| "n/a".to_owned())
-            };
             let timing_text = if timing.deadline_lateness.sample_count() == 0 {
                 "Timing: no deadline samples".to_owned()
             } else {
-                format!(
-                    "Timing (run): late p99 ≤ {} · render p99 ≤ {} · send call p99 ≤ {} · max late {}",
-                    p99(timing.deadline_lateness),
-                    p99(timing.render_duration),
-                    p99(timing.send_duration),
-                    timing
-                        .deadline_lateness
-                        .max()
-                        .map(compact_duration)
-                        .unwrap_or_else(|| "n/a".to_owned()),
-                )
+                {
+                    let samples = timing.send_duration.sample_count();
+                    format!(
+                        "Timing (run, {} sends): {} · {} · {}",
+                        thousands(samples),
+                        timing_metric("late", timing.deadline_lateness, samples),
+                        timing_metric("render", timing.render_duration, samples),
+                        timing_metric("send call", timing.send_duration, samples),
+                    )
+                }
             };
             ui.weak(timing_text).on_hover_text(TIMING_TOOLTIP);
         });
@@ -313,7 +317,11 @@ impl TalkerApp {
             .and_then(|demand| measured_service_estimate(demand, service_timing));
         let service_samples = service_sample_count(service_timing);
         let draft_projection = running && (iface_drift || run_drift);
-        let app_label = if draft_projection { "draft app" } else { "app" };
+        let app_label = if draft_projection {
+            "app (shown settings)"
+        } else {
+            "app"
+        };
 
         let app_capacity = if let Some(estimate) = service_estimate {
             let mut text = format!(
@@ -392,25 +400,32 @@ impl TalkerApp {
         // running schedule's own per-message intervals once the channel has
         // reported any, the on-screen draft otherwise. Mixing them would let a
         // stale draft interval appear inside a line of measured runtime facts.
-        let cadence_groups = if telemetry.per_message_timing.is_empty() {
-            self.message_analysis
-                .get(i)
-                .map(|analyses| draft_intervals(analyses))
-                .map(cadence_groups)
-                .unwrap_or_default()
-        } else {
+        let drafted_intervals = self
+            .message_analysis
+            .get(i)
+            .and_then(|analyses| draft_intervals(analyses));
+        let has_runtime_timing = !telemetry.per_message_timing.is_empty();
+        let cadence_groups = if has_runtime_timing {
             cadence_groups(
                 telemetry
                     .per_message_timing
                     .iter()
                     .map(|message| message.interval),
             )
+        } else {
+            drafted_intervals
+                .clone()
+                .map(cadence_groups)
+                .unwrap_or_default()
         };
+        // An unparseable interval is an unfinished edit, not an idle channel.
+        let cadence_setup_incomplete = !has_runtime_timing && drafted_intervals.is_none();
         let cadence_decision = cadence_decision(
             timing,
             cumulative_timing,
             active_cadence,
             &cadence_groups,
+            cadence_setup_incomplete,
             recent_snapshot_state,
         );
 
@@ -490,7 +505,7 @@ impl TalkerApp {
                         "Capacity",
                         &capacity.text,
                         capacity.tone,
-                        "Requested load comes from the draft currently shown and may differ from the running configuration until Apply & Restart. Sent rate is the rolling five-second average of configured-interface writes that returned success. Serial utilization is a theoretical UART line estimate. Application headroom compares the current draft with separate render and interface-write p99 bounds. A warmed recent snapshot is preferred while it is current; an expired snapshot is discarded and a clearly labelled run-wide fallback is used when available. This is an advisory projection, not a hard capacity promise.",
+                        "Requested load comes from the settings currently shown, which may differ from what is running until Apply & Restart. Sent rate is the rolling five-second average of configured-interface writes that returned success. Serial utilization is a theoretical UART line estimate. Application headroom compares the current draft with separate render and interface-write p99 bounds. A warmed recent snapshot is preferred while it is current; an expired snapshot is discarded and a clearly labelled run-wide fallback is used when available. This is an advisory projection, not a hard capacity promise.",
                     );
             });
 
@@ -498,10 +513,18 @@ impl TalkerApp {
             // count is already on the send-outcomes line above, and the message
             // showing the misses is rarely the one causing them (ADR-045).
             if let Some(routing) = missed_send_routing(
-                missed,
-                failed,
-                serial.is_some_and(|line| line.is_oversubscribed()),
-                service_estimate,
+                &MissedSendEvidence {
+                    missed,
+                    // The banner error is the only *current* interface signal
+                    // here; `failed` is a run total that may have recovered.
+                    interface_erroring: error.is_some(),
+                    failed,
+                    serial_oversubscribed: serial.is_some_and(|line| line.is_oversubscribed()),
+                    // Capacity is computed from the on-screen draft, so it only
+                    // describes this run while nothing is pending Apply.
+                    settings_match_run: !(iface_drift || run_drift),
+                    service: service_estimate,
+                },
                 &telemetry.per_message_timing,
             ) {
                 ui.add_space(4.0);
