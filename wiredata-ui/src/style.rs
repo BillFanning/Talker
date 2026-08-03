@@ -106,6 +106,7 @@ pub fn theme_toggle_button(ui: &mut egui::Ui, dark: &mut bool) -> bool {
 ///   laggy; for a utility UI an instant snap reads as snappier.
 /// - Collapsing-section triangles (and checkbox/radio glyphs) ~25% larger, so
 ///   they're easier to hit and read.
+/// - Scrollbars get a gutter instead of overlaying the content beneath them.
 pub fn apply_style_tweaks(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| {
         for font in style.text_styles.values_mut() {
@@ -116,5 +117,15 @@ pub fn apply_style_tweaks(ctx: &egui::Context) {
         style.animation_time = 0.0;
         style.spacing.icon_width *= 1.25;
         style.spacing.icon_width_inner *= 1.25;
+        // Scrollbars reserve their own width instead of covering content.
+        //
+        // egui's default `ScrollStyle::floating()` sets
+        // `floating_allocated_width: 0.0`, so the bar is drawn *over* whatever
+        // is at the right edge — channel rows, the rightmost characters of a
+        // stream line. Reserving the bar's width keeps the floating look (it
+        // still fades when dormant) while giving it a gutter of its own. egui
+        // scales this by `show_bars_factor`, so an area that does not need to
+        // scroll gives up nothing.
+        style.spacing.scroll.floating_allocated_width = style.spacing.scroll.bar_width;
     });
 }
