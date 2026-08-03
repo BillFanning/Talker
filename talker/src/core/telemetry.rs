@@ -90,6 +90,10 @@ pub struct MessageTiming {
     /// Zero means dormant. Carried with the measurement so a reader never has
     /// to pair run-time timing against a draft interval that may have moved.
     pub interval: Duration,
+    /// Wire bytes one send of this message produces. With `interval`, this is
+    /// the running schedule's own demand, so capacity can be calculated from
+    /// what is sending rather than from the settings on screen.
+    pub wire_bytes: usize,
     /// Whether this message's interval changed after it had started being
     /// measured. The histograms below are cumulative for the whole run, so when
     /// this is set they span more than one cadence and `interval` is only the
@@ -116,6 +120,14 @@ pub struct MessageTiming {
     /// The longest single send of this message that delayed another — the real
     /// elapsed time the channel was held, which `blocked_others` is not.
     pub longest_block: Duration,
+}
+
+impl MessageTiming {
+    /// This message's interval in whole milliseconds, the unit
+    /// [`MessageDemand`](crate::core::capacity::MessageDemand) is built from.
+    pub fn interval_ms(&self) -> u64 {
+        self.interval.as_millis() as u64
+    }
 }
 
 /// One completed send's occupancy of the channel thread.
@@ -225,11 +237,13 @@ impl MessageTimingRecorder {
         });
     }
 
-    /// Record each message's current cadence, so the snapshot describes the
-    /// schedule the timing was actually measured against.
-    pub(crate) fn set_intervals(&mut self, intervals: impl IntoIterator<Item = Duration>) {
-        for (index, interval) in intervals.into_iter().enumerate() {
+    /// Record each message's current wire size and cadence, so the snapshot
+    /// describes the schedule the timing was actually measured against — and
+    /// carries enough for a reader to recompute its demand.
+    pub(crate) fn set_schedule(&mut self, schedule: impl IntoIterator<Item = (usize, Duration)>) {
+        for (index, (wire_bytes, interval)) in schedule.into_iter().enumerate() {
             let entry = self.entry(index);
+            entry.wire_bytes = wire_bytes;
             // Only a change *away from* a cadence already in effect matters. The
             // first stamp moves from the zero default, and waking a dormant
             // message collected nothing to be misread.
@@ -397,26 +411,30 @@ mod tests {
         let mut recorder = MessageTimingRecorder::new(2);
 
         // First stamp: moving off the zero default is not a change.
-        recorder.set_intervals([ms(50), Duration::ZERO]);
+        recorder.set_schedule([(80, ms(50)), (0, Duration::ZERO)]);
         assert!(!recorder.snapshot()[0].interval_changed);
 
         recorder.record_send(0, t0, t0 + ms(1));
-        recorder.set_intervals([ms(50), Duration::ZERO]);
+        recorder.set_schedule([(80, ms(50)), (0, Duration::ZERO)]);
         assert!(
             !recorder.snapshot()[0].interval_changed,
             "no change, no flag"
         );
 
         // Waking a dormant message collected nothing that could be misread.
-        recorder.set_intervals([ms(50), ms(200)]);
+        recorder.set_schedule([(80, ms(50)), (40, ms(200))]);
         assert!(!recorder.snapshot()[1].interval_changed);
 
         // A real retune: the histograms now span two cadences and say so.
-        recorder.set_intervals([ms(1_000), ms(200)]);
+        recorder.set_schedule([(80, ms(1_000)), (40, ms(200))]);
         let snapshot = recorder.snapshot();
         assert!(snapshot[0].interval_changed);
         assert_eq!(snapshot[0].interval, ms(1_000));
         assert!(!snapshot[1].interval_changed);
+        // Wire size rides the same stamp, so a running channel's demand is
+        // recomputable from the snapshot alone.
+        assert_eq!(snapshot[0].wire_bytes, 80);
+        assert_eq!(snapshot[1].wire_bytes, 40);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::core::{
         ByteOrder, ChecksumAlgorithm, ChecksumConfig, CodePage, MessageConfig, NmeaChecksumMode,
         PayloadConfig, TimestampConfig,
     },
-    timing::{CadenceAlignment, TimingMode},
+    timing::CadenceAlignment,
 };
 
 // ── Channel interface ─────────────────────────────────────────────────────────
@@ -117,7 +117,6 @@ pub struct ConnDraft {
     /// Channel-level cadence wait policy, persisted with
     /// [`crate::core::channel::ChannelConfig`] by the GUI's all-or-none draft
     /// conversion.
-    pub timing_mode: TimingMode,
     pub cadence_alignment: CadenceAlignment,
     // Creation-time identity of the interface draft. Kept private so the GUI
     // cannot accidentally reintroduce an in-place transport switch; Add or a
@@ -155,7 +154,6 @@ impl Default for ConnDraft {
     fn default() -> Self {
         Self {
             name: String::new(),
-            timing_mode: TimingMode::default(),
             cadence_alignment: CadenceAlignment::default(),
             kind: ConnKind::Serial,
             serial_port: String::new(),
@@ -613,7 +611,6 @@ mod tests {
         for kind in ConnKind::ADD_MENU {
             let draft = ConnDraft::new(kind);
             assert_eq!(draft.kind(), kind);
-            assert_eq!(draft.timing_mode, TimingMode::Standard);
             assert_eq!(draft.cadence_alignment, CadenceAlignment::Immediate);
         }
     }

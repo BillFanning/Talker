@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use serde::{Deserialize, Serialize};
 
 use crate::core::message::MessageConfig;
-use crate::core::timing::{CadenceAlignment, TimingMode};
+use crate::core::timing::CadenceAlignment;
 
 /// One channel in a profile: a single interface and the messages sent on it.
 ///
@@ -22,8 +22,6 @@ pub struct ChannelConfig {
     pub name: String,
     /// Cadence-wait policy. Additive and omitted for the default Standard
     /// behavior, so existing schema-v2 profiles load unchanged.
-    #[serde(default, skip_serializing_if = "TimingMode::is_standard")]
-    pub timing_mode: TimingMode,
     /// Optional UTC phase alignment for the first and re-based send deadlines.
     #[serde(default, skip_serializing_if = "CadenceAlignment::is_immediate")]
     pub cadence_alignment: CadenceAlignment,
@@ -36,7 +34,6 @@ impl ChannelConfig {
     pub fn new(interface: InterfaceConfig, messages: Vec<MessageConfig>) -> Self {
         Self {
             name: String::new(),
-            timing_mode: TimingMode::default(),
             cadence_alignment: CadenceAlignment::default(),
             interface,
             messages,
@@ -51,7 +48,6 @@ impl ChannelConfig {
     ) -> Self {
         Self {
             name: name.into(),
-            timing_mode: TimingMode::default(),
             cadence_alignment: CadenceAlignment::default(),
             interface,
             messages,

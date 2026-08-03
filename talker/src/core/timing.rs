@@ -9,7 +9,7 @@
 //! fires. Requesting 1 ms resolution (`timeBeginPeriod(1)`) while a
 //! sub-[`HIGH_RATE_THRESHOLD`] schedule is running fixes the miss rate.
 //!
-//! A channel in [`TimingMode::Precise`] also stages a coarse wait, requests
+//! A schedule at or above that threshold instead stages a coarse wait, requests
 //! high resolution for the final [`PRECISION_WINDOW`] before a slower send,
 //! then releases it after the deadline wake. This tightens deadline wakes without
 //! holding the Windows power policy continuously. [`CadenceAlignment`] is the
@@ -69,26 +69,6 @@ impl CadenceAlignment {
     }
 }
 
-/// A channel's configured cadence-wait policy.
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TimingMode {
-    /// Automatically request finer Windows resolution only for schedules
-    /// whose shortest active interval is below [`HIGH_RATE_THRESHOLD`].
-    #[default]
-    Standard,
-    /// For slower schedules, request finer Windows resolution only during
-    /// the final [`PRECISION_WINDOW`] before each deadline.
-    Precise,
-}
-
-impl TimingMode {
-    pub fn is_standard(&self) -> bool {
-        *self == Self::Standard
-    }
-}
-
 /// Internal wait strategy selected from channel intent and active cadence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TimerIntent {
@@ -107,15 +87,32 @@ impl TimerIntent {
     }
 }
 
-pub(crate) fn timer_intent(
-    timing_mode: TimingMode,
-    shortest_active_interval: Option<Duration>,
-) -> TimerIntent {
+/// Select the deadline-wait policy from the schedule alone.
+///
+/// There was a per-channel Standard/Precise choice here. It asked the user to
+/// decide something they had no way to evaluate, did nothing at all below
+/// [`HIGH_RATE_THRESHOLD`] (where this function never reached it) and nothing on
+/// any platform without a timer-resolution request — and the answer is not
+/// actually in doubt.
+///
+/// The window's cost is its duty cycle, `PRECISION_WINDOW / interval`, which
+/// falls as schedules slow down. Its benefit is roughly constant: about 14 ms of
+/// worst-case wake error removed, whatever the interval. Cost drops, benefit
+/// does not, so above the threshold the window is never the wrong call — at the
+/// threshold its duty is 100%, exactly matching the continuous request it
+/// replaces, and it only gets cheaper from there.
+///
+/// Below the threshold there is nothing to window: the coarse wait preceding the
+/// window wakes on the platform tick, so the window cannot be narrower than the
+/// two ticks that make it necessary in the first place — which is why
+/// [`PRECISION_WINDOW`] and [`HIGH_RATE_THRESHOLD`] are the same constant. An
+/// interval shorter than the window leaves no coarse phase to stage, so a
+/// continuous request is the only mechanism that works.
+pub(crate) fn timer_intent(shortest_active_interval: Option<Duration>) -> TimerIntent {
     match shortest_active_interval {
         None => TimerIntent::None,
         Some(interval) if interval < HIGH_RATE_THRESHOLD => TimerIntent::ContinuousHighRate,
-        Some(_) if timing_mode == TimingMode::Precise => TimerIntent::PrecisionWindow,
-        Some(_) => TimerIntent::None,
+        Some(_) => TimerIntent::PrecisionWindow,
     }
 }
 
@@ -175,7 +172,8 @@ pub enum TimerReason {
     /// The shortest active interval is below [`HIGH_RATE_THRESHOLD`], so the
     /// resolution request is continuous regardless of configured mode.
     HighRate,
-    /// Explicit [`TimingMode::Precise`] uses final deadline windows.
+    /// The shortest active interval is at or above [`HIGH_RATE_THRESHOLD`], so
+    /// the request is bounded to a window before each waited deadline.
     PrecisionWindow,
 }
 
@@ -205,7 +203,6 @@ pub struct ActiveCadence {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TimerStatus {
     pub mode: TimerMode,
-    pub timing_mode: TimingMode,
     pub reason: TimerReason,
     /// `None` when every message is dormant.
     pub active_cadence: Option<ActiveCadence>,
@@ -224,7 +221,6 @@ impl TimerStatus {
 /// Describe the timer policy after the runner has reconciled its guard with
 /// the current schedule.
 pub(crate) struct TimerStatusInput<'a> {
-    pub timing_mode: TimingMode,
     pub intent: TimerIntent,
     pub active_cadence: Option<ActiveCadence>,
     pub guard: Option<&'a HighResolutionGuard>,
@@ -235,7 +231,6 @@ pub(crate) struct TimerStatusInput<'a> {
 
 pub(crate) fn timer_status(input: TimerStatusInput<'_>) -> TimerStatus {
     let TimerStatusInput {
-        timing_mode,
         intent,
         active_cadence,
         guard,
@@ -269,7 +264,6 @@ pub(crate) fn timer_status(input: TimerStatusInput<'_>) -> TimerStatus {
     };
     TimerStatus {
         mode,
-        timing_mode,
         reason: intent.reason(),
         active_cadence,
         cadence_alignment,
@@ -291,46 +285,34 @@ mod tests {
     }
 
     #[test]
-    fn intent_preserves_automatic_high_rate_and_adds_explicit_precision() {
+    fn intent_follows_the_schedule_with_no_configured_mode() {
         let just_below_high_rate = HIGH_RATE_THRESHOLD - Duration::from_nanos(1);
 
-        assert_eq!(timer_intent(TimingMode::Standard, None), TimerIntent::None);
         assert_eq!(
-            timer_intent(TimingMode::Precise, None),
+            timer_intent(None),
             TimerIntent::None,
             "dormant messages never hold timer resolution"
         );
         assert_eq!(
-            timer_intent(TimingMode::Standard, Some(just_below_high_rate)),
-            TimerIntent::ContinuousHighRate
-        );
-        assert_eq!(
-            timer_intent(TimingMode::Precise, Some(just_below_high_rate)),
+            timer_intent(Some(just_below_high_rate)),
             TimerIntent::ContinuousHighRate,
-            "automatic high-rate elevation applies in either configured mode"
+            "an interval shorter than the window leaves no coarse phase to stage"
         );
+        // The threshold is where the mechanism changes, not where it starts:
+        // a windowed request at exactly the threshold has 100% duty, matching
+        // the continuous request it takes over from, and cheapens from there.
         assert_eq!(
-            timer_intent(TimingMode::Standard, Some(HIGH_RATE_THRESHOLD)),
-            TimerIntent::None,
-            "the high-rate threshold is exclusive"
-        );
-        assert_eq!(
-            timer_intent(TimingMode::Precise, Some(HIGH_RATE_THRESHOLD)),
-            TimerIntent::PrecisionWindow,
-            "Precise mode windows every interval at or above the threshold"
-        );
-        assert_eq!(
-            timer_intent(TimingMode::Precise, Some(Duration::from_millis(50))),
-            TimerIntent::PrecisionWindow,
-            "near-threshold Precise intervals remain windowed"
-        );
-        assert_eq!(
-            timer_intent(TimingMode::Precise, Some(Duration::from_secs(1))),
+            timer_intent(Some(HIGH_RATE_THRESHOLD)),
             TimerIntent::PrecisionWindow
         );
         assert_eq!(
-            timer_intent(TimingMode::Standard, Some(Duration::from_secs(1))),
-            TimerIntent::None
+            timer_intent(Some(Duration::from_millis(50))),
+            TimerIntent::PrecisionWindow
+        );
+        assert_eq!(
+            timer_intent(Some(Duration::from_secs(1))),
+            TimerIntent::PrecisionWindow,
+            "a slow schedule is where the window is cheapest, not where it is skipped"
         );
     }
 
@@ -365,7 +347,6 @@ mod tests {
     #[test]
     fn timer_status_explains_standard_high_rate_and_windowed_waits() {
         let standard = timer_status(TimerStatusInput {
-            timing_mode: TimingMode::Standard,
             intent: TimerIntent::None,
             active_cadence: uniform_cadence(HIGH_RATE_THRESHOLD),
             guard: None,
@@ -382,7 +363,6 @@ mod tests {
 
         let guard = high_resolution();
         let fast = timer_status(TimerStatusInput {
-            timing_mode: TimingMode::Standard,
             intent: TimerIntent::ContinuousHighRate,
             active_cadence: uniform_cadence(Duration::from_millis(1)),
             guard: Some(&guard),
@@ -404,7 +384,6 @@ mod tests {
         assert_eq!(fast.mode, TimerMode::NativeDeadlineWaits);
 
         let retained = timer_status(TimerStatusInput {
-            timing_mode: TimingMode::Precise,
             intent: TimerIntent::PrecisionWindow,
             active_cadence: uniform_cadence(Duration::from_secs(1)),
             guard: None,
@@ -412,7 +391,6 @@ mod tests {
             cadence_alignment: CadenceAlignment::UtcPhase,
             clock_realignments: 2,
         });
-        assert_eq!(retained.timing_mode, TimingMode::Precise);
         assert_eq!(retained.reason, TimerReason::PrecisionWindow);
         assert_eq!(retained.cadence_alignment, CadenceAlignment::UtcPhase);
         assert_eq!(retained.clock_realignments, 2);

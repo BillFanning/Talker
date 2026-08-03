@@ -14,9 +14,14 @@ Revision note (no warm-up state; skipped sends name a cause):
 - **§3.2 missed-send routing (ADR-045)** — skipped cadence points get one callout
   suggesting where to look, in decisiveness order, rather than restating a count
   already on the send-outcomes line. It routes rather than convicts: run totals
-  are described in the past tense, findings drawn from unapplied settings say so,
-  and blocking evidence is qualified because it comes from deadlines the channel
-  reached rather than the ones it skipped.
+  are described in the past tense, and blocking evidence is qualified because it
+  comes from deadlines the channel reached rather than the ones it skipped.
+- **§3.2 Capacity describes what is running (ADR-035, amended)** — demand comes
+  from the running schedule's own wire sizes and intervals, and the serial verdict
+  from the interface the runner confirmed open. A channel that is not running is
+  projected from the settings shown and labelled a projection. Unapplied edits can
+  no longer produce a capacity verdict about a schedule that is not sending, which
+  also removes the qualifier the missed-send routing previously needed.
 - **§3.2 per-message blame is two figures, not one (ADR-045)** — **longest
   block** is an elapsed hold; **delay caused** sums the waiting imposed across
   every message displaced and can exceed the send that caused it. Presenting the
@@ -35,6 +40,14 @@ Revision note (no warm-up state; skipped sends name a cause):
   one line above.
 - **§3.2 percentages over a limit** read `>100%`, since flooring alone rendered
   100.4% as "100%" beside an alert that fired for exceeding it.
+- **§3.2 / §8.1 the Standard/Precise choice is removed (ADR-047)** — the
+  deadline-wait policy follows the shortest active interval, and nothing replaces
+  the control in the editor. The choice was inert below 32 ms and on platforms
+  without a timer-resolution request; a read-only preview of the derived policy
+  was rejected too, since its outcome does not vary between the bands. Profiles
+  carrying `timing_mode` still load; the field is ignored. The clipboard report
+  drops `timing_mode`, keeping `timer_policy` and `timer_reason`, which state
+  what actually applied.
 
 Previous revision note (per-message cadence and measured blame):
 
@@ -448,8 +461,15 @@ The **detail pane** (right) shows the selected channel:
     them; the tooltips carry that boundary. The aggregate `unsent`
     (`failed + suppressed + missed`) remains in the completed-run summary and in
     `RunSummary::unsent_sends`, where a single shortfall number is still useful.
-  - *Capacity:* current-draft aggregate `msg/s` and wire `B/s`; for Serial, UART
-    line utilization and headroom. A second line shows measured application
+  - *Capacity:* aggregate `msg/s` and wire `B/s` **for the configuration that is
+    actually sending** — each message's wire size and interval as reported by the
+    running schedule, and for Serial the framing and baud the runner confirmed
+    open (ADR-035, amended). A channel that is not running has no such
+    configuration, so it is projected from the settings shown and labelled a
+    projection; that preflight is the feature's original purpose and is retained.
+    Unapplied edits therefore no longer make this row describe a schedule that is
+    not running; for Serial it reports UART line utilization and headroom against
+    that configuration. A second line shows measured application
     headroom after warm-up from an eligible recent or cumulative run-wide
     render/send timing snapshot. An expired recent snapshot cannot supply this
     estimate; a warmed run-wide fallback is labelled explicitly. Low margin and
@@ -542,10 +562,18 @@ The **detail pane** (right) shows the selected channel:
 - **Configure interface** / **Configure messages** sections (the editors), and
   the **Output** display pane (sampled at high rates, with a sub-sampling badge).
 
-Configure interface includes the channel's **Timing** choice (Standard / Precise)
-and an independent **Align sends to UTC interval boundaries** choice. Both are part
-of the run configuration, so changing either on an active channel is applied by
-**Apply & Restart**, together with the rest of the prepared replacement.
+The deadline-wait policy is derived from the shortest active interval —
+continuous below 32 ms, a bounded window at or above it — and is **not
+configurable and not previewed** (ADR-047). The former Standard/Precise choice
+did nothing below 32 ms or on platforms without a timer-resolution request, and
+could not be evaluated by the person asked; a read-only preview of the derived
+policy was then rejected in turn, because its outcome is the same in both bands
+and a line stating it would read identically on every look. What a running
+channel actually got appears in the diagnostics card's timer readout.
+**Align sends to UTC interval boundaries** remains an
+independent choice and part of the run configuration, so changing it on an active
+channel is applied by **Apply & Restart**, together with the rest of the prepared
+replacement.
 
 #### GUI State Persistence
 

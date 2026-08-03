@@ -19,7 +19,7 @@ use crate::core::capacity::{
 use crate::core::telemetry::{
     DurationHistogram, MessageTiming, RecentSnapshotState, SendTimingTelemetry,
 };
-use crate::core::timing::{ActiveCadence, TimerMode, TimerReason, TimerStatus, TimingMode};
+use crate::core::timing::{ActiveCadence, TimerMode, TimerReason, TimerStatus};
 use wiredata_ui::diagnostics::SignalTone;
 use wiredata_ui::format::{compact_duration, interval as format_interval, percent, thousands};
 
@@ -699,9 +699,6 @@ pub(super) struct MissedSendEvidence {
     /// Run-total failed writes, which may all predate the current state.
     pub failed: u64,
     pub serial_oversubscribed: bool,
-    /// The settings on screen are the ones running, so a finding derived from
-    /// them describes this run rather than an unapplied edit.
-    pub settings_match_run: bool,
     pub service: Option<ServiceEstimate>,
 }
 
@@ -710,8 +707,11 @@ pub(super) struct MissedSendEvidence {
 /// A router, not a verdict. Nothing here is measured at the instant a send was
 /// skipped: the counts are run totals and the blocking evidence comes from
 /// sends that *were* reached, so the strongest honest claim is where to start.
-/// The verbs carry that — "check", "start from" — and a finding drawn from
-/// unapplied settings says so rather than being asserted about the run.
+/// The verbs carry that — "check", "start from".
+///
+/// Capacity findings now derive from the running schedule rather than the
+/// settings on screen, so an unapplied edit can no longer be blamed for a run's
+/// misses and no longer needs qualifying here.
 ///
 /// Order is by decisiveness. A live interface fault comes first because retry
 /// backoff withholds sends, which is a different failure wearing the same
@@ -726,7 +726,6 @@ pub(super) fn missed_send_routing(
         interface_erroring,
         failed,
         serial_oversubscribed,
-        settings_match_run,
         service,
     } = *evidence;
     if missed == 0 {
@@ -751,12 +750,8 @@ pub(super) fn missed_send_routing(
              period they follow the retry backoff, not the schedule — check Send outcomes above.",
             thousands(failed)
         )
-    } else if serial_oversubscribed && settings_match_run {
-        "Missed sends: the serial line cannot carry this schedule — see Capacity.".to_owned()
     } else if serial_oversubscribed {
-        "Missed sends: the settings shown are over the serial line's capacity, but they are not \
-         what is running — Apply & Restart to compare, or see Capacity."
-            .to_owned()
+        "Missed sends: the serial line cannot carry this schedule — see Capacity.".to_owned()
     } else if let Some((index, message)) = blocker {
         // Two different quantities, and only one of them is an elapsed hold:
         // the longest blocking send is what the channel actually spent, while
@@ -772,17 +767,12 @@ pub(super) fn missed_send_routing(
             thousands(message.blocking_sends),
         )
     } else if service.is_some_and(|estimate| estimate.headroom_factor() < 1.0) {
-        // An estimate built from the on-screen draft, so it projects rather
-        // than reports — "may not" is the strongest honest verb.
-        if settings_match_run {
-            "Missed sends: rendering and the interface write together may not service the \
-             requested rate — see Capacity."
-                .to_owned()
-        } else {
-            "Missed sends: the settings shown may be beyond what rendering and the interface write \
-             can service, but they are not what is running — see Capacity."
-                .to_owned()
-        }
+        // Still a projection even with the running schedule as its input: it
+        // divides summed p99 bounds into a requested rate, so "may not" stays
+        // the strongest honest verb.
+        "Missed sends: rendering and the interface write together may not service the requested \
+         rate — see Capacity."
+            .to_owned()
     } else if per_message
         .iter()
         .filter(|message| !message.interval.is_zero())
@@ -925,31 +915,21 @@ pub(super) fn timer_status_detail(status: TimerStatus) -> (String, bool) {
             false,
         ),
         (TimerReason::PrecisionWindow, TimerMode::WindowsOneMillisecond) => (
-            format!("Precise · Windows 1 ms deadline windows · shortest {shortest}"),
+            format!("Windows 1 ms deadline windows · shortest {shortest}"),
             false,
         ),
         (TimerReason::PrecisionWindow, TimerMode::WindowsRequestFailed) => (
-            format!("Precise · Windows 1 ms request failed · shortest {shortest}"),
+            format!("Windows 1 ms request failed · shortest {shortest}"),
             true,
         ),
         (TimerReason::PrecisionWindow, TimerMode::NativeDeadlineWaits) => (
-            format!("Precise · native deadline waits · shortest {shortest}"),
+            format!("native deadline waits · shortest {shortest}"),
             false,
         ),
         (TimerReason::PrecisionWindow, TimerMode::Standard) => (
-            format!(
-                "Precise selected · first waited deadline window pending · shortest {shortest}"
-            ),
+            format!("first waited deadline window pending · shortest {shortest}"),
             false,
         ),
-        (TimerReason::None, _)
-            if status.timing_mode == TimingMode::Precise && status.active_cadence.is_none() =>
-        {
-            (
-                "idle · Precise selected; no timer request".to_owned(),
-                false,
-            )
-        }
         (TimerReason::None, _) if status.active_cadence.is_some() => {
             (format!("standard deadline waits · {shortest}"), false)
         }
@@ -975,7 +955,7 @@ mod tests {
         DurationHistogram, MessageTiming, RecentSnapshotState, SendTimingTelemetry,
     };
     use crate::core::timing::{
-        ActiveCadence, CadenceAlignment, TimerMode, TimerReason, TimerStatus, TimingMode,
+        ActiveCadence, CadenceAlignment, TimerMode, TimerReason, TimerStatus,
     };
     use crate::gui::{
         draft::{ConnKind, PayloadKind, ScheduleDraft},
@@ -1352,54 +1332,42 @@ mod tests {
             ..MessageTiming::default()
         };
         let per_message = [MessageTiming::default(), blocker];
-        let evidence = |missed, interface_erroring, failed, oversubscribed, settings_match_run| {
-            MissedSendEvidence {
-                missed,
-                interface_erroring,
-                failed,
-                serial_oversubscribed: oversubscribed,
-                settings_match_run,
-                service: None,
-            }
+        let evidence = |missed, interface_erroring, failed, oversubscribed| MissedSendEvidence {
+            missed,
+            interface_erroring,
+            failed,
+            serial_oversubscribed: oversubscribed,
+            service: None,
         };
 
         // Nothing skipped: no line at all.
-        assert!(missed_send_routing(&evidence(0, false, 0, false, true), &per_message).is_none());
+        assert!(missed_send_routing(&evidence(0, false, 0, false), &per_message).is_none());
 
         // A *live* interface fault outranks everything: backoff withholding
         // sends is a different failure wearing the same symptom.
-        let failing =
-            missed_send_routing(&evidence(12, true, 3, true, true), &per_message).unwrap();
+        let failing = missed_send_routing(&evidence(12, true, 3, true), &per_message).unwrap();
         assert!(failing.text.contains("failing right now"), "{failing:?}");
         assert_eq!(failing.tone, SignalTone::Warning);
 
         // The same failure count with no current error is a run total that may
         // long since have recovered, and must not be stated in the present.
-        let recovered =
-            missed_send_routing(&evidence(12, false, 3, false, true), &per_message).unwrap();
+        let recovered = missed_send_routing(&evidence(12, false, 3, false), &per_message).unwrap();
         assert!(
             recovered.text.contains("earlier in this run"),
             "a recovered fault must not be reported as current: {recovered:?}"
         );
 
-        // A schedule the wire cannot carry — but only asserted about this run
-        // when the settings on screen are the ones running.
+        // A schedule the wire cannot carry. No settings-vs-running qualifier is
+        // needed any more: capacity is calculated from the running schedule, so
+        // an unapplied edit cannot reach this line.
         let oversubscribed =
-            missed_send_routing(&evidence(12, false, 0, true, true), &per_message).unwrap();
+            missed_send_routing(&evidence(12, false, 0, true), &per_message).unwrap();
         assert!(oversubscribed.text.contains("cannot carry this schedule"));
-
-        let unapplied =
-            missed_send_routing(&evidence(12, false, 0, true, false), &per_message).unwrap();
-        assert!(
-            unapplied.text.contains("not what is running"),
-            "an unapplied draft must not be blamed for this run's misses: {unapplied:?}"
-        );
 
         // The blocking message: routed to, not convicted, and the elapsed hold
         // is stated separately from the combined waiting it caused — the latter
         // sums across victims and can exceed the send itself.
-        let blocked =
-            missed_send_routing(&evidence(12, false, 0, false, true), &per_message).unwrap();
+        let blocked = missed_send_routing(&evidence(12, false, 0, false), &per_message).unwrap();
         assert_eq!(
             blocked.text,
             "Missed sends: check message #2 first — its longest send held the channel 120 ms, \
@@ -1415,7 +1383,7 @@ mod tests {
             ..MessageTiming::default()
         };
         let alone = missed_send_routing(
-            &evidence(12, false, 0, false, true),
+            &evidence(12, false, 0, false),
             &[active, MessageTiming::default()],
         )
         .unwrap();
@@ -1431,7 +1399,7 @@ mod tests {
             ..MessageTiming::default()
         };
         let unexplained =
-            missed_send_routing(&evidence(12, false, 0, false, true), &[active, second]).unwrap();
+            missed_send_routing(&evidence(12, false, 0, false), &[active, second]).unwrap();
         assert!(unexplained.text.contains("no message delayed another"));
     }
 
@@ -1690,7 +1658,6 @@ mod tests {
     fn precise_near_threshold_status_names_the_deadline_window_policy() {
         let (detail, hot) = timer_status_detail(TimerStatus {
             mode: TimerMode::WindowsOneMillisecond,
-            timing_mode: TimingMode::Precise,
             reason: TimerReason::PrecisionWindow,
             active_cadence: Some(ActiveCadence {
                 messages: 1,
@@ -1707,13 +1674,8 @@ mod tests {
 
     #[test]
     fn dormant_timer_status_names_idle_state_and_no_request() {
-        let (precise, hot) = timer_status_detail(TimerStatus {
-            timing_mode: TimingMode::Precise,
-            ..TimerStatus::default()
-        });
-        assert_eq!(precise, "idle · Precise selected; no timer request");
-        assert!(!hot);
-
+        // One idle state now, not two: with no configured mode there is no
+        // "Precise selected but idle" to distinguish from plain idle.
         let (standard, hot) = timer_status_detail(TimerStatus::default());
         assert_eq!(standard, "idle · no active messages; no timer request");
         assert!(!hot);

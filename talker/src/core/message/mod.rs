@@ -224,6 +224,24 @@ impl CompiledMessage {
         self.render_at(chrono::Utc::now())
     }
 
+    /// Wire bytes one send produces, without producing them.
+    ///
+    /// Lets a *running* schedule report its own demand, so capacity readouts
+    /// can describe the configuration that is actually sending rather than the
+    /// one on screen. Every term is fixed at compile time: the timestamp's
+    /// formatted width, the payload's compiled length (a live NMEA template
+    /// keeps the width of its rendered form), and the checksum's algorithm.
+    pub fn wire_len(&self) -> usize {
+        self.timestamp.map_or(0, |timestamp| timestamp.wire_len())
+            + self.payload.wire_len_hint()
+            + self.checksum.map_or(0, |checksum| checksum.wire_len())
+    }
+
+    #[cfg(test)]
+    fn wire_len_matches_render(&self) -> bool {
+        self.wire_len() == self.render().len()
+    }
+
     /// Byte positions that should be visually identified as lossy code-page
     /// substitutions. Computed once at compile time, never on the send path.
     pub(crate) fn replacement_wire_offsets(&self) -> &[usize] {
@@ -685,6 +703,54 @@ mod tests {
         MessageConfig::new(payload, 1)
             .compile()
             .map(|message| message.render_at(utc_at(2026, 1, 1, 0, 0, 0, 0)))
+    }
+
+    /// A running channel's capacity is calculated from `wire_len`, so it has to
+    /// equal what a send actually puts on the wire — across every combination
+    /// of the three terms that make it up.
+    #[test]
+    fn wire_len_equals_the_rendered_length_it_predicts() {
+        let cases = [
+            MessageConfig::new(PayloadConfig::raw_hex("DEADBEEF"), 100),
+            MessageConfig {
+                timestamp: Some(TimestampConfig::default()),
+                ..MessageConfig::new(PayloadConfig::raw_hex("DEADBEEF"), 100)
+            },
+            MessageConfig {
+                checksum: Some(ChecksumConfig {
+                    algorithm: ChecksumAlgorithm::Crc32,
+                    intentionally_wrong: false,
+                }),
+                ..MessageConfig::new(
+                    PayloadConfig::Utf8 {
+                        text: "hello".to_owned(),
+                    },
+                    100,
+                )
+            },
+            MessageConfig {
+                timestamp: Some(TimestampConfig::default()),
+                checksum: Some(ChecksumConfig {
+                    algorithm: ChecksumAlgorithm::Crc16Ccitt,
+                    intentionally_wrong: true,
+                }),
+                ..MessageConfig::new(
+                    PayloadConfig::Utf8 {
+                        text: "hello".to_owned(),
+                    },
+                    100,
+                )
+            },
+        ];
+        for config in cases {
+            let compiled = config.compile().expect("compiles");
+            assert!(
+                compiled.wire_len_matches_render(),
+                "predicted {} but rendered {} for {config:?}",
+                compiled.wire_len(),
+                compiled.render().len()
+            );
+        }
     }
 
     // ── RawHex ────────────────────────────────────────────────────────────────

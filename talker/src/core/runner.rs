@@ -309,7 +309,6 @@ impl RunnerObserver {
 pub fn open_and_run(
     who: RunnerIdentity,
     cfg: InterfaceConfig,
-    timing_mode: timing::TimingMode,
     schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
     observer: RunnerObserver,
@@ -324,15 +323,7 @@ pub fn open_and_run(
                     config: cfg.clone(),
                 },
             );
-            run(
-                who,
-                interface,
-                Some(cfg),
-                timing_mode,
-                schedule,
-                cmd_rx,
-                observer,
-            );
+            run(who, interface, Some(cfg), schedule, cmd_rx, observer);
         }
         Err(e) => {
             tracing::error!(
@@ -365,7 +356,6 @@ pub fn run(
     who: RunnerIdentity,
     interface: Box<dyn Interface>,
     current_config: Option<InterfaceConfig>,
-    timing_mode: timing::TimingMode,
     schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
     observer: RunnerObserver,
@@ -376,15 +366,7 @@ pub fn run(
         who.label,
         schedule.len()
     );
-    run_loop(
-        &who,
-        interface,
-        current_config,
-        timing_mode,
-        schedule,
-        cmd_rx,
-        observer,
-    );
+    run_loop(&who, interface, current_config, schedule, cmd_rx, observer);
     tracing::info!(channel = who.id.as_u64(), "channel {} stopped", who.label);
 }
 
@@ -401,7 +383,6 @@ struct TimerReconciler<'a> {
     who: &'a RunnerIdentity,
     status_tx: &'a Sender<TalkerStatus>,
     notify: &'a Option<StatusNotify>,
-    timing_mode: timing::TimingMode,
     intent: timing::TimerIntent,
     active_cadence: Option<timing::ActiveCadence>,
     cadence_alignment: timing::CadenceAlignment,
@@ -421,13 +402,11 @@ impl<'a> TimerReconciler<'a> {
         who: &'a RunnerIdentity,
         status_tx: &'a Sender<TalkerStatus>,
         notify: &'a Option<StatusNotify>,
-        timing_mode: timing::TimingMode,
     ) -> Self {
         Self {
             who,
             status_tx,
             notify,
-            timing_mode,
             intent: timing::TimerIntent::None,
             active_cadence: None,
             cadence_alignment: timing::CadenceAlignment::Immediate,
@@ -454,7 +433,7 @@ impl<'a> TimerReconciler<'a> {
         clock_realignments: u64,
     ) {
         let shortest_interval = active_cadence.map(|cadence| cadence.shortest);
-        let next_intent = timing::timer_intent(self.timing_mode, shortest_interval);
+        let next_intent = timing::timer_intent(shortest_interval);
         match next_intent {
             timing::TimerIntent::ContinuousHighRate => self.acquire(),
             timing::TimerIntent::None => self.release(),
@@ -523,7 +502,6 @@ impl<'a> TimerReconciler<'a> {
 
     fn refresh_status(&mut self) {
         let next = timing::timer_status(timing::TimerStatusInput {
-            timing_mode: self.timing_mode,
             intent: self.intent,
             active_cadence: self.active_cadence,
             guard: self.guard.as_ref(),
@@ -590,7 +568,6 @@ fn run_loop(
     who: &RunnerIdentity,
     mut interface: Box<dyn Interface>,
     mut current_config: Option<InterfaceConfig>,
-    timing_mode: timing::TimingMode,
     mut schedule: Schedule,
     cmd_rx: Receiver<TalkerCommand>,
     observer: RunnerObserver,
@@ -726,7 +703,7 @@ fn run_loop(
     // Timer guard, policy-edge notification, counter invalidation, and dropped
     // observer accounting advance as one state machine. SetInterval re-evaluates
     // its policy on the next loop pass.
-    let mut timer = TimerReconciler::new(who, &status_tx, &notify, timing_mode);
+    let mut timer = TimerReconciler::new(who, &status_tx, &notify);
 
     // The current failing episode, if any (bounded-backoff retry policy —
     // see [`RETRY_BACKOFF_INITIAL`]). `None` while sends are succeeding.
@@ -917,7 +894,7 @@ fn run_loop(
                 let now = Instant::now();
                 if timer.counters_due(now, policy.counter_interval) {
                     let drops_so_far = timer.dropped_statuses();
-                    per_message_timing.set_intervals(schedule.intervals());
+                    per_message_timing.set_schedule(schedule.message_demand());
                     timer.emit(TalkerStatus::Counters {
                         channel: who.id,
                         total_count,
@@ -994,7 +971,7 @@ fn run_loop(
     let finished_at = SystemTime::now();
     let missed_sends = schedule.missed_sends();
     let final_timing = send_timing.snapshot_at(finished_mono);
-    per_message_timing.set_intervals(schedule.intervals());
+    per_message_timing.set_schedule(schedule.message_demand());
     let final_per_message = per_message_timing.snapshot();
     let _ = status_tx.send(TalkerStatus::Counters {
         channel: who.id,
@@ -1136,7 +1113,7 @@ mod tests {
         fail: bool,
         policy: ObserverPolicy,
     ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle, ChannelId) {
-        spawn_runner_with_mode(messages, fail, policy, timing::TimingMode::Standard)
+        spawn_runner_with_mode(messages, fail, policy)
     }
 
     /// One active message at `interval_ms` — the schedule shape the timer
@@ -1153,16 +1130,14 @@ mod tests {
         messages: &[MessageConfig],
         fail: bool,
         policy: ObserverPolicy,
-        timing_mode: timing::TimingMode,
     ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle, ChannelId) {
-        spawn_runner_full(messages, fail, policy, timing_mode, None)
+        spawn_runner_full(messages, fail, policy, None)
     }
 
     fn spawn_runner_full(
         messages: &[MessageConfig],
         fail: bool,
         policy: ObserverPolicy,
-        timing_mode: timing::TimingMode,
         slow: Option<(u8, Duration)>,
     ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle, ChannelId) {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -1186,7 +1161,6 @@ mod tests {
                 who,
                 interface,
                 None,
-                timing_mode,
                 schedule,
                 cmd_rx,
                 RunnerObserver::new(status_tx, policy).with_control(control_tx),
@@ -1228,7 +1202,6 @@ mod tests {
             &[msg("AA", 10), msg("BB", 200)],
             false,
             ObserverPolicy::every_send(),
-            timing::TimingMode::Standard,
             Some((0xBB, Duration::from_millis(120))),
         );
 
@@ -1286,8 +1259,7 @@ mod tests {
             label: "timer-test".into(),
             run_id: RunId::mint(),
         };
-        let mut timer =
-            TimerReconciler::new(&who, &status_tx, &notify, timing::TimingMode::Precise);
+        let mut timer = TimerReconciler::new(&who, &status_tx, &notify);
 
         timer.reconcile_schedule(one_cadence(10), timing::CadenceAlignment::Immediate, 0);
         assert_eq!(timer.intent, timing::TimerIntent::ContinuousHighRate);
@@ -1372,8 +1344,7 @@ mod tests {
             label: "timer-edge-test".into(),
             run_id: RunId::mint(),
         };
-        let mut timer =
-            TimerReconciler::new(&who, &status_tx, &notify, timing::TimingMode::Precise);
+        let mut timer = TimerReconciler::new(&who, &status_tx, &notify);
         let now = Instant::now();
 
         timer.reconcile_schedule(None, timing::CadenceAlignment::UtcPhase, 0);
@@ -1806,12 +1777,7 @@ mod tests {
             counter_interval: Duration::from_secs(3600),
             sample_interval: Duration::from_secs(3600),
         };
-        let (_, handle, id) = spawn_runner_with_mode(
-            &[msg("AB", 100)],
-            false,
-            policy,
-            timing::TimingMode::Precise,
-        );
+        let (_, handle, id) = spawn_runner_with_mode(&[msg("AB", 100)], false, policy);
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut saw_window_policy = false;
         let mut saw_platform_result = false;
@@ -1869,7 +1835,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         let dormant = dormant.unwrap();
-        assert_eq!(dormant.timing_mode, timing::TimingMode::Precise);
         assert_eq!(dormant.reason, timing::TimerReason::None);
         assert_eq!(dormant.mode, timing::TimerMode::Standard);
 
@@ -2040,7 +2005,6 @@ mod tests {
                 who,
                 interface,
                 None,
-                timing::TimingMode::Standard,
                 schedule,
                 cmd_rx,
                 RunnerObserver::new(status_tx, ObserverPolicy::every_send())
@@ -2120,7 +2084,6 @@ mod tests {
         open_and_run(
             who,
             cfg,
-            timing::TimingMode::Standard,
             schedule,
             cmd_rx,
             RunnerObserver::new(status_tx, ObserverPolicy::every_send()),

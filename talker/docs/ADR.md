@@ -943,7 +943,9 @@ ADR-033 itself.
 
 ## ADR-034 — Explicit Precise mode uses bounded deadline-resolution windows
 
-**Status:** Accepted 2026-07-19 (spec v2.3).
+**Status:** Accepted 2026-07-19 (spec v2.3). **The bounded window stands; the
+per-channel choice is superseded by ADR-047 (2026-08-03)** — the mechanism below
+is unchanged, but it is now selected from the schedule rather than configured.
 
 **Context:** ADR-017's automatic Windows 1 ms request fixes high-rate schedules, but
 a slow schedule can still wake several milliseconds late on the default Windows
@@ -1000,12 +1002,31 @@ driver or kernel buffer rather than at the wire. Treating either estimate as a h
 real-time admission test would overstate what Talker knows and prevent intentional
 overload testing.
 
-**Decision:** `core::capacity` owns pure, GUI-independent calculations. Channel draft
-demand sums each non-dormant message's exact compiled wire bytes divided by interval.
-The GUI stores that byte count beside its memoized fixed-time preview, so selected-
-channel repaint folds scalar values only; it never recompiles or rerenders payloads.
-If any message is incomplete or invalid, the aggregate is withheld rather than
-silently computed from a partial schedule.
+**Decision:** `core::capacity` owns pure, GUI-independent calculations. Channel
+demand sums each non-dormant message's exact wire bytes divided by interval. If any
+message is incomplete or invalid, the aggregate is withheld rather than silently
+computed from a partial schedule.
+
+**Amended 2026-08-03 — demand comes from the running configuration.** As first
+built, demand always came from the on-screen draft, and a running channel with
+unapplied edits showed a capacity verdict about a schedule that was not sending.
+Every other figure on that pane is runtime truth, so capacity alone describing a
+hypothesis made the pane contradict itself — and it let an unapplied oversubscribed
+draft be offered as the explanation for a running channel's missed sends. The
+runner now stamps each message's wire size beside its interval on the counters
+lane (`CompiledMessage::wire_len`, exact and computed without rendering), so a
+live channel's demand is its own, and the serial verdict uses the interface the
+runner confirmed open rather than the one on screen.
+
+A channel that is *not* running has no such configuration, and preflight is this
+feature's stated purpose, so it still projects from the settings shown — labelled
+a projection rather than presented as current. Source therefore follows run
+state, which is the distinction the readouts were previously trying to carry with
+a label while computing from one source regardless.
+
+The GUI keeps a memoized wire-length beside its fixed-time preview for that
+projection path, so selected-channel repaint folds scalar values only; it never
+recompiles or rerenders payloads.
 
 For Serial, one byte consumes one frame of `1 start + configured data + parity +
 stop` bits. Required bits per second are compared with baud. Greater than 100% is a
@@ -1577,6 +1598,79 @@ one-off stall. Listener still carries its own warm-up gate and `p99 ≤ X`
 phrasing; the shared vocabulary module records that divergence as deliberate and
 tracked rather than leaving it to drift. No measurement, wire output, profile
 schema, or cadence behavior changes — this is presentation only.
+
+## ADR-047 — The deadline-wait policy follows the schedule, not a setting
+
+**Status:** Accepted 2026-08-03. Supersedes the per-channel choice in ADR-034;
+its bounded-window mechanism is retained unchanged.
+
+**Context:** ADR-034 exposed Standard/Precise per channel. Three things were
+wrong with asking.
+
+It did nothing in most configurations. `timer_intent` never consulted the mode
+below `HIGH_RATE_THRESHOLD` — those schedules hold the request continuously
+either way — and the guard is a no-op on every platform without a Windows-style
+resolution request. A control that is inert on two of three target platforms, and
+inert again below 32 ms on the third, is worse than no control, because it cannot
+say when it is being ignored.
+
+It asked for a decision the user had no way to evaluate. ADR-034 rejected
+inferring intent from payload formatting, then substituted a guess made before
+Start with no feedback. Talker now measures deadline lateness directly, so the
+evidence is better than the guess.
+
+And the answer is not in doubt. The window's cost is its duty cycle,
+`PRECISION_WINDOW / interval`; its benefit is roughly constant, about 14 ms of
+worst-case wake error removed. Cost falls as schedules slow while benefit holds,
+so above the threshold there is no interval where declining is right — at the
+threshold the window's duty is 100%, exactly the continuous request it takes
+over from, and it only cheapens from there.
+
+**Decision:** Select from the shortest active interval alone:
+
+```
+None            -> no request
+< 32 ms         -> hold 1 ms continuously
+>= 32 ms        -> hold 1 ms for the final 32 ms before each waited deadline
+```
+
+Below the threshold there is nothing to window: the coarse wait preceding the
+window wakes on the platform tick, so the window cannot be narrower than the two
+ticks that make it necessary — which is why `PRECISION_WINDOW` and
+`HIGH_RATE_THRESHOLD` are the same constant. An interval shorter than the window
+leaves no coarse phase to stage.
+
+`TimingMode`, its profile field, and the radio buttons are removed, and **nothing
+replaces them in the editor**.
+
+Two intermediate designs were considered and rejected. Making the radio
+auto-update as intervals change gives one value two owners — the user's pick and
+the derived value — so it must either discard the first or ignore the second,
+with no way to tell the reader which happened. A read-only preview line was then
+built and removed: with the policy automatic, the accuracy it produces is the
+same in both bands, so the line's only invariant content was a constant, and the
+one fact that did vary — continuous versus windowed — changes how much the
+process perturbs the machine's timer, not anything the user's output shows. A
+readout that says the same thing on every look is decoration.
+
+What a *running* channel actually got is still reported, in the diagnostics
+card's timer readout, where it is an observation rather than a prediction.
+
+**Consequences:** A 1 s channel previously defaulted to Standard and made no
+request; it now holds 1 ms for 3.2% of the time. That is a real change to
+system-wide timer behaviour for schedules nobody opted in, accepted because the
+duty is small exactly where the absolute accuracy gain is most visible — a
+payload printing milliseconds while the wake is 15 ms off was ADR-034's own
+motivating case.
+
+Profiles carrying `timing_mode` still load: serde ignores unknown fields, so the
+setting is silently dropped rather than erroring. This is the first *subtractive*
+profile change, and schema `version` stays at 2 on the grounds that no reader can
+misinterpret data that is simply absent. The clipboard report drops
+`timing_mode`; `timer_policy` and `timer_reason` already state which policy
+actually applied. `TimerReason::PrecisionWindow` now means "interval at or above
+the threshold" rather than "the user chose Precise". Non-Windows behaviour is
+unchanged.
 
 ---
 

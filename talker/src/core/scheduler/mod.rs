@@ -326,9 +326,15 @@ impl Schedule {
         Some(cadence)
     }
 
-    /// Each message's current interval in schedule order. Zero means dormant.
-    pub fn intervals(&self) -> impl Iterator<Item = Duration> + '_ {
-        self.messages.iter().map(|message| message.interval)
+    /// Each message's wire bytes and current interval, in schedule order.
+    /// A zero interval means dormant.
+    ///
+    /// This is the *running* schedule's own demand, so a capacity readout for a
+    /// live channel can describe what is sending rather than what is on screen.
+    pub fn message_demand(&self) -> impl Iterator<Item = (usize, Duration)> + '_ {
+        self.messages
+            .iter()
+            .map(|message| (message.compiled.wire_len(), message.interval))
     }
 
     /// Change message `index`'s send interval, effective immediately.

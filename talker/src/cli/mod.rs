@@ -211,12 +211,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 .with_context(|| format!("compiling channel {i} schedule"))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut prepared: Vec<(
-        runner::RunnerIdentity,
-        Box<dyn Interface>,
-        crate::core::timing::TimingMode,
-        Schedule,
-    )> = Vec::new();
+    let mut prepared: Vec<(runner::RunnerIdentity, Box<dyn Interface>, Schedule)> = Vec::new();
     for ((i, channel), schedule) in channels.into_iter().enumerate().zip(schedules) {
         let interface = channel
             .interface
@@ -232,7 +227,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             label,
             run_id: crate::core::run_summary::RunId::mint(),
         };
-        prepared.push((who, interface, channel.timing_mode, schedule));
+        prepared.push((who, interface, schedule));
     }
 
     // One runner thread per channel, each driven by the same core send loop
@@ -259,7 +254,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     // to the channel's position in the profile.
     let mut echo_index: std::collections::HashMap<ChannelId, usize> =
         std::collections::HashMap::new();
-    for (i, (who, interface, timing_mode, schedule)) in prepared.into_iter().enumerate() {
+    for (i, (who, interface, schedule)) in prepared.into_iter().enumerate() {
         let (cmd_tx, cmd_rx) = crossbeam_channel::bounded(8);
         cmd_txs.push(cmd_tx);
         echo_index.insert(who.id, i);
@@ -271,7 +266,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 who,
                 interface,
                 None,
-                timing_mode,
                 schedule,
                 cmd_rx,
                 runner::RunnerObserver::new(status_tx, policy),

@@ -165,7 +165,7 @@ mod tests {
     use super::*;
     use crate::core::channel::{ChannelConfig, InterfaceConfig, TcpClientConfig, UdpConfig};
     use crate::core::message::{MessageConfig, PayloadConfig};
-    use crate::core::timing::{CadenceAlignment, TimingMode};
+    use crate::core::timing::CadenceAlignment;
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("talker_profile_test_{name}.toml"))
@@ -243,7 +243,6 @@ mod tests {
             InterfaceConfig::TcpClient(TcpClientConfig::new(addr)),
             vec![MessageConfig::new(PayloadConfig::raw_hex("AABB"), 500)],
         );
-        precise.timing_mode = TimingMode::Precise;
         precise.cadence_alignment = CadenceAlignment::UtcPhase;
         profile.channels.push(precise);
         profile.channels.push(ChannelConfig::new(
@@ -256,7 +255,6 @@ mod tests {
 
         profile.save(&path).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(saved.matches("timing_mode = \"precise\"").count(), 1);
         assert_eq!(
             saved.matches("cadence_alignment = \"utc_phase\"").count(),
             1
@@ -267,12 +265,10 @@ mod tests {
         assert_eq!(loaded.channels.len(), 2);
         assert_eq!(loaded.channels[0].messages.len(), 1);
         assert_eq!(loaded.channels[1].messages.len(), 1);
-        assert_eq!(loaded.channels[0].timing_mode, TimingMode::Precise);
         assert_eq!(
             loaded.channels[0].cadence_alignment,
             CadenceAlignment::UtcPhase
         );
-        assert_eq!(loaded.channels[1].timing_mode, TimingMode::Standard);
         assert_eq!(
             loaded.channels[1].cadence_alignment,
             CadenceAlignment::Immediate

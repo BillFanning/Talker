@@ -34,7 +34,7 @@ use crate::core::runner::{
 };
 use crate::core::scheduler::Schedule;
 use crate::core::telemetry::{MessageTiming, SendTimingTelemetry};
-use crate::core::timing::{CadenceAlignment, TimerStatus, TimingMode};
+use crate::core::timing::{CadenceAlignment, TimerStatus};
 
 /// Bound on each runner's status queue. Occupancy near this cap means
 /// observer updates are about to be dropped (and counted) — surfaced as the
@@ -197,7 +197,6 @@ pub struct CommandSubmission {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedRunConfig {
     pub interface: InterfaceConfig,
-    pub timing_mode: TimingMode,
     pub cadence_alignment: CadenceAlignment,
     pub messages: Vec<MessageConfig>,
 }
@@ -438,7 +437,6 @@ impl TalkerSupervisor {
         i: usize,
         label: impl Into<String>,
         cfg: InterfaceConfig,
-        timing_mode: TimingMode,
         messages: Vec<MessageConfig>,
         schedule: Schedule,
     ) {
@@ -452,7 +450,6 @@ impl TalkerSupervisor {
         slot.label = Some(label.clone());
         slot.pending_start = Some(AppliedRunConfig {
             interface: cfg.clone(),
-            timing_mode,
             cadence_alignment,
             messages,
         });
@@ -491,7 +488,7 @@ impl TalkerSupervisor {
                 Some(notify) => observer.with_notify(notify),
                 None => observer,
             };
-            runner::open_and_run(who, cfg, timing_mode, schedule, cmd_rx, observer);
+            runner::open_and_run(who, cfg, schedule, cmd_rx, observer);
         });
         self.slots[i].handle = Some(TalkerHandle {
             cmd_tx,
@@ -1065,7 +1062,6 @@ mod tests {
                 who,
                 interface,
                 None,
-                TimingMode::Standard,
                 schedule,
                 cmd_rx,
                 runner::RunnerObserver::new(status_tx, policy).with_control(control_tx),
@@ -1318,7 +1314,6 @@ mod tests {
         ));
         sup.slots[0].applied_run = Some(AppliedRunConfig {
             interface: original.clone(),
-            timing_mode: TimingMode::Standard,
             cadence_alignment: CadenceAlignment::Immediate,
             messages: vec![msg("AB", 20)],
         });
@@ -1400,7 +1395,6 @@ mod tests {
             0,
             "1",
             config.clone(),
-            TimingMode::Standard,
             messages.clone(),
             schedule(&messages),
         );
@@ -1475,7 +1469,6 @@ mod tests {
             interface: InterfaceConfig::Udp(UdpConfig::unicast(
                 "127.0.0.1:9".parse().expect("socket address"),
             )),
-            timing_mode: TimingMode::Standard,
             cadence_alignment: CadenceAlignment::Immediate,
             messages: vec![msg("AB", 20)],
         });

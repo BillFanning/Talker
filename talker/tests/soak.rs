@@ -24,7 +24,6 @@ use talker::core::message::{MessageConfig, PayloadConfig};
 use talker::core::runner::ObserverPolicy;
 use talker::core::scheduler::Schedule;
 use talker::core::supervisor::{CommandOutcome, TalkerSupervisor};
-use talker::core::timing::TimingMode;
 
 fn soak_secs() -> u64 {
     std::env::var("WIREDATA_SOAK_SECS")
@@ -141,7 +140,6 @@ fn multi_channel_udp_soak_totals_exact_at_rest() {
             i,
             (i + 1).to_string(),
             InterfaceConfig::Udp(UdpConfig::unicast(sink.addr)),
-            TimingMode::Standard,
             messages,
             schedule,
         );
@@ -213,7 +211,6 @@ fn tcp_failed_send_storm_stays_bounded() {
         0,
         "1",
         InterfaceConfig::TcpClient(TcpClientConfig::new(addr)),
-        TimingMode::Standard,
         messages,
         schedule,
     );

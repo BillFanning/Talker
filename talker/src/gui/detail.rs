@@ -7,13 +7,14 @@ use egui::{Align, Layout};
 
 use crate::core::{
     capacity::{
-        measured_service_estimate, serial_line_estimate, service_sample_count, MIN_SERVICE_SAMPLES,
+        measured_service_estimate, serial_line_estimate, service_sample_count, ChannelDemand,
+        MessageDemand, MIN_SERVICE_SAMPLES,
     },
     channel::InterfaceConfig,
     message::NmeaChecksumMode,
     run_summary::RunSummary,
     telemetry::{recent_snapshot_state, RecentSnapshotState},
-    timing::{ActiveCadence, CadenceAlignment, TimerReason, TimingMode},
+    timing::{ActiveCadence, CadenceAlignment, TimerReason},
 };
 
 use wiredata_ui::{
@@ -289,18 +290,37 @@ impl TalkerApp {
         let outcomes = send_outcomes(msgs, failed, suppressed, missed);
         let outcomes_tip = send_outcomes_tooltip(msgs, failed, suppressed, missed);
 
-        // Capacity is computed from the current draft's memoized wire lengths,
-        // never by re-rendering payloads in this per-frame header path.
-        let demand = self
+        // Capacity describes the configuration that is actually sending. The
+        // runner reports each message's wire size and interval, so a running
+        // channel's demand is its own; the settings on screen are used only
+        // when there is no run to describe, and are labelled a projection.
+        let running_demand = (!telemetry.per_message_timing.is_empty()).then(|| {
+            ChannelDemand::from_messages(
+                telemetry
+                    .per_message_timing
+                    .iter()
+                    .map(|message| MessageDemand::new(message.wire_bytes, message.interval_ms())),
+            )
+        });
+        // Never re-renders payloads in this per-frame header path: the draft
+        // path folds already-memoized wire lengths.
+        let drafted_demand = self
             .sched_drafts
             .get(i)
             .zip(self.message_analysis.get(i))
             .and_then(|(messages, analyses)| analyzed_channel_demand(messages.len(), analyses));
+        let projecting = running_demand.is_none();
+        let demand = running_demand.or(drafted_demand);
+
+        // The interface follows the same rule: the one the runner confirmed
+        // open, so a serial verdict is about the baud that is carrying bytes.
+        let applied_interface = self.sup.applied_interface(i).cloned();
+        let capacity_interface = applied_interface.as_ref().or(draft_interface.as_ref());
         let serial = demand.and_then(|demand| {
             if !demand.is_active() {
                 return None;
             }
-            let InterfaceConfig::Serial(config) = draft_interface.as_ref()? else {
+            let InterfaceConfig::Serial(config) = capacity_interface? else {
                 return None;
             };
             serial_line_estimate(demand, config)
@@ -316,12 +336,10 @@ impl TalkerApp {
             .filter(|demand| demand.is_active())
             .and_then(|demand| measured_service_estimate(demand, service_timing));
         let service_samples = service_sample_count(service_timing);
-        let draft_projection = running && (iface_drift || run_drift);
-        let app_label = if draft_projection {
-            "app (shown settings)"
-        } else {
-            "app"
-        };
+        // Demand now comes from the running schedule whenever there is one, so
+        // unapplied edits no longer make this figure describe something other
+        // than the run. Only a channel with no run to describe is a projection.
+        let app_label = if projecting { "app (projected)" } else { "app" };
 
         let app_capacity = if let Some(estimate) = service_estimate {
             let mut text = format!(
@@ -505,7 +523,7 @@ impl TalkerApp {
                         "Capacity",
                         &capacity.text,
                         capacity.tone,
-                        "Requested load comes from the settings currently shown, which may differ from what is running until Apply & Restart. Sent rate is the rolling five-second average of configured-interface writes that returned success. Serial utilization is a theoretical UART line estimate. Application headroom compares the current draft with separate render and interface-write p99 bounds. A warmed recent snapshot is preferred while it is current; an expired snapshot is discarded and a clearly labelled run-wide fallback is used when available. This is an advisory projection, not a hard capacity promise.",
+                        "Requested load comes from the running schedule: each message's wire size and interval as the channel is actually sending them. A channel that is not running has none, so it is projected from the settings shown and labelled as such. Sent rate is the rolling five-second average of configured-interface writes that returned success. Serial utilization is a theoretical UART line estimate. Application headroom compares that same requested load with separate render and interface-write p99 bounds. A warmed recent snapshot is preferred while it is current; an expired snapshot is discarded and a clearly labelled run-wide fallback is used when available. This is an advisory projection, not a hard capacity promise.",
                     );
             });
 
@@ -520,9 +538,6 @@ impl TalkerApp {
                     interface_erroring: error.is_some(),
                     failed,
                     serial_oversubscribed: serial.is_some_and(|line| line.is_oversubscribed()),
-                    // Capacity is computed from the on-screen draft, so it only
-                    // describes this run while nothing is pending Apply.
-                    settings_match_run: !(iface_drift || run_drift),
                     service: service_estimate,
                 },
                 &telemetry.per_message_timing,
@@ -631,7 +646,7 @@ impl TalkerApp {
                                         ui,
                                         text,
                                         hot,
-                                        "Static draft estimate. Each compiled wire byte uses one UART frame: 1 start bit plus the configured data, parity, and stop bits. Above 100%, the sustained requested payload cannot physically fit at the configured baud. At or below 100% is not a real-time guarantee: flow control, adapter/driver buffering, operating-system delays, and same-deadline message bursts can reduce effective headroom. This warning is advisory so deliberate overload tests remain possible.",
+                                        "Calculated, not measured, from the running schedule and the baud the channel actually opened. Each wire byte uses one UART frame: 1 start bit plus the configured data, parity, and stop bits. Above 100%, the sustained requested payload cannot physically fit at the configured baud. At or below 100% is not a real-time guarantee: flow control, adapter/driver buffering, operating-system delays, and same-deadline message bursts can reduce effective headroom. This warning is advisory so deliberate overload tests remain possible.",
                                     );
                                 } else if draft_kind == ConnKind::Serial {
                                     detail_line(
@@ -647,17 +662,18 @@ impl TalkerApp {
                                         ui,
                                         format!("Capacity: requested {requested}"),
                                         false,
-                                        "Static draft demand from exact compiled wire lengths and active intervals. Network link capacity is unknown, so Talker reports requested load without inventing a physical headroom figure.",
+                                        "Calculated, not measured: the exact wire length of each message against its interval, taken from the running schedule where there is one and from the settings shown otherwise. Network link capacity is unknown, so Talker reports requested load without inventing a physical headroom figure.",
                                     );
                                 }
 
                                 if let Some(estimate) = service_estimate {
-                                    let estimate_kind = if !running {
-                                        "draft projection from retained timing"
-                                    } else if draft_projection {
-                                        "draft projection"
+                                    // Whose schedule, and whose timing. A live
+                                    // channel is described by its own; a
+                                    // stopped one can only be projected.
+                                    let estimate_kind = if projecting {
+                                        "settings shown, timing from the last run"
                                     } else {
-                                        "running estimate"
+                                        "running configuration"
                                     };
                                     detail_line(
                                         ui,
@@ -668,7 +684,7 @@ impl TalkerApp {
                                             compact_rate(estimate.capacity_messages_per_second, "msg/s"),
                                         ),
                                         estimate.utilization >= 0.8,
-                                        "Advisory projection: the separate render and configured-interface write p99 histogram upper bounds are added, then compared with the current on-screen draft's aggregate requested message rate. A current recent snapshot is preferred after 20 paired observations. Otherwise the run-wide histogram is used after it warms up; a running recent snapshot is always discarded once its capture age reaches ten seconds. If unapplied edits exist, this deliberately projects the draft using timing retained from the running or previous configuration. It is not a joint p99 or hard capacity promise. A write may return after driver/kernel buffering, and coincident due messages still serialize.",
+                                        "Advisory projection: the separate render and configured-interface write p99 histogram upper bounds are added, then compared with the aggregate message rate the running schedule is asking for. A current recent snapshot is preferred after 20 paired observations. Otherwise the run-wide histogram is used after it warms up; a running recent snapshot is always discarded once its capture age reaches ten seconds. A channel that is not running is projected from the settings shown, using timing retained from its previous run. It is not a joint p99 or hard capacity promise. A write may return after driver/kernel buffering, and coincident due messages still serialize.",
                                     );
                                 } else {
                                     let text = if service_samples == 0 {
@@ -846,35 +862,17 @@ impl TalkerApp {
                     }
                 };
 
+                // No timer control and no timer preview here (ADR-047). The
+                // policy is derived from the shortest active interval and its
+                // outcome is the same either way, so a line stating it would
+                // read the same on every look. The diagnostics card reports
+                // which policy a *running* channel actually got.
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("Timing");
-                    let before = self.conn_drafts[i].timing_mode;
-                    ui.radio_value(
-                        &mut self.conn_drafts[i].timing_mode,
-                        TimingMode::Standard,
-                        "Standard",
-                    )
-                    .on_hover_text(
-                        "Uses ordinary platform deadline waits at intervals of 32 ms or longer. On Windows, Talker still requests the shared process-wide 1 ms timer resolution continuously when the shortest active interval is below 32 ms. This affects deadline wake timing, not cadence phase, timestamp accuracy, or physical-wire arrival. Requires Apply & Restart.",
-                    );
-                    ui.radio_value(
-                        &mut self.conn_drafts[i].timing_mode,
-                        TimingMode::Precise,
-                        "Precise",
-                    )
-                    .on_hover_text(format!("{TIMER_TOOLTIP} Requires Apply & Restart."));
-                    if self.conn_drafts[i].timing_mode != before {
-                        self.dirty = true;
-                    }
-                });
                 let mut utc_aligned =
                     self.conn_drafts[i].cadence_alignment == CadenceAlignment::UtcPhase;
                 if ui
                     .checkbox(&mut utc_aligned, "Align sends to UTC interval boundaries")
-                    .on_hover_text(format!(
-                        "{ALIGNMENT_TOOLTIP} Requires Apply & Restart."
-                    ))
+                    .on_hover_text(format!("{ALIGNMENT_TOOLTIP} Requires Apply & Restart."))
                     .changed()
                 {
                     self.conn_drafts[i].cadence_alignment = if utc_aligned {

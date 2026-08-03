@@ -9,7 +9,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use super::{
     channel::ChannelId,
     telemetry::{DurationHistogram, MessageTiming, SendTimingReport},
-    timing::{CadenceAlignment, TimerMode, TimerReason, TimerStatus, TimingMode},
+    timing::{CadenceAlignment, TimerMode, TimerReason, TimerStatus},
 };
 
 /// Process-unique run identity. A channel can restart before its predecessor's
@@ -182,11 +182,6 @@ impl RunSummary {
             |m| m.longest_block.as_micros().to_string(),
         );
         let _ = writeln!(out, "observer_updates_dropped={}", self.dropped_statuses);
-        let _ = writeln!(
-            out,
-            "timing_mode={}",
-            timing_mode_name(self.timer.timing_mode)
-        );
         let _ = writeln!(out, "timer_policy={}", timer_mode_name(self.timer.mode));
         let _ = writeln!(out, "timer_reason={}", timer_reason_name(self.timer.reason));
         let shortest_us = self
@@ -283,13 +278,6 @@ const fn end_reason_name(reason: RunEndReason) -> &'static str {
     }
 }
 
-const fn timing_mode_name(mode: TimingMode) -> &'static str {
-    match mode {
-        TimingMode::Standard => "standard",
-        TimingMode::Precise => "precise",
-    }
-}
-
 const fn timer_mode_name(mode: TimerMode) -> &'static str {
     match mode {
         TimerMode::Standard => "standard",
@@ -348,6 +336,7 @@ mod tests {
                 // #0: the victim — fast cadence, late, blames nobody.
                 MessageTiming {
                     interval: Duration::from_millis(50),
+                    wire_bytes: 80,
                     interval_changed: false,
                     deadline_lateness: histogram(Duration::from_millis(9)),
                     render_duration: histogram(Duration::from_micros(40)),
@@ -359,6 +348,7 @@ mod tests {
                 // #1: the culprit — slow cadence, slow write, charged for it.
                 MessageTiming {
                     interval: Duration::from_secs(2),
+                    wire_bytes: 512,
                     interval_changed: true,
                     deadline_lateness: histogram(Duration::from_micros(80)),
                     render_duration: histogram(Duration::from_micros(90)),
@@ -378,7 +368,6 @@ mod tests {
             },
             timer: TimerStatus {
                 mode: TimerMode::WindowsOneMillisecond,
-                timing_mode: TimingMode::Precise,
                 reason: TimerReason::HighRate,
                 active_cadence: Some(ActiveCadence {
                     messages: 1,
@@ -417,7 +406,8 @@ mod tests {
         assert!(report.contains("per_message_late_max_us=9000,80\n"));
         assert!(report.contains("per_message_blocked_others_us=0,430000\n"));
         assert!(report.contains("per_message_blocking_sends=0,4\n"));
-        assert!(report.contains("timing_mode=precise\n"));
+        // `timing_mode` is gone from the report: the policy is derived from the
+        // schedule, and `timer_policy` below already states which one applied.
         assert!(report.contains("timer_policy=windows_1_ms\n"));
         assert!(report.contains("cadence_alignment=utc_phase\n"));
         assert!(report.contains("wall_clock_realignments=1\n"));
