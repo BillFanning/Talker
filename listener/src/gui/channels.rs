@@ -94,6 +94,14 @@ impl ListenerApp {
                     ui.close();
                 }
             });
+        });
+        // Bulk actions on their own row, as in talker. A `horizontal` does not
+        // wrap, so its minimum width is the sum of everything in it, and that
+        // minimum is the floor the channel panel can be dragged down to. With
+        // these two buttons in the header row the floor exceeded the panel's own
+        // default width, so the divider could be dragged right but never back
+        // left.
+        ui.horizontal(|ui| {
             if ui.button("Start all").clicked() {
                 // Only Stopped channels — starting an already-Running one would be an
                 // illegal Running→Starting transition. Validate each (unconfigured ones

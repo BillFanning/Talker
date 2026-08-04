@@ -159,15 +159,6 @@ impl ListenerApp {
         });
         if let Some(err) = &last_error {
             ui.colored_label(palette(ui).fault_red, format!("⚠ {err}"));
-            // The port/bind recourse only applies to a *start* fault (channel Faulted) —
-            // not a recording fault, which leaves the channel Running and whose error
-            // already names its own recourse (check the destination / on-exists).
-            if status == ChannelStatus::Faulted {
-                ui.label(
-                    "Recourse: change the port below and Apply, free the resource (Stop \
-                     the other channel on that port) then Retry, or Remove this channel.",
-                );
-            }
         }
         if let Some(view) = self.state.channel(id) {
             ui.add_space(6.0);
@@ -196,7 +187,7 @@ impl ListenerApp {
         if let Some((_, config)) = &mut self.edit_draft {
             // "Configure interface" — the shared section title in both apps
             // (talker's interface editor uses the same words).
-            egui::CollapsingHeader::new(bold("Configure interface"))
+            egui::CollapsingHeader::new("Configure interface")
                 // A STABLE id (not per-channel) so switching channels doesn't create a
                 // "new" header each time — that re-triggered a focus/animation highlight
                 // that flashed a rectangle around the label on every channel switch. The
@@ -226,7 +217,7 @@ impl ListenerApp {
                 // Outputs are clickable toggles (§161): clicking sends Set{Rts,Dtr};
                 // the shown state still comes from the live poll, so it reflects what
                 // the port actually did, not just what we asked for.
-                ui.label(bold("Out:"));
+                ui.label("Out:");
                 if line_toggle(ui, "RTS", lines.rts).clicked() {
                     self.send(UiCommand::SetRts(id, !lines.rts));
                 }
@@ -235,7 +226,7 @@ impl ListenerApp {
                 }
                 ui.separator();
                 // Inputs are read-only indicators.
-                ui.label(bold("In:"));
+                ui.label("In:");
                 line_indicator(ui, "CTS", lines.cts);
                 line_indicator(ui, "DSR", lines.dsr);
                 line_indicator(ui, "DCD", lines.dcd);
@@ -333,7 +324,7 @@ impl ListenerApp {
             )
             .show_header(ui, |ui| {
                 let (e, w, x) = dv.counts;
-                ui.label(bold("Diagnostics"));
+                ui.label("Diagnostics");
                 ui.label(egui::RichText::new(format!("({e} info · {w} warn · {x} err)")).weak());
                 ui.add(
                     egui::Label::new(egui::RichText::new(headline).color(headline_color))
@@ -343,7 +334,7 @@ impl ListenerApp {
             .body(|ui| {
                 ui.horizontal(|ui| {
                     let (e, w, x) = dv.counts;
-                    ui.label(bold("Show"));
+                    ui.label("Show");
                     ui.checkbox(&mut self.show_info, format!("Info ({e})"));
                     ui.checkbox(&mut self.show_warn, format!("Warn ({w})"));
                     ui.checkbox(&mut self.show_error, format!("Error ({x})"));
@@ -523,7 +514,7 @@ impl ListenerApp {
         // Raw header row: title + live state indicator + the Start/Stop recording
         // button on the same line (no expander — the setup follows below).
         ui.horizontal(|ui| {
-            ui.label(bold("Record Raw Data"));
+            ui.label("Record Raw Data");
             // Status glyph only (same symbol set/colors as channel status) — the word
             // ("recording"/"off"/"faulted") is dropped to keep the row compact; the glyph
             // ■/●/⚠ carries the state.
@@ -551,7 +542,7 @@ impl ListenerApp {
         ui.separator();
         let display_recording = self.state.channel(id).and_then(|v| v.display_recording);
         ui.horizontal(|ui| {
-            ui.label(bold("Record Display"));
+            ui.label("Record Display");
             let (glyph, color, _text) = recording_indicator(display_recording, palette(ui));
             paint_glyph(ui, glyph, recording_glyph_size(glyph), color);
             self.record_button(ui, id, status, display_recording, RecTap::Display);
@@ -726,7 +717,7 @@ fn recording_setup_section(
     let open = state.is_open();
     state
         .show_header(ui, |ui| {
-            ui.label(bold("Setup"));
+            ui.label("Setup");
             // The summary rides the (closed) header so it reads as one line; when
             // open, the full editor is in the body below, so keep the header terse.
             if !open {

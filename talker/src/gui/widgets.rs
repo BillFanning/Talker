@@ -156,10 +156,13 @@ pub(super) fn interface_summary(conn: &ConnDraft) -> String {
     match conn.kind() {
         ConnKind::Serial => {
             let data = conn.data_bits;
+            // Conventional serial notation — `9600,8,N,1` — matching listener's
+            // status line. Spelling the parity out made the one field that has
+            // a standard abbreviation the odd one in the group.
             let parity = match conn.parity {
-                1 => "Odd",
-                2 => "Even",
-                _ => "None",
+                1 => "O",
+                2 => "E",
+                _ => "N",
             };
             let stop = conn.stop_bits;
             let flow = match conn.flow_control {

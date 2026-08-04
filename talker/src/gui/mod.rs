@@ -74,7 +74,8 @@ pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
         // eframe restores the saved window state *after* the window is shown,
         // which produced a double frame/title-bar flash on launch — and a bad
         // tiny geometry could be restored too. The window always opens at the
-        // default size; zoom and the last profile are persisted separately.
+        // default size. Zoom is egui's own `zoom_factor`, persisted with egui
+        // memory; the last profile is persisted separately.
         persist_window: false,
         ..Default::default()
     };
@@ -96,17 +97,6 @@ pub fn run(initial_profile: Option<PathBuf>) -> anyhow::Result<()> {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
-/// The `pixels_per_point` the zoom widget treats as **100%**. This was
-/// the comfortable default on the app's target displays — what the
-/// widget used to label "115%". The widget now shows and steps zoom
-/// relative to this baseline, so a fresh install opens at 100%.
-const ZOOM_BASE_PPP: f32 = 1.15;
-/// One zoom click = ±10 percentage points of [`ZOOM_BASE_PPP`].
-const ZOOM_STEP_PPP: f32 = ZOOM_BASE_PPP * 0.10;
-/// Zoom clamp range, as `pixels_per_point` (50%..=200% of the base).
-const ZOOM_MIN_PPP: f32 = ZOOM_BASE_PPP * 0.5;
-const ZOOM_MAX_PPP: f32 = ZOOM_BASE_PPP * 2.0;
-
 // The status-queue bound moved into core with the supervisor (ADR-019); the
 // detail header's performance readouts still reference it via this path.
 pub(crate) use crate::core::supervisor::STATUS_QUEUE_CAP;
@@ -115,12 +105,6 @@ pub(crate) use crate::core::supervisor::STATUS_QUEUE_CAP;
 const RECENT_PROFILES_KEY: &str = "recent_profiles";
 /// How many entries the Profile menu's Recent section keeps.
 const MAX_RECENT_PROFILES: usize = 8;
-
-/// Convert a `pixels_per_point` value to the widget's displayed
-/// percentage (relative to [`ZOOM_BASE_PPP`]), rounded to a whole number.
-fn zoom_percent(ppp: f32) -> u32 {
-    (ppp / ZOOM_BASE_PPP * 100.0).round() as u32
-}
 
 /// All-or-none draft → profile conversion, **index-preserving**: any channel
 /// or message that cannot convert aborts the whole flush with human-readable
@@ -458,8 +442,6 @@ struct TalkerApp {
     displays: Vec<ChannelDisplay>,
     last_title: String,
     serial_ports: Vec<String>,
-    pixels_per_point: f32,
-    zoom_held_timer: Option<f32>, // None = not held; Some(t) = held, t<0 in delay, t>=0 repeating
     /// `true` = dark theme, `false` = light. Persisted; toggled from
     /// the top-bar sun/moon button next to the zoom control.
     dark_mode: bool,
@@ -637,13 +619,6 @@ impl TalkerApp {
         storage: Option<&dyn eframe::Storage>,
         log_level_handle: LogLevelHandle,
     ) -> Self {
-        let ppp = storage
-            .and_then(|s| s.get_string("pixels_per_point"))
-            .and_then(|s| s.parse::<f32>().ok())
-            .filter(|&v| v > 0.0)
-            // First run opens at 100% on the new scale (= ZOOM_BASE_PPP).
-            .unwrap_or(ZOOM_BASE_PPP);
-        ctx.set_pixels_per_point(ppp);
         // Default to dark; persisted across runs. Stored as the string
         // "false" only when the user has switched to light.
         let dark_mode = storage
@@ -680,8 +655,6 @@ impl TalkerApp {
             displays: Vec::new(),
             last_title: String::new(),
             serial_ports: Vec::new(),
-            pixels_per_point: ppp,
-            zoom_held_timer: None,
             dark_mode,
             selected: None,
             channels_collapsed: false,
@@ -1228,7 +1201,6 @@ impl TalkerApp {
 
 impl eframe::App for TalkerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        ui.ctx().set_pixels_per_point(self.pixels_per_point);
         // Re-arm the repaint coalescer BEFORE draining statuses, so a status
         // arriving mid-drain either lands in this frame's batch or triggers a
         // fresh wake — never lost.
@@ -1236,40 +1208,54 @@ impl eframe::App for TalkerApp {
         self.poll_channels(ui.ctx());
         self.refresh_message_analysis();
         self.handle_tab_keys(ui.ctx());
-        egui::Frame::new()
-            .inner_margin(4.0)
-            .stroke(egui::Stroke::new(
-                1.5_f32,
-                egui::Color32::from_rgb(110, 120, 145),
-            ))
-            .show(ui, |ui| {
-                self.show_top_bar(ui);
-                self.show_status_bar(ui);
-                self.show_log_panel(ui);
-                // Master–detail (spec §3.2): the channel list on the left
-                // (or its collapsed status strip), the selected channel's
-                // detail pane in the centre.
-                let channels_collapsed = self.channels_collapsed;
-                let channel_panel = if channels_collapsed {
-                    egui::Panel::left("channel_strip")
-                        .resizable(false)
-                        .show_separator_line(false)
-                        .show_inside(ui, |ui| self.show_channel_strip(ui))
-                } else {
-                    egui::Panel::left("channel_list")
-                        .resizable(true)
-                        .default_size(280.0)
-                        .show_separator_line(false)
-                        .show_inside(ui, |ui| self.show_channel_list(ui))
-                };
-                egui::CentralPanel::default().show_inside(ui, |ui| self.show_detail(ui));
-                selection::connect_tab_to_page(
-                    ui,
-                    channel_panel.response.rect,
-                    channel_panel.inner,
-                    (!channels_collapsed).then(|| egui::Id::new("channel_list")),
-                );
+        // Trial 3 px window frame: white / blue / white, one pixel each. Three
+        // nested frames rather than one thick stroke, because egui paints a
+        // frame's stroke with `StrokeKind::Inside` — a 1 px stroke sits wholly
+        // within its own rect, so a 1 px inner margin per level lands the next
+        // line exactly against it with no gap. The outermost carries the panel
+        // fill so no band is left unpainted (an unfilled margin was the earlier
+        // "black outline").
+        let fill = ui.visuals().panel_fill;
+        let line = |colour: egui::Color32| {
+            egui::Frame::new()
+                .stroke(egui::Stroke::new(1.0_f32, colour))
+                .inner_margin(1.0)
+        };
+        let blue = egui::Color32::from_rgb(60, 110, 200);
+        egui::Frame::new().fill(fill).show(ui, |ui| {
+            line(egui::Color32::WHITE).show(ui, |ui| {
+                line(blue).show(ui, |ui| {
+                    line(egui::Color32::WHITE).show(ui, |ui| {
+                        self.show_top_bar(ui);
+                        self.show_status_bar(ui);
+                        self.show_log_panel(ui);
+                        // Master–detail (spec §3.2): the channel list on the left
+                        // (or its collapsed status strip), the selected channel's
+                        // detail pane in the centre.
+                        let channels_collapsed = self.channels_collapsed;
+                        let channel_panel = if channels_collapsed {
+                            egui::Panel::left("channel_strip")
+                                .resizable(false)
+                                .show_separator_line(false)
+                                .show_inside(ui, |ui| self.show_channel_strip(ui))
+                        } else {
+                            egui::Panel::left("channel_list")
+                                .resizable(true)
+                                .default_size(280.0)
+                                .show_separator_line(false)
+                                .show_inside(ui, |ui| self.show_channel_list(ui))
+                        };
+                        egui::CentralPanel::default().show_inside(ui, |ui| self.show_detail(ui));
+                        selection::connect_tab_to_page(
+                            ui,
+                            channel_panel.response.rect,
+                            channel_panel.inner,
+                            (!channels_collapsed).then(|| egui::Id::new("channel_list")),
+                        );
+                    });
+                });
             });
+        });
         self.show_remove_confirm(ui.ctx());
         // Apply user-requested mutations AFTER the layout closes — never
         // inside it — so egui's two-pass layout sees one consistent state.
@@ -1283,7 +1269,6 @@ impl eframe::App for TalkerApp {
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         storage.set_string("last_profile_path", path_str);
-        storage.set_string("pixels_per_point", self.pixels_per_point.to_string());
         storage.set_string("dark_mode", self.dark_mode.to_string());
         let recents = self
             .recent_profiles
@@ -1315,53 +1300,18 @@ impl TalkerApp {
                 // list header next to "+ Add", as in listener — see
                 // `show_profile_menu` in `channels.rs`. The top bar keeps the
                 // app-wide controls: zoom and theme.
-                let r_minus = ui.small_button("−");
-                ui.label(format!("{}%", zoom_percent(self.pixels_per_point)));
-                let r_plus = ui.small_button("+");
-
-                let minus_down = r_minus.is_pointer_button_down_on();
-                let plus_down = r_plus.is_pointer_button_down_on();
-                let direction: f32 = if minus_down {
-                    -1.0
-                } else if plus_down {
-                    1.0
-                } else {
-                    0.0
-                };
-
-                if direction != 0.0 {
-                    let dt = ui.ctx().input(|i| i.stable_dt);
-                    match self.zoom_held_timer {
-                        None => {
-                            // First frame pressed — fire immediately.
-                            self.pixels_per_point = (self.pixels_per_point
-                                + direction * ZOOM_STEP_PPP)
-                                .clamp(ZOOM_MIN_PPP, ZOOM_MAX_PPP);
-                            self.zoom_held_timer = Some(-0.4);
-                        }
-                        Some(ref mut t) => {
-                            *t += dt;
-                            if *t >= 0.0 {
-                                *t -= 0.1; // repeat every 100 ms
-                                self.pixels_per_point = (self.pixels_per_point
-                                    + direction * ZOOM_STEP_PPP)
-                                    .clamp(ZOOM_MIN_PPP, ZOOM_MAX_PPP);
-                            }
-                        }
-                    }
-                    ui.ctx().request_repaint();
-                } else {
-                    // Fallback: handle a quick tap that releases before is_pointer_button_down_on fires.
-                    if r_minus.clicked() && self.zoom_held_timer.is_none() {
-                        self.pixels_per_point =
-                            (self.pixels_per_point - ZOOM_STEP_PPP).max(ZOOM_MIN_PPP);
-                    }
-                    if r_plus.clicked() && self.zoom_held_timer.is_none() {
-                        self.pixels_per_point =
-                            (self.pixels_per_point + ZOOM_STEP_PPP).min(ZOOM_MAX_PPP);
-                    }
-                    self.zoom_held_timer = None;
-                }
+                //
+                // egui's own zoom, not a hand-rolled one. It scales *relative*
+                // to the OS DPI rather than replacing it, which is what the old
+                // control did — a 1.15 base multiplied whatever the user had
+                // already set for their display. It also brings Ctrl +/−/0 and
+                // Ctrl+scroll for free, and egui persists the factor itself.
+                ui.menu_button(
+                    format!("Zoom {:.0}%", ui.ctx().zoom_factor() * 100.0),
+                    |ui| {
+                        egui::gui_zoom::zoom_menu_buttons(ui);
+                    },
+                );
 
                 ui.separator();
                 // Theme toggle — the shared button (same storage key as
@@ -1525,36 +1475,13 @@ impl TalkerApp {
         let Some(i) = self.confirm_remove else {
             return;
         };
-        let name = self.channel_name(i);
-        let mut close = false;
-        let resp = egui::Modal::new(egui::Id::new("remove_confirm")).show(ctx, |ui| {
-            ui.set_width(320.0);
-            ui.heading("Remove channel?");
-            ui.add_space(4.0);
-            ui.label(format!(
-                "“{name}” will be stopped and removed. Unsaved profile changes to it are lost."
-            ));
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    close = true;
-                }
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("Remove").color(egui::Color32::WHITE),
-                        )
-                        .fill(wiredata_ui::palette::LIGHT.fault_red),
-                    )
-                    .clicked()
-                {
-                    self.deferred.remove = Some(i);
-                    close = true;
-                }
-            });
-        });
-        if close || resp.should_close() {
-            self.confirm_remove = None;
+        match wiredata_ui::dialog::confirm_remove_channel(ctx, &self.channel_name(i)) {
+            wiredata_ui::dialog::Confirm::Pending => {}
+            wiredata_ui::dialog::Confirm::Cancelled => self.confirm_remove = None,
+            wiredata_ui::dialog::Confirm::Confirmed => {
+                self.deferred.remove = Some(i);
+                self.confirm_remove = None;
+            }
         }
     }
 
@@ -1734,27 +1661,6 @@ mod tests {
         );
         assert!((rate.per_sec - 0.2).abs() < f32::EPSILON);
         assert_eq!(rate.bytes_per_sec, 2.0);
-    }
-
-    // ── zoom widget ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn zoom_base_reads_as_100_percent() {
-        // The old "115%" ppp is the new 100% baseline.
-        assert_eq!(zoom_percent(ZOOM_BASE_PPP), 100);
-    }
-
-    #[test]
-    fn zoom_steps_are_ten_percent() {
-        assert_eq!(zoom_percent(ZOOM_BASE_PPP + ZOOM_STEP_PPP), 110);
-        assert_eq!(zoom_percent(ZOOM_BASE_PPP - ZOOM_STEP_PPP), 90);
-        assert_eq!(zoom_percent(ZOOM_BASE_PPP + 2.0 * ZOOM_STEP_PPP), 120);
-    }
-
-    #[test]
-    fn zoom_clamp_bounds_are_50_and_200() {
-        assert_eq!(zoom_percent(ZOOM_MIN_PPP), 50);
-        assert_eq!(zoom_percent(ZOOM_MAX_PPP), 200);
     }
 
     fn serial_draft(name: &str) -> ConnDraft {

@@ -509,6 +509,17 @@ impl TalkerApp {
             THROUGHPUT_TOOLTIP,
         );
 
+        // Lifecycle controls sit directly under the basic readouts, matching
+        // listener's control block. Below the diagnostics they were reachable
+        // only after scrolling past several collapsible sections, so the same
+        // pair of buttons lived in visibly different places in the two apps.
+        if let Some(err) = &error {
+            ui.colored_label(pal.fault_red, format!("\u{26A0} {err}"));
+        }
+        ui.add_space(12.0); // a blank line between the readouts and the buttons
+        self.show_lifecycle_buttons(ui, i, running, iface_drift || run_drift, error.is_some());
+        ui.add_space(6.0);
+
         decision_card(ui, "", card_status, card_tone, |ui| {
             signal_grid(ui, "send_decisions", |ui| {
                 signal_row(
@@ -753,12 +764,6 @@ impl TalkerApp {
             }
         });
 
-        if let Some(err) = &error {
-            ui.colored_label(pal.fault_red, format!("\u{26A0} {err}"));
-        }
-
-        ui.add_space(12.0); // a blank line between the readouts and the buttons
-        self.show_lifecycle_buttons(ui, i, running, iface_drift || run_drift, error.is_some());
         if let Some(summary) = self.sup.last_run_summary(i) {
             ui.add_space(4.0);
             show_last_run_summary(ui, summary);

@@ -535,36 +535,13 @@ impl ListenerApp {
             .channel(id)
             .map(|v| v.name.clone())
             .unwrap_or_default();
-        let mut close = false;
-        let resp = egui::Modal::new(egui::Id::new("remove_confirm")).show(ctx, |ui| {
-            ui.set_width(320.0);
-            ui.heading("Remove channel?");
-            ui.add_space(4.0);
-            ui.label(format!(
-                "“{name}” will be stopped and removed. This can't be undone."
-            ));
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
-                    close = true;
-                }
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("Remove").color(egui::Color32::WHITE),
-                        )
-                        .fill(wiredata_ui::palette::active(ui).fault_red),
-                    )
-                    .clicked()
-                {
-                    self.send(UiCommand::RemoveChannel(id));
-                    close = true;
-                }
-            });
-        });
-        // Clicking the dimmed backdrop or pressing Escape cancels.
-        if close || resp.should_close() {
-            self.confirm_remove = None;
+        match wiredata_ui::dialog::confirm_remove_channel(ctx, &name) {
+            wiredata_ui::dialog::Confirm::Pending => {}
+            wiredata_ui::dialog::Confirm::Cancelled => self.confirm_remove = None,
+            wiredata_ui::dialog::Confirm::Confirmed => {
+                self.send(UiCommand::RemoveChannel(id));
+                self.confirm_remove = None;
+            }
         }
     }
 }

@@ -15,8 +15,6 @@ use crate::config::{
 };
 use crate::core::{validate_zda_talker_id, TimestampConfig, MAX_ZDA_TALKER_ID_BYTES};
 
-use wiredata_ui::fonts::bold;
-
 /// Is this rule one the Mark editor owns — a single `BytePattern` condition whose only
 /// action is a timestamped `Mark`? Other rules (Idle, Record, bare Mark, multi-action)
 /// are shown read-only so the editor never silently drops profile-authored rules.
@@ -33,7 +31,7 @@ fn is_mark_timestamp_rule(rule: &MatchRule) -> bool {
 /// add-row. Returns nothing — edits land in `config.match_rules`; the caller's
 /// Apply & Restart path picks them up.
 pub(crate) fn edit_mark_rules(ui: &mut egui::Ui, config: &mut ChannelConfig) {
-    ui.label(bold("Timestamp marks")).on_hover_text(
+    ui.label("Timestamp marks").on_hover_text(
         "Insert local arrival time or an NMEA ZDA sentence before/after a byte pattern, \
              inline in the view and .disp recording (never .raw). Applying restarts the channel.",
     );

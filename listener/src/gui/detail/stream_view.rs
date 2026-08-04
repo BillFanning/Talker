@@ -17,7 +17,7 @@ use super::super::view_prefs::{
 };
 use super::super::widgets::{edit_mark_rules, human_bytes, ColorScheme, MSG_FONT_SIZES};
 use super::super::ListenerApp;
-use wiredata_ui::fonts::{bold, MonoFont};
+use wiredata_ui::fonts::MonoFont;
 
 impl ListenerApp {
     /// The stream viewer (§41): the toolbar (Pause/Resume, View mode, ctrl-chars,
@@ -60,7 +60,7 @@ impl ListenerApp {
         .show_header(ui, |ui| {
             // The collapse arrow is drawn by show_header; add the title + the
             // Pause/Resume button on the same row.
-            ui.label(bold("Configure display"));
+            ui.label("Configure display");
             if let Some((view_id, is_paused)) = view0 {
                 if is_paused {
                     if ui.button("Resume").clicked() {
@@ -292,7 +292,7 @@ impl ListenerApp {
     fn show_view_controls(&self, ui: &mut egui::Ui, prefs: &mut ViewPrefs, stream_len: usize) {
         let base = egui::TextStyle::Body.resolve(ui.style()).size;
         ui.horizontal(|ui| {
-            ui.label(bold("View"))
+            ui.label("View")
                 .on_hover_text("How the received bytes are displayed in the viewer.");
             ui.radio_value(&mut prefs.mode, DisplayMode::Hex, "Hex")
                 .on_hover_text("Each byte as two-digit hex (e.g. 0A 0D 41).");
@@ -310,7 +310,7 @@ impl ListenerApp {
             ui.add_enabled_ui(prefs.mode == DisplayMode::Raw, |ui| {
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(bold("ctrl-chars"));
+                        ui.label("ctrl-chars");
                         ui.radio_value(
                             &mut prefs.chars,
                             CharacterRendering::Glyph,
@@ -326,7 +326,7 @@ impl ListenerApp {
             });
         });
         ui.horizontal(|ui| {
-            ui.label(bold("Size"));
+            ui.label("Size");
             // An editable "combo": type any size into the field, or pick a preset from
             // the ▾ menu; the text is the source of truth while editing.
             let resp = ui.add(egui::TextEdit::singleline(&mut prefs.font_text).desired_width(40.0));
@@ -345,7 +345,7 @@ impl ListenerApp {
                 }
             });
             ui.separator();
-            ui.label(bold("Colors"));
+            ui.label("Colors");
             egui::ComboBox::from_id_salt("msg_colors")
                 .selected_text(prefs.colors.label())
                 .show_ui(ui, |ui| {
@@ -360,7 +360,7 @@ impl ListenerApp {
                     }
                 });
             ui.separator();
-            ui.label(bold("Mono"));
+            ui.label("Mono");
             egui::ComboBox::from_id_salt("msg_font")
                 .selected_text(prefs.mono.label())
                 .show_ui(ui, |ui| {
@@ -378,8 +378,7 @@ impl ListenerApp {
             heavier, so pick the smallest that covers what you need — the full history is \
             kept in the .raw recording regardless.";
         ui.horizontal(|ui| {
-            ui.label(bold("Scroll buffer"))
-                .on_hover_text(SCROLL_BUFFER_HINT);
+            ui.label("Scroll buffer").on_hover_text(SCROLL_BUFFER_HINT);
             egui::ComboBox::from_id_salt("scroll_buffer")
                 .selected_text(scroll_buffer_label(prefs.scroll_buffer_bytes))
                 // Tall enough for every preset: the default popup max height sat

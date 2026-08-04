@@ -16,8 +16,8 @@ use std::{collections::HashMap, time::Duration};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::config::{
-    ChannelConfig, DisplayConfig, DisplayRecordingConfig, InterfaceConfig, Profile,
-    RawRecordingConfig, RetentionConfig,
+    ChannelConfig, DataBits, DisplayConfig, DisplayRecordingConfig, FlowControl, InterfaceConfig,
+    Parity, Profile, RawRecordingConfig, RetentionConfig, StopBits,
 };
 use crate::core::{ChannelId, ChannelName, DisplayViewId, RuntimeEvent};
 use crate::runtime::{ChannelSnapshot, ChannelStats, Listener, PipelineCapacities, StreamDelta};
@@ -191,7 +191,36 @@ fn describe_interface(config: &ChannelConfig) -> String {
             format!("TCP listener · {}:{}", tcp.bind_address, tcp.port)
         }
         InterfaceConfig::Serial(serial) => {
-            format!("Serial · {} @ {} baud", serial.port, serial.baud_rate)
+            // Conventional serial notation — `9600,8,N,1` — so the line reads
+            // the way the settings are written down and spoken, rather than
+            // spelling out one term and omitting the rest.
+            let data = match serial.data_bits {
+                DataBits::Five => 5,
+                DataBits::Six => 6,
+                DataBits::Seven => 7,
+                DataBits::Eight => 8,
+            };
+            let parity = match serial.parity {
+                Parity::None => "N",
+                Parity::Even => "E",
+                Parity::Odd => "O",
+                Parity::Mark => "M",
+                Parity::Space => "S",
+            };
+            let stop = match serial.stop_bits {
+                StopBits::One => "1",
+                StopBits::OnePointFive => "1.5",
+                StopBits::Two => "2",
+            };
+            let flow = match serial.flow_control {
+                FlowControl::None => "None",
+                FlowControl::XonXoff => "XON/XOFF",
+                FlowControl::RtsCts => "RTS/CTS",
+            };
+            format!(
+                "Serial: {} {},{data},{parity},{stop} flow:{flow}",
+                serial.port, serial.baud_rate,
+            )
         }
     }
 }

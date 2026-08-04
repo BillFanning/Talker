@@ -22,8 +22,6 @@ use crate::config::{
 use crate::core::ChannelId;
 use crate::transport::udp::UdpMode;
 
-use wiredata_ui::fonts::bold;
-
 /// Which interface a new channel uses, in the Add menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum AddKind {
@@ -142,18 +140,26 @@ const FLOW_CONTROL: &[(FlowControl, &str)] = &[
 const BAUD_RATES: &[u32] = &[4800, 9600, 19200, 38400, 57600, 115200, 230400];
 
 /// A labelled row of radio buttons bound to an enum value with a fixed option table.
+/// One labelled row of radios inside the serial grid.
+///
+/// Grid rather than `horizontal` so the label occupies its own column: with a
+/// per-row `horizontal`, every row's controls started wherever that row's label
+/// happened to end, so "Flow" and "Data bits" put their first radio in
+/// different places. In a grid they all line up under the port selector, as in
+/// talker's `serial_grid`.
 fn radio_row<T: PartialEq + Copy>(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut T,
     options: &[(T, &str)],
 ) {
+    ui.label(label);
     ui.horizontal(|ui| {
-        ui.label(bold(label));
         for (v, s) in options {
             ui.radio_value(value, *v, *s);
         }
     });
+    ui.end_row();
 }
 
 /// An incrementing port box (talker-style): `[−] [text] [+]`, no drag-to-increment
@@ -209,7 +215,7 @@ pub(super) fn edit_interface(
                 .num_columns(2)
                 .spacing([8.0, 4.0])
                 .show(ui, |ui| {
-                    ui.label(bold("Mode"))
+                    ui.label("Mode")
                         .on_hover_text("How this UDP socket receives datagrams.");
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut udp.mode, UdpMode::Broadcast, "Broadcast")
@@ -255,7 +261,7 @@ pub(super) fn edit_interface(
                              local IP to join on just that NIC."
                         }
                     };
-                    ui.label(bold("Binding address")).on_hover_text(bind_hint);
+                    ui.label("Binding address").on_hover_text(bind_hint);
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut udp.bind_address)
@@ -278,7 +284,7 @@ pub(super) fn edit_interface(
                             administratively-scoped (private) block — a good default; \
                             avoid 224.0.0.x, which is reserved for local control traffic. \
                             Must match the sender's group.";
-                        ui.label(bold("Group")).on_hover_text(GROUP_HINT);
+                        ui.label("Group").on_hover_text(GROUP_HINT);
                         let mut group = udp.multicast_group.clone().unwrap_or_default();
                         if ui
                             .add(
@@ -296,7 +302,7 @@ pub(super) fn edit_interface(
                         ui.end_row();
                     }
 
-                    ui.label(bold("Arrival timing")).on_hover_text(
+                    ui.label("Arrival timing").on_hover_text(
                         "Choose whether UDP arrival wall-clock timestamps are captured after the read or requested from the OS receive path.",
                     );
                     ui.checkbox(&mut udp.kernel_timestamps, "Kernel timestamp")
@@ -311,7 +317,7 @@ pub(super) fn edit_interface(
                 .num_columns(2)
                 .spacing([8.0, 4.0])
                 .show(ui, |ui| {
-                    ui.label(bold("Binding address"));
+                    ui.label("Binding address");
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut tcp.bind_address)
@@ -326,76 +332,85 @@ pub(super) fn edit_interface(
                 });
         }
         InterfaceConfig::Serial(serial) => {
-            // Port dropdown + refresh.
-            ui.horizontal(|ui| {
-                ui.label(bold("Port"));
-                let label = if serial.port.is_empty() {
-                    "select port\u{2026}".to_string()
-                } else {
-                    serial.port.clone()
-                };
-                egui::ComboBox::from_id_salt("serial_port")
-                    .selected_text(label)
-                    .width(150.0)
-                    .show_ui(ui, |ui| {
-                        if serial_ports.is_empty() {
-                            ui.weak("No ports found");
+            // One grid so every row's controls begin at the same x, under the
+            // port selector — talker's `serial_grid` shape.
+            egui::Grid::new("serial_grid")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    // Port dropdown + refresh.
+                    ui.label("Port");
+                    ui.horizontal(|ui| {
+                        let label = if serial.port.is_empty() {
+                            "select port\u{2026}".to_string()
                         } else {
-                            for port in serial_ports {
-                                ui.selectable_value(&mut serial.port, port.clone(), port);
+                            serial.port.clone()
+                        };
+                        egui::ComboBox::from_id_salt("serial_port")
+                            .selected_text(label)
+                            .width(150.0)
+                            .show_ui(ui, |ui| {
+                                if serial_ports.is_empty() {
+                                    ui.weak("No ports found");
+                                } else {
+                                    for port in serial_ports {
+                                        ui.selectable_value(&mut serial.port, port.clone(), port);
+                                    }
+                                }
+                            });
+                        if ui
+                            .small_button("\u{2B6E}")
+                            .on_hover_text("Refresh port list")
+                            .clicked()
+                        {
+                            refresh = true;
+                        }
+                    });
+                    ui.end_row();
+                    // Baud — radios for common rates plus a free-entry box for any custom
+                    // rate. The box keeps its own buffer (egui temp memory, keyed per
+                    // channel) so typing isn't clobbered each frame: the old
+                    // re-derive-from-state box cleared itself the instant a standard rate was
+                    // typed, and couldn't hold a custom one. A radio click resyncs the box;
+                    // otherwise the typed text wins.
+                    let buf_id = egui::Id::new(("baud_custom_text", channel_id));
+                    let mut text = ui
+                        .data(|d| d.get_temp::<String>(buf_id))
+                        .unwrap_or_else(|| serial.baud_rate.to_string());
+                    ui.label("Baud");
+                    ui.horizontal(|ui| {
+                        let before = serial.baud_rate;
+                        for &baud in BAUD_RATES {
+                            ui.radio_value(&mut serial.baud_rate, baud, baud.to_string());
+                        }
+                        if serial.baud_rate != before {
+                            // A radio set the rate — mirror it into the custom box.
+                            text = serial.baud_rate.to_string();
+                        }
+                        ui.label("custom");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut text)
+                                    .id_salt("baud_custom")
+                                    .desired_width(80.0)
+                                    .hint_text("e.g. 250000"),
+                            )
+                            .changed()
+                        {
+                            if let Ok(baud) = text.trim().parse::<u32>() {
+                                if baud > 0 {
+                                    serial.baud_rate = baud;
+                                }
                             }
                         }
                     });
-                if ui
-                    .small_button("\u{2B6E}")
-                    .on_hover_text("Refresh port list")
-                    .clicked()
-                {
-                    refresh = true;
-                }
-            });
-            // Baud — radios for common rates plus a free-entry box for any custom
-            // rate. The box keeps its own buffer (egui temp memory, keyed per
-            // channel) so typing isn't clobbered each frame: the old
-            // re-derive-from-state box cleared itself the instant a standard rate was
-            // typed, and couldn't hold a custom one. A radio click resyncs the box;
-            // otherwise the typed text wins.
-            let buf_id = egui::Id::new(("baud_custom_text", channel_id));
-            let mut text = ui
-                .data(|d| d.get_temp::<String>(buf_id))
-                .unwrap_or_else(|| serial.baud_rate.to_string());
-            ui.horizontal(|ui| {
-                ui.label(bold("Baud"));
-                let before = serial.baud_rate;
-                for &baud in BAUD_RATES {
-                    ui.radio_value(&mut serial.baud_rate, baud, baud.to_string());
-                }
-                if serial.baud_rate != before {
-                    // A radio set the rate — mirror it into the custom box.
-                    text = serial.baud_rate.to_string();
-                }
-                ui.label("custom");
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut text)
-                            .id_salt("baud_custom")
-                            .desired_width(80.0)
-                            .hint_text("e.g. 250000"),
-                    )
-                    .changed()
-                {
-                    if let Ok(baud) = text.trim().parse::<u32>() {
-                        if baud > 0 {
-                            serial.baud_rate = baud;
-                        }
-                    }
-                }
-            });
-            ui.data_mut(|d| d.insert_temp(buf_id, text));
-            radio_row(ui, "Data bits", &mut serial.data_bits, DATA_BITS);
-            radio_row(ui, "Parity", &mut serial.parity, PARITY);
-            radio_row(ui, "Stop bits", &mut serial.stop_bits, STOP_BITS);
-            radio_row(ui, "Flow", &mut serial.flow_control, FLOW_CONTROL);
+                    ui.end_row();
+                    ui.data_mut(|d| d.insert_temp(buf_id, text));
+                    radio_row(ui, "Data bits", &mut serial.data_bits, DATA_BITS);
+                    radio_row(ui, "Parity", &mut serial.parity, PARITY);
+                    radio_row(ui, "Stop bits", &mut serial.stop_bits, STOP_BITS);
+                    radio_row(ui, "Flow", &mut serial.flow_control, FLOW_CONTROL);
+                });
         }
     }
     refresh
