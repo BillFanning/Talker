@@ -165,12 +165,20 @@ Message-model removal). Everything below this block is verified done:
       not auto-recording, so the toggle controls it. Pinned by
       `set_recording_begins_and_stops_raw_recording_live` (pipeline) +
       `set_recording_toggles_raw_recording_live_through_the_orchestrator` (loopback).
-- [ ] Expose the `.raw` timestamp sidecar in the UI (§57). The byte-offset-keyed
-      `.raw.idx` sidecar is **built** (`RawFileRecorder` writes `<offset>,<wall_nanos>`
-      when `RawRecordingConfig.timestamp_enabled`), byte-exact-safe (out of `.raw`), and
-      kept — but the flag is **config-only**: no GUI/CLI toggle sets it, so it never
-      turns on in practice. Add a control (and decide read-side tooling: a companion
-      viewer that pairs `.raw.idx` offsets with `.raw` bytes).
+- [x] Expose the `.raw` timestamp sidecar in the UI (§57) — done 2026-08-05. A
+      **Timestamp sidecar** checkbox in the Raw recording editor sets
+      `RawRecordingConfig.timestamp_enabled`, which was previously config-only, so
+      the writer never ran in practice. Raw-only by design: the sidecar keys times to
+      byte offsets, which a rendered `.disp` has no stable offsets for. When on, the
+      resulting file name is shown beside the checkbox (or `<recording>.idx` under
+      rotation, where the name is minted per period). Pinned by
+      `the_timestamp_sidecar_flag_reaches_the_recording_settings`.
+      **Read-side tooling: decided against, for now.** The sidecar is plain text
+      (`<offset>,<wall_nanos>` per line), so every tool already reads it; the help
+      text now states the format, the per-block (not per-byte) capture point, and
+      that a nanosecond field is not nanosecond accuracy. A bundled viewer pairing
+      `.raw.idx` offsets against `.raw` bytes is a real feature with no spec section
+      behind it — revisit with an amendment, not as a follow-up to this control.
 - [ ] General match-rule editor UI: the `Idle`/`Record`/`Notify`/`PauseDisplay`
       conditions + actions. The `BytePattern → Mark(+timestamp)` subset now has a
       minimal editor (ADR-016); the rest still arrive only via profiles.

@@ -1518,6 +1518,31 @@ mod tests {
         );
     }
 
+    /// The timestamp sidecar reaches the recorder from config (§57). The writer
+    /// was always there; until the GUI grew a control, nothing ever set the flag,
+    /// so this pins the path the control drives.
+    #[test]
+    fn the_timestamp_sidecar_flag_reaches_the_recording_settings() {
+        use crate::config::schema::RawRecordingConfig;
+        use crate::record::OverwritePolicy;
+        let listener = Listener::with_default_capacities();
+        let off = RawRecordingConfig {
+            enabled: true,
+            destination: Some(std::path::PathBuf::from("C:/tmp/rec.raw")),
+            timestamp_enabled: false,
+            overwrite_policy: OverwritePolicy::Overwrite,
+            file_rotation: FileRotationPolicy::None,
+            disk_guard: None,
+        };
+        assert!(!listener.settings_from(&off, "GPS").unwrap().timestamps);
+
+        let on = RawRecordingConfig {
+            timestamp_enabled: true,
+            ..off
+        };
+        assert!(listener.settings_from(&on, "GPS").unwrap().timestamps);
+    }
+
     #[test]
     fn unset_diagnostic_limits_fall_back_to_the_bounded_default() {
         // §88/§124: a channel config with no explicit event/warning/error limits

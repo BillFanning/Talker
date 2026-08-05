@@ -98,10 +98,25 @@ fn recording_file_fields(
     });
 }
 
-/// Edit the channel's **Raw** recording setup (§53): destination, overwrite, rotation.
-/// The byte-exact verbatim stream (§53) — a separate pipeline tap from Display
-/// (ADR-013). The live Record toggle and the "Record on start" flag (`enabled`, ADR-012)
-/// live next to the Record button, not here.
+/// Help for the timestamp sidecar (§57). It names the file, the format, and the
+/// resolution the timestamps actually have — a nanosecond *field* is not
+/// nanosecond accuracy, and the recorded time is when the read completed, not
+/// when any particular byte reached the wire.
+const TIMESTAMP_SIDECAR_TOOLTIP: &str = concat!(
+    "Write arrival times to a companion file beside the recording, named after it ",
+    "with .idx added (GPS.raw → GPS.raw.idx). One line per received block: the byte ",
+    "offset where that block starts in the .raw, a comma, and the wall-clock time in ",
+    "nanoseconds since the Unix epoch. It is plain text, so any tool can read it, and ",
+    "it is kept out of the .raw so that file stays byte-exact. Times are captured per ",
+    "block when the read completes — not per byte, and not device or wire time — so a ",
+    "nanosecond field does not imply nanosecond accuracy. With rotation on, each ",
+    "rotated file gets its own sidecar and offsets restart at zero within it."
+);
+
+/// Edit the channel's **Raw** recording setup (§53): destination, overwrite, rotation,
+/// timestamp sidecar. The byte-exact verbatim stream (§53) — a separate pipeline tap
+/// from Display (ADR-013). The live Record toggle and the "Record on start" flag
+/// (`enabled`, ADR-012) live next to the Record button, not here.
 pub(crate) fn edit_raw_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) {
     let rec = &mut config.raw_recording;
     recording_file_fields(
@@ -110,6 +125,26 @@ pub(crate) fn edit_raw_recording(ui: &mut egui::Ui, config: &mut ChannelConfig) 
         &mut rec.overwrite_policy,
         &mut rec.file_rotation,
     );
+    // Raw only: the sidecar keys wall-clock times to byte offsets in the `.raw`,
+    // which a rendered `.disp` has no stable offsets for (ADR-013 keeps the two
+    // taps independent, and only this one is byte-exact).
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut rec.timestamp_enabled, "Timestamp sidecar")
+            .on_hover_text(TIMESTAMP_SIDECAR_TOOLTIP);
+        if rec.timestamp_enabled {
+            let name = rec
+                .destination
+                .as_ref()
+                .filter(|_| rec.file_rotation == FileRotationPolicy::None)
+                .and_then(|path| path.file_name())
+                .map(|name| format!("{}.idx", name.to_string_lossy()))
+                // With rotation the file name is minted per period (§59), so
+                // naming one would be a guess; name the suffix instead.
+                .unwrap_or_else(|| "<recording>.idx".to_owned());
+            ui.label(egui::RichText::new(name).weak())
+                .on_hover_text(TIMESTAMP_SIDECAR_TOOLTIP);
+        }
+    });
 }
 
 /// Edit the channel's **Display** recording setup (§54): destination, overwrite,
