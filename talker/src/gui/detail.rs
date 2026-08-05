@@ -20,7 +20,9 @@ use crate::core::{
 use wiredata_ui::{
     diagnostics::{attention_callout, decision_card, signal_grid, signal_row, SignalTone},
     fonts::bold,
-    format::{compact_duration, human_byte_rate, human_bytes, percent, thousands},
+    format::{
+        compact_duration, human_byte_rate, human_bytes, percent, serial_port_hint, thousands,
+    },
     glyphs,
 };
 
@@ -515,6 +517,15 @@ impl TalkerApp {
         // pair of buttons lived in visibly different places in the two apps.
         if let Some(err) = &error {
             ui.colored_label(pal.fault_red, format!("\u{26A0} {err}"));
+            // Only the UI knows what is currently enumerated, so only the UI can
+            // say whether the port the OS called absent is still in the list.
+            if draft_kind == ConnKind::Serial {
+                let port = self.conn_drafts[i].serial_port.clone();
+                if !port.is_empty() {
+                    let listed = self.serial_ports.contains(&port);
+                    ui.colored_label(pal.warning_amber, serial_port_hint(&port, listed));
+                }
+            }
         }
         ui.add_space(12.0); // a blank line between the readouts and the buttons
         self.show_lifecycle_buttons(ui, i, running, iface_drift || run_drift, error.is_some());

@@ -124,6 +124,10 @@ pub enum UiCommand {
     /// `ProfileLoaded`; a load/parse error yields `ProfileError` and leaves the
     /// workspace untouched.
     LoadProfile(std::path::PathBuf),
+    /// Discard the workspace and start empty: stop and remove every channel,
+    /// emitting the usual `ChannelRemoved` updates so the UI folds the change.
+    /// The teardown half of `LoadProfile` with nothing loaded after it.
+    NewProfile,
     /// Stop all channels and end the driver (the App is closing).
     Shutdown,
 }
@@ -476,6 +480,7 @@ impl Driver {
             }
             UiCommand::SaveProfile(path) => self.save_profile(path),
             UiCommand::LoadProfile(path) => self.load_profile(path).await,
+            UiCommand::NewProfile => self.new_profile().await,
             UiCommand::Shutdown => return false,
         }
         true
@@ -507,6 +512,18 @@ impl Driver {
     /// do we stop/remove every existing channel and register the loaded ones
     /// (Stopped — load never starts a channel). Each removal/addition emits the
     /// usual update so the App folds the swap with no special-casing.
+    /// Tear the workspace down and leave it empty. Shares `load_profile`'s
+    /// teardown so a new profile and a loaded one start from the same state —
+    /// live channels stopped first (§8.5), selection and cursors cleared.
+    async fn new_profile(&mut self) {
+        for id in std::mem::take(&mut self.channels) {
+            let _ = self.listener.remove_channel(id).await;
+            self.push(UiUpdate::ChannelRemoved(id));
+        }
+        self.selected = None;
+        self.stream_cursors.clear();
+    }
+
     async fn load_profile(&mut self, path: std::path::PathBuf) {
         let profile = match Profile::load(&path) {
             Ok(p) => p,
@@ -618,16 +635,17 @@ impl Driver {
         sent
     }
 
-    /// Surface a channel error, identified by the channel **name** rather than a raw
-    /// id: `"<name>: <error>"`. (The id still routes the error to the right channel in
-    /// the UI; this makes the text itself readable wherever it's shown.) Falls back to
-    /// the bare error if the channel has no stored config.
+    /// Surface a channel error. The id routes it to the right channel, and the
+    /// text is the error alone.
+    ///
+    /// The channel name used to be prefixed, but every surface that shows this
+    /// already identifies the channel — the detail pane sits under that
+    /// channel's Name field, and the list row is that channel's own tab — so the
+    /// prefix repeated what was next to it. It also made these messages differ
+    /// from talker's for the same failure, and from Listener's own
+    /// `complain_unconfigured`, which never prefixed.
     fn push_channel_error(&self, id: ChannelId, error: impl std::fmt::Display) {
-        let msg = match self.listener.config(id) {
-            Some(cfg) => format!("{}: {error}", cfg.name.as_str()),
-            None => error.to_string(),
-        };
-        self.push(UiUpdate::ChannelError(id, msg));
+        self.push(UiUpdate::ChannelError(id, error.to_string()));
     }
 }
 

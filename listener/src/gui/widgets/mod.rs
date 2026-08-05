@@ -112,11 +112,13 @@ pub(super) const MSG_FONT_SIZES: &[f32] = &[
 ];
 
 /// Serial option tables (value, label) for the radio rows (§74).
+/// Widest first: 8 is the overwhelmingly common setting, so it sits leftmost
+/// where the eye lands, matching talker's row.
 const DATA_BITS: &[(DataBits, &str)] = &[
-    (DataBits::Five, "5"),
-    (DataBits::Six, "6"),
-    (DataBits::Seven, "7"),
     (DataBits::Eight, "8"),
+    (DataBits::Seven, "7"),
+    (DataBits::Six, "6"),
+    (DataBits::Five, "5"),
 ];
 const PARITY: &[(Parity, &str)] = &[
     (Parity::None, "None"),
@@ -139,8 +141,8 @@ const FLOW_CONTROL: &[(FlowControl, &str)] = &[
 /// Common serial baud rates for the baud radio row (§14.4).
 const BAUD_RATES: &[u32] = &[4800, 9600, 19200, 38400, 57600, 115200, 230400];
 
-/// A labelled row of radio buttons bound to an enum value with a fixed option table.
-/// One labelled row of radios inside the serial grid.
+/// One labelled row of radios inside the serial grid, bound to an enum value
+/// with a fixed option table.
 ///
 /// Grid rather than `horizontal` so the label occupies its own column: with a
 /// per-row `horizontal`, every row's controls started wherever that row's label
@@ -341,15 +343,34 @@ pub(super) fn edit_interface(
                     // Port dropdown + refresh.
                     ui.label("Port");
                     ui.horizontal(|ui| {
+                        // The closed box shows the *configured* port, which
+                        // outlives the hardware — it is saved in the profile.
+                        // Say so when the port is not currently enumerated, or
+                        // the box reads as though the device were present while
+                        // the list behind it is empty.
                         let label = if serial.port.is_empty() {
                             "select port\u{2026}".to_string()
-                        } else {
+                        } else if serial_ports.contains(&serial.port) {
                             serial.port.clone()
+                        } else {
+                            format!("{} (not found)", serial.port)
                         };
-                        egui::ComboBox::from_id_salt("serial_port")
+                        let combo = egui::ComboBox::from_id_salt("serial_port")
                             .selected_text(label)
                             .width(150.0)
                             .show_ui(ui, |ui| {
+                                // A way back to "no port". Without it a
+                                // configured port can never be unset: the list
+                                // holds only real ports, so when none are
+                                // present it holds nothing selectable at all,
+                                // and a port whose hardware has gone is stuck.
+                                if !serial.port.is_empty() {
+                                    ui.selectable_value(
+                                        &mut serial.port,
+                                        String::new(),
+                                        "(clear selection)",
+                                    );
+                                }
                                 if serial_ports.is_empty() {
                                     ui.weak("No ports found");
                                 } else {
@@ -358,6 +379,15 @@ pub(super) fn edit_interface(
                                     }
                                 }
                             });
+                        // Re-enumerate as the list is opened, not only at
+                        // startup and on the refresh button: otherwise the
+                        // choices are a snapshot from launch, and a port
+                        // unplugged since then still looks selectable.
+                        // Enumeration is not free, so this fires on the click
+                        // that opens the list rather than every frame it is open.
+                        if combo.response.clicked() {
+                            refresh = true;
+                        }
                         if ui
                             .small_button("\u{2B6E}")
                             .on_hover_text("Refresh port list")

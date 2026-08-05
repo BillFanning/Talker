@@ -107,7 +107,7 @@ impl ListenerApp {
             return;
         };
         self.sync_edit_draft(id);
-        let Some((details, status, bytes_total, bps, last_error, recording)) =
+        let Some((details, status, bytes_total, bps, last_error, recording, serial_port)) =
             self.state.channel(id).map(|v| {
                 (
                     v.details.clone(),
@@ -116,6 +116,10 @@ impl ListenerApp {
                     v.bytes_per_sec,
                     v.last_error.clone(),
                     v.recording,
+                    match &v.config.interface {
+                        crate::config::InterfaceConfig::Serial(serial) => Some(serial.port.clone()),
+                        _ => None,
+                    },
                 )
             })
         else {
@@ -159,6 +163,22 @@ impl ListenerApp {
         });
         if let Some(err) = &last_error {
             ui.colored_label(palette(ui).fault_red, format!("⚠ {err}"));
+        }
+        // Only the UI knows what is currently enumerated, so only the UI can say
+        // whether the port the OS called absent is still in the list.
+        //
+        // Keyed on Faulted as well as `last_error`: a failed *start* takes the
+        // channel to Faulted and leaves its reason to the runtime's diagnostics
+        // headline rather than setting `last_error`, so gating on the error
+        // alone hid this hint in exactly the case it was written for.
+        if status == ChannelStatus::Faulted || last_error.is_some() {
+            if let Some(port) = serial_port.filter(|p| !p.is_empty()) {
+                let listed = self.serial_ports.contains(&port);
+                ui.colored_label(
+                    palette(ui).warning_amber,
+                    wiredata_ui::format::serial_port_hint(&port, listed),
+                );
+            }
         }
         if let Some(view) = self.state.channel(id) {
             ui.add_space(6.0);

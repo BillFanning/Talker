@@ -10,6 +10,13 @@ const TAB_CLIP_TOLERANCE: f32 = 0.5;
 /// deliberately exceeds the curve radius so pixel rounding cannot clip the
 /// first or last card out of connector eligibility.
 pub const TAB_JOIN_MARGIN: f32 = TAB_JOIN_RADIUS + 2.0;
+
+/// Width of the channel list's Profile menu, in both apps.
+///
+/// Pinned rather than content-sized: without it each menu takes the width of
+/// whichever recent-file name happens to be longest, so the two apps' menus
+/// differ from each other and jump about as the recents list changes.
+pub const PROFILE_MENU_WIDTH: f32 = 200.0;
 const TAB_ARC_STEPS: usize = 24;
 
 /// Stable channel identity used in full and compact channel-list rows.

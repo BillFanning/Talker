@@ -46,15 +46,10 @@ impl ListenerApp {
             // so the two apps read and behave identically). Both themes'
             // visuals are pre-installed (ADR-019).
             wiredata_ui::style::theme_toggle_button(ui, &mut self.dark_mode);
-            ui.menu_button("+ Add", |ui| {
-                for kind in AddKind::ADD_MENU {
-                    if ui.button(kind.label()).clicked() {
-                        self.add_channel(kind);
-                        ui.close();
-                    }
-                }
-            });
             ui.menu_button("Profile", |ui| {
+                // Fixed width so the menu is the same size in both apps rather
+                // than sized by whichever recent-file name happens to be longest.
+                ui.set_min_width(selection::PROFILE_MENU_WIDTH);
                 // Recent profiles at the top: one click reloads (replaces the
                 // workspace, §70). Most-recent-first. The header always shows (with a
                 // placeholder when empty) so the section is visibly present.
@@ -93,6 +88,11 @@ impl ListenerApp {
                     self.load_profile_dialog();
                     ui.close();
                 }
+                ui.separator();
+                if ui.button("New").clicked() {
+                    self.new_profile();
+                    ui.close();
+                }
             });
         });
         // Bulk actions on their own row, as in talker. A `horizontal` does not
@@ -117,6 +117,18 @@ impl ListenerApp {
                 // driver iterates server-side and skips already-Stopped channels.
                 self.send(UiCommand::StopAll);
             }
+            // "+ Add" rides with the bulk actions rather than the title row, so
+            // the header carries only the title, theme toggle and Profile. That
+            // also lowers the header row's minimum width, which is the floor the
+            // channel panel can be dragged down to.
+            ui.menu_button("+ Add", |ui| {
+                for kind in AddKind::ADD_MENU {
+                    if ui.button(kind.label()).clicked() {
+                        self.add_channel(kind);
+                        ui.close();
+                    }
+                }
+            });
         });
         // The last Save/Load outcome (e.g. "Saved foo.toml" or an error), if any.
         if let Some(status) = self.state.workspace_status() {
@@ -312,6 +324,25 @@ impl ListenerApp {
         if let Some(path) = dialog.pick_file() {
             self.load_profile_path(path);
         }
+    }
+
+    /// Discard the workspace and start empty.
+    ///
+    /// Always confirms: Listener tracks no dirty flag, so it cannot know whether
+    /// anything would be lost — and this removes every channel, running ones
+    /// included. Uses the same native dialog as talker's New.
+    pub(super) fn new_profile(&mut self) {
+        let confirmed = rfd::MessageDialog::new()
+            .set_title("New Profile")
+            .set_description("Remove all channels and start a new profile?")
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .show()
+            == rfd::MessageDialogResult::Ok;
+        if !confirmed {
+            return;
+        }
+        self.current_profile_path = None;
+        self.send(UiCommand::NewProfile);
     }
 
     /// Load a profile from a known path (used by both the picker and the recent-files

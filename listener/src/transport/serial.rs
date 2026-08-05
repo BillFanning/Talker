@@ -257,6 +257,19 @@ impl SerialTransport {
         }
     }
 
+    /// Name the port in an open failure; the OS text is otherwise verbatim.
+    ///
+    /// `serialport` reports only the OS description, which does not say which
+    /// port it was. Why an enumerated port can still fail to open is the UI's
+    /// to explain (`serial_port_hint`) — only it knows what is currently
+    /// listed, and saying it here too put the same sentence on screen twice.
+    fn name_the_port(port: &str, error: serialport::Error) -> serialport::Error {
+        serialport::Error::new(
+            error.kind(),
+            format!("opening serial port {port:?}: {}", error.description),
+        )
+    }
+
     fn open_blocking(self) -> serialport::Result<OpenSerialTransport> {
         let mut port = serialport::new(&self.port, self.baud_rate)
             .data_bits(self.data_bits)
@@ -264,7 +277,8 @@ impl SerialTransport {
             .stop_bits(self.stop_bits)
             .flow_control(self.flow_control)
             .timeout(self.read_timeout)
-            .open()?;
+            .open()
+            .map_err(|e| Self::name_the_port(&self.port, e))?;
         if let Some(rts) = self.rts {
             port.write_request_to_send(rts)?;
         }

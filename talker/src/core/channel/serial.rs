@@ -16,6 +16,11 @@ impl SerialInterface {
             .flow_control(to_sp_flow_control(config.flow_control))
             .timeout(std::time::Duration::from_secs(1))
             .open()
+            // Names the port and otherwise reports the OS verbatim. Why a port
+            // that appears in the list can still fail to open is the UI's to
+            // explain (`serial_port_hint`) — only it knows what is currently
+            // enumerated, and saying it here too put the same sentence on
+            // screen twice.
             .with_context(|| format!("opening serial port {:?}", config.port))?;
         Ok(Self { port })
     }

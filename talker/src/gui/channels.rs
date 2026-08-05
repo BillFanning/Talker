@@ -66,14 +66,6 @@ impl TalkerApp {
                 self.channels_collapsed = true;
             }
             ui.heading("Channels");
-            ui.menu_button("+ Add", |ui| {
-                for kind in ConnKind::ADD_MENU {
-                    if ui.button(kind.label()).clicked() {
-                        self.deferred.add_channel = Some(kind);
-                        ui.close();
-                    }
-                }
-            });
             self.show_profile_menu(ui);
         });
         // Bulk actions on their own row so the header doesn't crowd. Plain
@@ -91,6 +83,18 @@ impl TalkerApp {
             if ui.button("Stop all").clicked() {
                 self.deferred.stop_all = true;
             }
+            // "+ Add" rides with the bulk actions rather than the title row, so
+            // the header carries only the title and Profile. That also lowers
+            // the header row's minimum width, which is the floor the channel
+            // panel can be dragged down to.
+            ui.menu_button("+ Add", |ui| {
+                for kind in ConnKind::ADD_MENU {
+                    if ui.button(kind.label()).clicked() {
+                        self.deferred.add_channel = Some(kind);
+                        ui.close();
+                    }
+                }
+            });
         });
         // The current profile + dirty marker (listener's status line under
         // its header). Renaming happens via Save As…, as in listener.
@@ -157,6 +161,9 @@ impl TalkerApp {
     /// channel-list header next to "+ Add", as in listener.
     fn show_profile_menu(&mut self, ui: &mut egui::Ui) {
         ui.menu_button("Profile", |ui| {
+            // Fixed width so the menu is the same size in both apps rather than
+            // sized by whichever recent-file name happens to be longest.
+            ui.set_min_width(selection::PROFILE_MENU_WIDTH);
             // Recent profiles at the top: one click reloads. Most-recent-
             // first. The header always shows (with a placeholder when empty)
             // so the section is visibly present.

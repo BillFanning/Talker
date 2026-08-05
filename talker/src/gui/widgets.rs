@@ -364,15 +364,32 @@ pub(super) fn show_serial_fields(
         .show(ui, |ui| {
             ui.label("Port");
             ui.horizontal(|ui| {
+                // The closed box shows the *configured* port, which outlives the
+                // hardware — it is saved in the profile. Say so when the port is
+                // not currently enumerated, or the box reads as though the
+                // device were present while the list behind it is empty.
                 let label = if conn.serial_port.is_empty() {
                     "select port\u{2026}".to_string()
-                } else {
+                } else if ports.contains(&conn.serial_port) {
                     conn.serial_port.clone()
+                } else {
+                    format!("{} (not found)", conn.serial_port)
                 };
-                egui::ComboBox::from_label("")
+                let combo = egui::ComboBox::from_label("")
                     .selected_text(label)
                     .width(180.0)
                     .show_ui(ui, |ui| {
+                        // A way back to "no port". Without it a configured port
+                        // can never be unset: the list holds only real ports, so
+                        // when none are present it holds nothing selectable at
+                        // all, and a port whose hardware has gone is stuck.
+                        if !conn.serial_port.is_empty() {
+                            ui.selectable_value(
+                                &mut conn.serial_port,
+                                String::new(),
+                                "(clear selection)",
+                            );
+                        }
                         if ports.is_empty() {
                             ui.weak("No ports found");
                         } else {
@@ -381,6 +398,14 @@ pub(super) fn show_serial_fields(
                             }
                         }
                     });
+                // Re-enumerate as the list is opened, not only at startup and
+                // on the refresh button: otherwise the choices are a snapshot
+                // from launch, and a port unplugged since then still looks
+                // selectable. Enumeration is not free, so this fires on the
+                // click that opens the list rather than every frame it is open.
+                if combo.response.clicked() {
+                    refresh = true;
+                }
                 if ui
                     .small_button("\u{21ba}")
                     .on_hover_text("Refresh port list")
@@ -429,7 +454,7 @@ pub(super) fn show_serial_fields(
 
             ui.label("Data bits");
             ui.horizontal(|ui| {
-                for &bits in &[5u8, 6, 7, 8] {
+                for &bits in &[8u8, 7, 6, 5] {
                     ui.radio_value(&mut conn.data_bits, bits, bits.to_string());
                 }
             });
