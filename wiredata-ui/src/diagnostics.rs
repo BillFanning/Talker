@@ -64,7 +64,10 @@ use std::hash::Hash;
 
 use egui::{Color32, Response, RichText, Ui, WidgetText};
 
-use crate::{fonts::bold, palette::active};
+use crate::{
+    fonts::bold,
+    palette::{active, tint},
+};
 
 /// Visual emphasis for a diagnostic signal. Semantics and thresholds remain local
 /// to the application that owns the measurement.
@@ -111,10 +114,8 @@ fn translucent(accent: Color32, alpha: u8) -> Color32 {
 fn card_frame(ui: &Ui) -> egui::Frame {
     let visuals = ui.visuals();
     let neutral = visuals.widgets.noninteractive.bg_stroke.color;
-    let stroke = visuals.panel_fill.blend(translucent(neutral, 150));
-    let fill = visuals
-        .panel_fill
-        .blend(translucent(visuals.widgets.noninteractive.weak_bg_fill, 90));
+    let stroke = tint(ui, neutral, 150);
+    let fill = tint(ui, visuals.widgets.noninteractive.weak_bg_fill, 90);
     egui::Frame::group(ui.style())
         .fill(fill)
         .stroke(egui::Stroke::new(1.0_f32, stroke))
@@ -125,7 +126,7 @@ fn card_frame(ui: &Ui) -> egui::Frame {
 fn status_badge(ui: &mut Ui, text: WidgetText, tone: SignalTone) -> Response {
     let accent = tone.accent(ui);
     let text_color = tone.text_color(ui);
-    let fill = ui.visuals().panel_fill.blend(translucent(accent, 38));
+    let fill = tint(ui, accent, 38);
     egui::Frame::new()
         .fill(fill)
         .stroke(egui::Stroke::new(1.0_f32, translucent(accent, 145)))
@@ -225,7 +226,7 @@ pub fn attention_callout(
 ) -> Response {
     debug_assert!(matches!(tone, SignalTone::Warning | SignalTone::Fault));
     let accent = tone.accent(ui);
-    let fill = ui.visuals().panel_fill.blend(translucent(accent, 24));
+    let fill = tint(ui, accent, 24);
     let response = ui
         .push_id(id_source, |ui| {
             egui::Frame::new()

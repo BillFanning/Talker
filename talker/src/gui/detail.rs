@@ -997,12 +997,16 @@ fn show_schedule_section(
                                     {
                                         entry.pending_remove = false;
                                     }
+                                    // The one red both apps use for destructive
+                                    // and faulted, so "this discards something"
+                                    // never arrives in a second shade.
+                                    let palette = wiredata_ui::palette::active(ui);
                                     let confirm = egui::Button::new(
                                         egui::RichText::new("Remove")
                                             .color(egui::Color32::WHITE)
                                             .strong(),
                                     )
-                                    .fill(egui::Color32::from_rgb(180, 60, 60));
+                                    .fill(palette.fault_red);
                                     if ui
                                         .add(confirm)
                                         .on_hover_text("Permanently remove this message")
@@ -1012,7 +1016,7 @@ fn show_schedule_section(
                                     }
                                     ui.label(
                                         egui::RichText::new("Remove this message?")
-                                            .color(egui::Color32::from_rgb(220, 180, 80)),
+                                            .color(palette.warning_amber),
                                     );
                                 } else if ui
                                     .button(egui::RichText::new("\u{00D7}").size(18.0).strong())
@@ -1641,6 +1645,11 @@ fn show_message_preview(ui: &mut egui::Ui, analysis: &MessageDraftAnalysis) {
 /// from the user's perspective. "Active" = channel is running and this
 /// message will fire on its interval. "Idle" = channel is stopped, so
 /// the count is the last value seen.
+/// How strongly the message status strip is tinted by its state accent. Enough
+/// to read as a strip rather than another row of widgets, light enough that the
+/// theme's body text stays the most legible thing on it.
+pub(super) const STATUS_STRIP_TINT_ALPHA: u8 = 46;
+
 fn show_message_status(ui: &mut egui::Ui, channel_running: bool, sent: u64) {
     // Footer bar: separator above to split it from the message body, then
     // a tinted Frame so the "Active / Sent: N" line reads as a status
@@ -1649,25 +1658,17 @@ fn show_message_status(ui: &mut egui::Ui, channel_running: bool, sent: u64) {
     // GUI feel like the same component.
     ui.add_space(2.0);
     ui.separator();
-    let dark = ui.visuals().dark_mode;
+    let palette = wiredata_ui::palette::active(ui);
     let (dot_color, state) = if channel_running {
-        (egui::Color32::from_rgb(80, 200, 80), "Active")
+        (palette.running_green, "Active")
     } else {
-        (
-            egui::Color32::from_gray(if dark { 140 } else { 120 }),
-            "Idle",
-        )
+        (palette.idle_grey, "Idle")
     };
-    // Tinted strip behind the status line, keyed to the theme so the
-    // label text (which follows the theme's body colour) stays
-    // legible on it: a deep green / dim grey on dark, a pale green /
-    // light grey on light.
-    let bg = match (channel_running, dark) {
-        (true, true) => egui::Color32::from_rgb(28, 52, 28),
-        (true, false) => egui::Color32::from_rgb(205, 232, 205),
-        (false, true) => egui::Color32::from_gray(40),
-        (false, false) => egui::Color32::from_gray(222),
-    };
+    // Tinted strip behind the status line. Blending the same accent into the
+    // panel gives a deep green on dark and a pale one on light without naming
+    // four background colors that would drift the moment the accent changed —
+    // and the label text keeps the theme's body colour, so it stays legible.
+    let bg = wiredata_ui::palette::tint(ui, dot_color, STATUS_STRIP_TINT_ALPHA);
     egui::Frame::default()
         .fill(bg)
         .corner_radius(egui::CornerRadius::same(3))

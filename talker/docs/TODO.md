@@ -84,12 +84,20 @@ Cross off items as they are completed. Add new ones inline as they come up.
   ADR-019 entry. CLI adoption rides with the future ad-hoc CLI work (the
   parity item below) — the one-shot headless run keeps its blocking `--echo`
   funnel by design. Pinned by the `core::supervisor` unit tests.
-- [ ] **Palette bypasses.** Several status/warning/log/destructive colors are
-  hardcoded in the talker GUI (e.g. `gui/detail.rs` destructive red,
-  `gui/mod.rs` log-severity colors) instead of coming from
-  `wiredata_ui::palette`. Move the semantic colors into shared palette helpers
-  (chrome rule, talker ADR-016 / listener ADR-019) — the next useful GUI
-  convergence step.
+- [x] **Palette bypasses** — done 2026-08-05 (ADR-048). Status, severity and
+  destructive colors now come from `wiredata_ui::palette`: `level_color`'s six
+  literals, the status-bar and message-status dots, the Remove confirm button and
+  its prompt, and the invalid-field outline (whose own comment already claimed it
+  was "the rest of the GUI's warning red" while being a different value). The
+  palette gains `tint(ui, accent, alpha)`, which derives a surface from an accent
+  and the theme's panel fill — so the four hand-named status-strip backgrounds and
+  the invalid-field wash are gone, and the shared diagnostics card's private
+  `translucent` now calls it. INFO takes `text_color()` rather than a palette
+  entry: it is the baseline the other severities are read against.
+  **Deliberately left Talker-owned:** the code-page replacement highlight
+  (ADR-023), the byte-marker blue, and the `?` fallback background. Those color
+  message *content*, not chrome — the same line the palette module doc already
+  draws — and the 3 px window-frame blue is an open trial, not a settled semantic.
 
 ## Robustness (external review round 2, 2026-07-12)
 

@@ -1328,9 +1328,10 @@ impl TalkerApp {
             ui.horizontal(|ui| {
                 let total = self.sup.len();
                 let running = (0..total).filter(|&i| self.sup.is_running(i)).count();
+                let palette = wiredata_ui::palette::active(ui);
                 let (color, label) = if running > 0 {
                     (
-                        egui::Color32::from_rgb(80, 200, 80),
+                        palette.running_green,
                         if running == total && total > 0 {
                             "\u{2022} All running".to_string()
                         } else {
@@ -1338,7 +1339,7 @@ impl TalkerApp {
                         },
                     )
                 } else {
-                    (egui::Color32::GRAY, "\u{2022} Stopped".to_string())
+                    (palette.idle_grey, "\u{2022} Stopped".to_string())
                 };
                 ui.colored_label(color, label);
                 ui.separator();
@@ -1409,7 +1410,6 @@ impl TalkerApp {
                     });
                 });
                 ui.separator();
-                let dark = ui.visuals().dark_mode;
                 // Filter first, then virtualize: `show_rows` lays out only the
                 // visible rows instead of all (up to 2,000) lines every
                 // repaint. Rows must be uniform height for virtualization, so
@@ -1436,7 +1436,7 @@ impl TalkerApp {
                                 egui::Label::new(
                                     egui::RichText::new(line)
                                         .monospace()
-                                        .color(level_color(level, dark)),
+                                        .color(level_color(ui, level)),
                                 )
                                 .truncate(),
                             )
@@ -1586,21 +1586,76 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
 /// background. INFO follows the theme's body text. DEBUG / TRACE are
 /// muted greys, lightened on dark and darkened on light so they
 /// stay legible and still read as "less important than INFO".
-fn level_color(level: tracing::Level, dark: bool) -> egui::Color32 {
+fn level_color(ui: &egui::Ui, level: tracing::Level) -> egui::Color32 {
+    let palette = wiredata_ui::palette::active(ui);
     match level {
-        tracing::Level::ERROR => egui::Color32::from_rgb(220, 80, 80),
-        tracing::Level::WARN if dark => egui::Color32::from_rgb(220, 180, 60),
-        tracing::Level::WARN => egui::Color32::from_rgb(150, 110, 0),
-        tracing::Level::DEBUG => egui::Color32::from_gray(if dark { 175 } else { 95 }),
-        tracing::Level::TRACE => egui::Color32::from_gray(if dark { 150 } else { 120 }),
-        // INFO: the theme's body text colour.
-        _ => egui::Color32::from_gray(if dark { 235 } else { 20 }),
+        // The same red as every other "something is wrong" in both apps: a log
+        // line reporting a fault should not be a second shade of it.
+        tracing::Level::ERROR => palette.fault_red,
+        tracing::Level::WARN => palette.warning_amber,
+        tracing::Level::DEBUG => palette.info_grey,
+        tracing::Level::TRACE => palette.idle_grey,
+        // INFO: the theme's body text colour — this line is the baseline the
+        // others are read against, so it takes no accent at all.
+        _ => ui.visuals().text_color(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Log severities come from the shared palette, in both themes.
+    ///
+    /// They used to be six hardcoded literals, so "error" in the log panel was a
+    /// different red from "faulted" everywhere else. INFO is the exception by
+    /// design: it is the baseline the other levels are read against, so it takes
+    /// the theme's body colour and no accent at all.
+    #[test]
+    fn log_severity_colors_come_from_the_shared_palette() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_theme(if dark {
+                egui::ThemePreference::Dark
+            } else {
+                egui::ThemePreference::Light
+            });
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let palette = wiredata_ui::palette::active(ui);
+                assert_eq!(level_color(ui, tracing::Level::ERROR), palette.fault_red);
+                assert_eq!(level_color(ui, tracing::Level::WARN), palette.warning_amber);
+                assert_eq!(level_color(ui, tracing::Level::DEBUG), palette.info_grey);
+                assert_eq!(level_color(ui, tracing::Level::TRACE), palette.idle_grey);
+                assert_eq!(
+                    level_color(ui, tracing::Level::INFO),
+                    ui.visuals().text_color()
+                );
+            });
+        }
+    }
+
+    /// A tinted surface is derived from the panel behind it, so one accent
+    /// covers both themes — the reason the palette holds no background pairs.
+    #[test]
+    fn a_tinted_status_strip_follows_the_theme_from_one_accent() {
+        let mut fills = Vec::new();
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_theme(if dark {
+                egui::ThemePreference::Dark
+            } else {
+                egui::ThemePreference::Light
+            });
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let accent = wiredata_ui::palette::active(ui).running_green;
+                let fill = wiredata_ui::palette::tint(ui, accent, detail::STATUS_STRIP_TINT_ALPHA);
+                assert_ne!(fill, accent, "a strip is a tint, not the accent itself");
+                assert_ne!(fill, ui.visuals().panel_fill, "the tint must be visible");
+                fills.push(fill);
+            });
+        }
+        assert_ne!(fills[0], fills[1], "light and dark strips must differ");
+    }
 
     #[test]
     fn throughput_uses_a_five_second_rolling_window_and_decays() {

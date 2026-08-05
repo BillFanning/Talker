@@ -1,10 +1,20 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.10
-**Date:** 2026-07-31
+**Version:** 1.11
+**Date:** 2026-08-05
 **Status:** Accepted
 
-Revision note (the warm-up gate retires):
+Revision note (semantic color has one source):
+
+- **ADR-048** routes Talker's remaining hardcoded status, severity and
+  destructive colors through `wiredata_ui::palette`, so a fault in the log panel
+  is the same red as a fault anywhere else in either application. The palette
+  gains `tint`, which derives a surface fill from an accent and the theme's own
+  panel color — replacing hand-named light/dark background pairs, which were the
+  same decision made twice and drifted the moment an accent changed. Content
+  annotation colors stay Talker-owned and are named as such.
+
+Revision note for 1.10 (the warm-up gate retires):
 
 - **ADR-046** removes the twenty-sample warm-up gate from Talker's readouts. It
   never guarded a bad computation: the percentile rank is
@@ -1671,6 +1681,68 @@ misinterpret data that is simply absent. The clipboard report drops
 actually applied. `TimerReason::PrecisionWindow` now means "interval at or above
 the threshold" rather than "the user chose Precise". Non-Windows behaviour is
 unchanged.
+
+---
+
+## ADR-048 — Semantic color has one source; surfaces are derived, not named
+
+**Status:** Accepted 2026-08-05. Completes the chrome rule of ADR-016 /
+listener ADR-019 for Talker's remaining bypasses.
+
+**Context:** `wiredata_ui::palette` was introduced to make a restyle a constant
+edit rather than a hunt through call sites, and Listener adopted it wholesale.
+Talker adopted it partly. What was left behind was not decorative: the log
+panel's six severity literals meant an ERROR line was `220,80,80` while a
+faulted channel was `fault_red`; the invalid-field outline carried its own red
+under a comment calling it "the rest of the GUI's warning red", which it was
+not; the status-bar and message-status dots each had their own green and grey.
+A user reading a fault in two places saw two reds and had no way to know they
+meant the same thing.
+
+The message status strip named four background colors — a green and a grey for
+each theme — chosen by hand to sit under body text.
+
+**Decision:** Every color that carries *meaning* comes from the palette. What
+"meaning" covers is status (running, idle), severity (error, warning, info,
+debug, trace), and destructive intent (the Remove button, an invalid field).
+
+Two things follow that were not just substitutions:
+
+- **Surfaces are derived from accents, not named beside them.** The palette
+  gains `tint(ui, accent, alpha)`, which blends an accent into the theme's own
+  `panel_fill`. A tinted surface then needs no light/dark pair: it lands pale on
+  light and deep on dark by construction, and it cannot drift away from the
+  accent it belongs to. The four hand-named status-strip backgrounds and the
+  invalid-field wash are now derived this way, and the shared diagnostics card's
+  private `translucent` helper is the same function — it was already doing this
+  privately, so `tint` de-duplicates rather than invents.
+- **INFO takes no accent.** It was `from_gray(235/20)`, which is body text
+  spelled as a literal. It is now `ui.visuals().text_color()`, because INFO is
+  the baseline the other severities are read *against*; giving it a palette
+  entry would assert it is a status when it is the absence of one.
+
+**Deliberately not moved:** the code-page replacement highlight (ADR-023), the
+byte-marker blue, and the `?` fallback background in the Wire preview. These
+color *message content*, not chrome — the same distinction the palette's own
+module doc already draws when it excludes stream/display content colors as
+"user-chosen per view". They are Talker-only, they exist to make one byte
+legible against its neighbours rather than to signal channel state, and moving
+them into shared chrome would make the palette answerable for Talker's message
+editor. The 3 px window-frame trial in `gui/mod.rs` is also untouched: it is an
+open experiment, not a settled semantic.
+
+**Consequences:** Some colors shift slightly — the invalid-field red moves from
+`220,80,80` to the palette's `fault_red`, and WARN/DEBUG/TRACE land on their
+nearest palette equivalents. That is the point: one red, one amber, one idle
+grey across both applications. `level_color` now takes `&Ui` rather than a
+`dark: bool`, since it reads both the palette and the theme's text color, and it
+is pinned in both themes by `log_severity_colors_come_from_the_shared_palette`.
+`tint` is pinned by `a_tinted_status_strip_follows_the_theme_from_one_accent`,
+which asserts the derived fill differs from both the accent and the panel, and
+differs between themes — the three ways a derived surface can be wrong.
+
+`wiredata-ui` still depends on `egui` alone; `tint` reads `Visuals` and nothing
+else.
 
 ---
 

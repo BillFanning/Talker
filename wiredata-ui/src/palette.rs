@@ -22,6 +22,25 @@ pub fn active(ui: &egui::Ui) -> &'static Palette {
     }
 }
 
+/// A semantic accent softened into a surface fill by blending it into the
+/// panel behind it, `alpha` out of 255.
+///
+/// A surface tinted this way needs no light and dark variants: it is derived
+/// from the theme's own panel color, so it lands pale on light and deep on
+/// dark by construction. That is why the palette holds accents and not
+/// backgrounds — a hardcoded pair of tints is the same decision made twice,
+/// and it drifts the moment an accent changes.
+pub fn tint(ui: &egui::Ui, accent: Color32, alpha: u8) -> Color32 {
+    ui.visuals()
+        .panel_fill
+        .blend(Color32::from_rgba_unmultiplied(
+            accent.r(),
+            accent.g(),
+            accent.b(),
+            alpha,
+        ))
+}
+
 /// The chrome colors, grouped by meaning rather than by widget.
 pub struct Palette {
     // ── Status / severity ────────────────────────────────────────────────

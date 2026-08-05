@@ -1963,12 +1963,18 @@ pub(super) fn red_bordered<F>(ui: &mut egui::Ui, invalid: bool, msg: &str, add: 
 where
     F: FnOnce(&mut egui::Ui) -> egui::Response,
 {
-    /// `220,80,80` — the rest of the GUI's "warning red" (status dot,
-    /// invalid-field outline, profile-summary `?` badge).
-    const RED: egui::Color32 = egui::Color32::from_rgb(220, 80, 80);
-    /// Translucent red — low alpha keeps text legible while making
-    /// the whole field obviously broken at a glance.
-    const TINT: egui::Color32 = egui::Color32::from_rgba_premultiplied(31, 12, 12, 36);
+    /// How strongly an invalid field is washed with the fault red. Low enough
+    /// that the text the user is fixing stays the most legible thing in it.
+    const TINT_ALPHA: u8 = 36;
+
+    // The shared fault red, so an invalid field, a faulted channel and a failed
+    // recording are all the same red — this used to be its own `220,80,80`,
+    // which its own comment described as "the rest of the GUI's warning red".
+    let red = wiredata_ui::palette::active(ui).fault_red;
+    // Derived from the same red rather than named, so the wash cannot drift
+    // away from the outline it sits inside, and it lands pale on the light
+    // theme and deep on the dark one without a second constant.
+    let tint = wiredata_ui::palette::tint(ui, red, TINT_ALPHA);
 
     // Always `ui.scope`, even when valid, so the field's id derives
     // from a stable position in the ui tree — flipping in and out of
@@ -1979,8 +1985,8 @@ where
             //  - `text_edit_bg_color` is the explicit override
             //  - `extreme_bg_color` is the fallback when the former is `None`
             let v = ui.visuals_mut();
-            v.text_edit_bg_color = Some(TINT);
-            v.extreme_bg_color = TINT;
+            v.text_edit_bg_color = Some(tint);
+            v.extreme_bg_color = tint;
         }
         add(ui)
     });
@@ -1992,7 +1998,7 @@ where
         ui.painter().rect_stroke(
             resp.rect,
             egui::CornerRadius::same(2),
-            egui::Stroke::new(2.0_f32, RED),
+            egui::Stroke::new(2.0_f32, red),
             egui::StrokeKind::Outside,
         );
         resp.on_hover_text(msg)
