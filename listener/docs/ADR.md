@@ -1244,6 +1244,64 @@ profile schema, recording format, or snapshot surface changes. The shared
 diagnostics-row chrome now attaches its tooltip to a row's label as well as its
 value (talker ADR-044), which reaches Listener's card automatically.
 
+## ADR-037 — Retire the warm-up gate; state the worst value with its sample count
+
+**Status:** Accepted 2026-08-05. Adopts talker ADR-046 on Listener's side.
+
+**Context:** Every duration readout in the Receive diagnostics card was gated on
+`TIMING_WARMUP_SAMPLES = 20`: below twenty samples it showed a maximum and
+labelled itself *warm-up*, above twenty it showed `p99 ≤ X`. The gate looked like
+a guard against an unreliable percentile, and it was not one. The percentile rank
+is `ceil(samples × 99 / 100)`, which equals `samples` for every count up to 99,
+so below a hundred samples the p99 bucket *is* the bucket holding the maximum.
+The gate relabelled a single number as two states, and it drew the line at 20
+while the two statistics only begin to separate at 100.
+
+It also cost the reader the one fact that was always exact. A maximum is true at
+one sample; the sample count is what says whether to trust it. The gate showed
+the count only while it was small and hid it exactly when the reader began
+relying on the figure.
+
+Talker reached this conclusion first (ADR-046). The shared vocabulary module
+recorded Listener's remaining gate as a deliberate divergence, which made the
+migration visible but left two applications describing one state two ways.
+
+**Decision:** No sample-count gate anywhere in Listener's diagnostics. State the
+largest value, always, with the population it came from — `worst 4 ms of 812
+chunks` — and add `99% ≤ X` only where `p99 < max` proves it is a different
+figure. That comparison is exactly the test for the p99 bucket sitting strictly
+below the maximum's, so the percentile appears when, and only when, it says
+something the maximum does not.
+
+Three consequences follow from applying one rule everywhere:
+
+- **The noun is the measurement's, not the transport's.** Handoff and Processing
+  count chunks; Idle-rule lateness counts firings. The row that reported firings
+  as an unlabelled integer now names them.
+- **The superlative is not always "worst".** Read gaps report the *longest*: a
+  quiet source is not a fault, and `worst` would imply one.
+- **Chunk sizes obey it too.** A median or percentile appears only when reads
+  actually varied, so a datagram socket delivering fixed-size payloads states
+  just the largest — which is the whole truth about its reads.
+
+**Consequences:** `TIMING_WARMUP_SAMPLES` is gone, along with the three tooltips
+that taught the retired state, and a test pins that no readout teaches it again.
+The compact Pipeline row states one chunk count and window for the line, so a
+boundary appends its own only when the populations differ — Handoff and
+Processing are recorded once each per ingest, but their recent windows are
+stamped at the start and end of that work, so a segment boundary can leave them
+one sample apart.
+
+`timing_figures` is deliberately duplicated in both applications rather than
+shared: it reads a `wiredata-telemetry` histogram, and `wiredata-ui` depends on
+`egui` alone (talker ADR-016 / listener ADR-019). The shared module documents the
+vocabulary and names both call sites; it does not own the rule.
+
+The detail rows no longer restate *post-read to pipeline* mid-line — the label
+names the boundary and the tooltip defines it, and the row now carries counts
+that earn the space. No measurement, telemetry type, snapshot surface, or profile
+schema changes; this is presentation only.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

@@ -11,19 +11,17 @@
 //! signal *means*, and when it deserves attention, stays here.
 
 use crate::core::{ArrivalTimestampStatus, ChannelId, RecordingState};
-use crate::runtime::{CounterAvailability, DurationHistogram, QueueDepth, TransportHealth};
+use crate::runtime::{
+    ByteHistogram, CounterAvailability, DurationHistogram, QueueDepth, TransportHealth,
+};
 
 use super::super::state::{ChannelStatus, ChannelView};
 use super::super::widgets::human_bytes;
 use wiredata_ui::diagnostics::{
     attention_callout, decision_card, signal_grid, signal_row, SignalTone,
 };
-use wiredata_ui::format::compact_duration;
+use wiredata_ui::format::{compact_duration, thousands};
 use wiredata_ui::palette::active as palette;
-
-/// Keep the existing display warm-up boundary. It affects whether a bounded
-/// percentile is useful to show; it is not a latency-health threshold.
-const TIMING_WARMUP_SAMPLES: u64 = 20;
 
 // Diagnostic help follows the same technician-facing sequence throughout:
 // locate the measurement in the receive path, explain how to read it, then
@@ -57,9 +55,10 @@ const PIPELINE_TOOLTIP: &str = concat!(
     "starts processing that block. Processing is the time Listener spends handling ",
     "it synchronously; background recorder I/O may run concurrently and is outside this ",
     "boundary. Recent values use an approximate latest or final ten-second segmented ",
-    "window. Before 20 samples the display shows the maximum; afterward, p99 ≤ X ",
-    "means at least 99% of samples fell within X. Compare changes with queue pressure ",
-    "and normal operation; there is no universal good/bad latency limit."
+    "window, and the chunk count on the same line says how many samples that is. The ",
+    "worst value is exact at any count; 99% ≤ X appears beside it only when at least ",
+    "99% of samples fell within a figure below that worst one. Compare changes with ",
+    "queue pressure and normal operation; there is no universal good/bad latency limit."
 );
 
 const UDP_DROP_CALLOUT_TOOLTIP: &str = concat!(
@@ -84,8 +83,9 @@ const SERIAL_BACKPRESSURE_TOOLTIP: &str = concat!(
 const RECEIVE_DETAILS_TOOLTIP: &str = concat!(
     "Use these measurements to locate pressure between the input, Listener ",
     "processing, and storage. Recent or final values use an approximate ten-second ",
-    "segmented window; run values cover the time since Start. p99 ≤ X is an ",
-    "upper-bound estimate for at least 99% of samples."
+    "segmented window; run values cover the time since Start. Each row states its worst ",
+    "value with the number of samples behind it; 99% ≤ X is an upper-bound estimate for ",
+    "at least 99% of those samples, and appears only where it differs from the worst."
 );
 const HANDOFF_TOOLTIP: &str = concat!(
     "Measures each received block from immediately after the operating-system read ",
@@ -104,7 +104,9 @@ const PROCESSING_TOOLTIP: &str = concat!(
 const CHUNK_SHAPE_TOOLTIP: &str = concat!(
     "Cumulative across the full channel run, not the recent ten-second window. One ",
     "chunk is the block returned by a single operating-system read; it is not ",
-    "necessarily a complete line or protocol message. Size shows bytes per read. ",
+    "necessarily a complete line or protocol message. Size shows bytes per read; a ",
+    "median or percentile appears only when reads actually varied, so a transport ",
+    "returning uniform blocks states just the largest. ",
     "Read gap is between consecutive post-read monotonic captures and can reflect ",
     "source cadence, buffering, and host scheduling—not per-byte wire timing. Because ",
     "these values accumulate, a long run can dilute a brief change."
@@ -138,8 +140,9 @@ const UDP_AVAILABLE_TOOLTIP: &str = concat!(
 );
 const IDLE_RULE_TIMING_TOOLTIP: &str = concat!(
     "Measures how late Listener evaluates and fires each Idle rule after its ",
-    "configured no-data deadline. For example, p99 ≤ 2 ms means at least 99% of ",
-    "measured firings were no more than about 2 ms late. Lateness can include ",
+    "configured no-data deadline. The worst firing is stated with the number of ",
+    "firings behind it; where it differs, 99% ≤ 2 ms means at least 99% of measured ",
+    "firings were no more than about 2 ms late. Lateness can include ",
     "operating-system wake delay, processor contention, and time Listener spent ",
     "servicing requests, processing input, or handling recording before evaluation. ",
     "It is not wall-clock or receive-time accuracy."
@@ -282,46 +285,156 @@ fn pressure_signal(
     }
 }
 
-fn recent_timing_signal(
+/// A sample population, named in the units the reader is looking at.
+fn counted(samples: u64, noun: &str) -> String {
+    if samples == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{} {noun}s", thousands(samples))
+    }
+}
+
+/// Summarize a duration histogram without a sample-count gate.
+///
+/// Listener had one: below twenty samples a readout showed its maximum and
+/// called itself warming up. Talker retired the same gate in ADR-046 and the
+/// arithmetic is why — the percentile rank is `ceil(samples × 99 / 100)`, which
+/// equals `samples` for any count up to 99, so below a hundred samples the p99
+/// bucket *is* the maximum's bucket. The gate relabelled one number as two
+/// states, and did it at 20, while the two statistics only separate at 100.
+///
+/// So state the largest value, which is exact and true at one sample, and add
+/// the percentile only where `p99 < max` proves it is a different figure:
+/// within one bucket the bound is `>=` the maximum, so that comparison is false
+/// until the p99 bucket sits strictly below the maximum's. The sample count,
+/// which every readout now carries, does the work the label only implied.
+///
+/// `superlative` names the largest value. A slow handoff is the *worst* one,
+/// but the largest gap between two reads is just the *longest* — nothing about
+/// a quiet source is bad.
+fn timing_figures(histogram: DurationHistogram, superlative: &str) -> Option<String> {
+    let max = histogram.max()?;
+    let p99 = histogram.percentile_upper_bound(99)?;
+    Some(if p99 < max {
+        format!(
+            "99% ≤ {}, {superlative} {}",
+            compact_duration(p99),
+            compact_duration(max)
+        )
+    } else {
+        format!("{superlative} {}", compact_duration(max))
+    })
+}
+
+/// The same no-gate rule for read-chunk sizes, whose figures are byte counts.
+///
+/// A median and a percentile each earn their place by differing from the
+/// largest, so a transport returning uniform blocks — a datagram socket
+/// delivering one fixed-size payload per read — says so by having nothing to
+/// add.
+fn size_figures(sizes: ByteHistogram) -> Option<String> {
+    let max = sizes.max()?;
+    let median = sizes.percentile_upper_bound(50)?;
+    let p99 = sizes.percentile_upper_bound(99)?;
+    let mut parts = Vec::new();
+    if median < max {
+        parts.push(format!("median ≤ {}", human_bytes(median)));
+    }
+    if p99 < max {
+        parts.push(format!("99% ≤ {}", human_bytes(p99)));
+    }
+    parts.push(format!("largest {}", human_bytes(max)));
+    Some(format!("size {}", parts.join(", ")))
+}
+
+/// One timing boundary's contribution to the compact Pipeline row.
+///
+/// The row states one chunk count and one window at its end, so a boundary
+/// appends its own count only when the populations differ. Handoff and
+/// Processing are recorded once each per ingest, but their recent windows are
+/// stamped at the start and the end of that work, so a segment boundary can
+/// leave them one sample apart.
+fn compact_timing(
     label: &str,
+    noun: &str,
     cumulative: DurationHistogram,
     recent: DurationHistogram,
+    line_samples: u64,
 ) -> String {
-    if cumulative.sample_count() == 0 {
-        return format!("{label} awaiting first chunk");
+    match timing_figures(recent, "worst") {
+        Some(figures) if recent.sample_count() == line_samples => format!("{label} {figures}"),
+        Some(figures) => format!(
+            "{label} {figures} of {}",
+            counted(recent.sample_count(), noun)
+        ),
+        // No recent samples: the run's own worst is the only thing measured, and
+        // saying which window it came from is the whole point of showing it.
+        None => match timing_figures(cumulative, "worst") {
+            Some(run) => format!("{label} {run} this run"),
+            None => format!("{label} awaiting the first {noun}"),
+        },
     }
-    if recent.sample_count() == 0 {
-        let run_max = cumulative
-            .max()
-            .map(compact_duration)
-            .unwrap_or_else(|| "n/a".to_owned());
-        return format!("{label} no recent chunks · run max {run_max}");
+}
+
+/// One timing boundary's expanded detail row: its own window, its own counts,
+/// and the run-wide figure beside the recent one.
+fn detail_timing(
+    label: &str,
+    noun: &str,
+    cumulative: DurationHistogram,
+    recent: DurationHistogram,
+    window: &str,
+) -> String {
+    let Some(run) = timing_figures(cumulative, "worst") else {
+        return format!("{label}: awaiting the first {noun}");
+    };
+    let run = format!(
+        "{run} of {} this run",
+        counted(cumulative.sample_count(), noun)
+    );
+    match timing_figures(recent, "worst") {
+        Some(figures) => format!(
+            "{label} ({window}): {figures} of {} · {run}",
+            counted(recent.sample_count(), noun)
+        ),
+        None => format!("{label}: no {noun}s in {window} · {run}"),
     }
-    if recent.sample_count() < TIMING_WARMUP_SAMPLES {
-        return format!(
-            "{label} warm-up ({}) · max {}",
-            recent.sample_count(),
-            compact_duration(recent.max().unwrap_or_default())
-        );
-    }
-    format!(
-        "{label} p99 ≤ {}",
-        compact_duration(recent.percentile_upper_bound(99).unwrap_or_default())
-    )
 }
 
 fn pipeline_signal(view: &ChannelView, status: ChannelStatus) -> DecisionSignal {
-    DecisionSignal {
-        value: format!(
-            "{} · {} · {}",
-            recent_timing_signal("Handoff", view.ingest_delay, view.recent_ingest_delay),
-            recent_timing_signal(
+    let window = timing_window(status);
+    let recent_chunks = view.recent_ingest_delay.sample_count();
+    let value = if view.ingest_delay.sample_count() == 0 {
+        // Both boundaries are recorded inside one ingest, so neither has
+        // anything to say — and repeating that twice beside an empty window
+        // says less than stating it once.
+        "Awaiting the first chunk".to_owned()
+    } else {
+        let tail = if recent_chunks == 0 {
+            format!("no chunks in {window}")
+        } else {
+            format!("{} in {window}", counted(recent_chunks, "chunk"))
+        };
+        format!(
+            "{} · {} · {tail}",
+            compact_timing(
+                "Handoff",
+                "chunk",
+                view.ingest_delay,
+                view.recent_ingest_delay,
+                recent_chunks,
+            ),
+            compact_timing(
                 "Processing",
+                "chunk",
                 view.ingest_processing,
                 view.recent_ingest_processing,
+                recent_chunks,
             ),
-            timing_window(status),
-        ),
+        )
+    };
+    DecisionSignal {
+        value,
         // No application latency budget exists, so these measurements are facts,
         // not a fabricated healthy/warning judgment.
         tone: SignalTone::Neutral,
@@ -451,98 +564,43 @@ pub(super) fn show_receive_diagnostics_card(
 }
 
 fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view: &ChannelView) {
-    let cumulative_timing = view.ingest_delay;
-    let timing = view.recent_ingest_delay;
-    let samples = timing.sample_count();
-    let run_samples = cumulative_timing.sample_count();
-    let run_max = cumulative_timing
-        .max()
-        .map(compact_duration)
-        .unwrap_or_else(|| "n/a".to_owned());
     let window = timing_window(status);
-    let timing_text = if run_samples == 0 {
-        "Handoff timing: awaiting first chunk".to_owned()
-    } else if samples == 0 {
-        format!("Handoff timing ({window}): no chunks · run max {run_max}")
-    } else if samples < TIMING_WARMUP_SAMPLES {
-        format!(
-            "Handoff timing ({window}): warming up ({samples} chunks) · max {} · run max {run_max}",
-            compact_duration(timing.max().unwrap_or_default()),
-        )
-    } else {
-        format!(
-            "Handoff timing ({window}): post-read to pipeline p99 ≤ {} · run max {run_max}",
-            compact_duration(timing.percentile_upper_bound(99).unwrap_or_default()),
-        )
-    };
+    let timing_text = detail_timing(
+        "Handoff timing",
+        "chunk",
+        view.ingest_delay,
+        view.recent_ingest_delay,
+        window,
+    );
     ui.label(egui::RichText::new(timing_text).weak())
         .on_hover_text(HANDOFF_TOOLTIP);
 
-    let cumulative_processing = view.ingest_processing;
-    let processing = view.recent_ingest_processing;
-    let processing_samples = processing.sample_count();
-    let processing_run_samples = cumulative_processing.sample_count();
-    let processing_run_max = cumulative_processing
-        .max()
-        .map(compact_duration)
-        .unwrap_or_else(|| "n/a".to_owned());
-    let processing_text = if processing_run_samples == 0 {
-        "Processing timing: awaiting first chunk".to_owned()
-    } else if processing_samples == 0 {
-        format!("Processing timing ({window}): no chunks · run max {processing_run_max}")
-    } else if processing_samples < TIMING_WARMUP_SAMPLES {
-        format!(
-            "Processing timing ({window}): warming up ({processing_samples} chunks) · max {} · run max {processing_run_max}",
-            compact_duration(processing.max().unwrap_or_default()),
-        )
-    } else {
-        format!(
-            "Processing timing ({window}): p99 ≤ {} · run max {processing_run_max}",
-            compact_duration(processing.percentile_upper_bound(99).unwrap_or_default()),
-        )
-    };
+    let processing_text = detail_timing(
+        "Processing timing",
+        "chunk",
+        view.ingest_processing,
+        view.recent_ingest_processing,
+        window,
+    );
     ui.label(egui::RichText::new(processing_text).weak())
         .on_hover_text(PROCESSING_TOOLTIP);
 
     let chunks = view.chunk_shape;
     let chunk_count = chunks.chunk_count();
     let chunk_text = if chunk_count == 0 {
-        "Chunk shape: awaiting first chunk".to_owned()
+        "Chunk shape: awaiting the first chunk".to_owned()
     } else {
-        let size_text = if chunk_count < TIMING_WARMUP_SAMPLES {
-            format!(
-                "size mean {} · max {}",
-                human_bytes(chunks.sizes.mean().unwrap_or_default()),
-                human_bytes(chunks.sizes.max().unwrap_or_default()),
-            )
-        } else {
-            format!(
-                "size p50 ≤ {} · p99 ≤ {} · max {}",
-                human_bytes(chunks.sizes.percentile_upper_bound(50).unwrap_or_default()),
-                human_bytes(chunks.sizes.percentile_upper_bound(99).unwrap_or_default()),
-                human_bytes(chunks.sizes.max().unwrap_or_default()),
-            )
+        let size_text = size_figures(chunks.sizes).unwrap_or_else(|| "size n/a".to_owned());
+        // A gap needs two reads to exist, so it is short one sample by
+        // definition rather than by anything having gone wrong.
+        let gap_text = match timing_figures(chunks.inter_read_gaps, "longest") {
+            Some(figures) => format!("read gap {figures}"),
+            None => "read gap awaiting a second chunk".to_owned(),
         };
-        let gap_samples = chunks.inter_read_gaps.sample_count();
-        let gap_text = if gap_samples == 0 {
-            "read gap awaiting second chunk".to_owned()
-        } else if gap_samples < TIMING_WARMUP_SAMPLES {
-            format!(
-                "read gap max {}",
-                compact_duration(chunks.inter_read_gaps.max().unwrap_or_default())
-            )
-        } else {
-            format!(
-                "read gap p99 ≤ {}",
-                compact_duration(
-                    chunks
-                        .inter_read_gaps
-                        .percentile_upper_bound(99)
-                        .unwrap_or_default()
-                )
-            )
-        };
-        format!("Chunks (run): {chunk_count} · {size_text} · {gap_text}")
+        format!(
+            "Chunks (run): {} · {size_text} · {gap_text}",
+            counted(chunk_count, "chunk")
+        )
     };
     ui.label(egui::RichText::new(chunk_text).weak())
         .on_hover_text(CHUNK_SHAPE_TOOLTIP);
@@ -614,31 +672,13 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
     let cumulative_rule_timing = view.rule_timer_lateness;
     let recent_rule_timing = view.recent_rule_timer_lateness;
     if has_idle_rule || cumulative_rule_timing.sample_count() > 0 {
-        let recent_samples = recent_rule_timing.sample_count();
-        let run_samples = cumulative_rule_timing.sample_count();
-        let run_max = cumulative_rule_timing
-            .max()
-            .map(compact_duration)
-            .unwrap_or_else(|| "n/a".to_owned());
-        let text = if run_samples == 0 {
-            "Idle rule timing: awaiting first firing".to_owned()
-        } else if recent_samples == 0 {
-            format!("Idle rule timing ({window}): no firings · run max {run_max}")
-        } else if recent_samples < TIMING_WARMUP_SAMPLES {
-            format!(
-                "Idle rule timing ({window}): {recent_samples} firings · max {} · run max {run_max}",
-                compact_duration(recent_rule_timing.max().unwrap_or_default())
-            )
-        } else {
-            format!(
-                "Idle rule timing ({window}): lateness p99 ≤ {} · run max {run_max}",
-                compact_duration(
-                    recent_rule_timing
-                        .percentile_upper_bound(99)
-                        .unwrap_or_default()
-                )
-            )
-        };
+        let text = detail_timing(
+            "Idle rule lateness",
+            "firing",
+            cumulative_rule_timing,
+            recent_rule_timing,
+            window,
+        );
         ui.label(egui::RichText::new(text).weak())
             .on_hover_text(IDLE_RULE_TIMING_TOOLTIP);
         let timer = view.idle_deadline_timer;
@@ -719,16 +759,18 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        card_tone, diagnostics_badge, pressure_signal, queue_level_reaches_half,
-        recent_timing_signal, timing_window, transport_signal, ChannelStatus,
-        ARRIVAL_TIMESTAMP_TOOLTIP, CHUNK_SHAPE_TOOLTIP, IDLE_RULE_TIMING_TOOLTIP,
-        IDLE_TIMER_TOOLTIP, PIPELINE_TOOLTIP, PRESSURE_TOOLTIP, RAW_QUEUE_ACTIVE_TOOLTIP,
-        RAW_QUEUE_FAULTED_TOOLTIP, SERIAL_BACKPRESSURE_TOOLTIP, TRANSPORT_TOOLTIP,
+        card_tone, compact_timing, counted, detail_timing, diagnostics_badge, pressure_signal,
+        queue_level_reaches_half, size_figures, timing_figures, timing_window, transport_signal,
+        ChannelStatus, ARRIVAL_TIMESTAMP_TOOLTIP, CHUNK_SHAPE_TOOLTIP, HANDOFF_TOOLTIP,
+        IDLE_RULE_TIMING_TOOLTIP, IDLE_TIMER_TOOLTIP, PIPELINE_TOOLTIP, PRESSURE_TOOLTIP,
+        PROCESSING_TOOLTIP, RAW_QUEUE_ACTIVE_TOOLTIP, RAW_QUEUE_FAULTED_TOOLTIP,
+        RECEIVE_DETAILS_TOOLTIP, SERIAL_BACKPRESSURE_TOOLTIP, TRANSPORT_TOOLTIP,
         UDP_AVAILABLE_TOOLTIP, UDP_UNAVAILABLE_TOOLTIP,
     };
     use crate::core::RecordingState;
     use crate::runtime::{
-        CounterAvailability, DurationHistogram, QueueDepth, SerialStallSummary, TransportHealth,
+        ByteHistogram, CounterAvailability, DurationHistogram, QueueDepth, SerialStallSummary,
+        TransportHealth,
     };
     use wiredata_ui::diagnostics::SignalTone;
     use wiredata_ui::format::compact_duration;
@@ -926,22 +968,157 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recent_timing_uses_warmup_max_then_bounded_p99() {
-        let mut cumulative = DurationHistogram::default();
-        let mut recent = DurationHistogram::default();
-        for _ in 0..19 {
-            cumulative.record(Duration::from_millis(2));
-            recent.record(Duration::from_millis(2));
+    /// One sample recorded `count` times, for exercising the state ladder.
+    fn histogram(count: u64, sample: Duration) -> DurationHistogram {
+        let mut histogram = DurationHistogram::default();
+        for _ in 0..count {
+            histogram.record(sample);
         }
-        let warmup = recent_timing_signal("Handoff", cumulative, recent);
-        assert!(warmup.contains("warm-up (19)"));
-        assert!(warmup.contains("max"));
-        assert!(!warmup.contains("p99"));
+        histogram
+    }
 
-        cumulative.record(Duration::from_millis(2));
-        recent.record(Duration::from_millis(2));
-        let mature = recent_timing_signal("Handoff", cumulative, recent);
-        assert!(mature.contains("p99 ≤"));
+    /// The rule that replaced the twenty-sample warm-up gate (ADR-046): the
+    /// worst value is reportable at any count, and the percentile earns its
+    /// place only by being a different figure.
+    #[test]
+    fn timing_figures_state_the_worst_value_without_a_warm_up_gate() {
+        assert_eq!(
+            timing_figures(histogram(1, Duration::from_millis(3)), "worst").unwrap(),
+            format!("worst {}", compact_duration(Duration::from_millis(3))),
+            "one sample is reportable; the retired gate called this warming up"
+        );
+
+        let uniform = timing_figures(histogram(500, Duration::from_millis(1)), "worst").unwrap();
+        assert!(
+            !uniform.contains("99%"),
+            "a percentile inside the maximum's own bucket is not a second figure"
+        );
+
+        let mut spread = histogram(999, Duration::from_micros(50));
+        spread.record(Duration::from_millis(40));
+        let figures = timing_figures(spread, "worst").unwrap();
+        assert!(
+            figures.starts_with("99% ≤ "),
+            "a p99 strictly below the maximum is worth stating: {figures}"
+        );
+        assert!(figures.ends_with(&format!(
+            "worst {}",
+            compact_duration(Duration::from_millis(40))
+        )));
+
+        assert_eq!(timing_figures(DurationHistogram::default(), "worst"), None);
+    }
+
+    /// A quiet source is not a fault, so its gaps are the longest, not the worst.
+    #[test]
+    fn read_gaps_are_named_longest_rather_than_worst() {
+        let figures = timing_figures(histogram(3, Duration::from_secs(2)), "longest").unwrap();
+        assert!(figures.starts_with("longest "));
+        assert!(!figures.contains("worst"));
+    }
+
+    #[test]
+    fn compact_timing_names_every_measurement_state() {
+        let empty = DurationHistogram::default();
+        let one = histogram(1, Duration::from_millis(2));
+        let worst = compact_duration(Duration::from_millis(2));
+
+        assert_eq!(
+            compact_timing("Handoff", "chunk", empty, empty, 0),
+            "Handoff awaiting the first chunk"
+        );
+        assert_eq!(
+            compact_timing("Handoff", "chunk", one, empty, 0),
+            format!("Handoff worst {worst} this run"),
+            "with nothing recent, the run's own figure is named as such"
+        );
+        assert_eq!(
+            compact_timing("Handoff", "chunk", one, one, 1),
+            format!("Handoff worst {worst}"),
+            "the row already states this count once"
+        );
+        assert_eq!(
+            compact_timing("Handoff", "chunk", one, one, 2),
+            format!("Handoff worst {worst} of 1 chunk"),
+            "a boundary whose population differs from the row states its own"
+        );
+    }
+
+    #[test]
+    fn detail_timing_pairs_the_recent_window_with_the_whole_run() {
+        let empty = DurationHistogram::default();
+        let run = histogram(40, Duration::from_millis(5));
+        let recent = histogram(7, Duration::from_millis(5));
+        let worst = compact_duration(Duration::from_millis(5));
+
+        assert_eq!(
+            detail_timing("Handoff timing", "chunk", empty, empty, "~last 10 s"),
+            "Handoff timing: awaiting the first chunk"
+        );
+        assert_eq!(
+            detail_timing("Handoff timing", "chunk", run, empty, "~final 10 s"),
+            format!(
+                "Handoff timing: no chunks in ~final 10 s · worst {worst} of 40 chunks this run"
+            )
+        );
+        assert_eq!(
+            detail_timing("Idle rule lateness", "firing", run, recent, "~last 10 s"),
+            format!(
+                "Idle rule lateness (~last 10 s): worst {worst} of 7 firings · \
+                 worst {worst} of 40 firings this run"
+            ),
+            "the noun follows the measurement, not the transport"
+        );
+    }
+
+    #[test]
+    fn chunk_sizes_add_a_median_only_when_reads_actually_varied() {
+        assert_eq!(size_figures(ByteHistogram::default()), None);
+
+        let mut uniform = ByteHistogram::default();
+        for _ in 0..200 {
+            uniform.record(64);
+        }
+        let figures = size_figures(uniform).unwrap();
+        assert!(
+            !figures.contains("median") && !figures.contains("99%"),
+            "fixed-size datagram reads have nothing to add: {figures}"
+        );
+        assert!(figures.starts_with("size largest "));
+
+        let mut varied = ByteHistogram::default();
+        for _ in 0..500 {
+            varied.record(8);
+        }
+        varied.record(64_000);
+        let figures = size_figures(varied).unwrap();
+        assert!(figures.contains("median ≤ "), "{figures}");
+        assert!(figures.contains("largest "), "{figures}");
+    }
+
+    #[test]
+    fn sample_counts_agree_with_their_noun() {
+        assert_eq!(counted(1, "chunk"), "1 chunk");
+        assert_eq!(counted(0, "chunk"), "0 chunks");
+        assert_eq!(counted(12_500, "firing"), "12,500 firings");
+    }
+
+    /// Nothing in the panel may teach the state Listener no longer has.
+    #[test]
+    fn no_readout_teaches_the_retired_warm_up_state() {
+        for tooltip in [
+            PIPELINE_TOOLTIP,
+            RECEIVE_DETAILS_TOOLTIP,
+            IDLE_RULE_TIMING_TOOLTIP,
+            CHUNK_SHAPE_TOOLTIP,
+            HANDOFF_TOOLTIP,
+            PROCESSING_TOOLTIP,
+        ] {
+            assert!(
+                !tooltip.to_ascii_lowercase().contains("warm"),
+                "tooltip still teaches a warm-up: {tooltip}"
+            );
+            assert!(!tooltip.contains("20 samples"), "{tooltip}");
+        }
     }
 }

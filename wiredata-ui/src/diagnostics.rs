@@ -8,16 +8,18 @@
 //!
 //! A technician may read both applications' panels in one session, so a
 //! measurement in the same *state* should be described the same way in both. The
-//! domain noun differs — Talker counts deadlines and sends, Listener counts
-//! chunks and firings — but the state names and the notation do not:
+//! domain noun differs — Talker counts scheduled sends, Listener counts read
+//! chunks and rule firings — but the states, and how each one is worded, do not.
+//! The columns are real renderings, so a change on one side that this table
+//! cannot describe is a divergence, not a variation:
 //!
-//! | State | When | Reads like |
-//! |---|---|---|
-//! | Awaiting first sample | nothing measured yet this run | `awaiting first <noun>` |
-//! | Measured | the recent window has samples | `worst X of N` (see below) |
-//! | No recent samples | the run has samples, the recent window does not | `no recent <noun>s · run max X` |
-//! | Expired | Talker only — see below | `recent snapshot expired · as of X ago` |
-//! | Final | Talker only — the exact-at-stop snapshot | `final snapshot` |
+//! | State | When | Talker | Listener |
+//! |---|---|---|---|
+//! | Awaiting first sample | nothing measured yet this run | `awaiting the first scheduled send` | `awaiting the first chunk` |
+//! | Measured | the recent window has samples | `worst was 4 ms behind schedule · 812 scheduled sends reached` | `Handoff worst 4 ms · 812 chunks in ~last 10 s` |
+//! | No recent samples | the run has samples, the recent window does not | `nothing sent in ~last 10 s · worst this run 9 ms` | `no chunks in ~last 10 s · Handoff worst 9 ms this run` |
+//! | Expired | Talker only — see below | `recent snapshot expired · as of 11.0 s ago` | — |
+//! | Final | Talker only — the exact-at-stop snapshot | `final snapshot` | — |
 //!
 //! Conventions that go with it:
 //!
@@ -26,26 +28,31 @@
 //! - **Two windows, named.** A rolling window (`~last 10 s` while running,
 //!   `~final 10 s` once stopped) sits beside a cumulative `run max`. Any readout
 //!   showing both must label which is which.
-//! - **No warm-up gate.** There was one — below 20 samples the readout showed a
-//!   maximum and called itself warming up. It never guarded a bad computation:
-//!   the percentile rank is `ceil(samples × 99 / 100)`, which equals `samples`
-//!   for any count up to 99, so below a hundred samples the p99 bucket *is* the
-//!   maximum's bucket and the gate only relabelled the same number — at 20,
-//!   while the two statistics actually separate at 100. Instead, state the
-//!   maximum with its sample count (exact, and true at one sample) and add the
-//!   percentile only when `p99 < max`, which is precisely the test for the p99
-//!   bucket sitting strictly below the maximum's. The count carries the weight
-//!   the label used to imply.
+//! - **No warm-up gate.** Both applications had one — below 20 samples the
+//!   readout showed a maximum and called itself warming up. It never guarded a
+//!   bad computation: the percentile rank is `ceil(samples × 99 / 100)`, which
+//!   equals `samples` for any count up to 99, so below a hundred samples the p99
+//!   bucket *is* the maximum's bucket and the gate only relabelled the same
+//!   number — at 20, while the two statistics actually separate at 100. Instead,
+//!   state the maximum with its sample count (exact, and true at one sample) and
+//!   add the percentile only when `p99 < max`, which is precisely the test for
+//!   the p99 bucket sitting strictly below the maximum's. The count carries the
+//!   weight the label used to imply. Talker retired its gate in ADR-046 and
+//!   Listener followed; neither has a warming-up state left to write against.
+//! - **Name the largest value for what it is.** A late send and a slow handoff
+//!   are the *worst* ones, but the longest gap between two reads is just the
+//!   longest — a quiet source is not a fault, and the superlative should not
+//!   imply one.
 //! - **No invented health thresholds.** Neither application scores latency
 //!   against a budget it does not have; escalation comes from evidence that
 //!   something is actually wrong (a confirmed drop, a queue at half capacity),
 //!   not from a timing number being large.
 //!
-//! **Migration in progress.** Talker's readouts follow the rule above; Listener
-//! still has its own 20-sample warm-up gate and `p99 ≤ X` phrasing. That
-//! divergence is deliberate and tracked (talker `docs/TODO.md`, "Cadence rework
-//! follow-ups"), not a licence for a third variant — nothing new should be
-//! written against the retired warm-up state.
+//! The rule lives in both applications rather than here: it reads a
+//! `wiredata-telemetry` histogram, and this crate depends on `egui` alone. See
+//! `timing_figures` in `talker/src/gui/diagnostics.rs` and in
+//! `listener/src/gui/detail/diagnostics.rs` — they are deliberately the same
+//! function, and a change to one is a change to the vocabulary above.
 //!
 //! *Expired* and *Final* are Talker-only, and deliberately so: Talker pushes
 //! collapsed snapshots that age between emissions, while Listener collapses each
