@@ -11,11 +11,35 @@
 //! are presets, so they round-trip as stable tokens (see `MonoFont::name` /
 //! `ColorScheme::name`), not free strings.
 
-use crate::config::schema::DisplayViewConfig;
+use crate::config::schema::{DisplayViewConfig, HexGrouping};
 use crate::display::{CharacterRendering, DisplayMode};
 
 use super::widgets::ColorScheme;
 use wiredata_ui::fonts::MonoFont;
+
+/// Selectable bytes-per-group values for the Hex view (§45). Powers of two up to
+/// eight: the widths a technician reads words and longs at, and past which the
+/// hex digits stop being countable by eye.
+pub(crate) const HEX_GROUP_SIZES: &[u8] = &[1, 2, 4, 8];
+
+/// Selectable groups-per-line values for the Hex view. `0` is the default and
+/// means "fit to the display width" (§45) — a question only the pane can answer.
+pub(crate) const HEX_LINE_GROUPS: &[u8] = &[0, 1, 2, 4, 8, 16];
+
+/// A label for a Hex line length. The config counts groups, so the control does
+/// too — but a reader thinks in bytes per line, so the resulting byte count
+/// rides along rather than making them multiply.
+pub(crate) fn hex_line_label(grouping: HexGrouping) -> String {
+    if grouping.groups_per_line == 0 {
+        return "fit to width".to_owned();
+    }
+    let bytes = u16::from(grouping.bytes_per_group.max(1)) * u16::from(grouping.groups_per_line);
+    format!(
+        "{} × {} = {bytes} bytes",
+        grouping.groups_per_line,
+        grouping.bytes_per_group.max(1)
+    )
+}
 
 /// The GUI default font size when a config carries none.
 pub(crate) const DEFAULT_FONT_SIZE: f32 = 13.0;
@@ -48,6 +72,10 @@ pub(crate) struct ViewPrefs {
     pub font_text: String,
     pub mono: MonoFont,
     pub colors: ColorScheme,
+    /// Hex byte grouping and line length (§45). Only the Hex mode reads it, but
+    /// it persists regardless, so switching modes back and forth does not lose
+    /// the setting.
+    pub hex_grouping: HexGrouping,
     /// Scroll-buffer cap in bytes (§87): how far back the viewer scrolls. Drives the
     /// GUI viewer's accumulation cap live and persists as the channel's
     /// `retention.byte_limit` (the runtime adopts it on the channel's next start).
@@ -65,6 +93,7 @@ impl Default for ViewPrefs {
             font_text: format!("{DEFAULT_FONT_SIZE:.0}"),
             mono: MonoFont::Cascadia,
             colors: ColorScheme::BlackOnWhite,
+            hex_grouping: HexGrouping::default(),
             scroll_buffer_bytes: DEFAULT_SCROLL_BUFFER_BYTES,
         }
     }
@@ -79,6 +108,7 @@ impl ViewPrefs {
             && self.font_size == other.font_size
             && self.mono == other.mono
             && self.colors == other.colors
+            && self.hex_grouping == other.hex_grouping
             && self.scroll_buffer_bytes == other.scroll_buffer_bytes
     }
 
@@ -107,6 +137,7 @@ impl ViewPrefs {
             font_text: format!("{font_size:.0}"),
             mono: MonoFont::from_name(view.font.as_deref()),
             colors: ColorScheme::from_name(view.foreground_color.as_deref()),
+            hex_grouping: view.hex_grouping,
             scroll_buffer_bytes,
         }
     }
@@ -129,6 +160,7 @@ fn apply_to_view(prefs: &ViewPrefs, view: &mut DisplayViewConfig) {
     view.font_size = Some(prefs.font_size);
     view.font = Some(prefs.mono.name().to_string());
     view.foreground_color = Some(prefs.colors.name().to_string());
+    view.hex_grouping = prefs.hex_grouping;
 }
 
 #[cfg(test)]
@@ -146,6 +178,10 @@ mod tests {
         prefs.font_size = 20.0;
         prefs.mono = MonoFont::JetBrains;
         prefs.colors = ColorScheme::GreenOnBlack;
+        prefs.hex_grouping = HexGrouping {
+            bytes_per_group: 4,
+            groups_per_line: 4,
+        };
         prefs.scroll_buffer_bytes = 256 * 1024;
 
         // Fold into the config, then re-seed from it — the settings survive.
@@ -154,6 +190,16 @@ mod tests {
         let restored = ViewPrefs::from_config(&config);
         assert!(restored.eq_settings(&prefs), "settings should round-trip");
         assert_eq!(restored.font_text, "20"); // edit buffer reflects the size
+                                              // Hex grouping reaches the view config, which is what a profile saves —
+                                              // the field existed and round-tripped through TOML long before anything
+                                              // read it, so the gap this closes is the write side of the GUI.
+        assert_eq!(
+            config.display.views[0].hex_grouping,
+            HexGrouping {
+                bytes_per_group: 4,
+                groups_per_line: 4
+            }
+        );
     }
 
     #[test]

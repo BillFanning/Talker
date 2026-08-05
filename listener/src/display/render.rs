@@ -212,71 +212,101 @@ fn tail_after_line_control(text: &str) -> Option<&str> {
         .map(|(i, c)| &text[i + c.len_utf8()..])
 }
 
+/// Hex-renderer position, carried across chunks so a streaming caller's output
+/// is identical to a one-shot render of the same bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HexCursor {
+    /// Cells emitted on the current output line, for wrapping.
+    cells_on_line: usize,
+    /// Bytes emitted into the current group, for spacing (§45).
+    bytes_in_group: usize,
+}
+
+/// Open the next cell: wrap the line if it is full, otherwise separate from the
+/// previous cell. `grouped` is false for a byte continuing a group — those run
+/// together, which is the whole point of `bytes_per_group`.
 fn start_hex_cell(
     out: &mut String,
-    cells_on_line: &mut usize,
+    cursor: &mut HexCursor,
     per_line: Option<usize>,
     separator: &str,
+    grouped: bool,
 ) {
-    if *cells_on_line > 0 {
-        if per_line.is_some_and(|n| *cells_on_line >= n) {
+    if cursor.cells_on_line > 0 {
+        if per_line.is_some_and(|n| cursor.cells_on_line >= n) {
             out.push('\n');
-            *cells_on_line = 0;
-        } else {
+            cursor.cells_on_line = 0;
+            cursor.bytes_in_group = 0;
+        } else if !grouped {
             out.push_str(separator);
         }
     }
-    *cells_on_line += 1;
+    cursor.cells_on_line += 1;
 }
 
 fn push_hex_annotation(
     out: &mut String,
-    cells_on_line: &mut usize,
+    cursor: &mut HexCursor,
     per_line: Option<usize>,
     separator: &str,
     text: &str,
 ) {
-    start_hex_cell(out, cells_on_line, per_line, separator);
+    // An annotation always stands apart, even mid-group: running a Mark into
+    // the bytes on either side (`4142‹T›4344`) would hide both.
+    cursor.bytes_in_group = 0;
+    start_hex_cell(out, cursor, per_line, separator, false);
     out.push_str(text);
     if let Some(tail) = tail_after_line_control(text) {
-        *cells_on_line = usize::from(!tail.is_empty());
+        cursor.cells_on_line = usize::from(!tail.is_empty());
     }
+    // The bytes after an annotation start a fresh group, so a Mark never shifts
+    // the grouping of everything that follows it.
+    cursor.bytes_in_group = 0;
 }
 
-/// Render bytes as Hex (§45): each byte as two uppercase hex digits, joined by
-/// `separator`. When `bytes_per_line` is `Some`, wrap to that many *cells* per
-/// line (annotation cells count, matching the old per-cell chunking).
+/// Render bytes as Hex (§45): each byte as two uppercase hex digits. Every
+/// `bytes_per_group` bytes run together as one group; groups are joined by
+/// `separator`. A `bytes_per_group` of 1 is the conventional hexdump, one byte
+/// per group, and is what a zero also means — no group can be empty.
+///
+/// When `bytes_per_line` is `Some`, wrap to that many *cells* per line
+/// (annotation cells count, matching the old per-cell chunking).
 /// `annotations` are spliced as extra cells before/after their target byte.
 /// Emits directly into one pre-sized `String` — no per-byte allocation.
-/// `cells_on_line` carries streaming continuation state across chunks. An
-/// annotation ending in CR/LF resets it, so the next byte starts flush.
+/// `cursor` carries streaming continuation state across chunks: an annotation
+/// ending in CR/LF resets the line, and a group survives a chunk boundary so a
+/// transport's read sizes never show up in the rendered spacing.
 fn render_hex(
     bytes: &[u8],
     separator: &str,
+    bytes_per_group: usize,
     bytes_per_line: Option<usize>,
     annotations: &[RenderAnnotation],
-    cells_on_line: &mut usize,
+    cursor: &mut HexCursor,
 ) -> String {
     let per_line = bytes_per_line.filter(|&n| n > 0);
+    let per_group = bytes_per_group.max(1);
     let mut walker = AnnotationWalker::new(annotations);
     let mut out = String::with_capacity(bytes.len() * (2 + separator.len()));
     for (i, b) in bytes.iter().enumerate() {
         let (before, after) = split_run(walker.run_at(i));
         for s in before {
-            push_hex_annotation(&mut out, cells_on_line, per_line, separator, s);
+            push_hex_annotation(&mut out, cursor, per_line, separator, s);
         }
-        start_hex_cell(&mut out, cells_on_line, per_line, separator);
+        let continues_group = cursor.bytes_in_group > 0;
+        start_hex_cell(&mut out, cursor, per_line, separator, continues_group);
         out.push(HEX_DIGITS[(b >> 4) as usize] as char);
         out.push(HEX_DIGITS[(b & 0xF) as usize] as char);
+        cursor.bytes_in_group = (cursor.bytes_in_group + 1) % per_group;
         for s in after {
-            push_hex_annotation(&mut out, cells_on_line, per_line, separator, s);
+            push_hex_annotation(&mut out, cursor, per_line, separator, s);
         }
     }
     // Annotations targeting the one-past-the-end offset (an `After` on the final byte
     // is handled above; a `Before` at len is a trailing mark) attach at the end.
     let (end_before, _) = split_run(walker.run_at(bytes.len()));
     for s in end_before {
-        push_hex_annotation(&mut out, cells_on_line, per_line, separator, s);
+        push_hex_annotation(&mut out, cursor, per_line, separator, s);
     }
     out
 }
@@ -389,7 +419,11 @@ pub struct DisplayView {
     /// View width in columns; wrapping is applied only when this is `Some`.
     pub wrap_width: Option<usize>,
     pub hex_separator: String,
-    /// Bytes per line for Hex display when wrapping (§45).
+    /// Bytes that run together between separators in Hex display (§45). 1 is the
+    /// conventional hexdump; 0 is treated as 1, since no group can be empty.
+    pub hex_bytes_per_group: usize,
+    /// Bytes per line for Hex display when wrapping (§45). Zero means "fit to
+    /// the display width" — the viewer's job, not the renderer's.
     pub hex_bytes_per_line: usize,
 }
 
@@ -402,6 +436,7 @@ impl Default for DisplayView {
             wrapping: WrappingMode::NoWrap,
             wrap_width: None,
             hex_separator: " ".to_string(),
+            hex_bytes_per_group: 1,
             hex_bytes_per_line: 16,
         }
     }
@@ -441,13 +476,14 @@ impl DisplayView {
         match self.mode {
             DisplayMode::Hex => {
                 let bytes_per_line = wrap.then_some(self.hex_bytes_per_line);
-                let mut cells_on_line = 0;
+                let mut cursor = HexCursor::default();
                 render_hex(
                     bytes,
                     &self.hex_separator,
+                    self.hex_bytes_per_group,
                     bytes_per_line,
                     annotations,
-                    &mut cells_on_line,
+                    &mut cursor,
                 )
             }
             DisplayMode::Raw => {
@@ -507,9 +543,10 @@ pub struct StreamRenderer {
     pending: Vec<RenderAnnotation>,
     /// Rendered-mode terminal column, so tab stops survive chunk boundaries.
     col: usize,
-    /// Number of Hex cells on the current output line. Explicit annotation
-    /// newlines reset it so the next chunk starts flush.
-    hex_cells_on_line: usize,
+    /// Hex line and group position. Explicit annotation newlines reset the line
+    /// so the next chunk starts flush, and the group survives the chunk
+    /// boundary so read sizes never show up in the spacing.
+    hex_cursor: HexCursor,
 }
 
 impl StreamRenderer {
@@ -519,7 +556,7 @@ impl StreamRenderer {
             carry: Vec::new(),
             pending: Vec::new(),
             col: 0,
-            hex_cells_on_line: 0,
+            hex_cursor: HexCursor::default(),
         }
     }
 
@@ -584,12 +621,19 @@ impl StreamRenderer {
     /// as the one-shot renderer, threaded with this recording's state.
     fn render_slice(&mut self, bytes: &[u8], annotations: &[RenderAnnotation]) -> String {
         match self.view.mode {
+            // A zero `hex_bytes_per_line` means "do not wrap", which is what the
+            // recorder's view always carries: `.disp` is the exact rendered
+            // stream and soft wrapping is the viewer's job (ADR-018). The GUI
+            // sets a real line length when the user asks for fixed columns, and
+            // wrapping here — where cells are known — keeps a separator from
+            // being stranded at the head of the next line.
             DisplayMode::Hex => render_hex(
                 bytes,
                 &self.view.hex_separator,
-                None,
+                self.view.hex_bytes_per_group,
+                Some(self.view.hex_bytes_per_line).filter(|&n| n > 0),
                 annotations,
-                &mut self.hex_cells_on_line,
+                &mut self.hex_cursor,
             ),
             DisplayMode::Rendered => {
                 render_rendered(bytes, self.view.encoding, annotations, &mut self.col)
@@ -641,6 +685,44 @@ mod tests {
         v.wrapping = WrappingMode::Wrap;
         v.hex_bytes_per_line = 2;
         assert_eq!(v.render_text(b"ABCDE"), "41 42\n43 44\n45");
+    }
+
+    /// Bytes inside a group run together; only groups are separated (§45).
+    #[test]
+    fn hex_groups_bytes_between_separators() {
+        let mut v = view(DisplayMode::Hex, CharacterRendering::Native);
+        assert_eq!(v.render_text(b"ABCDE"), "41 42 43 44 45", "1 = hexdump");
+
+        v.hex_bytes_per_group = 2;
+        assert_eq!(v.render_text(b"ABCDE"), "4142 4344 45");
+
+        v.hex_bytes_per_group = 4;
+        assert_eq!(v.render_text(b"ABCDE"), "41424344 45");
+
+        // Zero cannot mean "one unbroken run of the whole stream", so it is the
+        // conventional single byte per group.
+        v.hex_bytes_per_group = 0;
+        assert_eq!(v.render_text(b"ABCDE"), "41 42 43 44 45");
+    }
+
+    /// Grouping is rendering, so it reaches a Display recording — and it must
+    /// not depend on how the transport happened to divide the stream into reads.
+    #[test]
+    fn hex_grouping_is_chunking_invariant() {
+        let mut v = view(DisplayMode::Hex, CharacterRendering::Native);
+        v.hex_bytes_per_group = 4;
+        let data = b"ABCDEFGHIJ";
+        let want = v.render_text(data);
+        assert_eq!(want, "41424344 45464748 494A");
+        for chunk in [1usize, 2, 3, 7] {
+            let mut renderer = StreamRenderer::new(v.clone());
+            let mut got = String::new();
+            for slice in data.chunks(chunk) {
+                got.push_str(&renderer.render_chunk(slice, &[]));
+            }
+            got.push_str(&renderer.finish());
+            assert_eq!(got, want, "chunk {chunk}");
+        }
     }
 
     #[test]

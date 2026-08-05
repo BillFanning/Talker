@@ -12,11 +12,12 @@ use crate::display::{
 
 use super::super::bridge::UiCommand;
 use super::super::view_prefs::{
-    scroll_buffer_label, ViewPrefs, MAX_SCROLL_BUFFER_BYTES, MIN_SCROLL_BUFFER_BYTES,
-    SCROLL_BUFFER_PRESETS_KB,
+    hex_line_label, scroll_buffer_label, ViewPrefs, HEX_GROUP_SIZES, HEX_LINE_GROUPS,
+    MAX_SCROLL_BUFFER_BYTES, MIN_SCROLL_BUFFER_BYTES, SCROLL_BUFFER_PRESETS_KB,
 };
 use super::super::widgets::{edit_mark_rules, human_bytes, ColorScheme, MSG_FONT_SIZES};
 use super::super::ListenerApp;
+use crate::config::schema::HexGrouping;
 use wiredata_ui::fonts::MonoFont;
 
 impl ListenerApp {
@@ -123,6 +124,10 @@ impl ListenerApp {
             .map(|v| v.snapshot.is_some())
             .unwrap_or(false);
         // The stream viewer (§41): there is one source — the verbatim byte stream.
+        // A fixed Hex line length is wrapped by the renderer, which knows where
+        // cells end; the pane's own width still soft-wraps whatever it gets, so a
+        // line too wide for the window is never cut off mid-view.
+        let hex_grouping = prefs.hex_grouping;
         let renderer = DisplayView {
             mode: msg_mode,
             encoding: DisplayEncoding::Utf8,
@@ -130,7 +135,9 @@ impl ListenerApp {
             wrapping: WrappingMode::NoWrap,
             wrap_width: None,
             hex_separator: " ".to_string(),
-            hex_bytes_per_line: 16,
+            hex_bytes_per_group: usize::from(hex_grouping.bytes_per_group.max(1)),
+            hex_bytes_per_line: usize::from(hex_grouping.bytes_per_group.max(1))
+                * usize::from(hex_grouping.groups_per_line),
         };
         // Verbatim received bytes (§17–18, §41): line breaks come only from the
         // data — Rendered honors real CR/LF (§44), Raw shows control pictures, Hex
@@ -323,6 +330,54 @@ impl ListenerApp {
                             .on_hover_text("Hex escapes (<0A> <0D> <09> …)");
                     });
                 });
+            });
+        });
+        // Hex grouping (§45) — enabled only in Hex mode, but the setting persists
+        // either way, so switching modes and back does not lose it.
+        ui.add_enabled_ui(prefs.mode == DisplayMode::Hex, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Group").on_hover_text(
+                    "How many bytes run together between spaces. 1 is the conventional \
+                         hexdump (41 42 43 44); 4 reads as words (41424344). Grouping is part \
+                         of the rendering, so a Display recording (.disp) gets the same \
+                         spacing the viewer shows.",
+                );
+                egui::ComboBox::from_id_salt("hex_bytes_per_group")
+                    .selected_text(format!(
+                        "{} bytes",
+                        prefs.hex_grouping.bytes_per_group.max(1)
+                    ))
+                    .show_ui(ui, |ui| {
+                        for &size in HEX_GROUP_SIZES {
+                            ui.selectable_value(
+                                &mut prefs.hex_grouping.bytes_per_group,
+                                size,
+                                format!("{size} bytes"),
+                            );
+                        }
+                    });
+                ui.label("Line").on_hover_text(
+                    "How many groups fill one line. Fit to width lets the pane decide, \
+                         so a wider window shows more per line; a fixed count holds the \
+                         columns still while the window is resized. This is layout, not \
+                         rendering — a Display recording (.disp) is never hard-wrapped \
+                         either way.",
+                );
+                egui::ComboBox::from_id_salt("hex_groups_per_line")
+                    .selected_text(hex_line_label(prefs.hex_grouping))
+                    .show_ui(ui, |ui| {
+                        for &groups in HEX_LINE_GROUPS {
+                            let candidate = HexGrouping {
+                                groups_per_line: groups,
+                                ..prefs.hex_grouping
+                            };
+                            ui.selectable_value(
+                                &mut prefs.hex_grouping.groups_per_line,
+                                groups,
+                                hex_line_label(candidate),
+                            );
+                        }
+                    });
             });
         });
         ui.horizontal(|ui| {
@@ -533,12 +588,19 @@ fn rebuild_rows(p: &StreamRefresh, window_start: u64) -> super::super::StreamRen
     // from snapshot firings, lifetime tied to the bytes), NOT the snapshot's
     // bounded rolling `matches` window — deriving from that made timestamps
     // vanish from a paused view as firings churned.
+    //
+    // The bound is half-open, matching `delta_annotations`. A mark at exactly
+    // one past the window's end is a `Before` whose byte has not arrived yet —
+    // including it rendered the mark ahead of its byte and then spliced it a
+    // second time when that byte turned up in the next delta, so a Mark landing
+    // on a delta boundary appeared twice. (`After` marks anchor on their own
+    // byte, so they are always inside the window once that byte is.)
     let annotations: Vec<RenderAnnotation> = p
         .marks
         .iter()
         .filter_map(|m| {
             let within = m.offset.checked_sub(window_start)? as usize;
-            (within <= p.window.len()).then(|| RenderAnnotation {
+            (within < p.window.len()).then(|| RenderAnnotation {
                 offset: within,
                 placement: if m.before {
                     AnnotationPlacement::Before
@@ -748,6 +810,7 @@ mod tests {
             wrapping: WrappingMode::NoWrap,
             wrap_width: None,
             hex_separator: " ".to_string(),
+            hex_bytes_per_group: 1,
             hex_bytes_per_line: 16,
         }
     }
@@ -836,6 +899,75 @@ mod tests {
         let v = view(DisplayMode::Hex);
         let got = incremental_rows(b"ABCD", 2, &[], &v, 80);
         assert_eq!(got, vec!["41 42 43 44".to_string()]);
+    }
+
+    /// A group must not break at a read boundary: the transport's chunk sizes
+    /// are not a property of the data being read.
+    #[test]
+    fn hex_groups_survive_delta_boundaries() {
+        let mut v = view(DisplayMode::Hex);
+        v.hex_bytes_per_group = 4;
+        for chunk in [1usize, 2, 3, 5, 8] {
+            let got = incremental_rows(b"ABCDEFGH", chunk, &[], &v, 80);
+            assert_eq!(
+                got,
+                vec!["41424344 45464748".to_string()],
+                "grouping changed with the read size (chunk {chunk})"
+            );
+        }
+    }
+
+    /// A fixed line length wraps where a cell ends, so no separator is stranded
+    /// at the head of the next line — the reason the renderer owns this and the
+    /// row splitter does not.
+    #[test]
+    fn hex_lines_wrap_between_groups_not_inside_them() {
+        let mut v = view(DisplayMode::Hex);
+        v.hex_bytes_per_group = 4;
+        v.hex_bytes_per_line = 8; // two groups of four
+        for chunk in [1usize, 3, 5, 12] {
+            let got = incremental_rows(b"ABCDEFGHIJKL", chunk, &[], &v, 80);
+            assert_eq!(
+                got,
+                vec!["41424344 45464748".to_string(), "494A4B4C".to_string()],
+                "chunk {chunk}"
+            );
+        }
+    }
+
+    /// A Mark stands apart from the bytes on both sides, and the bytes after it
+    /// start a fresh group — otherwise one annotation shifts every column below.
+    #[test]
+    fn hex_annotations_break_out_of_their_group() {
+        let mut v = view(DisplayMode::Hex);
+        v.hex_bytes_per_group = 4;
+        let marks = vec![mark(2, true, "[T]")];
+        let got = incremental_rows(b"ABCDEF", 2, &[], &v, 80);
+        assert_eq!(got, vec!["41424344 4546".to_string()], "no mark, no break");
+        let got = incremental_rows(b"ABCDEF", 3, &marks, &v, 80);
+        assert_eq!(got, vec!["4142 [T] 43444546".to_string()]);
+    }
+
+    /// A Mark whose byte lands exactly on a delta boundary is spliced once.
+    ///
+    /// The rebuild used to include a mark at one *past* the window end — a
+    /// `Before` whose byte had not arrived — so it rendered ahead of its byte
+    /// and again when that byte turned up. Every mode is checked because the
+    /// splice point is shared, and the read size must not be observable.
+    #[test]
+    fn a_mark_on_a_delta_boundary_splices_once() {
+        let marks = vec![mark(2, true, "[T]")];
+        for mode in [DisplayMode::Rendered, DisplayMode::Raw, DisplayMode::Hex] {
+            let v = view(mode);
+            let want = batch_rows(b"ABCDEF", &marks, &v, 80);
+            for chunk in [1usize, 2, 3, 6] {
+                assert_eq!(
+                    incremental_rows(b"ABCDEF", chunk, &marks, &v, 80),
+                    want,
+                    "mode {mode:?} chunk {chunk}"
+                );
+            }
+        }
     }
 
     #[test]

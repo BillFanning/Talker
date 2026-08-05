@@ -140,11 +140,23 @@ Message-model removal). Everything below this block is verified done:
       { bytes_per_group, groups_per_line }` added with `#[serde(default)]`, so
       profiles round-trip it (`b8960a1`). Pinned by `hex_grouping_round_trips_through_
       a_profile` + `a_profile_without_hex_grouping_loads_with_the_default`.
-- [ ] Consume `hex_grouping` in the Hex renderer: `hex_bytes_per_line` is hardcoded to
-      16 in both `build_display_view` (`build.rs`) and the GUI stream renderer
-      (`gui/detail/stream_view.rs`); map the config `HexGrouping` onto `hex_bytes_per_line`/
-      `hex_separator` at both sites so the persisted grouping drives the Hex view
-      (with a GUI control).
+- [x] Consume `hex_grouping` in the Hex renderer (ADR-038, 2026-08-05). Both halves
+      are wired, and they land in different places by design: `bytes_per_group` is
+      **rendering** (`DisplayView::hex_bytes_per_group` → `render_hex` runs that many
+      bytes together), so it reaches the `.disp`; `groups_per_line` is **layout**, so
+      it sets the viewer's line length and `build_display_view` passes 0 — no hard
+      wraps in a recording (ADR-018). `0` groups stays "fit to the display width"
+      (§45). A `HexCursor` carries group position across chunks so read sizes are not
+      visible in the spacing, and an annotation stands apart and resets the group so
+      one Mark cannot shift every column below it. GUI control under Configure
+      display, in the schema's own units. Pinned by `hex_groups_bytes_between_
+      separators`, `hex_grouping_is_chunking_invariant`, `hex_lines_wrap_between_
+      groups_not_inside_them`, and `hex_annotations_break_out_of_their_group`.
+- [x] **Marks spliced twice on a delta boundary** — found while testing the above.
+      `rebuild_rows` admitted a mark at one *past* the window end (a `Before` whose
+      byte had not arrived), so it rendered ahead of its byte and again when that
+      byte arrived. The bound is now half-open, matching `delta_annotations`. Pinned
+      by `a_mark_on_a_delta_boundary_splices_once` across all three modes.
 - [x] Live `Record` begin/stop without a restart (ADR-012). `Listener::set_recording`
       → `PipelineRequest::SetRecording` into `run_channel` → the pipeline's lazy
       begin / clean finalize path (shared with the match-rule `Record` action); GUI

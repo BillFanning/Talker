@@ -1302,6 +1302,66 @@ names the boundary and the tooltip defines it, and the row now carries counts
 that earn the space. No measurement, telemetry type, snapshot surface, or profile
 schema changes; this is presentation only.
 
+## ADR-038 — Hex grouping is rendering; line length is layout
+
+**Status:** Accepted 2026-08-05.
+
+**Context:** `HexGrouping { bytes_per_group, groups_per_line }` (§45) was
+specified, persisted, `#[serde(default)]`-ed, and pinned by a profile round-trip
+test — and read by nothing. Both places that built a `DisplayView` hardcoded
+`hex_bytes_per_line: 16`, and no GUI control set the field, so a profile could
+express a grouping that the viewer and the `.disp` both ignored.
+
+The obvious fix — map the config onto the existing `hex_bytes_per_line` — does
+not deliver what §45 asks for. `bytes_per_group` means bytes *run together*
+between separators (`41424344` at four), which the renderer could not express:
+it emitted one separator between every cell. Line length alone would have left
+the setting half-implemented in a way no readout would reveal.
+
+**Decision:** Split the two halves by where they belong.
+
+- **`bytes_per_group` is rendering.** `DisplayView` gains
+  `hex_bytes_per_group`; `render_hex` runs that many bytes together and
+  separates only groups. It therefore reaches the `.disp` — the recorded stream
+  is the rendered stream, and the spacing is part of what was rendered.
+- **`groups_per_line` is layout.** It sets the viewer's line length and never
+  reaches a recording: ADR-018 holds that `.disp` is never hard-wrapped, so
+  `build_display_view` passes `hex_bytes_per_line: 0` unconditionally while the
+  GUI passes a real length. The flag is the mechanism, not the code path — a
+  `0` means "do not wrap", which is what the recorder's view always carries.
+- **`groups_per_line: 0` stays "fit to the display width" (§45)** — a question
+  only a viewer that knows its own width can answer, so the renderer is told not
+  to wrap and the pane wraps what it gets.
+
+Two rules keep the output stable under things the reader did not choose:
+
+- **A group never breaks at a read boundary.** The `HexCursor` carries group
+  position across chunks alongside line position, so a transport's read sizes
+  are not observable in the spacing (`hex_grouping_is_chunking_invariant`).
+- **An annotation stands apart and resets the group.** Running a Mark into the
+  bytes on either side (`4142‹T›4344`) would hide both, and letting it count as
+  a group member would shift every column below it.
+
+The line wrap is done by the renderer rather than by splitting rendered text at
+a computed column count. The arithmetic works out to the same width, but the
+splitter cannot know that the character at the boundary is a separator, so it
+stranded one at the head of every continuation line.
+
+**Consequences:** A GUI control under Configure display sets both halves, in the
+units §45 and the schema use (bytes per group, groups per line) with the
+resulting bytes-per-line shown alongside so the reader does not multiply. The
+setting persists through `ViewPrefs` like the other view presentation fields —
+the field already round-tripped through TOML, so what this closes is the write
+side. A zero `bytes_per_group` resolves to 1 everywhere rather than erroring:
+no group can be empty, and the config has no way to mean otherwise.
+
+**Found while testing:** the row cache spliced a Mark twice when its byte landed
+exactly on a delta boundary. `rebuild_rows` admitted a mark at one *past* the
+window end — a `Before` whose byte had not arrived — so it rendered ahead of its
+byte and again when that byte turned up in the next delta. The bound is now
+half-open, matching `delta_annotations`, and pinned across all three modes and
+four chunk sizes by `a_mark_on_a_delta_boundary_splices_once`.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

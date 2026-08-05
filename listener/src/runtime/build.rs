@@ -47,8 +47,21 @@ pub fn build_display_view(config: &DisplayViewConfig) -> DisplayView {
         wrapping: config.wrapping,
         wrap_width: None,
         hex_separator: " ".to_string(),
-        hex_bytes_per_line: 16,
+        hex_bytes_per_group: hex_bytes_per_group(config),
+        // Never wrap. `HexGrouping` splits into rendering and layout, and only
+        // rendering belongs in a recording: `bytes_per_group` changes what the
+        // bytes look like and reaches the `.disp`, while `groups_per_line`
+        // decides where lines end, which is the viewer's question (ADR-018 —
+        // `.disp` is the exact rendered stream, never hard-wrapped).
+        hex_bytes_per_line: 0,
     }
+}
+
+/// Bytes that run together between separators (§45). Zero would render every
+/// byte of the stream as one unbroken run, which the config cannot mean, so it
+/// resolves to the conventional single byte per group.
+pub fn hex_bytes_per_group(config: &DisplayViewConfig) -> usize {
+    usize::from(config.hex_grouping.bytes_per_group).max(1)
 }
 
 fn map_data_bits(bits: CfgDataBits) -> DataBits {
