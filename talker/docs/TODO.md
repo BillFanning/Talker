@@ -137,10 +137,11 @@ badges (`ISSUE` / `ATTENTION` / `MONITORING`) — that is the pattern to copy.
   nobody has looked yet. Now cheap to check: with four accents there are six
   pairs, and the rule to test each against is written on `Palette` — colour
   reinforces a state, it never carries one alone.
-- [ ] **Look at the reduced palette in both apps.** The one thing tests cannot
-  answer: collapsing four greys into two theme emphases flattens hierarchy in
-  the talker log panel and the listener diagnostics list. Worth a look at both
-  in light and dark before trusting it.
+- [x] **Looked at the reduced palette in both apps** — 2026-08-06, confirmed
+  good. This was the open risk in the reduction: four greys became two theme
+  emphases, and nothing but eyes could say whether the log panel and diagnostics
+  list still read hierarchically. They do. The theme's own `weak_text_color` was
+  enough, which is the argument for not having had four greys.
 
 ## Robustness (external review round 2, 2026-07-12)
 
