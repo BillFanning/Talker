@@ -132,11 +132,29 @@ badges (`ISSUE` / `ATTENTION` / `MONITORING`) — that is the pattern to copy.
   differed by green against amber alone, the pair confirmed above as
   indistinguishable. Reconnecting now has `◐`. The detail pane was never
   affected: it prints `status_label` beside the glyph.
-- [ ] **Audit for colour-only states across both apps.** Everything found so far
-  was found by looking, not by any rule, so the remaining ones are wherever
-  nobody has looked yet. Now cheap to check: with four accents there are six
-  pairs, and the rule to test each against is written on `Palette` — colour
-  reinforces a state, it never carries one alone.
+- [x] **Audited every colour-only state across both apps** — 2026-08-06. Method:
+  every use of a palette accent, checked against one question — *is the state
+  still legible with the colour removed?* Two failed.
+  - **`signal_row` carried tone by colour alone** (shared chrome, so both apps'
+    decision rows). A warning row and a calm one were the same string in two
+    hues. Warning and Fault now prefix `⚠`; they share it deliberately, because
+    what has to survive without colour is the binary *does this want
+    attention*, and which of the two it is stays in the row's text and the
+    card's badge. Pinned by `only_the_tones_that_want_attention_are_marked`.
+  - **Listener's Raw record queue line** stated "at or above half capacity" in
+    amber only. The numbers were always there, but the *judgement the app had
+    drawn from them* was not; it now says ", at half capacity".
+
+  What the audit **cleared**, and why, since that is the reusable part:
+  status glyphs and recording indicators carry a glyph plus a word; log lines
+  are formatted `[time] [LEVEL] message`; severity counts read "3 warn";
+  diagnostics lists prefix `INFO `/`WARN `/`ERROR`; the per-message table shows
+  `—` where a non-blocking message has nothing to report, so the *presence* of a
+  value is the signal; the timer line says "request failed" in words; "duplicate
+  name" and the interface-error line only exist when they apply; `red_bordered`
+  adds an outline, and presence-of-outline is not a hue. Every one of those was
+  already obeying the rule before anyone wrote it down — which is why they
+  survived and the two above did not.
 - [x] **Looked at the reduced palette in both apps** — 2026-08-06, confirmed
   good. This was the open risk in the reduction: four greys became two theme
   emphases, and nothing but eyes could say whether the log panel and diagnostics

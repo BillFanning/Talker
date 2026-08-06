@@ -246,13 +246,32 @@ pub fn signal_row(
     )
     .on_hover_text(tooltip.clone());
     let text_color = tone.text_color(ui);
+    let value = format!("{}{}", tone_marker(tone), value.into().text());
     ui.add(
-        egui::Label::new(RichText::new(value.into().text()).color(text_color))
+        egui::Label::new(RichText::new(value).color(text_color))
             .wrap()
             .sense(egui::Sense::hover()),
     )
     .on_hover_text(tooltip);
     ui.end_row();
+}
+
+/// The mark a row wears when it wants attention, or nothing when it does not.
+///
+/// Rows used to differ by colour alone: a warning row and a calm one were the
+/// same text in two hues, which is the failure mode this module's own rule
+/// forbids — colour reinforces a state, it never carries one alone.
+///
+/// Warning and Fault share `⚠` deliberately. What must survive without colour
+/// is the binary *does this row want attention*, and both answer yes; which of
+/// the two it is stays in the row's own text and in the card's badge, where a
+/// word already says it. Adding a second glyph would split a distinction the
+/// reader does not have to make at a glance.
+fn tone_marker(tone: SignalTone) -> &'static str {
+    match tone {
+        SignalTone::Warning | SignalTone::Fault => "\u{26A0} ",
+        SignalTone::Neutral | SignalTone::Healthy => "",
+    }
 }
 
 /// Draw an exceptional condition beneath the summary rows. Healthy information
@@ -292,6 +311,26 @@ pub fn attention_callout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row that wants attention says so without its colour.
+    ///
+    /// This is the module's own rule applied to itself: tone used to reach the
+    /// reader through colour alone, so a warning row and a calm one were one
+    /// string in two hues.
+    #[test]
+    fn only_the_tones_that_want_attention_are_marked() {
+        for calm in [SignalTone::Neutral, SignalTone::Healthy] {
+            assert_eq!(tone_marker(calm), "", "a calm row carries no mark");
+        }
+        for wants_attention in [SignalTone::Warning, SignalTone::Fault] {
+            let marker = tone_marker(wants_attention);
+            assert!(!marker.is_empty(), "{wants_attention:?} is colour-only");
+            assert!(
+                marker.starts_with('\u{26A0}'),
+                "attention uses the shared ⚠, not a private symbol"
+            );
+        }
+    }
 
     /// The three terms are fixed and distinct — the point of defining them once
     /// is that neither app invents a fourth word for the same idea.

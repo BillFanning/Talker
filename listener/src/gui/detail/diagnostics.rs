@@ -725,12 +725,19 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
             .on_hover_text(RAW_QUEUE_FAULTED_TOOLTIP);
         }
         Some(queue) if view.recording == Some(RecordingState::Enabled) => {
+            // The half-capacity judgement is named, not just coloured. The
+            // numbers were always here, but "this crossed the reference" was a
+            // conclusion the app had drawn and was stating in amber alone.
+            let pressured = queue_level_reaches_half(queue.current, queue.capacity);
             let text = egui::RichText::new(format!(
-                "Raw record queue: latest sample {}/{} · highest observed {}",
-                queue.current, queue.capacity, queue.peak
+                "Raw record queue: latest sample {}/{}{} · highest observed {}",
+                queue.current,
+                queue.capacity,
+                if pressured { ", at half capacity" } else { "" },
+                queue.peak
             ))
             .weak();
-            ui.label(if queue_level_reaches_half(queue.current, queue.capacity) {
+            ui.label(if pressured {
                 text.color(palette(ui).warning)
             } else {
                 text
