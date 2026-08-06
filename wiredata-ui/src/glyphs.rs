@@ -19,6 +19,20 @@ pub const STOPPED: &str = "\u{25A0}";
 /// Faulted / needs attention: `⚠`.
 pub const FAULT: &str = "\u{26A0}";
 
+/// A serial control line that is **high** (asserted): `●`.
+///
+/// Deliberately the same symbol as [`RUNNING`] — an asserted line and a running
+/// channel mean the same thing to a reader, and one product should not spell
+/// "active" two ways. Paired with [`LINE_LOW`] it is filled against hollow,
+/// which is the distinction that survives when the colour does not.
+pub const LINE_HIGH: &str = "\u{25CF}";
+/// A serial control line that is **low**: `○`.
+///
+/// Hollow, so high and low differ in *shape* and not only in colour. Green
+/// against grey is the classic red-green collision, and a control-line readout
+/// whose whole job is telling the two levels apart cannot rest on it.
+pub const LINE_LOW: &str = "\u{25CB}";
+
 /// The base size multiplier for status glyphs (relative to body size). The
 /// square (`■`) is the reference at this size; the dot and triangle are
 /// enlarged by the optical correction in [`glyph_size`] to match the

@@ -38,16 +38,16 @@ pub(crate) fn stop_enabled(status: ChannelStatus) -> bool {
 
 /// The recording-state indicator: glyph, color, and label for a channel's raw
 /// recording state (§53). Uses the **same symbol set and colors as channel status**
-/// ([`status_glyph`] / [`status_color`]) — `■` off (grey), `●` recording (green), `⚠`
-/// faulted (red) — so the two read consistently. Pure, unit-tested; the detail pane
+/// ([`status_glyph`] / [`status_color`]) — `■` off, `●` recording, `⚠` faulted —
+/// so the two read consistently. Pure, unit-tested; the detail pane
 /// renders it as a colored label sized via [`recording_glyph_size`].
 pub(crate) fn recording_indicator(
     recording: Option<crate::core::RecordingState>,
     pal: &Palette,
 ) -> (&'static str, egui::Color32, &'static str) {
     use crate::core::RecordingState;
-    // Same colors as channel status (`status_color`): the active ● is RUNNING_GREEN
-    // (like a Running channel), faulted ⚠ is FAULT_RED, off ■ is IDLE_GREY.
+    // Same colors as channel status (`status_color`): active ● matches a Running
+    // channel, faulted ⚠ the fault accent, off ■ the idle grey.
     use wiredata_ui::glyphs;
     match recording {
         Some(RecordingState::Enabled) => (glyphs::RUNNING, pal.running, "recording"),
@@ -66,25 +66,43 @@ pub(crate) fn status_label(status: ChannelStatus) -> &'static str {
     }
 }
 
-/// A serial control-line indicator (§161): the line name colored green when the
-/// line is high (asserted), grey when low, with a hover tooltip.
+/// The glyph marking a control line's level (§161).
+///
+/// Shape carries the level; colour reinforces it. This is the rule the channel
+/// status glyphs below already follow, and the control lines are where it was
+/// missed: green against grey is the classic red-green collision, so a readout
+/// whose entire job is telling high from low was resting on the one cue a
+/// colour-blind reader does not get.
+pub(crate) fn line_glyph(high: bool) -> &'static str {
+    if high {
+        wiredata_ui::glyphs::LINE_HIGH
+    } else {
+        wiredata_ui::glyphs::LINE_LOW
+    }
+}
+
+/// A serial control-line indicator (§161): the line name prefixed by a filled
+/// glyph when the line is high (asserted) and a hollow one when low, coloured to
+/// match, with a hover tooltip naming the level.
 pub(crate) fn line_indicator(ui: &mut egui::Ui, name: &str, high: bool) {
     let pal = wiredata_ui::palette::active(ui);
     let color = if high { pal.line_high } else { pal.line_low };
-    ui.colored_label(color, name)
+    ui.colored_label(color, format!("{} {name}", line_glyph(high)))
         .on_hover_text(if high { "high" } else { "low" });
 }
 
-/// A clickable serial output-line toggle (RTS/DTR, §161): a selectable chip,
-/// highlighted and green when the line is asserted (high). Returns the click
-/// response so the caller can send the matching Set command.
+/// A clickable serial output-line toggle (RTS/DTR, §161): a selectable chip
+/// carrying the same level glyph as [`line_indicator`], highlighted when the
+/// line is asserted. Returns the click response so the caller can send the
+/// matching Set command.
 pub(crate) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Response {
     let color = if high {
         wiredata_ui::palette::active(ui).line_high
     } else {
         ui.visuals().weak_text_color()
     };
-    ui.selectable_label(high, egui::RichText::new(name).color(color))
+    let label = format!("{} {name}", line_glyph(high));
+    ui.selectable_label(high, egui::RichText::new(label).color(color))
         .on_hover_text(format!(
             "{name} output is {} — click to set it {}",
             if high { "high" } else { "low" },
@@ -92,9 +110,9 @@ pub(crate) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Re
         ))
 }
 
-/// The color for a status glyph. Running is a bright blue-green and Reconnecting a
-/// yellower amber, both chosen to read distinctly from the red fault for red-green
-/// color blindness (the distinct glyphs ●/■/⚠ are the primary signal; color reinforces).
+/// The color for a status glyph. The distinct glyphs `●`/`■`/`⚠` are the primary
+/// signal and colour reinforces them, which is why this readout survived the
+/// colour-deficiency problem that the control lines above did not.
 /// Pure — callers pass the active theme's palette (`wiredata_ui::palette::active`),
 /// the same pattern as talker's `lifecycle_indicator`.
 pub(crate) fn status_color(status: ChannelStatus, pal: &Palette) -> egui::Color32 {
@@ -133,3 +151,25 @@ pub(crate) use wiredata_ui::glyphs::glyph_size as recording_glyph_size;
 
 /// The fixed-cell, non-interactive glyph painter — see `wiredata_ui::glyphs`.
 pub(crate) use wiredata_ui::glyphs::paint_glyph;
+
+#[cfg(test)]
+mod tests {
+    use super::line_glyph;
+
+    /// The two control-line levels must be distinguishable with the colour
+    /// removed — that is the whole point of the glyph, and the defect it fixed.
+    #[test]
+    fn control_line_levels_differ_without_colour() {
+        let high = line_glyph(true);
+        let low = line_glyph(false);
+        assert_ne!(
+            high, low,
+            "high and low would read identically in greyscale"
+        );
+        assert!(!high.is_empty() && !low.is_empty());
+        // Filled against hollow: a fill difference survives at small sizes,
+        // where two similar outlines would not.
+        assert_eq!(high, "\u{25CF}");
+        assert_eq!(low, "\u{25CB}");
+    }
+}

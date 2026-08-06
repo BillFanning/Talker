@@ -82,13 +82,11 @@ pub struct Palette {
     pub count_info: Color32,
 
     // ── Serial control lines ─────────────────────────────────────────────
-    /// A high (asserted) serial control/status line.
-    ///
-    /// Distinguished from [`Palette::line_low`] by colour **alone**, which is a
-    /// known accessibility defect — see the colour-accessibility items in
-    /// `talker/docs/TODO.md`. The fix is a second channel, not a third green.
+    /// A high (asserted) serial control/status line. Reinforces the filled
+    /// [`crate::glyphs::LINE_HIGH`] glyph; it does not carry the level alone.
     pub line_high: Color32,
-    /// A low serial control/status line.
+    /// A low serial control/status line. Reinforces the hollow
+    /// [`crate::glyphs::LINE_LOW`] glyph.
     pub line_low: Color32,
 }
 

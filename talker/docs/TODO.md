@@ -99,17 +99,25 @@ alone is the bug.** Colour may reinforce a distinction; it may not be the only
 thing making it. The diagnostics cards already do this correctly with word
 badges (`ISSUE` / `ATTENTION` / `MONITORING`) — that is the pattern to copy.
 
-- [ ] **Serial control lines are colour-only** (`line_high` vs `line_low`,
-  `wiredata-ui/src/palette.rs`; listener's control-line display). Asserted vs
-  low is shown by nothing but the colour, and green against grey is the classic
-  deuteranopia collision — so CTS/DSR/DCD/RI may read identically in both
-  states. This is a functional failure, not a cosmetic one: the whole point of
-  the readout is telling the two apart. Fix by adding a non-colour channel
-  (glyph or `HIGH`/`low` text), not by picking a different green.
-- [ ] **`running` vs `warning`.** The other risky pair; check whether a running
-  channel and a warning are distinguishable at the status dot, the status bar,
-  and the message status strip (which derives its background from the same
-  accent, so a collision there doubles).
+- [x] **Serial control lines were colour-only** — fixed 2026-08-06. `●` filled
+  for high, `○` hollow for low (`glyphs::LINE_HIGH`/`LINE_LOW`), so shape
+  carries the level and colour reinforces it. That rule was already stated in
+  `status.rs` for the channel glyphs and already followed there; the control
+  lines were the one readout that missed it, which is why the fix was small.
+  Pinned by `control_line_levels_differ_without_colour`.
+- [ ] **`running` vs `warning` collide — confirmed 2026-08-06.** Checked against
+  the same red-green deficiency: the green and the amber read as similar. Unlike
+  the control lines this is **not** a functional failure, and the difference is
+  worth understanding rather than filing as another bug: everywhere the two
+  appear, a distinct glyph and a word are already carrying the state (`●` vs
+  `⚠`, "running" vs the warning's own text), so nothing is unreadable. The
+  diagnostics card is safe by construction too — `SignalTone::Healthy` resolves
+  to the theme's body text, not to green, so a healthy row is never a green
+  smudge next to an amber one.
+  What the finding actually says is that these two accents are **not earning
+  their keep**: they cost a distinguishable-pair budget and buy reinforcement a
+  reader with this deficiency does not receive. That is an argument for the
+  reduction item below, not for a third colour — resolve it there.
 - [ ] **Reduce the palette — probably too many colours.** Ten fields, of which
   **five are greys** (`idle`, `info`, `event`, `count_info`, `line_low` — 120,
   80, 60, 110, 150 in the light theme). Those differences encode *emphasis*, not
