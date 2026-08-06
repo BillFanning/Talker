@@ -1,11 +1,27 @@
-# Listener Specification v2.2.3
+# Listener Specification v2.3.0
 
 Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (authoritative Serial stall snapshots):
+Revision note (Hex grouping and the timestamp sidecar become specified behaviour):
+
+- **§45 Hex grouping (ADR-038/ADR-040).** `HexGrouping` was specified and
+  persisted but read by nothing. Its two halves now have stated reach: bytes per
+  group is rendering and appears in the `.disp`; groups per line is view layout,
+  never reaches a recording, and is reduced when the pane cannot show it. The
+  section states the invariant that follows — no displayed row splits a byte or
+  begins or ends with a separator.
+- **§57 Raw timestamp sidecar (ADR-039).** The flag is no longer config-only: the
+  Raw recording editor exposes it. An offset is a position in the `.raw` beside
+  it, so appending continues from that file's end rather than restarting — the
+  previous behaviour indexed an appended run's blocks onto the previous run's
+  bytes while leaving the `.raw` itself byte-exact.
+- No schema, transport, queue, or telemetry change; `CURRENT_VERSION` is
+  unchanged. Existing profiles are unaffected.
+
+Revision note for v2.2.3 (authoritative Serial stall snapshots):
 
 - **§91.2 / §97 / §99 / §101 / §104 / §128 Serial backpressure telemetry
   (ADR-034).** Each successfully opened Serial run now owns reader-maintained
@@ -1051,6 +1067,18 @@ Hex Display shall display each byte as two uppercase hexadecimal digits.
 Grouping and spacing are configurable per view (`HexGrouping`, §78/§80.1): the
 number of bytes per group and groups per line (0 = fit to the display width).
 
+The two halves have different reach (ADR-038/ADR-040):
+
+- **Bytes per group is rendering.** Those bytes run together and only groups are
+  separated, so the grouping appears in a Display Recording (`.disp`) exactly as
+  on screen. A group is never broken by a read-chunk boundary, and an inline
+  `Mark` (§50.2) stands apart from the bytes on both sides and starts a fresh
+  group after it.
+- **Groups per line is view layout.** It shall not reach a recording, which is
+  never hard-wrapped (§54). A configured count shall be reduced when the pane is
+  too narrow to show it, and 0 fills the pane; in every case **no displayed row
+  shall split a byte** or begin or end with a group separator.
+
 ## 46. Character Rendering
 
 Character Rendering options shall include:
@@ -1325,8 +1353,11 @@ fact that cannot be regenerated from them.
 - **Raw Recording:** timestamps are `ChunkTime` values (wall clock + monotonic)
   written to a **sidecar index** (`.raw.idx`) keyed by byte offset; the `.raw` byte
   stream stays pure and byte-exact. The sidecar is written when
-  `RawRecordingConfig.timestamp_enabled` is set — currently a config-only flag with no
-  UI toggle yet (a TODO tracks exposing it).
+  `RawRecordingConfig.timestamp_enabled` is set, from the Raw recording editor or a
+  profile. An offset is a **position in the `.raw` beside it**, not a count for the
+  current run: appending to an existing recording continues from that file's end, and
+  with rotation each period's file has its own sidecar counting from its own start
+  (ADR-039). One line per received block, `<offset>,<wall_clock_nanos>`.
 - **Display Recording:** the recorder writes the rendered text verbatim and adds **no**
   timestamps of its own. The only display timestamp is the per-match `Mark` timestamp
   (§50.2), which is spliced inline into the rendered text *before* the recorder sees it
