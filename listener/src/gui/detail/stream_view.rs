@@ -124,11 +124,13 @@ impl ListenerApp {
             .map(|v| v.snapshot.is_some())
             .unwrap_or(false);
         // The stream viewer (§41): there is one source — the verbatim byte stream.
-        // A fixed Hex line length is wrapped by the renderer, which knows where
-        // cells end; the pane's own width still soft-wraps whatever it gets, so a
-        // line too wide for the window is never cut off mid-view.
+        // Hex line length is filled in below, once the pane's width is known, so
+        // that every Hex wrap happens in the renderer — the only place a cell
+        // boundary is known. `split_stream_rows` is still character-based, and
+        // still wraps the text modes; Hex simply never reaches it with a line
+        // left to cut (see `hex_line_bytes`).
         let hex_grouping = prefs.hex_grouping;
-        let renderer = DisplayView {
+        let mut renderer = DisplayView {
             mode: msg_mode,
             encoding: DisplayEncoding::Utf8,
             character_rendering: msg_chars,
@@ -136,8 +138,7 @@ impl ListenerApp {
             wrap_width: None,
             hex_separator: " ".to_string(),
             hex_bytes_per_group: usize::from(hex_grouping.bytes_per_group.max(1)),
-            hex_bytes_per_line: usize::from(hex_grouping.bytes_per_group.max(1))
-                * usize::from(hex_grouping.groups_per_line),
+            hex_bytes_per_line: 0,
         };
         // Verbatim received bytes (§17–18, §41): line breaks come only from the
         // data — Rendered honors real CR/LF (§44), Raw shows control pictures, Hex
@@ -175,6 +176,10 @@ impl ListenerApp {
                 // when the column count changes (the cache key includes it).
                 let avail_w = (ui.available_width() - SCROLLBAR_WIDTH).max(char_w);
                 let wrap_cols = (avail_w / char_w).floor().max(8.0) as usize;
+                // Resolve Hex line length against the pane now that its width is
+                // known, so the renderer wraps at a whole group and the row
+                // splitter below never has a Hex line left to cut.
+                renderer.hex_bytes_per_line = hex_line_bytes(hex_grouping, wrap_cols);
                 self.refresh_stream_rows(id, &renderer, wrap_cols);
                 let rows: &[String] = self
                     .stream_cache
@@ -359,9 +364,10 @@ impl ListenerApp {
                 ui.label("Line").on_hover_text(
                     "How many groups fill one line. Fit to width lets the pane decide, \
                          so a wider window shows more per line; a fixed count holds the \
-                         columns still while the window is resized. This is layout, not \
-                         rendering — a Display recording (.disp) is never hard-wrapped \
-                         either way.",
+                         columns still while the window is resized, and is reduced if the \
+                         window is too narrow to show it — a row never splits a byte. \
+                         This is layout, not rendering: a Display recording (.disp) is \
+                         never hard-wrapped either way.",
                 );
                 egui::ComboBox::from_id_salt("hex_groups_per_line")
                     .selected_text(hex_line_label(prefs.hex_grouping))
@@ -494,6 +500,53 @@ impl ListenerApp {
     }
 }
 
+/// Narrowest row width the viewer will lay out to, in monospace columns.
+///
+/// Shared by the row splitter and the Hex line-length resolver: if the two used
+/// different floors, a very narrow pane would let the renderer emit a line the
+/// splitter then cut, which is exactly the case Hex wrapping exists to avoid.
+const MIN_WRAP_COLS: usize = 8;
+
+/// Bytes per rendered Hex line, resolved against the pane (§45).
+///
+/// Fit-to-width has to become a *byte* count before rendering, never a
+/// character count after it. [`split_stream_rows`] cuts at a raw column, and on
+/// a Hex run that column can land between the two digits of one byte or strand
+/// a group separator at the head of the next row. Resolving the width here puts
+/// every Hex wrap in the renderer, which is the only place a cell boundary is
+/// known.
+///
+/// `G` groups of `B` bytes occupy `G × B × 2` digits plus the `G - 1`
+/// separators between them, so the largest `G` fitting `cols` columns is
+/// `(cols + 1) / (2B + 1)`.
+///
+/// A configured group count is **clamped** to what fits rather than allowed to
+/// overflow. Overflow would hand the excess back to the character splitter and
+/// reintroduce the split byte, so the choice is between showing fewer groups
+/// than asked and showing broken ones.
+///
+/// When not even one whole group fits, the fallback is whole *bytes* — not one
+/// group anyway. Returning an oversized line is what re-engages the splitter,
+/// which was the original defect; a byte is the smallest unit that can be
+/// wrapped without lying about the data.
+fn hex_line_bytes(grouping: HexGrouping, wrap_cols: usize) -> usize {
+    // Share the splitter's own floor, so the width the renderer wraps to and
+    // the width the splitter would cut at can never disagree.
+    let cols = wrap_cols.max(MIN_WRAP_COLS);
+    let bytes_per_group = usize::from(grouping.bytes_per_group.max(1));
+    // A unit's footprint: its digits plus the separator that follows it.
+    let stride = bytes_per_group * 2 + 1;
+    let fitting_groups = (cols + 1) / stride;
+    if fitting_groups == 0 {
+        return ((cols + 1) / 3).max(1);
+    }
+    let groups = match grouping.groups_per_line {
+        0 => fitting_groups,
+        requested => usize::from(requested).min(fitting_groups),
+    };
+    groups * bytes_per_group
+}
+
 /// Inputs for one refresh of the incremental row cache.
 struct StreamRefresh<'a> {
     channel: ChannelId,
@@ -542,6 +595,10 @@ fn refresh_rows(cache: &mut Option<super::super::StreamRenderCache>, p: StreamRe
                 || c.mode != p.view.mode
                 || c.chars != p.view.character_rendering
                 || c.wrap_cols != p.wrap_cols
+                // Grouping changes the text of rows already rendered, so it
+                // cannot ride the append path the way new bytes do.
+                || c.hex_bytes_per_group != p.view.hex_bytes_per_group
+                || c.hex_bytes_per_line != p.view.hex_bytes_per_line
                 // The stream restarted / reset behind us…
                 || p.cursor < c.rendered_cursor
                 // …or eviction ran past the rendered point (a gap we can't append over).
@@ -620,6 +677,8 @@ fn rebuild_rows(p: &StreamRefresh, window_start: u64) -> super::super::StreamRen
         mode: p.view.mode,
         chars: p.view.character_rendering,
         wrap_cols: p.wrap_cols,
+        hex_bytes_per_group: p.view.hex_bytes_per_group,
+        hex_bytes_per_line: p.view.hex_bytes_per_line,
         history_marks_sig: marks_signature_below(p.marks, p.cursor),
         marks_version: p.marks_version,
         rendered_cursor: p.cursor,
@@ -779,7 +838,7 @@ fn scrollbar_colors(bg: egui::Color32) -> (egui::Color32, egui::Color32) {
 /// height — required by `show_rows`). A data line shorter than `wrap_cols` is one row;
 /// a longer one (or a line with no LF, e.g. raw binary / UDP) is wrapped into several.
 fn split_stream_rows(text: &str, wrap_cols: usize) -> Vec<String> {
-    let cols = wrap_cols.max(8);
+    let cols = wrap_cols.max(MIN_WRAP_COLS);
     let mut rows: Vec<String> = Vec::new();
     for line in text.split('\n') {
         if line.is_empty() {
@@ -915,6 +974,91 @@ mod tests {
                 "grouping changed with the read size (chunk {chunk})"
             );
         }
+    }
+
+    /// The invariant the whole two-stage wrap exists to hold: a rendered Hex
+    /// row never cuts a byte in half, at any pane width or grouping.
+    ///
+    /// Fit-to-width used to hand the line to the character splitter, which cuts
+    /// at a raw column — so a byte could arrive as `4` on one row and `1` on the
+    /// next, and a separator could open a row. Every row here must be whole
+    /// groups joined by single spaces.
+    #[test]
+    fn no_pane_width_or_grouping_ever_splits_a_hex_byte() {
+        let data: Vec<u8> = (0u8..=255).collect();
+        for bytes_per_group in [1u8, 2, 4, 8] {
+            // 0 is fit-to-width; the rest must clamp rather than overflow.
+            for groups_per_line in [0u8, 1, 4, 16] {
+                let grouping = HexGrouping {
+                    bytes_per_group,
+                    groups_per_line,
+                };
+                for cols in [8usize, 9, 13, 20, 33, 47, 80, 200] {
+                    let mut v = view(DisplayMode::Hex);
+                    v.hex_bytes_per_group = usize::from(bytes_per_group);
+                    v.hex_bytes_per_line = hex_line_bytes(grouping, cols);
+                    let rows = incremental_rows(&data, 7, &[], &v, cols);
+                    for row in &rows {
+                        let context =
+                            format!("B={bytes_per_group} G={groups_per_line} cols={cols}");
+                        assert!(
+                            !row.starts_with(' ') && !row.ends_with(' '),
+                            "row has a stranded separator ({context}): {row:?}"
+                        );
+                        for group in row.split(' ') {
+                            assert!(
+                                !group.is_empty() && group.len() % 2 == 0,
+                                "row splits a byte ({context}): {row:?}"
+                            );
+                            assert!(
+                                group.chars().all(|c| c.is_ascii_hexdigit()),
+                                "row is not whole hex ({context}): {row:?}"
+                            );
+                        }
+                    }
+                    // Whole rows still reconstruct the stream exactly.
+                    let flat: String = rows.join(" ").split(' ').collect::<Vec<_>>().join("");
+                    let expected: String = data.iter().map(|b| format!("{b:02X}")).collect();
+                    assert_eq!(flat, expected, "bytes lost or reordered (cols={cols})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hex_line_bytes_fills_the_pane_and_clamps_what_cannot_fit() {
+        let fit = |b: u8, cols: usize| {
+            hex_line_bytes(
+                HexGrouping {
+                    bytes_per_group: b,
+                    groups_per_line: 0,
+                },
+                cols,
+            )
+        };
+        // Single bytes: "41 42 43" is 3 chars per group less the final space.
+        assert_eq!(fit(1, 8), 3, "8 columns hold 3 single-byte groups");
+        assert_eq!(fit(1, 47), 16, "the classic 16-byte hexdump line");
+        // Four-byte groups occupy 9 columns each.
+        assert_eq!(fit(4, 35), 16, "4 groups of 4");
+        assert_eq!(fit(4, 8), 4, "a pane too narrow still renders one group");
+
+        // A configured count is honored when it fits and clamped when it does not.
+        let fixed = |b: u8, g: u8, cols: usize| {
+            hex_line_bytes(
+                HexGrouping {
+                    bytes_per_group: b,
+                    groups_per_line: g,
+                },
+                cols,
+            )
+        };
+        assert_eq!(fixed(4, 2, 80), 8, "asked for 2 groups, pane is wide");
+        assert_eq!(
+            fixed(4, 16, 35),
+            16,
+            "asked for 16 groups in a pane holding 4 — clamped, not overflowed"
+        );
     }
 
     /// A fixed line length wraps where a cell ends, so no separator is stranded

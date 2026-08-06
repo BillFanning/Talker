@@ -1347,6 +1347,12 @@ a computed column count. The arithmetic works out to the same width, but the
 splitter cannot know that the character at the boundary is a separator, so it
 stranded one at the head of every continuation line.
 
+*Amended 2026-08-05 (ADR-040): as first written this held only for a configured
+group count. Fit-to-width — the default — still passed a zero line length and
+let the character splitter cut the row, so the guarantee above described half the
+feature. ADR-040 resolves fit-to-width to a byte count before rendering, which
+makes the sentence true for both paths.*
+
 **Consequences:** A GUI control under Configure display sets both halves, in the
 units §45 and the schema use (bytes per group, groups per line) with the
 resulting bytes-per-line shown alongside so the reader does not multiply. The
@@ -1411,6 +1417,59 @@ Pinned by `an_appended_sidecar_indexes_from_the_end_of_the_existing_file`,
 `rotated_sidecars_index_their_own_period_file_across_a_restart`. All three were
 confirmed to fail against the previous behaviour before the fix landed — the
 append test reported offsets `0, 0, 2` where the file holds `0, 5, 7`.
+
+## ADR-040 — Fit-to-width resolves to whole bytes before rendering
+
+**Status:** Accepted 2026-08-05. Amends ADR-038; from external review.
+
+**Context:** ADR-038 put Hex wrapping in the renderer, where a cell boundary is
+known, and said so as though it covered the feature. It covered one half. A
+configured `groups_per_line` produced a real line length; fit-to-width — the
+*default* — passed zero, meaning "do not wrap", and left the row to
+`split_stream_rows`, which cuts at a raw monospace column.
+
+That column does not respect cells. A row could arrive as `" 03 04 0"`: a
+separator stranded at the head, and a byte delivered as `0` here and `A` on the
+next row. The comment above the renderer construction claimed the cell-aware
+guarantee for the whole Hex path, so the code read as though this were handled.
+
+A second defect sat beside it. The row cache's rebuild key was channel, mode,
+control-character rendering and pane width. Grouping was absent, so changing
+bytes-per-group restyled only newly arriving bytes and left the existing
+scrollback in the old shape until an unrelated change forced a rebuild — a
+setting that appeared not to work.
+
+**Decision:** Fit-to-width becomes a byte count *before* rendering. `G` groups of
+`B` bytes occupy `G × B × 2` digits plus `G − 1` separators, so the largest `G`
+fitting `cols` columns is `(cols + 1) / (2B + 1)`. The renderer then wraps at
+that many bytes and the splitter has nothing left to cut.
+
+Two edges follow from refusing to return an oversized line, since an oversized
+line is precisely what re-engages the splitter:
+
+- **A configured group count is clamped, not overflowed.** Asking for sixteen
+  groups in a pane holding four shows four. The alternative is showing sixteen
+  broken ones, and the control's help now states the reduction.
+- **When not one whole group fits, the fallback is whole bytes** — not one group
+  anyway. A byte is the smallest unit that can be wrapped without misreporting
+  the data.
+
+Both the splitter and the resolver read one `MIN_WRAP_COLS`, so the width the
+renderer wraps to and the width the splitter would cut at cannot disagree.
+
+Grouping and resolved line length join the row cache's rebuild key.
+
+**Consequences:** One invariant now holds and is tested directly rather than
+asserted in prose: **no pane width or grouping splits a byte.**
+`no_pane_width_or_grouping_ever_splits_a_hex_byte` sweeps four group sizes, four
+line settings and eight pane widths over all 256 byte values, checking every row
+is whole hex groups joined by single spaces, with no leading or trailing
+separator, and that the rows still reconstruct the stream exactly. It was
+confirmed to fail against the previous behaviour, reporting `" 03 04 0"`.
+
+`split_stream_rows` remains character-based and still wraps the text modes, where
+a character *is* the unit. The comment at the call site now says which stage owns
+which, instead of claiming the stronger boundary for both.
 
 ## Open questions
 

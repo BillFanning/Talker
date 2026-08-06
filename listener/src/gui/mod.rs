@@ -230,6 +230,14 @@ struct StreamRenderCache {
     mode: DisplayMode,
     chars: CharacterRendering,
     wrap_cols: usize,
+    /// Hex grouping and resolved line length the cached rows were rendered at.
+    ///
+    /// Part of the rebuild key because they change the *text* of rows already
+    /// rendered, not just the text of rows to come — without them, changing the
+    /// grouping restyled only newly arriving bytes and left the scrollback in
+    /// the old shape until something else forced a rebuild.
+    hex_bytes_per_group: usize,
+    hex_bytes_per_line: usize,
     /// Signature of the marks already spliced into rendered rows (offset <
     /// `rendered_cursor`). A change — a late mark for an already-rendered
     /// byte, or front-pruning of the mark list — forces a rebuild; marks for
