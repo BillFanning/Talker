@@ -162,7 +162,7 @@ impl ListenerApp {
             });
         });
         if let Some(err) = &last_error {
-            ui.colored_label(palette(ui).fault_red, format!("⚠ {err}"));
+            ui.colored_label(palette(ui).fault, format!("⚠ {err}"));
         }
         // Only the UI knows what is currently enumerated, so only the UI can say
         // whether the port the OS called absent is still in the list.
@@ -175,7 +175,7 @@ impl ListenerApp {
             if let Some(port) = serial_port.filter(|p| !p.is_empty()) {
                 let listed = self.serial_ports.contains(&port);
                 ui.colored_label(
-                    palette(ui).warning_amber,
+                    palette(ui).warning,
                     wiredata_ui::format::serial_port_hint(&port, listed),
                 );
             }
@@ -307,13 +307,13 @@ impl ListenerApp {
         let (headline_level, headline, headline_color) = match entries.last() {
             Some(d) => {
                 let (level, color) = match d.severity {
-                    DiagnosticSeverity::Event => ("INFO", palette(ui).event_grey),
-                    DiagnosticSeverity::Warning => ("WARN", palette(ui).warning_amber),
-                    DiagnosticSeverity::Error => ("ERROR", palette(ui).fault_red),
+                    DiagnosticSeverity::Event => ("INFO", palette(ui).event),
+                    DiagnosticSeverity::Warning => ("WARN", palette(ui).warning),
+                    DiagnosticSeverity::Error => ("ERROR", palette(ui).fault),
                 };
                 (level, d.message.clone(), color)
             }
-            None => ("", "no diagnostics yet".to_string(), palette(ui).idle_grey),
+            None => ("", "no diagnostics yet".to_string(), palette(ui).idle),
         };
         let dv = DiagView {
             headline_level,
@@ -374,13 +374,13 @@ impl ListenerApp {
                         for d in dv.entries.iter().rev() {
                             let (enabled, color, level) = match d.severity {
                                 DiagnosticSeverity::Event => {
-                                    (self.show_info, palette(ui).info_grey, "INFO ")
+                                    (self.show_info, palette(ui).info, "INFO ")
                                 }
                                 DiagnosticSeverity::Warning => {
-                                    (self.show_warn, palette(ui).warning_amber, "WARN ")
+                                    (self.show_warn, palette(ui).warning, "WARN ")
                                 }
                                 DiagnosticSeverity::Error => {
-                                    (self.show_error, palette(ui).fault_red, "ERROR")
+                                    (self.show_error, palette(ui).fault, "ERROR")
                                 }
                             };
                             if !enabled {
@@ -472,7 +472,7 @@ impl ListenerApp {
             if self.name_duplicate {
                 ui.label(
                     egui::RichText::new("⚠ name already in use — names must be unique")
-                        .color(palette(ui).warning_amber),
+                        .color(palette(ui).warning),
                 );
             }
         });

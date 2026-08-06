@@ -658,7 +658,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
             let reported = reported_udp_drops(dropped);
             let text = egui::RichText::new(format!("UDP kernel receive-queue drops: {reported}"));
             ui.label(if dropped > 0 {
-                text.color(palette(ui).warning_amber)
+                text.color(palette(ui).warning)
             } else {
                 text.weak()
             })
@@ -720,7 +720,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
                     "Raw record queue (faulted): highest observed {}/{}",
                     queue.peak, queue.capacity
                 ))
-                .color(palette(ui).fault_red),
+                .color(palette(ui).fault),
             )
             .on_hover_text(RAW_QUEUE_FAULTED_TOOLTIP);
         }
@@ -731,7 +731,7 @@ fn show_receive_transport_details(ui: &mut egui::Ui, status: ChannelStatus, view
             ))
             .weak();
             ui.label(if queue_level_reaches_half(queue.current, queue.capacity) {
-                text.color(palette(ui).warning_amber)
+                text.color(palette(ui).warning)
             } else {
                 text
             })

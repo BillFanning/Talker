@@ -42,70 +42,84 @@ pub fn tint(ui: &egui::Ui, accent: Color32, alpha: u8) -> Color32 {
 }
 
 /// The chrome colors, grouped by meaning rather than by widget.
+///
+/// # Naming
+///
+/// Every field names the **role**, never the hue. `fault`, not `fault_red` —
+/// because a palette exists precisely so a colour can change, and a name that
+/// encodes the value contradicts the thing it is for. This is not hypothetical:
+/// `fault` was red until it turned out to be indistinguishable from `warning`
+/// for a red-green colour deficiency, and the two serial-line colours are next
+/// in line for the same reason. `Color32` in a struct called `Palette` already
+/// says these are colours; the field only has to say what for.
 pub struct Palette {
     // ── Status / severity ────────────────────────────────────────────────
     /// Everything that means "fault / error / destructive" — channel fault,
-    /// recording fault, error diagnostics, the Remove button. One red so
+    /// recording fault, error diagnostics, the Remove button. One color so
     /// "something is wrong" always looks identical.
-    pub fault_red: Color32,
-    /// A running / active channel (and an active recording). A bright
-    /// blue-green chosen to read distinctly from the fault red for red-green
-    /// color blindness.
-    pub running_green: Color32,
-    /// A reconnecting channel — a yellower amber, pushed away from the red.
-    pub reconnecting_amber: Color32,
+    ///
+    /// Blue, deliberately. This is the app's most important signal, so it must
+    /// survive the most common colour deficiency; blue is discriminable on
+    /// every common type, being the axis red-green deficiency leaves intact.
+    /// Red was tried first and failed against [`Palette::warning`] — see talker
+    /// ADR-049. Do not "restore" it.
+    pub fault: Color32,
+    /// A running / active channel, and an active recording.
+    pub running: Color32,
+    /// A reconnecting channel — a yellower amber than [`Palette::warning`].
+    pub reconnecting: Color32,
     /// A warning (diagnostics, "won't start" hints).
-    pub warning_amber: Color32,
+    pub warning: Color32,
     /// A stopped/idle status glyph and other "neutral, inactive" accents.
-    pub idle_grey: Color32,
+    pub idle: Color32,
 
     // ── Diagnostic-log text ──────────────────────────────────────────────
     /// An INFO-severity diagnostic line.
-    pub info_grey: Color32,
+    pub info: Color32,
     /// A faded info line in a real-time headline.
-    pub event_grey: Color32,
+    pub event: Color32,
     /// A per-tab "info" count (lighter, secondary).
-    pub count_info_grey: Color32,
+    pub count_info: Color32,
 
     // ── Serial control lines ─────────────────────────────────────────────
     /// A high (asserted) serial control/status line.
-    pub line_high_green: Color32,
+    ///
+    /// Distinguished from [`Palette::line_low`] by colour **alone**, which is a
+    /// known accessibility defect — see the colour-accessibility items in
+    /// `talker/docs/TODO.md`. The fix is a second channel, not a third green.
+    pub line_high: Color32,
     /// A low serial control/status line.
-    pub line_low_grey: Color32,
-
-    // ── Structure ────────────────────────────────────────────────────────
-    /// The channel-card border.
-    pub box_stroke: Color32,
+    pub line_low: Color32,
 }
 
-/// The light-theme palette — the values listener shipped with.
+/// The light-theme palette.
 pub const LIGHT: Palette = Palette {
-    fault_red: Color32::from_rgb(170, 30, 30),
-    running_green: Color32::from_rgb(0, 200, 140),
-    reconnecting_amber: Color32::from_rgb(220, 180, 0),
-    warning_amber: Color32::from_rgb(150, 100, 0),
-    idle_grey: Color32::from_gray(120),
-    info_grey: Color32::from_gray(80),
-    event_grey: Color32::from_gray(60),
-    count_info_grey: Color32::from_gray(110),
-    line_high_green: Color32::from_rgb(30, 150, 30),
-    line_low_grey: Color32::from_gray(150),
-    box_stroke: Color32::from_rgb(140, 160, 200),
+    // Deep enough to carry white text on the Remove button's fill.
+    fault: Color32::from_rgb(0, 85, 200),
+    running: Color32::from_rgb(0, 200, 140),
+    reconnecting: Color32::from_rgb(220, 180, 0),
+    warning: Color32::from_rgb(150, 100, 0),
+    idle: Color32::from_gray(120),
+    info: Color32::from_gray(80),
+    event: Color32::from_gray(60),
+    count_info: Color32::from_gray(110),
+    line_high: Color32::from_rgb(30, 150, 30),
+    line_low: Color32::from_gray(150),
 };
 
 /// The dark-theme palette. Brighter accents and lighter greys so every value
-/// stays readable on a dark backdrop (the light `warning_amber`/`info_grey`
-/// would all but vanish). Tune values here as the dark look evolves.
+/// stays readable on a dark backdrop (the light `warning`/`info` would all but
+/// vanish). Tune values here as the dark look evolves.
 pub const DARK: Palette = Palette {
-    fault_red: Color32::from_rgb(235, 90, 90),
-    running_green: Color32::from_rgb(0, 210, 150),
-    reconnecting_amber: Color32::from_rgb(230, 195, 60),
-    warning_amber: Color32::from_rgb(230, 175, 70),
-    idle_grey: Color32::from_gray(150),
-    info_grey: Color32::from_gray(180),
-    event_grey: Color32::from_gray(200),
-    count_info_grey: Color32::from_gray(140),
-    line_high_green: Color32::from_rgb(80, 210, 80),
-    line_low_grey: Color32::from_gray(120),
-    box_stroke: Color32::from_rgb(110, 130, 175),
+    // Lightened so it stays legible as small text on the dark panel.
+    fault: Color32::from_rgb(95, 165, 255),
+    running: Color32::from_rgb(0, 210, 150),
+    reconnecting: Color32::from_rgb(230, 195, 60),
+    warning: Color32::from_rgb(230, 175, 70),
+    idle: Color32::from_gray(150),
+    info: Color32::from_gray(180),
+    event: Color32::from_gray(200),
+    count_info: Color32::from_gray(140),
+    line_high: Color32::from_rgb(80, 210, 80),
+    line_low: Color32::from_gray(120),
 };

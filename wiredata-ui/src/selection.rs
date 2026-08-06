@@ -49,16 +49,16 @@ pub fn channel_row_emphasis(ui: &egui::Ui, selected: bool) -> ChannelRowEmphasis
         } else {
             ui.visuals().weak_text_color()
         },
-        info: palette.count_info_grey,
+        info: palette.count_info,
         warning: if selected {
-            palette.warning_amber
+            palette.warning
         } else {
-            palette.count_info_grey
+            palette.count_info
         },
         error: if selected {
-            palette.fault_red
+            palette.fault
         } else {
-            palette.count_info_grey
+            palette.count_info
         },
     }
 }
@@ -106,7 +106,7 @@ pub fn last_error_line(ui: &mut egui::Ui, error: &str) {
         egui::Label::new(
             egui::RichText::new(format!("\u{26A0} {error}"))
                 .small()
-                .color(active_palette(ui).fault_red),
+                .color(active_palette(ui).fault),
         )
         .wrap(),
     );

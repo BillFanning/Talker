@@ -1,10 +1,20 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.11
-**Date:** 2026-08-05
+**Version:** 1.12
+**Date:** 2026-08-06
 **Status:** Accepted
 
-Revision note (semantic color has one source):
+Revision note (the fault colour becomes visible):
+
+- **ADR-049** makes the fault colour blue. Red was not distinguishable from the
+  amber warning under a red-green colour deficiency, so the applications' most
+  important signal was the one that did not arrive. Palette fields now name the
+  role and not the hue — `fault`, not `fault_red` — because a palette exists so
+  a colour can change, and this rename is that argument's own proof. Two further
+  colour-only defects are recorded in the TODO rather than fixed here, along
+  with the larger question of whether ten colours are needed at all.
+
+Revision note for 1.11 (semantic color has one source):
 
 - **ADR-048** routes Talker's remaining hardcoded status, severity and
   destructive colors through `wiredata_ui::palette`, so a fault in the log panel
@@ -1749,6 +1759,70 @@ differs between themes — the three ways a derived surface can be wrong.
 
 `wiredata-ui` still depends on `egui` alone; `tint` reads `Visuals` and nothing
 else.
+
+---
+
+## ADR-049 — The fault colour is blue, and palette fields name roles
+
+**Status:** Accepted 2026-08-06.
+
+**Context:** ADR-048 gave every semantic colour one source. It did not ask
+whether the colours could be *seen*. Checking the palette against a red-green
+colour deficiency answered that: `fault_red` was not distinguishable from
+`warning_amber`. The most important signal either application has — a channel
+faulted, a recording dead, a field invalid, a destructive button — was the one
+that did not arrive, while the less urgent warning did.
+
+This is not a preference. Red against amber is the hardest pair under the most
+common deficiency, and the palette had staked its highest-priority meaning on
+exactly that pair. The module's own doc claimed `running_green` had been "chosen
+to read distinctly from the fault red for red-green color blindness", which
+shows the concern was considered — and considered only for green, while red and
+amber sat next to each other carrying more.
+
+**Decision — the fault colour is blue.** `rgb(0, 85, 200)` light,
+`rgb(95, 165, 255)` dark. Blue is discriminable under every common deficiency,
+being the axis red-green deficiency leaves intact; the light value is deep
+enough to carry white text on the Remove button's fill, and the dark one light
+enough to stay legible as small text. Confirmed visible in both applications
+before adoption.
+
+**Decision — palette fields name the role, never the hue.** `fault`, not
+`fault_red`. A palette exists precisely so a colour can change; a field name
+that encodes the value contradicts the thing the field is for, and the rename is
+the proof — `fault_red` became blue, and two more fields are queued to change
+for the same accessibility reason. `Color32` in a struct called `Palette`
+already says these are colours, so the name only has to say what for. All ten
+fields were renamed together rather than only the one that moved, since
+otherwise this recurs twice more. 73 call sites, every one compiler-checked.
+
+`box_stroke` was removed: declared in both palettes and read by nothing. It was
+also the only field already named for its role rather than its value, which is
+not a coincidence — a name describing the job does not rot when the appearance
+changes.
+
+**Consequences:** Both applications change appearance wherever a fault is shown.
+The doc comment on `fault` says why it is blue and says not to restore red,
+because the failure it fixes is invisible to anyone who does not share the
+deficiency — a future contributor "correcting" the colour would be undoing a fix
+they cannot see.
+
+Two known defects are recorded rather than fixed here (`talker/docs/TODO.md`,
+"Colour accessibility"): serial control lines distinguish asserted from low by
+colour alone, which is a functional failure in a readout whose only job is
+telling those apart; and `running` against `warning` is unchecked. `line_high`
+carries a doc comment naming its own defect.
+
+The durable rule is stated there rather than repeated per call site: **anywhere
+a state is carried by colour alone is the bug.** Colour may reinforce a
+distinction; it may not be the only thing making it. The diagnostics cards
+already satisfy this with word badges, and that is the pattern to copy.
+
+Also open, and larger: the palette may simply hold too many colours — five of
+ten fields are greys separated by emphasis rather than meaning. The burden is
+pairs, not colours, so ten colours is 45 pairs that must stay distinguishable
+against four's 6. Deferred to its own pass because collapsing the greys is a
+change that must be looked at, not proven.
 
 ---
 

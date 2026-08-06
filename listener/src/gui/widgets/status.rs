@@ -50,9 +50,9 @@ pub(crate) fn recording_indicator(
     // (like a Running channel), faulted ⚠ is FAULT_RED, off ■ is IDLE_GREY.
     use wiredata_ui::glyphs;
     match recording {
-        Some(RecordingState::Enabled) => (glyphs::RUNNING, pal.running_green, "recording"),
-        Some(RecordingState::Faulted) => (glyphs::FAULT, pal.fault_red, "faulted"),
-        Some(RecordingState::Disabled) | None => (glyphs::STOPPED, pal.idle_grey, "off"),
+        Some(RecordingState::Enabled) => (glyphs::RUNNING, pal.running, "recording"),
+        Some(RecordingState::Faulted) => (glyphs::FAULT, pal.fault, "faulted"),
+        Some(RecordingState::Disabled) | None => (glyphs::STOPPED, pal.idle, "off"),
     }
 }
 
@@ -70,11 +70,7 @@ pub(crate) fn status_label(status: ChannelStatus) -> &'static str {
 /// line is high (asserted), grey when low, with a hover tooltip.
 pub(crate) fn line_indicator(ui: &mut egui::Ui, name: &str, high: bool) {
     let pal = wiredata_ui::palette::active(ui);
-    let color = if high {
-        pal.line_high_green
-    } else {
-        pal.line_low_grey
-    };
+    let color = if high { pal.line_high } else { pal.line_low };
     ui.colored_label(color, name)
         .on_hover_text(if high { "high" } else { "low" });
 }
@@ -84,7 +80,7 @@ pub(crate) fn line_indicator(ui: &mut egui::Ui, name: &str, high: bool) {
 /// response so the caller can send the matching Set command.
 pub(crate) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Response {
     let color = if high {
-        wiredata_ui::palette::active(ui).line_high_green
+        wiredata_ui::palette::active(ui).line_high
     } else {
         ui.visuals().weak_text_color()
     };
@@ -103,10 +99,10 @@ pub(crate) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Re
 /// the same pattern as talker's `lifecycle_indicator`.
 pub(crate) fn status_color(status: ChannelStatus, pal: &Palette) -> egui::Color32 {
     match status {
-        ChannelStatus::Running => pal.running_green,
-        ChannelStatus::Stopped => pal.idle_grey,
-        ChannelStatus::Faulted => pal.fault_red,
-        ChannelStatus::Reconnecting => pal.reconnecting_amber,
+        ChannelStatus::Running => pal.running,
+        ChannelStatus::Stopped => pal.idle,
+        ChannelStatus::Faulted => pal.fault,
+        ChannelStatus::Reconnecting => pal.reconnecting,
     }
 }
 

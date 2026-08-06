@@ -54,7 +54,7 @@ fn recording_file_fields(
     if destination.is_none() {
         ui.label(
             egui::RichText::new("⚠ set a destination — recording won't start without one")
-                .color(palette(ui).warning_amber),
+                .color(palette(ui).warning),
         );
     }
     // With rotation on, each period gets a fresh file, so "Refuse" makes no

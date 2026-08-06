@@ -88,6 +88,52 @@ Cross off items as they are completed. Add new ones inline as they come up.
   shared chrome colors (status, severity, destructive) come from
   `wiredata-ui`; content-semantic highlights stay application-owned.
 
+## Colour accessibility (2026-08-06)
+
+Found by testing the palette against a red-green colour deficiency: `fault` was
+not visible as distinct from `warning`, which meant the most important signal in
+either app was the one that did not arrive. `fault` is now blue (ADR-049).
+
+The general rule these items serve: **anywhere a state is carried by colour
+alone is the bug.** Colour may reinforce a distinction; it may not be the only
+thing making it. The diagnostics cards already do this correctly with word
+badges (`ISSUE` / `ATTENTION` / `MONITORING`) — that is the pattern to copy.
+
+- [ ] **Serial control lines are colour-only** (`line_high` vs `line_low`,
+  `wiredata-ui/src/palette.rs`; listener's control-line display). Asserted vs
+  low is shown by nothing but the colour, and green against grey is the classic
+  deuteranopia collision — so CTS/DSR/DCD/RI may read identically in both
+  states. This is a functional failure, not a cosmetic one: the whole point of
+  the readout is telling the two apart. Fix by adding a non-colour channel
+  (glyph or `HIGH`/`low` text), not by picking a different green.
+- [ ] **`running` vs `warning`.** The other risky pair; check whether a running
+  channel and a warning are distinguishable at the status dot, the status bar,
+  and the message status strip (which derives its background from the same
+  accent, so a collision there doubles).
+- [ ] **Reduce the palette — probably too many colours.** Ten fields, of which
+  **five are greys** (`idle`, `info`, `event`, `count_info`, `line_low` — 120,
+  80, 60, 110, 150 in the light theme). Those differences encode *emphasis*, not
+  meaning: no reader ever needs to tell "this grey means INFO" from "this grey
+  means idle", because they never appear where the distinction would matter, and
+  egui expresses emphasis natively with `weak()`/`text_color()` (which
+  `level_color`'s INFO already uses). Beyond the greys there are two near-equal
+  ambers (`warning`, `reconnecting` — and reconnecting *is* a warning state) and
+  two greens (`running`, `line_high`).
+  The semantic core looks like four — fault, warning, running, idle — which is
+  exactly `SignalTone { Fault, Warning, Healthy, Neutral }`; the palette and the
+  tone enum currently describe the same four states in two vocabularies.
+  **Why this is an accessibility item and not tidying:** the burden is *pairs*,
+  not colours, because each must stay distinguishable from every other. Ten
+  colours is 45 pairs; four is 6. Three pairs were checked on 2026-08-06 and two
+  failed. Reducing the palette shrinks the surface this defect can recur on by
+  roughly seven-fold.
+  Do it as a "look at it" change, not a test-driven one: collapsing the greys
+  flattens visual hierarchy in the log panel and the diagnostics details, and
+  that has to be seen rather than reasoned about.
+- [ ] **Audit for colour-only states across both apps** once the pairs above are
+  settled — the two found so far were found by looking, not by any rule, so the
+  remaining ones are wherever nobody has looked yet.
+
 ## Robustness (external review round 2, 2026-07-12)
 
 - [x] **Transactional draft → profile flush.** `flush_drafts_to_profile` was

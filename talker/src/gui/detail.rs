@@ -74,13 +74,13 @@ fn show_per_message_table(ui: &mut egui::Ui, rows: &[MessageRow]) {
                 // having delayed another message is an attributable fact.
                 let hold = egui::RichText::new(&row.longest_block).size(12.0);
                 ui.label(if row.blocks_others {
-                    hold.color(pal.warning_amber)
+                    hold.color(pal.warning)
                 } else {
                     hold
                 });
                 let caused = egui::RichText::new(&row.delay_caused).size(12.0);
                 ui.label(if row.blocks_others {
-                    caused.color(pal.warning_amber)
+                    caused.color(pal.warning)
                 } else {
                     caused
                 });
@@ -135,7 +135,7 @@ fn show_last_run_summary(ui: &mut egui::Ui, summary: &RunSummary) {
             let (timer_detail, timer_hot) = timer_status_detail(summary.timer);
             let timer = egui::RichText::new(format!("Timer: {timer_detail}")).weak();
             ui.label(if timer_hot {
-                timer.color(theme_palette(ui).warning_amber)
+                timer.color(theme_palette(ui).warning)
             } else {
                 timer
             })
@@ -252,7 +252,7 @@ impl TalkerApp {
                 if duplicate {
                     ui.label(
                         egui::RichText::new("duplicate name")
-                            .color(pal.warning_amber)
+                            .color(pal.warning)
                             .size(11.0),
                     )
                     .on_hover_text("Another channel has the same name — allowed, but confusing.");
@@ -275,7 +275,7 @@ impl TalkerApp {
         // remain one click away in the card's details section.
         let detail_line = |ui: &mut egui::Ui, text: String, hot: bool, tip: &str| {
             let rt = egui::RichText::new(text).weak();
-            ui.label(if hot { rt.color(pal.warning_amber) } else { rt })
+            ui.label(if hot { rt.color(pal.warning) } else { rt })
                 .on_hover_text(tip);
         };
 
@@ -490,8 +490,8 @@ impl TalkerApp {
         ui.add(
             egui::Label::new(
                 egui::RichText::new(&outcomes.text).color(match outcomes.tone {
-                    SignalTone::Fault => pal.fault_red,
-                    SignalTone::Warning => pal.warning_amber,
+                    SignalTone::Fault => pal.fault,
+                    SignalTone::Warning => pal.warning,
                     _ => ui.visuals().text_color(),
                 }),
             )
@@ -516,14 +516,14 @@ impl TalkerApp {
         // only after scrolling past several collapsible sections, so the same
         // pair of buttons lived in visibly different places in the two apps.
         if let Some(err) = &error {
-            ui.colored_label(pal.fault_red, format!("\u{26A0} {err}"));
+            ui.colored_label(pal.fault, format!("\u{26A0} {err}"));
             // Only the UI knows what is currently enumerated, so only the UI can
             // say whether the port the OS called absent is still in the list.
             if draft_kind == ConnKind::Serial {
                 let port = self.conn_drafts[i].serial_port.clone();
                 if !port.is_empty() {
                     let listed = self.serial_ports.contains(&port);
-                    ui.colored_label(pal.warning_amber, serial_port_hint(&port, listed));
+                    ui.colored_label(pal.warning, serial_port_hint(&port, listed));
                 }
             }
         }
@@ -1020,7 +1020,7 @@ fn show_schedule_section(
                                             .color(egui::Color32::WHITE)
                                             .strong(),
                                     )
-                                    .fill(palette.fault_red);
+                                    .fill(palette.fault);
                                     if ui
                                         .add(confirm)
                                         .on_hover_text("Permanently remove this message")
@@ -1030,7 +1030,7 @@ fn show_schedule_section(
                                     }
                                     ui.label(
                                         egui::RichText::new("Remove this message?")
-                                            .color(palette.warning_amber),
+                                            .color(palette.warning),
                                     );
                                 } else if ui
                                     .button(egui::RichText::new("\u{00D7}").size(18.0).strong())
@@ -1331,7 +1331,7 @@ fn show_ascii_payload(
                 .collect::<Vec<_>>()
                 .join(", ");
             ui.colored_label(
-                theme_palette(ui).warning_amber,
+                theme_palette(ui).warning,
                 format!("{} replaced with ?; use UTF-8", summary.count),
             )
             .on_hover_text(format!(
@@ -1458,7 +1458,7 @@ fn show_nmea_payload(ui: &mut egui::Ui, entry: &mut ScheduleDraft) -> bool {
         changed |= entry.nmea_live_millis != millis_before;
 
         if entry.nmea_live_time && !supports_live_time {
-            ui.colored_label(theme_palette(ui).fault_red, "Unsupported sentence type")
+            ui.colored_label(theme_palette(ui).fault, "Unsupported sentence type")
                 .on_hover_text("Turn Live time off or choose a sentence with defined UTC fields.");
         }
     });
@@ -1641,7 +1641,7 @@ fn show_message_preview(ui: &mut egui::Ui, analysis: &MessageDraftAnalysis) {
                 egui::RichText::new(text).monospace().into()
             }
             MessagePreview::Invalid(error) => egui::RichText::new(format!("Invalid: {error}"))
-                .color(theme_palette(ui).fault_red)
+                .color(theme_palette(ui).fault)
                 .monospace()
                 .into(),
             MessagePreview::Incomplete => egui::RichText::new("(message is incomplete)")
@@ -1674,9 +1674,9 @@ fn show_message_status(ui: &mut egui::Ui, channel_running: bool, sent: u64) {
     ui.separator();
     let palette = wiredata_ui::palette::active(ui);
     let (dot_color, state) = if channel_running {
-        (palette.running_green, "Active")
+        (palette.running, "Active")
     } else {
-        (palette.idle_grey, "Idle")
+        (palette.idle, "Idle")
     };
     // Tinted strip behind the status line. Blending the same accent into the
     // panel gives a deep green on dark and a pale one on light without naming

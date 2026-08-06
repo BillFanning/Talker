@@ -27,7 +27,7 @@ fn replacement_highlight_colors(ui: &egui::Ui) -> (egui::Color32, egui::Color32)
     if ui.visuals().dark_mode {
         (
             egui::Color32::BLACK,
-            wiredata_ui::palette::active(ui).warning_amber,
+            wiredata_ui::palette::active(ui).warning,
         )
     } else {
         (
@@ -50,10 +50,10 @@ pub(super) fn lifecycle_indicator(
 ) -> (&'static str, egui::Color32, &'static str) {
     use wiredata_ui::glyphs;
     match (running, has_error) {
-        (true, false) => (glyphs::RUNNING, pal.running_green, "running"),
-        (true, true) => (glyphs::FAULT, pal.fault_red, "running"),
-        (false, true) => (glyphs::FAULT, pal.fault_red, "faulted"),
-        (false, false) => (glyphs::STOPPED, pal.idle_grey, "stopped"),
+        (true, false) => (glyphs::RUNNING, pal.running, "running"),
+        (true, true) => (glyphs::FAULT, pal.fault, "running"),
+        (false, true) => (glyphs::FAULT, pal.fault, "faulted"),
+        (false, false) => (glyphs::STOPPED, pal.idle, "stopped"),
     }
 }
 
@@ -1883,7 +1883,7 @@ pub(super) fn show_display_pane(
                     "sampled output · not every sent payload is shown · limit ~{sample_hz:.0}/s"
                 ))
                 .small()
-                .color(pal.info_grey),
+                .color(pal.info),
             )
             .on_hover_text(format!(
                 "Above ~{sample_hz:.0} messages/s the Output pane shows a \
@@ -1970,7 +1970,7 @@ where
     // The shared fault red, so an invalid field, a faulted channel and a failed
     // recording are all the same red — this used to be its own `220,80,80`,
     // which its own comment described as "the rest of the GUI's warning red".
-    let red = wiredata_ui::palette::active(ui).fault_red;
+    let red = wiredata_ui::palette::active(ui).fault;
     // Derived from the same red rather than named, so the wash cannot drift
     // away from the outline it sits inside, and it lands pale on the light
     // theme and deep on the dark one without a second constant.
@@ -2251,7 +2251,7 @@ mod tests {
             ui.visuals_mut().dark_mode = true;
             let (dark_text, dark_background) = replacement_highlight_colors(ui);
             assert_eq!(dark_text, egui::Color32::BLACK);
-            assert_eq!(dark_background, wiredata_ui::palette::DARK.warning_amber);
+            assert_eq!(dark_background, wiredata_ui::palette::DARK.warning);
         });
     }
 
@@ -2460,17 +2460,17 @@ mod tests {
         use wiredata_ui::palette::LIGHT;
         let (g, c, w) = lifecycle_indicator(true, false, &LIGHT);
         assert_eq!((g, w), (glyphs::RUNNING, "running"));
-        assert_eq!(c, LIGHT.running_green);
+        assert_eq!(c, LIGHT.running);
         // Running with a live error: the ⚠ carries the alarm, the word stays
         // honest about the run state; the detail header prints the error below.
         let (g, c, w) = lifecycle_indicator(true, true, &LIGHT);
         assert_eq!((g, w), (glyphs::FAULT, "running"));
-        assert_eq!(c, LIGHT.fault_red);
+        assert_eq!(c, LIGHT.fault);
         let (g, _, w) = lifecycle_indicator(false, true, &LIGHT);
         assert_eq!((g, w), (glyphs::FAULT, "faulted"));
         let (g, c, w) = lifecycle_indicator(false, false, &LIGHT);
         assert_eq!((g, w), (glyphs::STOPPED, "stopped"));
-        assert_eq!(c, LIGHT.idle_grey);
+        assert_eq!(c, LIGHT.idle);
     }
 
     #[test]

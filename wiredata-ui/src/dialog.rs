@@ -53,7 +53,7 @@ pub fn confirm_destructive(
                     egui::Button::new(
                         egui::RichText::new(confirm_label).color(egui::Color32::WHITE),
                     )
-                    .fill(active(ui).fault_red),
+                    .fill(active(ui).fault),
                 )
                 .clicked()
             {

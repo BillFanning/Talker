@@ -1331,7 +1331,7 @@ impl TalkerApp {
                 let palette = wiredata_ui::palette::active(ui);
                 let (color, label) = if running > 0 {
                     (
-                        palette.running_green,
+                        palette.running,
                         if running == total && total > 0 {
                             "\u{2022} All running".to_string()
                         } else {
@@ -1339,7 +1339,7 @@ impl TalkerApp {
                         },
                     )
                 } else {
-                    (palette.idle_grey, "\u{2022} Stopped".to_string())
+                    (palette.idle, "\u{2022} Stopped".to_string())
                 };
                 ui.colored_label(color, label);
                 ui.separator();
@@ -1591,10 +1591,10 @@ fn level_color(ui: &egui::Ui, level: tracing::Level) -> egui::Color32 {
     match level {
         // The same red as every other "something is wrong" in both apps: a log
         // line reporting a fault should not be a second shade of it.
-        tracing::Level::ERROR => palette.fault_red,
-        tracing::Level::WARN => palette.warning_amber,
-        tracing::Level::DEBUG => palette.info_grey,
-        tracing::Level::TRACE => palette.idle_grey,
+        tracing::Level::ERROR => palette.fault,
+        tracing::Level::WARN => palette.warning,
+        tracing::Level::DEBUG => palette.info,
+        tracing::Level::TRACE => palette.idle,
         // INFO: the theme's body text colour — this line is the baseline the
         // others are read against, so it takes no accent at all.
         _ => ui.visuals().text_color(),
@@ -1622,10 +1622,10 @@ mod tests {
             });
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
                 let palette = wiredata_ui::palette::active(ui);
-                assert_eq!(level_color(ui, tracing::Level::ERROR), palette.fault_red);
-                assert_eq!(level_color(ui, tracing::Level::WARN), palette.warning_amber);
-                assert_eq!(level_color(ui, tracing::Level::DEBUG), palette.info_grey);
-                assert_eq!(level_color(ui, tracing::Level::TRACE), palette.idle_grey);
+                assert_eq!(level_color(ui, tracing::Level::ERROR), palette.fault);
+                assert_eq!(level_color(ui, tracing::Level::WARN), palette.warning);
+                assert_eq!(level_color(ui, tracing::Level::DEBUG), palette.info);
+                assert_eq!(level_color(ui, tracing::Level::TRACE), palette.idle);
                 assert_eq!(
                     level_color(ui, tracing::Level::INFO),
                     ui.visuals().text_color()
@@ -1647,7 +1647,7 @@ mod tests {
                 egui::ThemePreference::Light
             });
             let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-                let accent = wiredata_ui::palette::active(ui).running_green;
+                let accent = wiredata_ui::palette::active(ui).running;
                 let fill = wiredata_ui::palette::tint(ui, accent, detail::STATUS_STRIP_TINT_ALPHA);
                 assert_ne!(fill, accent, "a strip is a tint, not the accent itself");
                 assert_ne!(fill, ui.visuals().panel_fill, "the tint must be visible");

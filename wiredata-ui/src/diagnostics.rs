@@ -129,10 +129,10 @@ impl SignalTone {
     fn accent(self, ui: &Ui) -> Color32 {
         let palette = active(ui);
         match self {
-            Self::Neutral => palette.idle_grey,
-            Self::Healthy => palette.running_green,
-            Self::Warning => palette.warning_amber,
-            Self::Fault => palette.fault_red,
+            Self::Neutral => palette.idle,
+            Self::Healthy => palette.running,
+            Self::Warning => palette.warning,
+            Self::Fault => palette.fault,
         }
     }
 
