@@ -672,19 +672,31 @@ backoff then withheld, and the send call is timed for writes that failed. Figure
 run, and a percentile appears only where it differs from the worst value; the rolling ten-second \
 view is channel-wide and appears in the Cadence row instead.";
 
+/// Hover text for the missed-send callout: what a miss is, and what to do.
+///
+/// Deliberately short. A technician hovering a fault wants the next action, not
+/// the epistemology of the measurement; the limits that qualify the answer live
+/// in [`MISSED_ROUTING_LIMITS`], under Timing & runtime details, where someone
+/// who has followed the routing and wants to know how far to trust it will look.
 pub(super) const MISSED_ROUTING_TOOLTIP: &str =
-    "A missed send is a scheduled send the channel never reached, because it had fallen more than \
-one interval behind. Nothing was attempted and no timing exists for it, so nothing here is \
-measured at the moment a send was skipped. This line suggests where to look, in the order worth \
-checking; it does not prove a cause. Two limits are worth knowing. The counts it weighs are run \
-totals, so a fault that has since recovered still appears, and a finding drawn from the settings \
-on screen describes those settings rather than whatever is running. And the blocking evidence is \
-measured against scheduled sends the channel did reach, not against the ones it skipped — the two \
-usually share a cause, but they are different populations, and under heavy overload fewer sends \
-are reached, so blocking is measured least well exactly when it matters most. What is reliable is \
-the direction: misses concentrate on whichever message has the tightest interval, because one \
-grid point is skipped per interval of lateness, so the message showing the misses is rarely the \
-one causing them.";
+    "A missed send is a scheduled send the channel never reached, having fallen more than one \
+interval behind: nothing was attempted, so no timing exists for it. Work the line left to right \
+— it is ordered by what would settle the question soonest. See Timing & runtime details for how \
+far this evidence reaches.";
+
+/// The measurement limits behind the routing line, shown in the details section.
+///
+/// Each sentence states a boundary the routing cannot cross, so the reader can
+/// tell a strong signal from a weak one. This is the material the callout's
+/// hover used to carry.
+pub(super) const MISSED_ROUTING_LIMITS: &str =
+    "Where missed sends point, and how far: nothing is measured at the instant a send was \
+skipped. The counts weighed are run totals, so a fault that has since recovered still appears. \
+The blocking evidence comes from scheduled sends the channel did reach, not the ones it skipped \
+— usually the same cause, but different populations, and under heavy overload fewer sends are \
+reached, so blocking is measured least well exactly when it matters most. What is reliable is \
+the direction: one grid point is skipped per interval of lateness, so misses concentrate on the \
+message with the tightest interval, which is rarely the one causing them.";
 
 /// Evidence available when scheduled sends are being skipped.
 ///
@@ -709,9 +721,8 @@ pub(super) struct MissedSendEvidence {
 /// sends that *were* reached, so the strongest honest claim is where to start.
 /// The verbs carry that — "check", "start from".
 ///
-/// Capacity findings now derive from the running schedule rather than the
-/// settings on screen, so an unapplied edit can no longer be blamed for a run's
-/// misses and no longer needs qualifying here.
+/// Capacity findings use the running schedule, not the editable draft, so an
+/// unapplied edit is never blamed for a run's misses.
 ///
 /// Order is by decisiveness. A live interface fault comes first because retry
 /// backoff withholds sends, which is a different failure wearing the same

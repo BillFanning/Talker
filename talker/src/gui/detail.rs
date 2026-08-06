@@ -552,6 +552,7 @@ impl TalkerApp {
             // Skipped cadence points name a cause rather than a count: the
             // count is already on the send-outcomes line above, and the message
             // showing the misses is rarely the one causing them (ADR-045).
+            let mut missed_routing_shown = false;
             if let Some(routing) = missed_send_routing(
                 &MissedSendEvidence {
                     missed,
@@ -572,6 +573,7 @@ impl TalkerApp {
                     routing.tone,
                     MISSED_ROUTING_TOOLTIP,
                 );
+                missed_routing_shown = true;
             }
 
             // No unsent callout: the send-outcomes line above the card already
@@ -623,6 +625,18 @@ impl TalkerApp {
                         // repeated here — they are always visible above the
                         // card, so this section carries only what the compact
                         // readouts leave out.
+                        //
+                        // Shown only while the callout above is: the limits
+                        // qualify that routing, and without it they describe
+                        // nothing on screen.
+                        if missed_routing_shown {
+                            detail_line(
+                                ui,
+                                MISSED_ROUTING_LIMITS.to_owned(),
+                                false,
+                                "How far the missed-send routing above can be trusted.",
+                            );
+                        }
                         match demand {
                             None => detail_line(
                                 ui,

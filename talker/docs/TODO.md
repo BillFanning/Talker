@@ -84,20 +84,9 @@ Cross off items as they are completed. Add new ones inline as they come up.
   ADR-019 entry. CLI adoption rides with the future ad-hoc CLI work (the
   parity item below) — the one-shot headless run keeps its blocking `--echo`
   funnel by design. Pinned by the `core::supervisor` unit tests.
-- [x] **Palette bypasses** — done 2026-08-05 (ADR-048). Status, severity and
-  destructive colors now come from `wiredata_ui::palette`: `level_color`'s six
-  literals, the status-bar and message-status dots, the Remove confirm button and
-  its prompt, and the invalid-field outline (whose own comment already claimed it
-  was "the rest of the GUI's warning red" while being a different value). The
-  palette gains `tint(ui, accent, alpha)`, which derives a surface from an accent
-  and the theme's panel fill — so the four hand-named status-strip backgrounds and
-  the invalid-field wash are gone, and the shared diagnostics card's private
-  `translucent` now calls it. INFO takes `text_color()` rather than a palette
-  entry: it is the baseline the other severities are read against.
-  **Deliberately left Talker-owned:** the code-page replacement highlight
-  (ADR-023), the byte-marker blue, and the `?` fallback background. Those color
-  message *content*, not chrome — the same line the palette module doc already
-  draws — and the 3 px window-frame blue is an open trial, not a settled semantic.
+- [x] **Palette bypasses** — done 2026-08-05, ADR-048. The durable boundary:
+  shared chrome colors (status, severity, destructive) come from
+  `wiredata-ui`; content-semantic highlights stay application-owned.
 
 ## Robustness (external review round 2, 2026-07-12)
 
@@ -260,14 +249,10 @@ Cross off items as they are completed. Add new ones inline as they come up.
 
 ## Review disposition — per-message blame and warm-up (2026-08-01)
 
-Applied: the two wording defects (combined victim waiting was presented as an
-elapsed hold; the lateness denominator was called "sends" while including sends
-withheld by retry backoff), the missed-send routing honesty pass, ADR-045's
-stale consequences, an unfinished edit no longer reported as "No messages
-sending", `>100%` above the serial limit, one timing model across the
-per-message table and the completed-run panel, a Render column, per-boundary
-sample counts and maxima in the clipboard report, an interval-change marker, the
-`Arc<[…]>` per-frame clone, and the mechanics-leaking half of the help text.
+Applied: see ADR-045 and the commits it names. (The previous inventory here
+listed a Render column among the changes; `MessageRow` has none and the spec
+asks for none — a restated UI schema nobody rechecked, which is why this section
+now points at its ADR instead of duplicating it.)
 
 Not applied, deliberately:
 

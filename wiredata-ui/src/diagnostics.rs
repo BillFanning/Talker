@@ -28,17 +28,10 @@
 //! - **Two windows, named.** A rolling window (`~last 10 s` while running,
 //!   `~final 10 s` once stopped) sits beside a cumulative `run max`. Any readout
 //!   showing both must label which is which.
-//! - **No warm-up gate.** Both applications had one — below 20 samples the
-//!   readout showed a maximum and called itself warming up. It never guarded a
-//!   bad computation: the percentile rank is `ceil(samples × 99 / 100)`, which
-//!   equals `samples` for any count up to 99, so below a hundred samples the p99
-//!   bucket *is* the maximum's bucket and the gate only relabelled the same
-//!   number — at 20, while the two statistics actually separate at 100. Instead,
-//!   state the maximum with its sample count (exact, and true at one sample) and
-//!   add the percentile only when `p99 < max`, which is precisely the test for
-//!   the p99 bucket sitting strictly below the maximum's. The count carries the
-//!   weight the label used to imply. Talker retired its gate in ADR-046 and
-//!   Listener followed; neither has a warming-up state left to write against.
+//! - **No sample-count gate.** State the largest value with its sample count —
+//!   exact, and true at one sample — and add the percentile only when
+//!   `p99 < max`. There is no warming-up state in either application. (Why the
+//!   twenty-sample gate was retired: talker ADR-046, listener ADR-037.)
 //! - **Name the largest value for what it is.** A late send and a slow handoff
 //!   are the *worst* ones, but the longest gap between two reads is just the
 //!   longest — a quiet source is not a fault, and the superlative should not
@@ -47,6 +40,18 @@
 //!   against a budget it does not have; escalation comes from evidence that
 //!   something is actually wrong (a confirmed drop, a queue at half capacity),
 //!   not from a timing number being large.
+//!
+//! # How certain a reading is
+//!
+//! Both applications report things they measured directly, things they can only
+//! point at, and things they cannot see at all. That difference is carried by
+//! [`Evidence`] — three words, defined here once — rather than by a paragraph of
+//! qualifiers under each result. A caveat repeated everywhere stops being read;
+//! a label that is always one of three things gets learned.
+//!
+//! Reach for prose only where a *specific* boundary is not implied by the label
+//! — that a counter excludes loss upstream of this socket, say. "This is
+//! indirect" is the label's job.
 //!
 //! The rule lives in both applications rather than here: it reads a
 //! `wiredata-telemetry` histogram, and this crate depends on `egui` alone. See
@@ -68,6 +73,42 @@ use crate::{
     fonts::bold,
     palette::{active, tint},
 };
+
+/// How directly a reading is supported by what was actually measured.
+///
+/// Orthogonal to [`SignalTone`], which says how much a reading matters.
+/// A [`Evidence::Measured`] fault and a [`Evidence::Check`] hint can both be
+/// urgent; they differ in what the application is entitled to claim.
+///
+/// The three are exhaustive by design. A reading is taken from the thing it
+/// describes, taken from something correlated with it, or not taken at all —
+/// and the last is never rendered as a zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Evidence {
+    /// Sampled at the boundary being described. The figure means what it says.
+    #[default]
+    Measured,
+    /// Real, but sampled somewhere adjacent — a different population, a run
+    /// total behind a current question, a correlated signal. Enough to say
+    /// where to look, never enough to name a cause.
+    Check,
+    /// No measurement exists: the platform has no such counter, or the request
+    /// for one failed. Distinct from a measured zero, and the distinction is
+    /// load-bearing — "unavailable" means unknown.
+    Unavailable,
+}
+
+impl Evidence {
+    /// The word this evidence is presented under. One vocabulary, so a reader
+    /// learns three terms instead of parsing three paragraphs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Measured => "Measured",
+            Self::Check => "Check",
+            Self::Unavailable => "Unavailable",
+        }
+    }
+}
 
 /// Visual emphasis for a diagnostic signal. Semantics and thresholds remain local
 /// to the application that owns the measurement.
@@ -251,6 +292,23 @@ pub fn attention_callout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three terms are fixed and distinct — the point of defining them once
+    /// is that neither app invents a fourth word for the same idea.
+    #[test]
+    fn evidence_has_exactly_three_distinct_words() {
+        let all = [Evidence::Measured, Evidence::Check, Evidence::Unavailable];
+        let labels: Vec<&str> = all.iter().map(|e| e.label()).collect();
+        assert_eq!(labels, vec!["Measured", "Check", "Unavailable"]);
+        for (index, label) in labels.iter().enumerate() {
+            assert!(!labels[..index].contains(label));
+        }
+        assert_eq!(
+            Evidence::default(),
+            Evidence::Measured,
+            "a reading is direct unless it says otherwise"
+        );
+    }
 
     #[test]
     fn card_chrome_is_rounded_and_quiet() {

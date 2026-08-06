@@ -13,6 +13,11 @@ Revision note (semantic color has one source):
   panel color — replacing hand-named light/dark background pairs, which were the
   same decision made twice and drifted the moment an accent changed. Content
   annotation colors stay Talker-owned and are named as such.
+- **Correction (2026-08-05):** as first written, ADR-048 said the diagnostics
+  card's private `translucent` helper "is the same function" as `tint`. It is
+  not, and it still exists: `translucent` returns an alpha-adjusted color and
+  remains in use for the card's two strokes. What changed is three call sites
+  that blended it into the panel fill.
 
 Revision note for 1.10 (the warm-up gate retires):
 
@@ -1713,9 +1718,10 @@ Two things follow that were not just substitutions:
   `panel_fill`. A tinted surface then needs no light/dark pair: it lands pale on
   light and deep on dark by construction, and it cannot drift away from the
   accent it belongs to. The four hand-named status-strip backgrounds and the
-  invalid-field wash are now derived this way, and the shared diagnostics card's
-  private `translucent` helper is the same function — it was already doing this
-  privately, so `tint` de-duplicates rather than invents.
+  invalid-field wash are now derived this way, as are the three places in the
+  shared diagnostics card that were blending a color into the panel by hand. The
+  card's `translucent` helper is *not* the same function and remains in use: it
+  adjusts a color's alpha, which is what the card's two strokes want.
 - **INFO takes no accent.** It was `from_gray(235/20)`, which is body text
   spelled as a literal. It is now `ui.visuals().text_color()`, because INFO is
   the baseline the other severities are read *against*; giving it a palette
