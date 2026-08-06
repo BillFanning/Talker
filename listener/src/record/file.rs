@@ -98,7 +98,14 @@ pub struct RawFileRecorder {
     file: BufWriter<File>,
     /// Timestamp index: one `offset,wall_clock_nanos` line per chunk (§57).
     sidecar: Option<BufWriter<File>>,
-    bytes_written: u64,
+    /// Absolute offset in the destination file where the next byte lands.
+    ///
+    /// Absolute, not "bytes this recorder wrote", because that is what the
+    /// sidecar keys on: an index into a `.raw` has to count from the start of
+    /// the file the bytes actually joined. Under `AppendIfExists` those differ,
+    /// and they differ silently — the `.raw` stays perfectly correct while its
+    /// index points into the wrong part of it.
+    stream_offset: u64,
     /// Advisory lock on the destination (§121, ADR-014); held for the recorder's
     /// lifetime, released deterministically when this std handle drops.
     _lock: std::fs::File,
@@ -131,19 +138,32 @@ impl RawFileRecorder {
         } else {
             None
         };
-        let file = BufWriter::new(open_recording_file(path, policy).await?);
+        let file = open_recording_file(path, policy).await?;
+        // Start counting from wherever this recording's first byte will land,
+        // which under `AppendIfExists` (§55) is the end of what is already
+        // there. Taken from the opened file rather than branched on the policy:
+        // a truncated or freshly created destination reports zero, so one read
+        // covers all three policies and cannot disagree with the open above.
+        //
+        // This matters more than it looks. Append is the default, rotation
+        // coerces Refuse to Append (`effective_overwrite`, §59), and rotation
+        // is also the default — so restarting a recording inside its current
+        // period is the ordinary path, not a corner. Counting from zero there
+        // left every new index entry pointing at bytes from the previous run.
+        let stream_offset = file.metadata().await?.len();
         Ok(Self {
-            file,
+            file: BufWriter::new(file),
             sidecar,
-            bytes_written: 0,
+            stream_offset,
             _lock: lock,
         })
     }
 
-    /// Total bytes durably offered to the byte stream — the truncation point on
-    /// fault (§56.1).
-    pub fn bytes_written(&self) -> u64 {
-        self.bytes_written
+    /// Absolute offset one past the last byte durably offered to the file — the
+    /// sidecar's key for the next chunk, and the truncation point on fault
+    /// (§56.1). Both want a position in the file, not a count for this run.
+    pub fn stream_offset(&self) -> u64 {
+        self.stream_offset
     }
 }
 
@@ -155,13 +175,13 @@ impl RawRecorder for RawFileRecorder {
             // Key the timestamp by the offset of this chunk's first byte (§57).
             let line = format!(
                 "{},{}\n",
-                self.bytes_written,
+                self.stream_offset,
                 wall_clock_nanos(chunk.received_at.wall_clock)
             );
             sidecar.write_all(line.as_bytes()).await?;
         }
         self.file.write_all(bytes).await?;
-        self.bytes_written += bytes.len() as u64;
+        self.stream_offset += bytes.len() as u64;
         Ok(())
     }
 
@@ -347,6 +367,102 @@ mod tests {
             .map(|l| l.split(',').next().unwrap())
             .collect();
         assert_eq!(offsets, vec!["0", "2"]);
+
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = tokio::fs::remove_file(&sidecar_path(&path)).await;
+    }
+
+    /// An appended run indexes where its bytes actually landed (§55, §57).
+    ///
+    /// The failure this pins is silent and asymmetric: the `.raw` stays
+    /// perfectly byte-exact while its index points into the previous run's
+    /// bytes, so nothing looks wrong until someone trusts a timestamp. It is
+    /// also the ordinary path — append is the default, and rotation (also the
+    /// default) coerces Refuse to Append, so any restart inside the current
+    /// period lands here.
+    #[tokio::test]
+    async fn an_appended_sidecar_indexes_from_the_end_of_the_existing_file() {
+        let path = temp_path("sidecar-append");
+        {
+            let recorder = RawFileRecorder::create(&path, OverwritePolicy::Overwrite, true)
+                .await
+                .unwrap();
+            let mut recording = start_raw_recording(recorder, 16);
+            recording.try_record(chunk(b"ABCDE"));
+            recording.finalize(RecordingStopReason::Disabled).await;
+        }
+        {
+            let recorder = RawFileRecorder::create(&path, OverwritePolicy::AppendIfExists, true)
+                .await
+                .unwrap();
+            let mut recording = start_raw_recording(recorder, 16);
+            recording.try_record(chunk(b"FG"));
+            recording.try_record(chunk(b"HIJ"));
+            recording.finalize(RecordingStopReason::Disabled).await;
+        }
+
+        let raw = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(raw, b"ABCDEFGHIJ", "the byte stream is still exact");
+        let sidecar = tokio::fs::read_to_string(&sidecar_path(&path))
+            .await
+            .unwrap();
+        let offsets: Vec<&str> = sidecar
+            .lines()
+            .map(|line| line.split(',').next().unwrap())
+            .collect();
+        assert_eq!(
+            offsets,
+            vec!["0", "5", "7"],
+            "the second run's entries must continue from the existing length, not restart"
+        );
+        // Every offset names the first byte of the chunk it timed.
+        for (offset, expected) in offsets.iter().zip(["A", "F", "H"]) {
+            let at: usize = offset.parse().unwrap();
+            assert_eq!(&raw[at..at + 1], expected.as_bytes(), "offset {offset}");
+        }
+
+        let _ = tokio::fs::remove_file(&path).await;
+        let _ = tokio::fs::remove_file(&sidecar_path(&path)).await;
+    }
+
+    /// A sidecar enabled on a later run indexes the file it is joining, and
+    /// says nothing about the bytes recorded before it existed.
+    #[tokio::test]
+    async fn a_sidecar_added_to_an_existing_recording_starts_at_that_file_s_end() {
+        let path = temp_path("sidecar-late");
+        {
+            let recorder = RawFileRecorder::create(&path, OverwritePolicy::Overwrite, false)
+                .await
+                .unwrap();
+            let mut recording = start_raw_recording(recorder, 16);
+            recording.try_record(chunk(b"early-bytes"));
+            recording.finalize(RecordingStopReason::Disabled).await;
+        }
+        assert!(
+            tokio::fs::metadata(&sidecar_path(&path)).await.is_err(),
+            "no sidecar while timestamps were off"
+        );
+        {
+            let recorder = RawFileRecorder::create(&path, OverwritePolicy::AppendIfExists, true)
+                .await
+                .unwrap();
+            let mut recording = start_raw_recording(recorder, 16);
+            recording.try_record(chunk(b"late"));
+            recording.finalize(RecordingStopReason::Disabled).await;
+        }
+
+        let sidecar = tokio::fs::read_to_string(&sidecar_path(&path))
+            .await
+            .unwrap();
+        let offsets: Vec<&str> = sidecar
+            .lines()
+            .map(|line| line.split(',').next().unwrap())
+            .collect();
+        assert_eq!(
+            offsets,
+            vec!["11"],
+            "the first timed chunk sits after the untimed bytes it followed"
+        );
 
         let _ = tokio::fs::remove_file(&path).await;
         let _ = tokio::fs::remove_file(&sidecar_path(&path)).await;

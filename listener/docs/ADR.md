@@ -607,7 +607,7 @@ A second, parallel command enum on top of a working method API + a GUI transport
 
 **Why this is *not* the `Highlight` cost.** Splicing a string during rendering is a **text insertion**, not a coordinate mapping: no glyph-width measurement, no soft-wrap position math, no per-mode screen geometry. The renderers already produce their output by walking bytes/characters in order; "when you reach offset N, emit this string too" is a one-line addition per mode. The one place a byte offset must meet the character stream (multi-byte UTF-8/UTF-16 in Rendered/Raw) is handled by `decode_with_offsets`, which pairs each decoded character with its source byte offset — a small, tested helper, not a subsystem.
 
-**Also removed (one timestamping mechanism, not three).** Two abandoned pieces are deleted so the per-match `Mark` is the *only* timestamp path: (a) the per-chunk Display-Recording timestamp (`DisplayRecordingConfig.timestamp_enabled` + its GUI checkbox), which was never surfaced meaningfully; and (b) the spec-only `TimestampDisplay`/`TimestampSource`/`TimestampResolution` types, which had no implementation. The byte-exact **Raw Recording timestamp sidecar** (`.raw.idx`, §57) is **kept** — it stays out of the `.raw` bytes and is byte-exact-safe — but remains config-only (`RawRecordingConfig.timestamp_enabled`) with a TODO to add a UI toggle.
+**Also removed (one timestamping mechanism, not three).** Two abandoned pieces are deleted so the per-match `Mark` is the *only* timestamp path: (a) the per-chunk Display-Recording timestamp (`DisplayRecordingConfig.timestamp_enabled` + its GUI checkbox), which was never surfaced meaningfully; and (b) the spec-only `TimestampDisplay`/`TimestampSource`/`TimestampResolution` types, which had no implementation. The byte-exact **Raw Recording timestamp sidecar** (`.raw.idx`, §57) is **kept** — it stays out of the `.raw` bytes and is byte-exact-safe — but remains config-only (`RawRecordingConfig.timestamp_enabled`) with a TODO to add a UI toggle. *(Superseded 2026-08-05: the Raw recording editor now carries that toggle, and ADR-039 corrects the offsets it writes. The decision above is kept as the original reasoning.)*
 
 **Consequences.**
 - `MatchAction::Mark` becomes `Mark { timestamp: Option<MarkTimestamp> }`; new `MarkTimestamp`/`MarkPosition`/`TimestampConfig` config types. `MatchAction` is `#[serde(tag = "kind")]`; a bare `Mark` still parses (the field is `#[serde(default)]`). No `schema_version` bump — additive field plus an additive-safe drop of the display timestamp field (dev-only profiles, ADR-013 precedent).
@@ -1361,6 +1361,56 @@ window end — a `Before` whose byte had not arrived — so it rendered ahead of
 byte and again when that byte turned up in the next delta. The bound is now
 half-open, matching `delta_annotations`, and pinned across all three modes and
 four chunk sizes by `a_mark_on_a_delta_boundary_splices_once`.
+
+## ADR-039 — A sidecar offset is a position in a file, not a count for a run
+
+**Status:** Accepted 2026-08-05. Fixes a defect that predated ADR-037/038 but
+became reachable when the GUI toggle landed.
+
+**Context:** `RawFileRecorder` counted from zero at construction and keyed each
+`.raw.idx` line on that counter. Under `OverwritePolicy::Overwrite` and `Refuse`
+the counter and the file position agree, because the file starts empty. Under
+`AppendIfExists` they do not: the bytes join an existing file at its end while
+the index claims they start at zero.
+
+Three things made this the ordinary path rather than a corner. Append is the
+default `overwrite_policy`. Rotation is the default `file_rotation`, and
+`effective_overwrite` coerces Refuse to Append whenever rotation is on (§59),
+because each period is meant to be resumable. So stopping and restarting a
+recording inside its current period — the most natural thing a user does — hit
+it every time.
+
+The failure mode is the reason it went unnoticed. The `.raw` stays perfectly
+byte-exact; only its index is wrong, and wrong in a way that still parses and
+still looks plausible. Nothing surfaces until someone trusts a timestamp.
+
+**Decision:** The recorder tracks `stream_offset` — the absolute position in the
+destination where the next byte lands — seeded from the opened file's length.
+The name carries the semantics: an index into a `.raw` counts from the start of
+the file the bytes actually joined, never from the start of this run.
+
+The length is read from the opened file rather than branched on the policy. A
+truncated or freshly created destination reports zero, so one read covers all
+three policies and cannot drift out of agreement with the `OpenOptions` above
+it. `bytes_written()` became `stream_offset()`: it was documented as the
+truncation point on fault (§56.1), which also wants a file position, so both of
+its readings improve and neither had an external caller.
+
+**Consequences:** Rotation is correct in both directions — a fresh period file
+starts its index at zero because it is empty, and a reopened one continues,
+through the same code path. A sidecar enabled on a later run indexes the file it
+joins and simply says nothing about the bytes recorded before it existed, which
+is the honest result rather than a special case.
+
+The GUI help said offsets "restart at zero" under rotation. That was true of a
+fresh period file and false of a reopened one, so the tooltip was teaching the
+bug; it now states the invariant instead.
+
+Pinned by `an_appended_sidecar_indexes_from_the_end_of_the_existing_file`,
+`a_sidecar_added_to_an_existing_recording_starts_at_that_file_s_end`, and
+`rotated_sidecars_index_their_own_period_file_across_a_restart`. All three were
+confirmed to fail against the previous behaviour before the fix landed — the
+append test reported offsets `0, 0, 2` where the file holds `0, 5, 7`.
 
 ## Open questions
 

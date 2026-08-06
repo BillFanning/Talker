@@ -109,8 +109,10 @@ const TIMESTAMP_SIDECAR_TOOLTIP: &str = concat!(
     "nanoseconds since the Unix epoch. It is plain text, so any tool can read it, and ",
     "it is kept out of the .raw so that file stays byte-exact. Times are captured per ",
     "block when the read completes — not per byte, and not device or wire time — so a ",
-    "nanosecond field does not imply nanosecond accuracy. With rotation on, each ",
-    "rotated file gets its own sidecar and offsets restart at zero within it."
+    "nanosecond field does not imply nanosecond accuracy. Offsets are always positions ",
+    "in the file beside them, so appending to an existing recording continues from its ",
+    "end rather than starting over, and with rotation on each file has its own sidecar ",
+    "counting from that file's start."
 );
 
 /// Edit the channel's **Raw** recording setup (§53): destination, overwrite, rotation,

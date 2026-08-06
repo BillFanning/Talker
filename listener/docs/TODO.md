@@ -179,6 +179,13 @@ Message-model removal). Everything below this block is verified done:
       that a nanosecond field is not nanosecond accuracy. A bundled viewer pairing
       `.raw.idx` offsets against `.raw` bytes is a real feature with no spec section
       behind it — revisit with an amendment, not as a follow-up to this control.
+- [x] **Appended sidecars indexed from zero** (ADR-039, external review 2026-08-05).
+      `RawFileRecorder` counted from construction, so under `AppendIfExists` the
+      index claimed offsets the bytes did not occupy. Append is the default, rotation
+      is the default, and rotation coerces Refuse to Append — so a restart inside the
+      current period hit it every time, while the `.raw` stayed byte-exact and hid it.
+      Now `stream_offset`, seeded from the opened file's length. Pinned by three tests
+      confirmed to fail against the old behaviour first.
 - [ ] General match-rule editor UI: the `Idle`/`Record`/`Notify`/`PauseDisplay`
       conditions + actions. The `BytePattern → Mark(+timestamp)` subset now has a
       minimal editor (ADR-016); the rest still arrive only via profiles.

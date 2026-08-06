@@ -383,6 +383,92 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
+    /// Each period's sidecar indexes its own file, and a restart inside a period
+    /// continues that file's offsets rather than restarting them.
+    ///
+    /// This is the default configuration, not a corner: rotation defaults to
+    /// hourly and coerces Refuse to Append (§59), so stopping and starting a
+    /// recording within the hour reopens the current period file. Counting from
+    /// zero there indexed the second run's chunks onto the first run's bytes.
+    #[tokio::test]
+    async fn rotated_sidecars_index_their_own_period_file_across_a_restart() {
+        let dir = temp_dir("raw-idx");
+        let offsets = |text: String| -> Vec<String> {
+            text.lines()
+                .map(|line| line.split(',').next().unwrap().to_owned())
+                .collect()
+        };
+
+        let mut rec = RotatingRawRecorder::create(
+            &dir,
+            "GPS",
+            ".raw",
+            OverwritePolicy::AppendIfExists,
+            true,
+            FileRotationPolicy::Hourly,
+        )
+        .await
+        .unwrap();
+        rec.write_chunk(&chunk_at(b"AB", local(2026, 6, 3, 8, 30)))
+            .await
+            .unwrap();
+        rec.write_chunk(&chunk_at(b"CDE", local(2026, 6, 3, 8, 45)))
+            .await
+            .unwrap();
+        // Crossing the hour opens a fresh file, so its index starts over — that
+        // restart of offsets is correct, and is what makes the other one wrong.
+        rec.write_chunk(&chunk_at(b"FG", local(2026, 6, 3, 9, 5)))
+            .await
+            .unwrap();
+        rec.finalize(RecordingStopReason::ChannelStopped)
+            .await
+            .unwrap();
+        drop(rec);
+
+        // Stop and start again inside the 09:00 hour: the same file is reopened.
+        let mut rec = RotatingRawRecorder::create(
+            &dir,
+            "GPS",
+            ".raw",
+            OverwritePolicy::AppendIfExists,
+            true,
+            FileRotationPolicy::Hourly,
+        )
+        .await
+        .unwrap();
+        rec.write_chunk(&chunk_at(b"HIJ", local(2026, 6, 3, 9, 20)))
+            .await
+            .unwrap();
+        rec.finalize(RecordingStopReason::ChannelStopped)
+            .await
+            .unwrap();
+        drop(rec);
+
+        let f08 = dir.join("GPS_2026-06-03_08.raw");
+        let f09 = dir.join("GPS_2026-06-03_09.raw");
+        assert_eq!(tokio::fs::read(&f08).await.unwrap(), b"ABCDE");
+        assert_eq!(tokio::fs::read(&f09).await.unwrap(), b"FGHIJ");
+        assert_eq!(
+            offsets(
+                tokio::fs::read_to_string(f08.with_extension("raw.idx"))
+                    .await
+                    .unwrap()
+            ),
+            vec!["0", "2"],
+        );
+        assert_eq!(
+            offsets(
+                tokio::fs::read_to_string(f09.with_extension("raw.idx"))
+                    .await
+                    .unwrap()
+            ),
+            vec!["0", "2"],
+            "the restart's chunk is at offset 2 of its own file, not 0"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
     #[tokio::test]
     async fn display_rotates_on_the_day_with_correct_names() {
         let dir = temp_dir("disp");
