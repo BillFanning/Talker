@@ -329,16 +329,26 @@ now points at its ADR instead of duplicating it.)
 
 Not applied, deliberately:
 
-- [ ] **Attribute misses at the moment they occur.** The deepest point in the
-  review: `blocked_others` is sampled when the channel *reaches* a deadline, so
-  it explains observed lateness directly and observed misses only by inference.
-  Worse, the two diverge exactly when it matters — under heavy overload fewer
-  deadlines are reached, so blame thins out as the problem grows. The routing
-  callout and ADR-045 now state this boundary rather than paper over it, but the
-  real fix is to attribute at the skip: `Schedule::poll` already computes
-  `skipped` per message and knows the interval it was skipping against, so the
-  runner could charge those points to the send that was in flight. That is a
-  measurement change, not a wording one, and wants its own ADR.
+- [x] **Attribute misses at the moment they occur (ADR-051).** Done 2026-08-06.
+  The deepest point in the review. `Schedule::poll` reports `skipped` and
+  `interval` on `Tick::Due`, and `MessageTimingRecorder::record_skips` charges
+  those points to whichever send held the thread as each one passed — the same
+  rule `blocked_others` uses, now shared as `blocker_for`. Surfaces as
+  `MessageTiming::missed_others`, the `per_message_missed_others` report lane,
+  and the **Cost to others** column (was *Delay caused*). The missed-send
+  callout gained its one convicting branch, which states the unattributed
+  remainder rather than absorbing it. Pinned by
+  `miss_blame_scales_with_overload_where_delay_blame_thins_out` (the defect
+  itself: a longer block cannot yield more lateness samples),
+  `an_enormous_stall_is_charged_without_visiting_each_point` (closed form, not a
+  loop), and `charging_skips_does_not_disinherit_the_deadline_handled_next`
+  (the skip lookup must not advance the backlog cursor).
+- [ ] **Only the interface write counts as holding the channel.** The boundary
+  ADR-051 states rather than fixes: a point is charged to whichever message was
+  inside `send` when it passed, so time spent rendering is charged to nobody.
+  Justified today because render is 1–3 µs and below the histogram's first
+  bucket — check it again if a payload format ever makes rendering expensive,
+  since the fix is just widening the recorded window.
 - [ ] **Cache the Cadence grouping and its tooltip.** `cadence_groups` allocates
   and `cadence_tooltip` builds a ~1 kB string every repaint, hovered or not.
   Caching needs either app-side state keyed on the interval set, or a

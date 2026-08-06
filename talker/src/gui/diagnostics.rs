@@ -577,13 +577,16 @@ pub(super) struct MessageRow {
     pub late: String,
     pub send_call: String,
     /// Longest single send of this message that delayed another: an elapsed
-    /// hold time, unlike [`Self::delay_caused`].
+    /// hold time, unlike [`Self::cost_to_others`].
     pub longest_block: String,
-    /// Combined waiting this message imposed, summed across every message it
-    /// delayed. Can exceed `longest_block`; never an elapsed time.
-    pub delay_caused: String,
-    /// This message delayed others, so its row carries the attention tone.
-    pub blocks_others: bool,
+    /// What this message cost the rest, in the two currencies that are not
+    /// convertible into each other: combined waiting it imposed (summed across
+    /// every message it delayed, so it can exceed `longest_block` and is never
+    /// an elapsed time), and cadence points others lost outright.
+    pub cost_to_others: String,
+    /// This message delayed or displaced others, so its row carries the
+    /// attention tone.
+    pub costs_others: bool,
 }
 
 const NO_MEASUREMENT: &str = "—";
@@ -646,12 +649,22 @@ pub(super) fn per_message_rows(counts: &[u64], timing: &[MessageTiming]) -> Vec<
                         thousands(message.blocking_sends)
                     )
                 },
-                delay_caused: if message.blocked_others.is_zero() {
-                    NO_MEASUREMENT.to_owned()
-                } else {
-                    compact_duration(message.blocked_others)
+                // Two units in one cell, each with its noun attached, because
+                // they answer one question — what did this message cost the
+                // others — and a reader comparing rows should not have to
+                // track which of two columns moved.
+                cost_to_others: match (message.blocked_others.is_zero(), message.missed_others == 0)
+                {
+                    (true, true) => NO_MEASUREMENT.to_owned(),
+                    (false, true) => format!("{} late", compact_duration(message.blocked_others)),
+                    (true, false) => format!("{} missed", thousands(message.missed_others)),
+                    (false, false) => format!(
+                        "{} late · {} missed",
+                        compact_duration(message.blocked_others),
+                        thousands(message.missed_others)
+                    ),
                 },
-                blocks_others: !message.blocked_others.is_zero(),
+                costs_others: !message.blocked_others.is_zero() || message.missed_others > 0,
             }
         })
         .collect()
@@ -659,11 +672,14 @@ pub(super) fn per_message_rows(counts: &[u64], timing: &[MessageTiming]) -> Vec<
 
 pub(super) const PER_MESSAGE_TOOLTIP: &str =
     "One row per message, numbered as in the Messages editor. Late is what that message \
-suffered: how long after its own scheduled moment the channel got to it. Longest block and Delay \
-caused are what it cost everything else — the longest single send of this message that held the \
-channel against another, and the waiting that imposed added up across every message delayed. \
-Those two are different quantities: the second sums several messages' waits, so it can exceed the \
-send that caused it and is not an elapsed time. Suffering and causing usually land on different \
+suffered: how long after its own scheduled moment the channel got to it. Longest block and Cost to \
+others are what it cost everything else — the longest single send of this message that held the \
+channel against another, then the waiting that imposed added up across every message delayed and \
+the cadence points others lost outright while this message was sending. Those are three different \
+quantities: the combined wait sums several messages, so it can exceed the send that caused it and \
+is not an elapsed time, and a missed point is a send that never happened rather than a late one. \
+Misses are counted at the moment they are skipped, so they stay attributable when overload gets \
+bad enough that few deadlines are reached at all. Suffering and causing usually land on different \
 rows, and that is the normal shape of a cadence problem: a channel handles its messages one at a \
 time, so a slow infrequent message can delay a fast one badly while recording almost no lateness \
 itself. Read across a row, not down a column. Sends counts writes that succeeded; a timing figure \
@@ -690,13 +706,16 @@ far this evidence reaches.";
 /// tell a strong signal from a weak one. This is the material the callout's
 /// hover used to carry.
 pub(super) const MISSED_ROUTING_LIMITS: &str =
-    "Where missed sends point, and how far: nothing is measured at the instant a send was \
-skipped. The counts weighed are run totals, so a fault that has since recovered still appears. \
-The blocking evidence comes from scheduled sends the channel did reach, not the ones it skipped \
-— usually the same cause, but different populations, and under heavy overload fewer sends are \
-reached, so blocking is measured least well exactly when it matters most. What is reliable is \
-the direction: one grid point is skipped per interval of lateness, so misses concentrate on the \
-message with the tightest interval, which is rarely the one causing them.";
+    "Where missed sends point, and how far: a miss charged to a message is counted as the \
+cadence point is skipped, so that share is measured rather than inferred, and unlike delay it \
+does not thin out as overload gets worse. Its own limits are narrower. A point is charged to \
+whichever message was inside its interface write as the point passed, so a message that holds \
+the channel some other way is not charged; and a message is never charged for its own skipped \
+points, which show up instead as a send call longer than its interval. Misses left uncharged \
+were skipped with the thread free — a late deadline wake, or the machine suspended — and no \
+message caused them. The rest of the line is weaker evidence: the counts weighed are run \
+totals, so a fault that has since recovered still appears, and the capacity finding is a \
+projection rather than a measurement.";
 
 /// Evidence available when scheduled sends are being skipped.
 ///
@@ -716,10 +735,13 @@ pub(super) struct MissedSendEvidence {
 
 /// Where to look when scheduled sends are being skipped.
 ///
-/// A router, not a verdict. Nothing here is measured at the instant a send was
-/// skipped: the counts are run totals and the blocking evidence comes from
-/// sends that *were* reached, so the strongest honest claim is where to start.
-/// The verbs carry that — "check", "start from".
+/// Mostly a router, occasionally a verdict, and the wording says which. One
+/// input *is* measured at the instant a send was skipped —
+/// [`MessageTiming::missed_others`], charged to whichever send held the thread
+/// as each point passed (ADR-051) — and where that lands on a message the text
+/// states an amount rather than a place to look. Everything else here is a run
+/// total or evidence from deadlines that were reached, so those branches keep
+/// the hedged verbs: "check", "start from", "may not".
 ///
 /// Capacity findings use the running schedule, not the editable draft, so an
 /// unapplied edit is never blamed for a run's misses.
@@ -748,6 +770,13 @@ pub(super) fn missed_send_routing(
         .enumerate()
         .filter(|(_, message)| !message.blocked_others.is_zero())
         .max_by_key(|(_, message)| message.blocked_others);
+    // Measured where the miss happened rather than inferred from lateness, so
+    // this outranks `blocker` when both are present.
+    let convicted = per_message
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.missed_others > 0)
+        .max_by_key(|(_, message)| message.missed_others);
 
     let text = if interface_erroring {
         "Missed sends: the interface is failing right now, and retry backoff withholds sends while \
@@ -763,6 +792,42 @@ pub(super) fn missed_send_routing(
         )
     } else if serial_oversubscribed {
         "Missed sends: the serial line cannot carry this schedule — see Capacity.".to_owned()
+    } else if let Some((index, message)) = convicted {
+        // The one branch entitled to say "caused". Every point counted here was
+        // charged while the named message's send held the thread, so this is an
+        // amount, not a lead to follow.
+        let hold = if message.longest_block.is_zero() {
+            String::new()
+        } else {
+            format!(
+                ", the longest for {}",
+                compact_duration(message.longest_block)
+            )
+        };
+        let attributed: u64 = per_message
+            .iter()
+            .map(|message| message.missed_others)
+            .sum();
+        // The rest were skipped with the thread free. Naming that share stops
+        // the reader from generalizing one message's blame to the whole count.
+        let idle = missed.saturating_sub(attributed);
+        let remainder = if idle == 0 {
+            String::new()
+        } else {
+            format!(
+                " The other {} passed with the channel thread free, so no send caused them — \
+                 suspect late deadline wakes instead.",
+                thousands(idle)
+            )
+        };
+        format!(
+            "Missed sends: message #{} caused {} of them — its sends held the channel as those \
+             cadence points passed{}.{} See Per-message timing.",
+            index + 1,
+            thousands(message.missed_others),
+            hold,
+            remainder,
+        )
     } else if let Some((index, message)) = blocker {
         // Two different quantities, and only one of them is an elapsed hold:
         // the longest blocking send is what the channel actually spent, while
@@ -1263,6 +1328,7 @@ mod tests {
             blocked_others: Duration::from_millis(430),
             blocking_sends: 4,
             longest_block: Duration::from_millis(120),
+            missed_others: 37,
             ..MessageTiming::default()
         };
         culprit.deadline_lateness.record(Duration::from_micros(80));
@@ -1277,18 +1343,19 @@ mod tests {
         assert_eq!(rows[0].sends, "600");
         assert_eq!(rows[0].late, "worst 9 ms of 1");
         assert_eq!(rows[0].longest_block, "—");
-        assert_eq!(rows[0].delay_caused, "—");
-        assert!(!rows[0].blocks_others);
+        assert_eq!(rows[0].cost_to_others, "—");
+        assert!(!rows[0].costs_others);
 
-        // #2 is barely late itself, and is charged for the delay it caused.
+        // #2 is barely late itself, and is charged for what it cost.
         assert_eq!(rows[1].label, "#2");
         assert_eq!(rows[1].late, "worst 80.0 us of 1");
         assert_eq!(rows[1].send_call, "worst 120 ms of 1");
-        // The hold and the combined waiting are separate cells because the
-        // second is a sum across victims and is not an elapsed time.
+        // The hold is its own cell because it is the one elapsed time here:
+        // the combined waiting sums across victims and the misses are a count,
+        // so neither may be read as a duration the channel actually spent.
         assert_eq!(rows[1].longest_block, "120 ms in 4 sends");
-        assert_eq!(rows[1].delay_caused, "430 ms");
-        assert!(rows[1].blocks_others);
+        assert_eq!(rows[1].cost_to_others, "430 ms late · 37 missed");
+        assert!(rows[1].costs_others);
     }
 
     /// The Sends column already carries the count, so repeating it in all three
@@ -1328,7 +1395,7 @@ mod tests {
         assert_eq!(rows[0].late, "—");
         assert_eq!(rows[0].send_call, "—");
         assert_eq!(rows[0].longest_block, "—");
-        assert_eq!(rows[0].delay_caused, "—");
+        assert_eq!(rows[0].cost_to_others, "—");
     }
 
     /// The routing exists because the message showing the misses is rarely the
@@ -1412,6 +1479,49 @@ mod tests {
         let unexplained =
             missed_send_routing(&evidence(12, false, 0, false), &[active, second]).unwrap();
         assert!(unexplained.text.contains("no message delayed another"));
+    }
+
+    /// The one branch entitled to convict rather than route, and the boundary
+    /// that keeps it honest. Misses charged at the skip are evidence about the
+    /// misses themselves, so this outranks the delay-based lead above — but
+    /// only for the share actually charged. The remainder passed with the
+    /// thread free, and absorbing it into the named message would convert a
+    /// measurement back into the inference this replaced.
+    #[test]
+    fn measured_misses_convict_and_still_name_the_share_nobody_caused() {
+        let culprit = MessageTiming {
+            blocked_others: Duration::from_millis(430),
+            blocking_sends: 4,
+            longest_block: Duration::from_millis(120),
+            missed_others: 9,
+            ..MessageTiming::default()
+        };
+        let per_message = [MessageTiming::default(), culprit];
+        let evidence = |missed| MissedSendEvidence {
+            missed,
+            interface_erroring: false,
+            failed: 0,
+            serial_oversubscribed: false,
+            service: None,
+        };
+
+        // Every miss accounted for. Note this same input routes to the
+        // delay-based lead when `missed_others` is zero, above.
+        let all = missed_send_routing(&evidence(9), &per_message).unwrap();
+        assert_eq!(
+            all.text,
+            "Missed sends: message #2 caused 9 of them — its sends held the channel as those \
+             cadence points passed, the longest for 120 ms. See Per-message timing."
+        );
+
+        // Three more than any send can account for.
+        let partial = missed_send_routing(&evidence(12), &per_message).unwrap();
+        assert!(
+            partial
+                .text
+                .contains("The other 3 passed with the channel thread free"),
+            "an unattributable remainder must not be worn by the named message: {partial:?}"
+        );
     }
 
     #[test]

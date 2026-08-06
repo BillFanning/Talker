@@ -747,6 +747,8 @@ fn run_loop(
             Tick::Due {
                 index,
                 scheduled_for,
+                interval,
+                skipped,
             } => {
                 // A bounded-window request has done its job once the deadline
                 // wait returns. Rendering and clock reads do not benefit from
@@ -758,6 +760,10 @@ fn run_loop(
                     due_handled_at.saturating_duration_since(scheduled_for),
                 );
                 per_message_timing.record_due(index, scheduled_for, due_handled_at);
+                // Order matters: `record_due` settles which send this tick's
+                // backlog belongs to, and the skipped points belong to the
+                // same one.
+                per_message_timing.record_skips(index, scheduled_for, interval, skipped);
                 let suppressed = episode
                     .as_ref()
                     .is_some_and(|ep| due_handled_at < ep.next_attempt);
@@ -1247,6 +1253,18 @@ mod tests {
         assert!(
             slow.blocked_others >= Duration::from_millis(50),
             "attributed delay is implausibly small for a 120 ms block: {slow:?}"
+        );
+        // The same write also destroys cadence points outright — about eleven
+        // of the fast message's per 120 ms block — and the runner charges
+        // those where they happened rather than leaving them to be inferred
+        // from the one deadline it did reach.
+        assert!(
+            slow.missed_others >= 5,
+            "skipped points were not charged to the blocking send: {slow:?}"
+        );
+        assert_eq!(
+            fast.missed_others, 0,
+            "the message that lost the points must not be charged for them: {fast:?}"
         );
     }
 

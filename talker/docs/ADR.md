@@ -1,10 +1,21 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.13
+**Version:** 1.14
 **Date:** 2026-08-06
 **Status:** Accepted
 
-Revision note (four accents, and one rule):
+Revision note (misses are measured where they happen):
+
+- **ADR-051** amends the scope limit ADR-045 set for itself. Delay blame is
+  collected per deadline the channel *reaches*, so a ten-second block against a
+  10 ms cadence destroys a thousand cadence points and yields one lateness
+  sample — the evidence thinned out as the fault grew. `Schedule::poll` now
+  reports the points it skips, and each is charged to whichever send held the
+  thread as it passed, by ADR-045's own rule. The missed-send callout gains one
+  branch entitled to convict, and must state the share it cannot account for.
+  ADR-045's refusal of a *victim-side* miss count still stands and is unchanged.
+
+Revision note for 1.13 (four accents, and one rule):
 
 - **ADR-050** reduces the palette from ten colours to four — `fault`, `warning`,
   `running`, `idle`, the same states `SignalTone` already names. Five greys were
@@ -1898,6 +1909,86 @@ pair argument written into it — a fifth field should be read as the question
 "could a glyph or a word do this?" rather than a number to bump.
 `fault_stays_on_the_blue_axis` pins ADR-049's fix against a future edit that
 quietly walks it back toward red.
+
+---
+
+## ADR-051 — A missed send is charged where it was missed
+
+**Status:** Accepted 2026-08-06. Amends the scope limit in ADR-045.
+
+**Context:** ADR-045 measured which send caused a deadline to be *late*, and was
+explicit that this could not explain a send that was *missed*: a skipped cadence
+point is passed over by `Schedule::poll` before any measurement runs, so the
+only evidence available was inference from the deadlines the channel did reach.
+
+That limit is not uniform — it is worst precisely where the answer matters. Blame
+accrues per reached deadline, so a write that holds the thread for ten seconds
+against a 10 ms cadence destroys a thousand cadence points and yields exactly
+**one** lateness sample. Doubling the stall does not double the evidence; it
+halves it. The measurement was thinning out as the fault grew, which is the
+opposite of what a diagnostic should do, and the surfaces built on it had to
+hedge accordingly (spec §3.2: "it routes, it does not convict").
+
+ADR-045 also refused per-message miss counts, correctly: skips accrue as
+`late / interval + 1`, so a *victim-side* count concentrates on the tightest
+interval and names the message that suffered. That reasoning rules out one
+column. It does not rule out measuring the misses at all.
+
+**Decision:** Attribute misses at the skip, on the culprit side.
+
+`Schedule::poll` already computes how many grid points it is passing over and
+knows the interval it is passing them against. It now reports both on
+`Tick::Due` (`skipped`, `interval`) instead of only folding them into the
+channel-wide `missed_sends` total. The skipped points lie at
+`scheduled_for + interval`, `+ 2 × interval`, …, which is enough to place every
+one of them on the timeline.
+
+`MessageTiming::missed_others` counts, for each message, the cadence points
+**other** messages lost while its own sends held the channel. The charging rule
+is ADR-045's, unchanged and now shared as one function (`blocker_for`): a point
+is charged to whichever send spanned the moment it passed; a backlog stays with
+the send that opened it; a point that passed with the thread free is charged to
+nobody; and a message is never charged for its own points, which are already
+visible as a send call longer than its interval.
+
+Two details the arithmetic forced:
+
+- **Closed form, never a loop.** A machine suspended overnight against a 1 ms
+  cadence skips tens of millions of points. The count of points falling before
+  the blocking send ended is `ceil(span / interval)`, capped at the number
+  skipped, so recording a stall costs the same whether it lost one point or
+  billions. This runs on the channel thread.
+- **The skip lookup must not move the backlog cursor.** Messages are handled
+  earliest-first, so a tick's skipped points reach further forward in time than
+  deadlines still queued behind it. Letting a skip lookup advance the cursor
+  would step over those deadlines, and a real block would go unattributed —
+  `blocker_for` is therefore a pure query and only the deadline being handled
+  advances the cursor.
+
+**What this does and does not claim.** The charged share is measured, not
+inferred, so the missed-send callout may now state an amount and name a message
+for it. Its own limits are narrower than the old ones but real: a point is
+charged to whichever message was inside its *interface write* when the point
+passed, so a message that holds the channel some other way is not charged
+(render is 1–3 µs and below the histogram's first bucket, which is why the send
+call is the only window measured). Misses left uncharged were skipped with the
+thread free — a late deadline wake, or the machine suspended — and the callout
+states that remainder rather than letting the named message wear it. Absorbing
+it would convert the measurement straight back into the inference this replaces.
+
+**Consequences:** `MessageTiming` gains one `u64`; the recorder gains one
+saturating add per tick that skipped anything, and no allocation. The
+clipboard report gains a `per_message_missed_others` lane which sums to at most
+`missed_sends`, so the unattributed share is a subtraction the reader can do
+from two adjacent lines. The per-message table's **Delay caused** column becomes
+**Cost to others** and carries both currencies with their nouns attached
+(`430 ms late · 37 missed`) rather than taking an eighth column — they answer
+one question, and a reader comparing rows should not have to track which of two
+columns moved. Neither is convertible into the other: one is time spent waiting,
+the other is sends that never happened.
+
+No wire output, cadence, scheduling behaviour, or profile schema changes. The
+stall policy is untouched — this measures the skips it was already making.
 
 ---
 

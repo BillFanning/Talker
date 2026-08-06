@@ -1,9 +1,23 @@
 # Talker — Program Specification
-**Version:** 2.4.7
+**Version:** 2.4.8
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (no warm-up state; skipped sends name a cause):
+Revision note (a missed send names its cause):
+
+- **§3.2 missed-send routing (ADR-051)** — one branch of the callout may now
+  convict rather than route: misses charged at the moment they were skipped are
+  evidence about the misses themselves, so that branch states an amount and
+  names a message. It must also state the share no send accounts for. Every
+  other branch keeps its hedged verbs and its old justification.
+- **§3.2 per-message timing (ADR-051)** — **Delay caused** becomes **Cost to
+  others** and carries both currencies with their nouns attached
+  (`430 ms late · 37 missed`) rather than taking an eighth column. A
+  victim-side miss count is still refused for ADR-045's reason; the count now
+  shown is the culprit's, and unlike the delay figures beside it, it does not
+  thin out under heavy overload.
+
+Revision note for 2.4.7 (no warm-up state; skipped sends name a cause):
 
 - **§3.2 Cadence (ADR-046)** — the twenty-sample warm-up state is removed. Below
   a hundred samples the p99 bucket *is* the maximum's bucket, so the gate only
@@ -488,27 +502,37 @@ The **detail pane** (right) shows the selected channel:
     already names it on the same line. Interval detail comes from the running
     schedule's own per-message intervals once the channel has reported any, and
     from the on-screen draft otherwise — never both in one render.
-  - *Missed-send routing (ADR-045):* when any scheduled send has been skipped,
-    one callout suggests where to look rather than restating the count — a
-    **live** interface fault first (retry backoff withholds sends), then a serial
-    line that cannot carry the schedule, then the message whose sends delayed the
-    others, then application headroom, and otherwise the render and send-call
-    timing. It **routes, it does not convict**: nothing available is measured at
-    the instant a send was skipped. Its counts are run totals, so a fault that
-    has since recovered is described in the past tense rather than the present;
-    a finding derived from the on-screen settings says so when those settings
-    are not what is running; and blocking evidence is qualified because it comes
-    from deadlines the channel reached, not from the ones it skipped.
-  - *Per-message timing (ADR-045):* a collapsed table, one row per message
-    numbered as in the Messages editor, with seven columns — **Msg**,
-    **Interval**, **Sends**, **Late**, **Send call**, **Longest block**, and
-    **Delay caused**. The last two are distinct quantities: longest block is the
-    longest single send of that message which delayed another, and is the only
-    one of the two that is an elapsed hold; delay caused sums the waiting it
-    imposed across every message displaced, so it can exceed the send that caused
-    it and must never be presented as a duration the channel was held. Both come
-    from charging each deadline to whichever send was holding the channel when it
-    passed. Because a channel handles its messages one at a time, the message
+  - *Missed-send routing (ADR-045, amended by ADR-051):* when any scheduled send
+    has been skipped, one callout says where to look rather than restating the
+    count — a **live** interface fault first (retry backoff withholds sends),
+    then a serial line that cannot carry the schedule, then the message the
+    misses were **charged to**, then the message whose sends delayed the others,
+    then application headroom, and otherwise the render and send-call timing.
+    Exactly one of those branches may convict: misses charged at the moment they
+    were skipped are evidence about the misses themselves, so that branch states
+    an amount and names a message for it. Every other branch keeps the hedged
+    verbs, and for the same reasons as before — its counts are run totals, so a
+    fault that has since recovered is described in the past tense; a capacity
+    finding is a projection; and delay-based blocking evidence is qualified
+    because it comes from deadlines the channel reached rather than the ones it
+    skipped. The convicting branch must also state the share it **cannot**
+    account for: misses skipped with the channel thread free belong to no
+    message, and folding them into the named one would turn the measurement back
+    into an inference.
+  - *Per-message timing (ADR-045, amended by ADR-051):* a collapsed table, one
+    row per message numbered as in the Messages editor, with seven columns —
+    **Msg**, **Interval**, **Sends**, **Late**, **Send call**, **Longest
+    block**, and **Cost to others**. The last two are distinct quantities:
+    longest block is the longest single send of that message which delayed
+    another, and is the only elapsed hold among them. Cost to others carries the
+    two currencies a message can spend on the rest, each with its noun attached
+    (`430 ms late · 37 missed`): the waiting it imposed summed across every
+    message displaced — which can exceed the send that caused it and must never
+    be presented as a duration the channel was held — and the cadence points
+    others lost outright while it was sending. Neither converts into the other.
+    All three come from charging each deadline, and each skipped point, to
+    whichever send was holding the channel when it passed. Because a channel
+    handles its messages one at a time, the message
     recording the lateness and the message causing it are routinely different
     rows; the table exists so that comparison is a single read across a row. An
     interval that changed mid-run is marked, because the timing beside it is
@@ -517,11 +541,13 @@ The **detail pane** (right) shows the selected channel:
     a memcpy — typically 1–3 µs, below the 50 µs first bucket of the histogram
     that would report it — so it stays in the clipboard report and the
     channel-wide work line rather than taking a column that reads the same
-    forever. Per-message **miss** counts are likewise not offered at any
+    forever. A **victim-side** miss count is still not offered at any
     granularity: skips accrue as `late / interval + 1`, so they concentrate on
-    the shortest interval — the victim — and would misidentify the cause.
-    Per-message histograms are cumulative-only; the rolling window stays
-    channel-wide.
+    the shortest interval and would name the message that suffered. The count
+    that is offered is the culprit's, charged at the moment each point was
+    skipped, which is why it stays attributable under the heavy overload that
+    starves the delay figures beside it (ADR-051). Per-message histograms are
+    cumulative-only; the rolling window stays channel-wide.
   - *Work per send:* the two stages of the work itself — render and the
     synchronous send call — over the approximate last ten seconds, beside the
     cumulative run maximum lateness. Deadline lateness is deliberately **absent**:

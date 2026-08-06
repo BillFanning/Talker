@@ -57,7 +57,7 @@ fn show_per_message_table(ui: &mut egui::Ui, rows: &[MessageRow]) {
                 "Late",
                 "Send call",
                 "Longest block",
-                "Delay caused",
+                "Cost to others",
             ] {
                 ui.label(bold(heading).size(12.0));
             }
@@ -73,13 +73,13 @@ fn show_per_message_table(ui: &mut egui::Ui, rows: &[MessageRow]) {
                 // against an invented budget, so a late row stays neutral;
                 // having delayed another message is an attributable fact.
                 let hold = egui::RichText::new(&row.longest_block).size(12.0);
-                ui.label(if row.blocks_others {
+                ui.label(if row.costs_others {
                     hold.color(pal.warning)
                 } else {
                     hold
                 });
-                let caused = egui::RichText::new(&row.delay_caused).size(12.0);
-                ui.label(if row.blocks_others {
+                let caused = egui::RichText::new(&row.cost_to_others).size(12.0);
+                ui.label(if row.costs_others {
                     caused.color(pal.warning)
                 } else {
                     caused

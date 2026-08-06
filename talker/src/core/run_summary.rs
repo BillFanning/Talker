@@ -181,6 +181,12 @@ impl RunSummary {
             &self.per_message_timing,
             |m| m.longest_block.as_micros().to_string(),
         );
+        // Sends lost rather than delayed. This lane sums to at most
+        // `missed_sends`; the shortfall is what was skipped with the thread
+        // idle, which no message is answerable for.
+        write_per_message(&mut out, "missed_others", &self.per_message_timing, |m| {
+            m.missed_others.to_string()
+        });
         let _ = writeln!(out, "observer_updates_dropped={}", self.dropped_statuses);
         let _ = writeln!(out, "timer_policy={}", timer_mode_name(self.timer.mode));
         let _ = writeln!(out, "timer_reason={}", timer_reason_name(self.timer.reason));
@@ -344,6 +350,7 @@ mod tests {
                     blocked_others: Duration::ZERO,
                     blocking_sends: 0,
                     longest_block: Duration::ZERO,
+                    missed_others: 0,
                 },
                 // #1: the culprit — slow cadence, slow write, charged for it.
                 MessageTiming {
@@ -356,6 +363,9 @@ mod tests {
                     blocked_others: Duration::from_millis(430),
                     blocking_sends: 4,
                     longest_block: Duration::from_millis(120),
+                    // Two of the run's three misses are its doing; the third
+                    // passed with the thread free and belongs to no message.
+                    missed_others: 2,
                 },
             ],
             dropped_statuses: 2,
@@ -406,6 +416,11 @@ mod tests {
         assert!(report.contains("per_message_late_max_us=9000,80\n"));
         assert!(report.contains("per_message_blocked_others_us=0,430000\n"));
         assert!(report.contains("per_message_blocking_sends=0,4\n"));
+        // The miss lane sums to at most the run's `missed_sends`; the gap is
+        // what was skipped with the thread idle, and a reader can take that
+        // difference straight off these two lines.
+        assert!(report.contains("per_message_missed_others=0,2\n"));
+        assert!(report.contains("missed_sends=3\n"));
         // `timing_mode` is gone from the report: the policy is derived from the
         // schedule, and `timer_policy` below already states which one applied.
         assert!(report.contains("timer_policy=windows_1_ms\n"));

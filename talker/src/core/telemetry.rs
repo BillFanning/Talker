@@ -77,13 +77,18 @@ pub struct SendTimingReport {
 /// tightest interval, not the one responsible. [`MessageTiming::blocked_others`]
 /// is the other half of that pair.
 ///
-/// **What that pair does and does not establish.** Blame is measured against
-/// deadlines the channel *reached*, because a skipped cadence point is passed
-/// by the scheduler before any measurement runs. It therefore explains observed
-/// **lateness** directly and observed **misses** only by inference — and the two
-/// diverge worst under overload, when fewer deadlines are reached and blame
-/// thins out as the problem grows. Callers explaining misses must route rather
-/// than convict (ADR-045).
+/// **What that pair does and does not establish.** Delay blame
+/// ([`blocked_others`](MessageTiming::blocked_others)) is measured against
+/// deadlines the channel *reached*, so it explains observed **lateness**
+/// directly (ADR-045). It could never explain a **miss**, because a skipped
+/// cadence point is passed over before any of it runs — and it failed worst
+/// exactly under overload, where fewer deadlines are reached and the evidence
+/// thins out as the problem grows.
+///
+/// [`missed_others`](MessageTiming::missed_others) closes that gap by counting
+/// at the skip instead of at the deadline (ADR-051). The two are separate
+/// columns on purpose: one is time other messages spent waiting, the other is
+/// sends they never made, and neither is convertible into the other.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MessageTiming {
     /// The cadence this message was running at when the snapshot was taken.
@@ -120,6 +125,21 @@ pub struct MessageTiming {
     /// The longest single send of this message that delayed another — the real
     /// elapsed time the channel was held, which `blocked_others` is not.
     pub longest_block: Duration,
+    /// Cadence points of **other** messages that were passed over while this
+    /// message's sends held the channel thread, and so will never fire.
+    ///
+    /// The counterpart to `blocked_others` for the sends that never happened
+    /// rather than the ones that happened late — and the one that survives
+    /// overload. `blocked_others` can only grow when a deadline is *reached*,
+    /// so the worse the stall, the fewer deadlines there are to observe and
+    /// the thinner the evidence gets. A skipped point is counted where it
+    /// occurred, so this grows with the problem instead (ADR-051).
+    ///
+    /// Summing this across every message gives the share of the channel's
+    /// `missed_sends` that some send is answerable for. The remainder was
+    /// skipped with the thread idle — a late wake, machine sleep — and is
+    /// deliberately charged to nobody.
+    pub missed_others: u64,
 }
 
 impl MessageTiming {
@@ -128,6 +148,27 @@ impl MessageTiming {
     pub fn interval_ms(&self) -> u64 {
         self.interval.as_millis() as u64
     }
+}
+
+/// How many of `count` points, starting at `first` and spaced `interval`
+/// apart, fall strictly before `limit`.
+///
+/// Closed form, not a loop: a 1 ms cadence stalled for a minute skips sixty
+/// thousand points, and a machine suspended overnight skips tens of millions.
+/// This runs on the channel thread between sends, so it has to cost the same
+/// whether one point was lost or a million.
+fn points_before(first: Instant, interval: Duration, count: u64, limit: Instant) -> u64 {
+    let Some(span) = limit.checked_duration_since(first) else {
+        return 0;
+    };
+    let interval = interval.as_nanos();
+    if span.is_zero() || interval == 0 {
+        return 0;
+    }
+    // The points before `limit` are those with k * interval < span, for
+    // k = 0, 1, …; there are ceil(span / interval) of them.
+    let fitting = span.as_nanos().div_ceil(interval);
+    u64::try_from(fitting).unwrap_or(u64::MAX).min(count)
 }
 
 /// One completed send's occupancy of the channel thread.
@@ -149,6 +190,11 @@ struct SendWindow {
 /// the send that opened it, rather than to the quick catch-up sends that
 /// happen to precede each later victim. Lateness with no send spanning the
 /// deadline — an OS wake delay on an idle thread — is charged to nobody.
+///
+/// Cadence points that were skipped outright follow the same rule at the same
+/// resolution ([`record_skips`](Self::record_skips)): each point is charged to
+/// whichever send held the thread when it passed, and to nobody when the
+/// thread was free. One rule, two consequences — time lost and sends lost.
 #[derive(Debug, Default)]
 pub(crate) struct MessageTimingRecorder {
     messages: Vec<MessageTiming>,
@@ -174,30 +220,51 @@ impl MessageTimingRecorder {
         &mut self.messages[index]
     }
 
+    /// Which send, if any, held the channel thread when `deadline` passed.
+    ///
+    /// The single definition of "who was in the way", shared by the two things
+    /// that need it: a deadline that was reached late, and a cadence point that
+    /// was never reached at all. They must agree — a run where the same stall
+    /// named one message for the lateness and another for the misses would be
+    /// reporting an artefact of two rules, not a finding.
+    fn blocker_for(&self, deadline: Instant) -> Option<SendWindow> {
+        // Still inside a backlog opened by an earlier send: that send keeps the
+        // charge, so a quick catch-up send is not blamed for a delay it
+        // inherited.
+        match self.burst {
+            Some(burst) if deadline < burst.ended => Some(burst),
+            _ => match self.last_send {
+                Some(send) if deadline >= send.started && deadline < send.ended => Some(send),
+                _ => None,
+            },
+        }
+    }
+
+    /// [`Self::blocker_for`], and advance the backlog cursor to match.
+    ///
+    /// Only the deadline actually being handled may move the cursor. A skipped
+    /// point lies *after* that deadline, so letting it advance the cursor would
+    /// step over deadlines the runner has not processed yet — messages are
+    /// handled earliest-first, so a later query must not decide for an earlier
+    /// one.
+    fn blocker_at(&mut self, deadline: Instant) -> Option<SendWindow> {
+        let blocker = self.blocker_for(deadline);
+        let continuing = self.burst.is_some_and(|burst| deadline < burst.ended);
+        if !continuing {
+            self.burst = blocker;
+        }
+        blocker
+    }
+
     /// Record one due message's lateness and charge it to whichever send was
     /// holding the thread when its deadline passed.
     pub(crate) fn record_due(&mut self, index: usize, scheduled_for: Instant, handled_at: Instant) {
         let lateness = handled_at.saturating_duration_since(scheduled_for);
         self.entry(index).deadline_lateness.record(lateness);
 
-        // Still inside a backlog opened by an earlier send: that send keeps the
-        // charge, so a quick catch-up send is not blamed for a delay it
-        // inherited.
-        let blocker = match self.burst {
-            Some(burst) if scheduled_for < burst.ended => Some(burst),
-            _ => {
-                self.burst = None;
-                match self.last_send {
-                    Some(send) if scheduled_for >= send.started && scheduled_for < send.ended => {
-                        self.burst = Some(send);
-                        Some(send)
-                    }
-                    _ => None,
-                }
-            }
+        let Some(blocker) = self.blocker_at(scheduled_for) else {
+            return;
         };
-
-        let Some(blocker) = blocker else { return };
         // A send that overran its own next deadline is visible in its own
         // send_duration; this column is what a message cost *others*.
         if blocker.index == index {
@@ -218,6 +285,48 @@ impl MessageTimingRecorder {
         if first_victim {
             entry.blocking_sends = entry.blocking_sends.saturating_add(1);
         }
+    }
+
+    /// Charge the cadence points this poll skipped to whichever send was
+    /// holding the thread as each one passed.
+    ///
+    /// `scheduled_for` is the deadline that *did* fire; the `skipped` points
+    /// follow it at `interval` spacing. Call this after
+    /// [`record_due`](Self::record_due) for the same tick, so the backlog
+    /// cursor already reflects the deadline these skips belong to.
+    ///
+    /// Points that passed after the blocking send had returned are charged to
+    /// nobody: with the thread free, nothing here caused them. That is the
+    /// whole reason the split is worth measuring — it separates a channel that
+    /// is over-subscribed from one that is being starved of wake-ups, and the
+    /// two want opposite fixes.
+    pub(crate) fn record_skips(
+        &mut self,
+        index: usize,
+        scheduled_for: Instant,
+        interval: Duration,
+        skipped: u64,
+    ) {
+        if skipped == 0 || interval.is_zero() {
+            return;
+        }
+        let Some(first) = scheduled_for.checked_add(interval) else {
+            return;
+        };
+        let Some(blocker) = self.blocker_for(first) else {
+            return;
+        };
+        // A message that outruns its own cadence says so in its send_duration;
+        // this column is what a message cost *others*, same as blocked_others.
+        if blocker.index == index {
+            return;
+        }
+        let charged = points_before(first, interval, skipped, blocker.ended);
+        if charged == 0 {
+            return;
+        }
+        let entry = self.entry(blocker.index);
+        entry.missed_others = entry.missed_others.saturating_add(charged);
     }
 
     pub(crate) fn record_render(&mut self, index: usize, duration: Duration) {
@@ -354,6 +463,141 @@ mod tests {
         assert!(
             snapshot[3].blocked_others > snapshot[3].longest_block,
             "combined victim waiting is expected to exceed the blocking send"
+        );
+    }
+
+    /// Sends that never happened, charged the same way as sends that happened
+    /// late: to whoever was writing when the point went by.
+    #[test]
+    fn a_skipped_point_is_charged_to_the_send_that_was_writing() {
+        let t0 = Instant::now();
+        let mut recorder = MessageTimingRecorder::new(4);
+
+        // #3 holds the thread for 412 ms. #1 runs at 100 ms, so its points at
+        // 200, 300 and 400 pass unreachable inside that write, while the one
+        // at 100 fires late as soon as the thread comes free.
+        recorder.record_send(3, t0, t0 + ms(412));
+        recorder.record_due(1, t0 + ms(100), t0 + ms(412));
+        recorder.record_skips(1, t0 + ms(100), ms(100), 3);
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot[3].missed_others, 3);
+        assert_eq!(
+            snapshot[1].missed_others, 0,
+            "the message that lost the points is not the one that caused it"
+        );
+    }
+
+    /// The split that makes the column worth having: an over-subscribed
+    /// channel and a starved one both miss sends, and only the position of
+    /// the skipped points tells them apart.
+    #[test]
+    fn points_skipped_after_the_write_returned_are_charged_to_nobody() {
+        let t0 = Instant::now();
+        let mut recorder = MessageTimingRecorder::new(4);
+
+        // #3 writes for 250 ms, then the thread is free — but the next wake
+        // does not arrive until 550 ms, by which time #1 has lost the points
+        // at 200, 300, 400 and 500.
+        recorder.record_send(3, t0, t0 + ms(250));
+        recorder.record_due(1, t0 + ms(100), t0 + ms(550));
+        recorder.record_skips(1, t0 + ms(100), ms(100), 4);
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot[3].missed_others, 1,
+            "only the point at 200 ms passed while the write held the thread"
+        );
+    }
+
+    /// A message that outruns its own cadence is a real fault, but it is not
+    /// a cost to anyone else — and it is already visible as a send call longer
+    /// than the interval.
+    #[test]
+    fn a_message_is_never_charged_for_its_own_skipped_points() {
+        let t0 = Instant::now();
+        let mut recorder = MessageTimingRecorder::new(2);
+
+        recorder.record_send(1, t0, t0 + ms(412));
+        recorder.record_due(1, t0 + ms(100), t0 + ms(412));
+        recorder.record_skips(1, t0 + ms(100), ms(100), 3);
+
+        assert_eq!(recorder.snapshot()[1].missed_others, 0);
+    }
+
+    /// The defect this measurement exists to fix. Delay blame can only be
+    /// collected at a deadline the channel *reached*, so a block long enough
+    /// to swallow a thousand cadence points still yields exactly one lateness
+    /// sample: the evidence thins out as the fault gets worse. Counting at the
+    /// skip scales with the damage instead.
+    #[test]
+    fn miss_blame_scales_with_overload_where_delay_blame_thins_out() {
+        let t0 = Instant::now();
+        let mut recorder = MessageTimingRecorder::new(2);
+
+        // One ten-second write against a 10 ms cadence.
+        recorder.record_send(0, t0, t0 + ms(10_005));
+        recorder.record_due(1, t0 + ms(10), t0 + ms(10_005));
+        recorder.record_skips(1, t0 + ms(10), ms(10), 999);
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot[1].deadline_lateness.sample_count(),
+            1,
+            "a longer block cannot produce more lateness samples — that is the point"
+        );
+        assert_eq!(snapshot[0].missed_others, 999);
+    }
+
+    /// A suspended machine skips more cadence points than any loop could
+    /// visit. Recording the charge is arithmetic, so it costs the same whether
+    /// one point was lost or billions.
+    #[test]
+    fn an_enormous_stall_is_charged_without_visiting_each_point() {
+        let t0 = Instant::now();
+        let mut recorder = MessageTimingRecorder::new(2);
+        // The write outlasts the hour by a millisecond, so the last skipped
+        // point falls inside it and the count is not a boundary case.
+        let block_end = t0 + Duration::from_secs(3600) + Duration::from_millis(1);
+
+        recorder.record_send(0, t0, block_end);
+        recorder.record_due(1, t0, block_end);
+        // A 1 µs cadence across an hour: 3.6 billion points.
+        recorder.record_skips(1, t0, Duration::from_micros(1), 3_600_000_000);
+
+        assert_eq!(recorder.snapshot()[0].missed_others, 3_600_000_000);
+    }
+
+    /// Messages are handled earliest-first, so a tick's skipped points reach
+    /// further forward in time than deadlines still queued behind it. Looking
+    /// those points up must not advance the backlog cursor past the deadlines
+    /// still to come, or the message handled next finds no blocker and a real
+    /// block goes unattributed.
+    #[test]
+    fn charging_skips_does_not_disinherit_the_deadline_handled_next() {
+        let t0 = Instant::now();
+        let mut recorder = MessageTimingRecorder::new(3);
+
+        // #2 holds the thread from 0 to 350 ms.
+        recorder.record_send(2, t0, t0 + ms(350));
+        // #0 runs at 300 ms and is handled very late; its skipped points start
+        // at 400 ms, after that block ended.
+        recorder.record_due(0, t0 + ms(100), t0 + ms(900));
+        recorder.record_skips(0, t0 + ms(100), ms(300), 2);
+        // #0's own catch-up send becomes the most recent one…
+        recorder.record_send(0, t0 + ms(900), t0 + ms(901));
+        // …and only now is #1's deadline handled, which fell inside #2's block.
+        recorder.record_due(1, t0 + ms(150), t0 + ms(901));
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot[2].missed_others, 0,
+            "points skipped after the block ended belong to nobody"
+        );
+        assert_eq!(
+            snapshot[2].blocked_others,
+            ms(250) + ms(200),
+            "the deadline handled after the skip lookup lost its blocker"
         );
     }
 

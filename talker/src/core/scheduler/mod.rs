@@ -41,6 +41,19 @@ pub enum Tick {
     Due {
         index: usize,
         scheduled_for: Instant,
+        /// The cadence this fire belongs to. Carried so a receiver can place
+        /// the skipped grid points below on the timeline without holding its
+        /// own copy of the schedule, which could have moved since.
+        interval: Duration,
+        /// Cadence points of *this* message that this poll passed over: they
+        /// lie at `scheduled_for + interval`, `+ 2 * interval`, … and none of
+        /// them will ever fire (see the stall policy on [`Schedule::poll`]).
+        ///
+        /// Reported here, at the poll that skips them, because that is the
+        /// only moment their position in time is known. A count recovered
+        /// later can say how many were lost but not when — and *when* is what
+        /// decides who was holding the thread.
+        skipped: u64,
     },
     /// Nothing is due yet — sleep until at most this instant.
     Wait(Instant),
@@ -227,6 +240,11 @@ impl Schedule {
     /// to the first point of the message's original cadence grid that lies
     /// in the future. Talker generates test traffic — a receiver cares about
     /// cadence, not about conservation of message count.
+    ///
+    /// The points dropped that way are both added to
+    /// [`missed_sends`](Self::missed_sends) and reported on the returned
+    /// [`Tick::Due`], so a caller can attribute them while it still knows what
+    /// was happening at the time.
     pub fn poll(&mut self, now: Instant) -> Tick {
         // Defensive convenience for direct core users. The production runner
         // arms explicitly after interface open, but an unarmed schedule still
@@ -241,12 +259,15 @@ impl Schedule {
         let Some(next_fire) = msg.next_fire else {
             return Tick::Idle;
         };
+        let interval = msg.interval;
         if next_fire <= now {
-            let Some(mut following) = next_fire.checked_add(msg.interval) else {
+            let Some(mut following) = next_fire.checked_add(interval) else {
                 msg.next_fire = None;
                 return Tick::Due {
                     index,
                     scheduled_for: next_fire,
+                    interval,
+                    skipped: 0,
                 };
             };
             let mut skipped = 0u64;
@@ -257,14 +278,14 @@ impl Schedule {
                 // (`interval` is non-zero: `earliest` only yields active
                 // messages.)
                 let late = now.duration_since(following).as_nanos();
-                let interval = msg.interval.as_nanos();
+                let interval_nanos = interval.as_nanos();
                 // Grid points in (old next_fire, now] that will never fire:
                 // the one at `next_fire` plus one per full interval of
                 // additional lateness.
-                skipped = (late / interval + 1) as u64;
-                let rem = late % interval;
+                skipped = (late / interval_nanos + 1) as u64;
+                let rem = late % interval_nanos;
                 following = (now - Duration::from_nanos(rem as u64))
-                    .checked_add(msg.interval)
+                    .checked_add(interval)
                     .unwrap_or(following);
             }
             msg.next_fire = Some(following);
@@ -272,6 +293,8 @@ impl Schedule {
             Tick::Due {
                 index,
                 scheduled_for: next_fire,
+                interval,
+                skipped,
             }
         } else {
             Tick::Wait(next_fire)
@@ -448,9 +471,13 @@ mod tests {
             Tick::Due {
                 index,
                 scheduled_for,
+                interval,
+                skipped,
             } => {
                 assert_eq!(index, 0);
                 assert_eq!(scheduled_for, t0);
+                assert_eq!(interval, ms(100));
+                assert_eq!(skipped, 0);
                 assert_eq!(s.render(index), Some(vec![0xAB]));
             }
             other => panic!("expected Due, got {other:?}"),
@@ -502,6 +529,7 @@ mod tests {
             s.poll(t0 + ms(1050)),
             Tick::Due {
                 scheduled_for,
+                skipped: 9,
                 ..
             } if scheduled_for == t0 + ms(100)
         ));
@@ -510,6 +538,27 @@ mod tests {
         assert_eq!(s.poll(t0 + ms(1050)), Tick::Wait(t0 + ms(1100)));
         // The nine skipped grid points (t0+200 … t0+1000) are counted.
         assert_eq!(s.missed_sends(), 9);
+    }
+
+    /// The running total and the per-tick report are two views of one event,
+    /// so they must never disagree. The counter is what the run summary
+    /// publishes; the tick is what attribution charges to a blocking send. If
+    /// these drifted, a channel could report misses that no message caused —
+    /// or the reverse — and nothing else in the app would notice.
+    #[test]
+    fn the_running_total_is_exactly_what_the_ticks_reported() {
+        let t0 = Instant::now();
+        let mut s = Schedule::compile(&[msg("AB", 100), msg("CD", 250)], t0).unwrap();
+        let mut reported = 0u64;
+        // Poll across an even stall, an uneven one, and points that are on
+        // grid, draining every message due at each instant.
+        for offset in [0, 30, 1050, 1100, 1337, 3000] {
+            while let Tick::Due { skipped, .. } = s.poll(t0 + ms(offset)) {
+                reported += skipped;
+            }
+        }
+        assert!(reported > 0, "the stalls should have skipped something");
+        assert_eq!(reported, s.missed_sends());
     }
 
     #[test]
