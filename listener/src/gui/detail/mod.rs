@@ -307,13 +307,20 @@ impl ListenerApp {
         let (headline_level, headline, headline_color) = match entries.last() {
             Some(d) => {
                 let (level, color) = match d.severity {
-                    DiagnosticSeverity::Event => ("INFO", palette(ui).event),
+                    // The headline already prints its level, so INFO is the
+                    // baseline the other two are read against — body text, not
+                    // an accent of its own.
+                    DiagnosticSeverity::Event => ("INFO", ui.visuals().text_color()),
                     DiagnosticSeverity::Warning => ("WARN", palette(ui).warning),
                     DiagnosticSeverity::Error => ("ERROR", palette(ui).fault),
                 };
                 (level, d.message.clone(), color)
             }
-            None => ("", "no diagnostics yet".to_string(), palette(ui).idle),
+            None => (
+                "",
+                "no diagnostics yet".to_string(),
+                ui.visuals().weak_text_color(),
+            ),
         };
         let dv = DiagView {
             headline_level,
@@ -374,7 +381,7 @@ impl ListenerApp {
                         for d in dv.entries.iter().rev() {
                             let (enabled, color, level) = match d.severity {
                                 DiagnosticSeverity::Event => {
-                                    (self.show_info, palette(ui).info, "INFO ")
+                                    (self.show_info, ui.visuals().weak_text_color(), "INFO ")
                                 }
                                 DiagnosticSeverity::Warning => {
                                     (self.show_warn, palette(ui).warning, "WARN ")

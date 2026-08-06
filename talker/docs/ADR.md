@@ -1,10 +1,23 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.12
+**Version:** 1.13
 **Date:** 2026-08-06
 **Status:** Accepted
 
-Revision note (the fault colour becomes visible):
+Revision note (four accents, and one rule):
+
+- **ADR-050** reduces the palette from ten colours to four — `fault`, `warning`,
+  `running`, `idle`, the same states `SignalTone` already names. Five greys were
+  emphasis rather than meaning and became the theme's own `weak_text_color`;
+  three more fields meant one thing in two places. The burden a palette carries
+  is *pairs*, not colours: ten is forty-five to keep distinguishable, four is
+  six, and two of the three ever checked had failed. It also states the rule the
+  whole accessibility pass produced — colour reinforces a state, it never
+  carries one alone — and fixes a live case found while applying it, where
+  Running and Reconnecting shared the `●` glyph and differed only by the two
+  colours already confirmed indistinguishable.
+
+Revision note for 1.12 (the fault colour becomes visible):
 
 - **ADR-049** makes the fault colour blue. Red was not distinguishable from the
   amber warning under a red-green colour deficiency, so the applications' most
@@ -1823,6 +1836,68 @@ ten fields are greys separated by emphasis rather than meaning. The burden is
 pairs, not colours, so ten colours is 45 pairs that must stay distinguishable
 against four's 6. Deferred to its own pass because collapsing the greys is a
 change that must be looked at, not proven.
+
+---
+
+## ADR-050 — Four accents, and colour never carries a state alone
+
+**Status:** Accepted 2026-08-06. Completes the accessibility work of ADR-049.
+
+**Context:** The palette held ten colours. Five were greys — `idle`, `info`,
+`event`, `count_info`, `line_low`, at 120/80/60/110/150 in the light theme. Two
+were ambers a shade apart (`warning`, `reconnecting`). Two were greens meaning
+the same thing in different places (`running`, `line_high`).
+
+None of that was free, and the cost is not the count. Every colour must stay
+distinguishable from every other, so the burden is **pairs**: ten colours is
+forty-five pairs, four is six. Three of those pairs were checked against a
+red-green deficiency during ADR-049 and two failed. The pair count was not a
+theoretical budget — it was the surface a real defect had been living on.
+
+**Decision — four accents:** `fault`, `warning`, `running`, `idle`. They are the
+same four states `SignalTone { Fault, Warning, Healthy, Neutral }` already names;
+the palette and the tone enum had been describing one set of states in two
+vocabularies.
+
+What replaced the removed fields is not another colour:
+
+- **The greys became `Visuals::weak_text_color` and `text_color`.** They encoded
+  *emphasis*, not meaning, and emphasis is something the theme already defines.
+  A palette re-deciding it produces four values that must track two.
+- **`reconnecting` folded into `warning`**, `line_high` into `running`,
+  `line_low` into `idle`. Each pair meant one thing in two places — an asserted
+  line *is* active, a reconnecting channel *does* need attention.
+
+Each collapse was checked against the same test before it was made: **is the
+state still legible with the colour removed?** In every case it was, because the
+readout already said it in words — a log line is formatted `[time] [LEVEL]
+message`, the severity counts read "3 warn", the diagnostics list prefixes
+`INFO `/`WARN `/`ERROR `. That is not a coincidence. It is the rule the palette
+now states:
+
+> Colour reinforces a state. It never carries one alone.
+
+The readouts that survived ADR-049's review were exactly the ones already obeying
+it; the ones that failed were the ones that did not.
+
+**Found during the reduction:** `status_glyph` mapped Running *and* Reconnecting
+to `●`. In the detail pane that is harmless — it prints `status_label` beside the
+glyph. But the channel list shows the glyph and the channel's *name*, so on the
+one surface built for scanning many channels at once, a reconnecting channel and
+a healthy one were the same mark separated by green against amber: the exact pair
+confirmed indistinguishable a day earlier. Reconnecting now has `◐`, half-filled
+between a solid dot and an empty one, which is also what the state is.
+
+**Consequences:** Both applications change appearance in the log panel, the
+diagnostics list, and the channel-list counts, where four greys became two theme
+emphases. That flattens some hierarchy; it is the one part of this that tests
+cannot judge, and it is filed to be looked at.
+
+`the_palette_stays_four_distinct_accents` pins the count in both themes, with the
+pair argument written into it — a fifth field should be read as the question
+"could a glyph or a word do this?" rather than a number to bump.
+`fault_stays_on_the_blue_axis` pins ADR-049's fix against a future edit that
+quietly walks it back toward red.
 
 ---
 

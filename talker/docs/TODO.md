@@ -105,7 +105,7 @@ badges (`ISSUE` / `ATTENTION` / `MONITORING`) — that is the pattern to copy.
   `status.rs` for the channel glyphs and already followed there; the control
   lines were the one readout that missed it, which is why the fix was small.
   Pinned by `control_line_levels_differ_without_colour`.
-- [ ] **`running` vs `warning` collide — confirmed 2026-08-06.** Checked against
+- [x] **`running` vs `warning` collide — confirmed 2026-08-06.** Checked against
   the same red-green deficiency: the green and the amber read as similar. Unlike
   the control lines this is **not** a functional failure, and the difference is
   worth understanding rather than filing as another bug: everywhere the two
@@ -118,29 +118,29 @@ badges (`ISSUE` / `ATTENTION` / `MONITORING`) — that is the pattern to copy.
   their keep**: they cost a distinguishable-pair budget and buy reinforcement a
   reader with this deficiency does not receive. That is an argument for the
   reduction item below, not for a third colour — resolve it there.
-- [ ] **Reduce the palette — probably too many colours.** Ten fields, of which
-  **five are greys** (`idle`, `info`, `event`, `count_info`, `line_low` — 120,
-  80, 60, 110, 150 in the light theme). Those differences encode *emphasis*, not
-  meaning: no reader ever needs to tell "this grey means INFO" from "this grey
-  means idle", because they never appear where the distinction would matter, and
-  egui expresses emphasis natively with `weak()`/`text_color()` (which
-  `level_color`'s INFO already uses). Beyond the greys there are two near-equal
-  ambers (`warning`, `reconnecting` — and reconnecting *is* a warning state) and
-  two greens (`running`, `line_high`).
-  The semantic core looks like four — fault, warning, running, idle — which is
-  exactly `SignalTone { Fault, Warning, Healthy, Neutral }`; the palette and the
-  tone enum currently describe the same four states in two vocabularies.
-  **Why this is an accessibility item and not tidying:** the burden is *pairs*,
-  not colours, because each must stay distinguishable from every other. Ten
-  colours is 45 pairs; four is 6. Three pairs were checked on 2026-08-06 and two
-  failed. Reducing the palette shrinks the surface this defect can recur on by
-  roughly seven-fold.
-  Do it as a "look at it" change, not a test-driven one: collapsing the greys
-  flattens visual hierarchy in the log panel and the diagnostics details, and
-  that has to be seen rather than reasoned about.
-- [ ] **Audit for colour-only states across both apps** once the pairs above are
-  settled — the two found so far were found by looking, not by any rule, so the
-  remaining ones are wherever nobody has looked yet.
+- [x] **Palette reduced to four accents** — done 2026-08-06, ADR-050. Ten fields
+  became `fault` / `warning` / `running` / `idle`, which is the same four states
+  `SignalTone` already names. The five greys were *emphasis*, not meaning, so
+  they became `Visuals::weak_text_color`/`text_color` — the theme owns emphasis
+  and no palette should re-decide it. `reconnecting` folded into `warning`,
+  `line_high` into `running`, `line_low` into `idle`, because each pair meant
+  the same thing in two places. Pinned by
+  `the_palette_stays_four_distinct_accents` and `fault_stays_on_the_blue_axis`.
+- [x] **Running and Reconnecting shared a glyph** — found during the reduction
+  and fixed with it. `status_glyph` mapped both to `●`, so on the channel list —
+  which shows the glyph and the channel *name*, not the status word — they
+  differed by green against amber alone, the pair confirmed above as
+  indistinguishable. Reconnecting now has `◐`. The detail pane was never
+  affected: it prints `status_label` beside the glyph.
+- [ ] **Audit for colour-only states across both apps.** Everything found so far
+  was found by looking, not by any rule, so the remaining ones are wherever
+  nobody has looked yet. Now cheap to check: with four accents there are six
+  pairs, and the rule to test each against is written on `Palette` — colour
+  reinforces a state, it never carries one alone.
+- [ ] **Look at the reduced palette in both apps.** The one thing tests cannot
+  answer: collapsing four greys into two theme emphases flattens hierarchy in
+  the talker log panel and the listener diagnostics list. Worth a look at both
+  in light and dark before trusting it.
 
 ## Robustness (external review round 2, 2026-07-12)
 

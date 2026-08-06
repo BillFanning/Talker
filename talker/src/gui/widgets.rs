@@ -1877,13 +1877,15 @@ pub(super) fn show_display_pane(
                 .sample_interval
                 .as_secs_f32();
         if display.payload_samples_omitted(accepted_total) {
-            let pal = wiredata_ui::palette::active(ui);
+            // A standing note about how the pane works, not a state to act on,
+            // so it recedes with the theme rather than taking an accent.
+            let note = ui.visuals().weak_text_color();
             ui.label(
                 egui::RichText::new(format!(
                     "sampled output · not every sent payload is shown · limit ~{sample_hz:.0}/s"
                 ))
                 .small()
-                .color(pal.info),
+                .color(note),
             )
             .on_hover_text(format!(
                 "Above ~{sample_hz:.0} messages/s the Output pane shows a \

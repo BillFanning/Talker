@@ -41,19 +41,39 @@ pub fn tint(ui: &egui::Ui, accent: Color32, alpha: u8) -> Color32 {
         ))
 }
 
-/// The chrome colors, grouped by meaning rather than by widget.
+/// The chrome colors: four states, and only four.
 ///
 /// # Naming
 ///
 /// Every field names the **role**, never the hue. `fault`, not `fault_red` —
 /// because a palette exists precisely so a colour can change, and a name that
-/// encodes the value contradicts the thing it is for. This is not hypothetical:
-/// `fault` was red until it turned out to be indistinguishable from `warning`
-/// for a red-green colour deficiency, and the two serial-line colours are next
-/// in line for the same reason. `Color32` in a struct called `Palette` already
-/// says these are colours; the field only has to say what for.
+/// encodes the value contradicts the thing it is for. `Color32` in a struct
+/// called `Palette` already says these are colours; the field only has to say
+/// what for.
+///
+/// # Why four
+///
+/// There were ten. Five were greys separated by *emphasis* rather than meaning,
+/// two ambers sat a shade apart, and two greens meant the same thing in
+/// different places. None of that was free: every colour must stay
+/// distinguishable from every other, so the cost is **pairs**. Ten colours is
+/// forty-five pairs to keep apart; four is six. Three of those pairs were
+/// checked against a red-green deficiency and two failed, so the pair count was
+/// not a theoretical budget — it was the surface a real defect lived on.
+///
+/// What replaced the removed fields is not a different colour. Emphasis is
+/// `Visuals::weak_text_color` and `text_color`, which the theme already owns and
+/// which no palette should be re-deciding; and every state that used to lean on
+/// a hue of its own now carries a glyph or a word that says the same thing. That
+/// substitution is the rule this palette runs on:
+///
+/// **Colour reinforces a state. It never carries one alone.**
+///
+/// The readouts that survived the colour-deficiency review were exactly the ones
+/// already obeying that, and the ones that failed were the ones that did not.
+/// Before adding a fifth colour, check whether a glyph or a word would do it —
+/// that is the cheaper thing to add, and the one that works for every reader.
 pub struct Palette {
-    // ── Status / severity ────────────────────────────────────────────────
     /// Everything that means "fault / error / destructive" — channel fault,
     /// recording fault, error diagnostics, the Remove button. One color so
     /// "something is wrong" always looks identical.
@@ -64,60 +84,79 @@ pub struct Palette {
     /// Red was tried first and failed against [`Palette::warning`] — see talker
     /// ADR-049. Do not "restore" it.
     pub fault: Color32,
-    /// A running / active channel, and an active recording.
-    pub running: Color32,
-    /// A reconnecting channel — a yellower amber than [`Palette::warning`].
-    pub reconnecting: Color32,
-    /// A warning (diagnostics, "won't start" hints).
+    /// Needs attention, short of a failure: warning diagnostics, "won't start"
+    /// hints, a reconnecting channel. Paired with `⚠` or `◐`, never alone.
     pub warning: Color32,
-    /// A stopped/idle status glyph and other "neutral, inactive" accents.
+    /// Active: a running channel, a live recording, an asserted serial control
+    /// line. Paired with `●`.
+    pub running: Color32,
+    /// Inactive: a stopped channel, a recording that is off, a low serial
+    /// control line, a neutral diagnostic tone. Paired with `■` or `○`.
     pub idle: Color32,
-
-    // ── Diagnostic-log text ──────────────────────────────────────────────
-    /// An INFO-severity diagnostic line.
-    pub info: Color32,
-    /// A faded info line in a real-time headline.
-    pub event: Color32,
-    /// A per-tab "info" count (lighter, secondary).
-    pub count_info: Color32,
-
-    // ── Serial control lines ─────────────────────────────────────────────
-    /// A high (asserted) serial control/status line. Reinforces the filled
-    /// [`crate::glyphs::LINE_HIGH`] glyph; it does not carry the level alone.
-    pub line_high: Color32,
-    /// A low serial control/status line. Reinforces the hollow
-    /// [`crate::glyphs::LINE_LOW`] glyph.
-    pub line_low: Color32,
 }
 
 /// The light-theme palette.
 pub const LIGHT: Palette = Palette {
     // Deep enough to carry white text on the Remove button's fill.
     fault: Color32::from_rgb(0, 85, 200),
-    running: Color32::from_rgb(0, 200, 140),
-    reconnecting: Color32::from_rgb(220, 180, 0),
     warning: Color32::from_rgb(150, 100, 0),
+    running: Color32::from_rgb(0, 200, 140),
     idle: Color32::from_gray(120),
-    info: Color32::from_gray(80),
-    event: Color32::from_gray(60),
-    count_info: Color32::from_gray(110),
-    line_high: Color32::from_rgb(30, 150, 30),
-    line_low: Color32::from_gray(150),
 };
 
-/// The dark-theme palette. Brighter accents and lighter greys so every value
-/// stays readable on a dark backdrop (the light `warning`/`info` would all but
-/// vanish). Tune values here as the dark look evolves.
+/// The dark-theme palette. Brighter accents and a lighter grey so every value
+/// stays readable on a dark backdrop (the light `warning` would all but vanish).
 pub const DARK: Palette = Palette {
     // Lightened so it stays legible as small text on the dark panel.
     fault: Color32::from_rgb(95, 165, 255),
-    running: Color32::from_rgb(0, 210, 150),
-    reconnecting: Color32::from_rgb(230, 195, 60),
     warning: Color32::from_rgb(230, 175, 70),
+    running: Color32::from_rgb(0, 210, 150),
     idle: Color32::from_gray(150),
-    info: Color32::from_gray(180),
-    event: Color32::from_gray(200),
-    count_info: Color32::from_gray(140),
-    line_high: Color32::from_rgb(80, 210, 80),
-    line_low: Color32::from_gray(120),
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Four accents, all distinct, in both themes.
+    ///
+    /// The count is the point, not just the distinctness: every colour has to
+    /// stay tellable from every other, so the maintenance burden is pairs. Four
+    /// is six pairs; the ten this replaced was forty-five, and two of the three
+    /// pairs ever checked against a red-green deficiency failed. If a fifth
+    /// field is ever added, this test should be read as the question "can a
+    /// glyph or a word do it instead?" rather than a number to bump.
+    #[test]
+    fn the_palette_stays_four_distinct_accents() {
+        for palette in [&LIGHT, &DARK] {
+            let accents = [
+                palette.fault,
+                palette.warning,
+                palette.running,
+                palette.idle,
+            ];
+            assert_eq!(accents.len(), 4, "a fifth accent needs the pair argument");
+            for (index, color) in accents.iter().enumerate() {
+                assert!(
+                    !accents[..index].contains(color),
+                    "two accents share a value: {color:?}"
+                );
+            }
+        }
+    }
+
+    /// The fault accent is blue and must stay that way — red was measurably
+    /// invisible against `warning` (talker ADR-049). Pinned by its blue channel
+    /// dominating, so a future edit toward red or amber trips here rather than
+    /// silently undoing an accessibility fix.
+    #[test]
+    fn fault_stays_on_the_blue_axis() {
+        for palette in [&LIGHT, &DARK] {
+            let fault = palette.fault;
+            assert!(
+                fault.b() > fault.r() && fault.b() > fault.g(),
+                "fault is no longer blue: {fault:?}"
+            );
+        }
+    }
+}

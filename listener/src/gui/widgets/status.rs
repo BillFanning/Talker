@@ -86,7 +86,7 @@ pub(crate) fn line_glyph(high: bool) -> &'static str {
 /// match, with a hover tooltip naming the level.
 pub(crate) fn line_indicator(ui: &mut egui::Ui, name: &str, high: bool) {
     let pal = wiredata_ui::palette::active(ui);
-    let color = if high { pal.line_high } else { pal.line_low };
+    let color = if high { pal.running } else { pal.idle };
     ui.colored_label(color, format!("{} {name}", line_glyph(high)))
         .on_hover_text(if high { "high" } else { "low" });
 }
@@ -97,7 +97,7 @@ pub(crate) fn line_indicator(ui: &mut egui::Ui, name: &str, high: bool) {
 /// matching Set command.
 pub(crate) fn line_toggle(ui: &mut egui::Ui, name: &str, high: bool) -> egui::Response {
     let color = if high {
-        wiredata_ui::palette::active(ui).line_high
+        wiredata_ui::palette::active(ui).running
     } else {
         ui.visuals().weak_text_color()
     };
@@ -120,7 +120,7 @@ pub(crate) fn status_color(status: ChannelStatus, pal: &Palette) -> egui::Color3
         ChannelStatus::Running => pal.running,
         ChannelStatus::Stopped => pal.idle,
         ChannelStatus::Faulted => pal.fault,
-        ChannelStatus::Reconnecting => pal.reconnecting,
+        ChannelStatus::Reconnecting => pal.warning,
     }
 }
 
@@ -130,7 +130,14 @@ pub(crate) fn status_color(status: ChannelStatus, pal: &Palette) -> egui::Color3
 /// - Stopped / recording-off → `■`
 /// - Running / recording-on → `●`
 /// - Faulted (channel or recording) → `⚠`
-/// - Reconnecting → `●`
+/// - Reconnecting → `◐`
+///
+/// Reconnecting used to share `●` with Running and was told apart by colour
+/// alone. That is fine in the detail pane, which prints [`status_label`] beside
+/// the glyph — but the channel list shows the glyph and the channel's *name*,
+/// so on the one surface built for scanning many channels at once, a
+/// reconnecting channel and a healthy one were the same mark in two greens-ish
+/// hues. It now has its own.
 ///
 /// Returns the glyph and the body-relative size (base scale × optical correction), so
 /// every call site renders the same symbol at the same apparent size. Pair with
@@ -140,7 +147,8 @@ pub(crate) fn status_glyph(status: ChannelStatus) -> (&'static str, f32) {
     let glyph = match status {
         ChannelStatus::Stopped => glyphs::STOPPED,
         ChannelStatus::Faulted => glyphs::FAULT,
-        ChannelStatus::Running | ChannelStatus::Reconnecting => glyphs::RUNNING,
+        ChannelStatus::Running => glyphs::RUNNING,
+        ChannelStatus::Reconnecting => glyphs::RECONNECTING,
     };
     (glyph, glyphs::glyph_size(glyph))
 }

@@ -43,23 +43,20 @@ pub struct ChannelRowEmphasis {
 /// its saturated fault line regardless of selection.
 pub fn channel_row_emphasis(ui: &egui::Ui, selected: bool) -> ChannelRowEmphasis {
     let palette = active_palette(ui);
+    // A background row's counts recede to the theme's own faded text rather
+    // than to a palette grey of their own: "receded" is emphasis, which the
+    // theme already defines, and the counts name themselves ("3 warn") so the
+    // colour is never what tells them apart.
+    let receded = ui.visuals().weak_text_color();
     ChannelRowEmphasis {
         name: if selected {
             ui.visuals().text_color()
         } else {
-            ui.visuals().weak_text_color()
+            receded
         },
-        info: palette.count_info,
-        warning: if selected {
-            palette.warning
-        } else {
-            palette.count_info
-        },
-        error: if selected {
-            palette.fault
-        } else {
-            palette.count_info
-        },
+        info: receded,
+        warning: if selected { palette.warning } else { receded },
+        error: if selected { palette.fault } else { receded },
     }
 }
 

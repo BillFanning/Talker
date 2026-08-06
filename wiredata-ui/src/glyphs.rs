@@ -18,6 +18,13 @@ pub const RUNNING: &str = "\u{25CF}";
 pub const STOPPED: &str = "\u{25A0}";
 /// Faulted / needs attention: `⚠`.
 pub const FAULT: &str = "\u{26A0}";
+/// Reconnecting — running, but not yet: `◐`.
+///
+/// Half-filled between [`RUNNING`]'s solid dot and an empty one, which is what
+/// the state is. It exists because Reconnecting used to share `●` with Running
+/// and was told apart by colour alone — green against amber, the pair this
+/// palette is least able to rely on.
+pub const RECONNECTING: &str = "\u{25D0}";
 
 /// A serial control line that is **high** (asserted): `●`.
 ///
@@ -45,9 +52,10 @@ const STATUS_GLYPH_SCALE: f32 = 1.5;
 /// same size.
 fn optical_scale(glyph: &str) -> f32 {
     match glyph {
-        STOPPED => 1.0,  // ■ square — the reference
-        RUNNING => 1.34, // ● dot — enlarge up to the square
-        FAULT => 1.30,   // ⚠ triangle — enlarge up to the square
+        STOPPED => 1.0,       // ■ square — the reference
+        RUNNING => 1.34,      // ● dot — enlarge up to the square
+        RECONNECTING => 1.34, // ◐ same circle bounding box as ●
+        FAULT => 1.30,        // ⚠ triangle — enlarge up to the square
         _ => 1.0,
     }
 }

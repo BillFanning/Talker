@@ -1593,8 +1593,12 @@ fn level_color(ui: &egui::Ui, level: tracing::Level) -> egui::Color32 {
         // line reporting a fault should not be a second shade of it.
         tracing::Level::ERROR => palette.fault,
         tracing::Level::WARN => palette.warning,
-        tracing::Level::DEBUG => palette.info,
-        tracing::Level::TRACE => palette.idle,
+        // Below INFO the level is context, not signal, so it recedes rather
+        // than taking an accent of its own. DEBUG and TRACE share one faded
+        // colour deliberately: every line already prints its level (the format
+        // is `[time] [LEVEL] message`), so the word tells them apart and two
+        // near-identical greys bought nothing but a pair to keep distinct.
+        tracing::Level::DEBUG | tracing::Level::TRACE => ui.visuals().weak_text_color(),
         // INFO: the theme's body text colour — this line is the baseline the
         // others are read against, so it takes no accent at all.
         _ => ui.visuals().text_color(),
@@ -1624,12 +1628,20 @@ mod tests {
                 let palette = wiredata_ui::palette::active(ui);
                 assert_eq!(level_color(ui, tracing::Level::ERROR), palette.fault);
                 assert_eq!(level_color(ui, tracing::Level::WARN), palette.warning);
-                assert_eq!(level_color(ui, tracing::Level::DEBUG), palette.info);
-                assert_eq!(level_color(ui, tracing::Level::TRACE), palette.idle);
                 assert_eq!(
                     level_color(ui, tracing::Level::INFO),
-                    ui.visuals().text_color()
+                    ui.visuals().text_color(),
+                    "INFO is the baseline, not an accent"
                 );
+                // Below INFO the theme supplies the emphasis, not the palette.
+                for below in [tracing::Level::DEBUG, tracing::Level::TRACE] {
+                    assert_eq!(level_color(ui, below), ui.visuals().weak_text_color());
+                }
+                // Only the two that mean something take an accent.
+                for accented in [tracing::Level::ERROR, tracing::Level::WARN] {
+                    assert_ne!(level_color(ui, accented), ui.visuals().text_color());
+                    assert_ne!(level_color(ui, accented), ui.visuals().weak_text_color());
+                }
             });
         }
     }
