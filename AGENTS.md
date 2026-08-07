@@ -81,6 +81,18 @@ explained in seven places, this is the rule that was not applied:
 Rustdoc describes what exists. It is not a memorial for deleted code — that is
 what the commit and, where a decision was involved, the ADR are for.
 
+**A document must not name a test function as evidence for a current claim.**
+State the invariant; the test states the case. A cited test name is the one part
+of a document guaranteed to rot — it breaks on a rename, and the document then
+asserts a guarantee that no longer exists.
+
+`cargo test -p talker --test docs` checks every `docs/` file, and this one, for
+backticked identifiers the source no longer contains. Naming an identifier
+*because* it was removed is legitimate history; add it to that test's
+`REMOVED_ON_PURPOSE` list with a reason. The check found four wrong references
+on its first run, in documents that had just been reviewed twice — and a fifth
+in the paragraph you are reading.
+
 ## 3. Scope & workflow discipline
 
 - **Test-first** for core logic: write the unit/integration tests before or alongside

@@ -345,7 +345,7 @@ preceded it. The first two are cross-crate consistency debts, not local cleanups
   now renders them in plain language instead — `worst send started X late of N
   sends`, `nothing sent in <window> · worst this run X`, `awaiting the first
   scheduled send`; the warm-up form is gone entirely (ADR-046). Talker's own split
-  closed first (`recent_timing_metric` and the Cadence row share one rule), and
+  closed first (`timing_metric` and the Cadence row share one rule), and
   the shared table in `wiredata-ui/src/diagnostics.rs` now carries a real
   rendering from **both** apps per state, so a wording change one side cannot
   describe is a divergence rather than a variation.

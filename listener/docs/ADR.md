@@ -245,7 +245,8 @@ reporting contract for each.
    silent — and cancellation is observed mid-stall, §111.)*
    *Status: implemented and tested* (`sustained_stall_sends_a_reception_stalled_notice`,
    `a_wedged_pipeline_raises_the_notice_while_still_stalled_and_can_cancel`,
-   `momentary_backpressure_sends_no_notice`, `run_channel_records_a_transport_notice_as_a_diagnostic`).
+   `momentary_backpressure_updates_totals_without_a_warning`,
+   `run_channel_records_a_transport_notice_as_a_diagnostic`).
 
 3. **Fundamentally unobservable — pre-receive kernel/NIC loss.** Kernel-dropped
    UDP datagrams, and any bytes lost in the driver/NIC before our `recv`, leave
@@ -611,7 +612,8 @@ A second, parallel command enum on top of a working method API + a GUI transport
 
 **Consequences.**
 - `MatchAction::Mark` becomes `Mark { timestamp: Option<MarkTimestamp> }`; new `MarkTimestamp`/`MarkPosition`/`TimestampConfig` config types. `MatchAction` is `#[serde(tag = "kind")]`; a bare `Mark` still parses (the field is `#[serde(default)]`). No `schema_version` bump — additive field plus an additive-safe drop of the display timestamp field (dev-only profiles, ADR-013 precedent).
-- The renderer gains `render_text_annotated`/`render_stream_annotated`; `RenderedOutput.timestamp` is retained (it drives time-based Display rotation, §59) but never carries an inline mark — the inline text lives in `RenderedOutput.text`.
+- The renderer gains `render_text_annotated`, and the streaming
+  `StreamRenderer::render_chunk` takes annotations; `RenderedOutput.timestamp` is retained (it drives time-based Display rotation, §59) but never carries an inline mark — the inline text lives in `RenderedOutput.text`.
 - The snapshot's `TriggeredMatch` carries an optional `MarkRender { text, before }` so the live viewer splices the same timestamp the `.disp` got, rebasing the match onto the scrollback window via its view-space `view_offset` (ADR-017 — the stream-space `byte_offset` counts bytes a paused view skipped).
 - A minimal in-app editor creates `BytePattern → Mark(+timestamp)` rules; committing uses the existing Apply & Restart path (`config_needs_restart` counts `match_rules`) — no new runtime command. The general match-rule editor (Idle/Record/Notify/PauseDisplay) remains a separate TODO.
 
@@ -1508,16 +1510,15 @@ An annotation wider than the whole pane still overruns, because there is
 nowhere for it to go. That cuts Mark text, never a byte, and is stated rather
 than silently absorbed.
 
-**Consequences:** `a_mark_in_the_line_never_pushes_a_hex_byte_across_the_wrap`
-crosses grouping, pane width, annotation width and placement, and was confirmed
-to fail against the previous behaviour.
+**Consequences:** the invariant — no pane width, grouping or annotation
+splits a byte — is checked across all four dimensions crossed, and was
+confirmed capable of failing before the fix.
 
-The one-shot reference `batch_rows` now configures its renderer exactly as
-`rebuild_rows` does. It previously modelled a *different* renderer, so the
-incremental-equals-batch invariant could be satisfied by both sides being
-wrong — and for Hex at a narrow pane, both sides were. A reference
-implementation that drifts from the thing it references is worth more attention
-than the bug it hid.
+A reference implementation must be configured as the thing it references. The
+one-shot comparison for the incremental row cache was not, so the equality it
+asserted could be satisfied by both sides being wrong, and for Hex at a narrow
+pane both sides were. That is a property of any such pairing, not of this
+one.
 
 **Known structural risk.** Hex still wraps in two stages: cell-aware rendering
 followed by a generic character splitter. Two successive defects have now lived

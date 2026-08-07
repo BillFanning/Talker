@@ -1801,21 +1801,22 @@ diagnostics list, and the channel-list counts, where four greys became two theme
 emphases. That flattens some hierarchy; it is the one part of this that tests
 cannot judge, and it is filed to be looked at.
 
-**Correction (2026-08-06, from external review).** The two tests this entry
-first named proved less than it claimed. `the_palette_stays_four_distinct_accents`
-asserted that an array built from the four named fields had four elements —
-true by construction, and a fifth field would simply not have appeared in it.
-`fault_stays_on_the_blue_axis` proved only that blue was the largest channel,
-which any blue satisfies, including one sitting on top of `warning`.
+**Correction (2026-08-06, from external review).** This entry originally cited
+two tests as evidence for the decision, and both proved less than it claimed —
+one asserted that an array built from four named fields had four elements, the
+other that blue was a colour's largest channel. A ratchet over a simulated
+red-green deficiency replaced them and was removed in turn: it did not
+reproduce the original defect, because red and amber differ in lightness even
+where their hue collapses.
 
-What is checked now: `no_two_accents_share_a_value`, and
-`no_accent_pair_gets_closer_under_a_red_green_deficiency` — a ratchet over a
-linear protanope/deuteranope simulation. That second one is a regression floor
-and is documented as one, because it does **not** reproduce the original defect:
-red `fault` against amber `warning` scores well under the model, since the two
-differ in lightness even where their hue collapses. The set size stays an
-argument in the type's own documentation, where someone adding a field will
-read it, rather than a number a test pretends to guard.
+The durable policy, which is what this entry should have stated instead of a
+test list: **four semantic accents, each distinct from the others, and colour
+never carrying a state alone.** The first half is mechanically checkable and is
+checked. The second is the one that actually delivers accessibility, and it is
+enforced where the states are rendered — every one carries a glyph or a word.
+Whether the accents are *comfortable* remains a visual review with a human
+looking at both themes; no metric available here substitutes for that, and
+pretending otherwise is how the removed tests came to exist.
 
 ---
 
@@ -1873,8 +1874,8 @@ same busy stretch matched nothing — the startup case above went entirely
 uncharged — and ADR-045's `blocked_others` had carried the same hole silently
 since it shipped. Calling the shortfall idle time then converted a gap in the
 record into an affirmative claim about the machine. The record now retains
-`RETAINED_SENDS` windows and both paths search them, which closes the delay
-hole as well; and an uncharged point is reported as **unattributed**, never as
+one send window per message and both paths search them, which closes the
+delay hole as well; and an uncharged point is reported as **unattributed**, never as
 idle, because reaching the end of the retained history produces exactly the same
 silence as a genuinely free thread and nothing here can tell them apart. (The
 history was first capped at a constant, which the same review then pointed out

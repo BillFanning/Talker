@@ -47,9 +47,8 @@
 //! point at, and things they cannot see at all. Each readout says which in its
 //! own words — "worst", "check", "unavailable", "not charged to any send" — and
 //! the wording is reviewed per readout. There is deliberately no shared
-//! certainty vocabulary: one was defined here and adopted nowhere, and a term
-//! set with no speakers governs nothing. Introduce it with its first two call
-//! sites if it is ever wanted.
+//! certainty vocabulary here; if one is ever wanted, add it with its first two
+//! call sites and not before.
 //!
 //! The rule lives in both applications rather than here: it reads a
 //! `wiredata-telemetry` histogram, and this crate depends on `egui` alone. See
