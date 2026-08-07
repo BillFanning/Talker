@@ -220,44 +220,74 @@ pub struct HexCursor {
     cells_on_line: usize,
     /// Bytes emitted into the current group, for spacing (§45).
     bytes_in_group: usize,
+    /// Monospace columns already written on the current output line.
+    ///
+    /// Tracked separately from the cell count because cells are **not** the
+    /// same width: a byte is two columns, an annotation is as wide as its
+    /// text. A line of N cells can therefore be far wider than N columns, and
+    /// a cell count alone cannot keep a rendered line inside the pane.
+    columns_on_line: usize,
 }
 
 /// Open the next cell: wrap the line if it is full, otherwise separate from the
 /// previous cell. `grouped` is false for a byte continuing a group — those run
 /// together, which is the whole point of `bytes_per_group`.
+///
+/// `width` is the cell's monospace width. A line ends when it has taken all the
+/// cells it was asked for **or** when the next cell would not fit within
+/// `max_columns` — the second condition is what an annotation trips, since it
+/// spends one cell but several columns.
 fn start_hex_cell(
     out: &mut String,
     cursor: &mut HexCursor,
     per_line: Option<usize>,
+    max_columns: Option<usize>,
     separator: &str,
     grouped: bool,
+    width: usize,
 ) {
     if cursor.cells_on_line > 0 {
-        if per_line.is_some_and(|n| cursor.cells_on_line >= n) {
+        let lead = if grouped {
+            0
+        } else {
+            separator.chars().count()
+        };
+        let full = per_line.is_some_and(|n| cursor.cells_on_line >= n)
+            || max_columns.is_some_and(|n| cursor.columns_on_line + lead + width > n);
+        if full {
             out.push('\n');
             cursor.cells_on_line = 0;
             cursor.bytes_in_group = 0;
+            cursor.columns_on_line = 0;
         } else if !grouped {
             out.push_str(separator);
+            cursor.columns_on_line += lead;
         }
     }
     cursor.cells_on_line += 1;
+    cursor.columns_on_line += width;
 }
 
 fn push_hex_annotation(
     out: &mut String,
     cursor: &mut HexCursor,
     per_line: Option<usize>,
+    max_columns: Option<usize>,
     separator: &str,
     text: &str,
 ) {
     // An annotation always stands apart, even mid-group: running a Mark into
     // the bytes on either side (`4142‹T›4344`) would hide both.
     cursor.bytes_in_group = 0;
-    start_hex_cell(out, cursor, per_line, separator, false);
+    // Measured whole for the fit decision even when it carries a line control:
+    // erring toward an early wrap costs a short line, while erring the other
+    // way costs a byte cut in half.
+    let width = text.chars().count();
+    start_hex_cell(out, cursor, per_line, max_columns, separator, false, width);
     out.push_str(text);
     if let Some(tail) = tail_after_line_control(text) {
         cursor.cells_on_line = usize::from(!tail.is_empty());
+        cursor.columns_on_line = tail.chars().count();
     }
     // The bytes after an annotation start a fresh group, so a Mark never shifts
     // the grouping of everything that follows it.
@@ -269,8 +299,15 @@ fn push_hex_annotation(
 /// `separator`. A `bytes_per_group` of 1 is the conventional hexdump, one byte
 /// per group, and is what a zero also means — no group can be empty.
 ///
-/// When `bytes_per_line` is `Some`, wrap to that many *cells* per line
-/// (annotation cells count, matching the old per-cell chunking).
+/// When `bytes_per_line` is `Some`, wrap to that many cells per line
+/// (annotation cells count). `max_columns` bounds the same line by width, and
+/// is the one that holds when annotations are present: a Mark spends one cell
+/// but several columns, so a line correct by cell count can still overrun the
+/// pane and be cut mid-byte by the viewer's character splitter.
+///
+/// A single annotation wider than `max_columns` still overruns — there is
+/// nowhere for it to go — but that cuts annotation text, never a byte.
+///
 /// `annotations` are spliced as extra cells before/after their target byte.
 /// Emits directly into one pre-sized `String` — no per-byte allocation.
 /// `cursor` carries streaming continuation state across chunks: an annotation
@@ -281,35 +318,48 @@ fn render_hex(
     separator: &str,
     bytes_per_group: usize,
     bytes_per_line: Option<usize>,
+    max_columns: Option<usize>,
     annotations: &[RenderAnnotation],
     cursor: &mut HexCursor,
 ) -> String {
     let per_line = bytes_per_line.filter(|&n| n > 0);
+    let max_columns = max_columns.filter(|&n| n > 0);
     let per_group = bytes_per_group.max(1);
     let mut walker = AnnotationWalker::new(annotations);
     let mut out = String::with_capacity(bytes.len() * (2 + separator.len()));
     for (i, b) in bytes.iter().enumerate() {
         let (before, after) = split_run(walker.run_at(i));
         for s in before {
-            push_hex_annotation(&mut out, cursor, per_line, separator, s);
+            push_hex_annotation(&mut out, cursor, per_line, max_columns, separator, s);
         }
         let continues_group = cursor.bytes_in_group > 0;
-        start_hex_cell(&mut out, cursor, per_line, separator, continues_group);
+        start_hex_cell(
+            &mut out,
+            cursor,
+            per_line,
+            max_columns,
+            separator,
+            continues_group,
+            HEX_CELL_COLUMNS,
+        );
         out.push(HEX_DIGITS[(b >> 4) as usize] as char);
         out.push(HEX_DIGITS[(b & 0xF) as usize] as char);
         cursor.bytes_in_group = (cursor.bytes_in_group + 1) % per_group;
         for s in after {
-            push_hex_annotation(&mut out, cursor, per_line, separator, s);
+            push_hex_annotation(&mut out, cursor, per_line, max_columns, separator, s);
         }
     }
     // Annotations targeting the one-past-the-end offset (an `After` on the final byte
     // is handled above; a `Before` at len is a trailing mark) attach at the end.
     let (end_before, _) = split_run(walker.run_at(bytes.len()));
     for s in end_before {
-        push_hex_annotation(&mut out, cursor, per_line, separator, s);
+        push_hex_annotation(&mut out, cursor, per_line, max_columns, separator, s);
     }
     out
 }
+
+/// Columns one byte occupies in Hex: two digits, always.
+const HEX_CELL_COLUMNS: usize = 2;
 
 /// Hard-wrap each existing line of `text` to `width` characters.
 fn wrap_lines(text: &str, width: Option<usize>) -> String {
@@ -482,6 +532,9 @@ impl DisplayView {
                     &self.hex_separator,
                     self.hex_bytes_per_group,
                     bytes_per_line,
+                    // Only a view that already wraps gets a column bound, so a
+                    // non-wrapping caller cannot acquire one by side effect.
+                    bytes_per_line.and(self.wrap_width),
                     annotations,
                     &mut cursor,
                 )
@@ -627,14 +680,21 @@ impl StreamRenderer {
             // sets a real line length when the user asks for fixed columns, and
             // wrapping here — where cells are known — keeps a separator from
             // being stranded at the head of the next line.
-            DisplayMode::Hex => render_hex(
-                bytes,
-                &self.view.hex_separator,
-                self.view.hex_bytes_per_group,
-                Some(self.view.hex_bytes_per_line).filter(|&n| n > 0),
-                annotations,
-                &mut self.hex_cursor,
-            ),
+            DisplayMode::Hex => {
+                let per_line = Some(self.view.hex_bytes_per_line).filter(|&n| n > 0);
+                render_hex(
+                    bytes,
+                    &self.view.hex_separator,
+                    self.view.hex_bytes_per_group,
+                    per_line,
+                    // Tied to the same request: the recorder's view asks for no
+                    // line length, so `.disp` stays the exact rendered stream
+                    // however wide the viewer happens to be.
+                    per_line.and(self.view.wrap_width),
+                    annotations,
+                    &mut self.hex_cursor,
+                )
+            }
             DisplayMode::Rendered => {
                 render_rendered(bytes, self.view.encoding, annotations, &mut self.col)
             }

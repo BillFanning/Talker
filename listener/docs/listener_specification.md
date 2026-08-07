@@ -1,11 +1,22 @@
-# Listener Specification v2.3.0
+# Listener Specification v2.3.1
 
 Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (Hex grouping and the timestamp sidecar become specified behaviour):
+Revision note (2026-08-06) — a Hex line is bounded by columns:
+
+- **§45 Hex line width (ADR-041).** A row ends when the next cell would exceed
+  the pane, not only when the byte budget is spent. An inline `Mark` occupies one
+  cell and as many columns as its text, so the cell-count bound alone let a line
+  overrun and be cut mid-byte by the viewer's character splitter. A `Mark` wider
+  than the whole pane may still overrun; that cuts Mark text, never a byte.
+- **§57 sidecar record.** The prose said `ChunkTime` — wall clock *and*
+  monotonic — reached the sidecar, six lines above the record format that carries
+  only the wall-clock value. The description now matches the format.
+
+Revision note (2026-08-06) — Hex grouping and the timestamp sidecar become specified behaviour:
 
 - **§45 Hex grouping (ADR-038/ADR-040).** `HexGrouping` was specified and
   persisted but read by nothing. Its two halves now have stated reach: bytes per
@@ -21,7 +32,7 @@ Revision note (Hex grouping and the timestamp sidecar become specified behaviour
 - No schema, transport, queue, or telemetry change; `CURRENT_VERSION` is
   unchanged. Existing profiles are unaffected.
 
-Revision note for v2.2.3 (authoritative Serial stall snapshots):
+Revision note (2026-07-27) — authoritative Serial stall snapshots:
 
 - **§91.2 / §97 / §99 / §101 / §104 / §128 Serial backpressure telemetry
   (ADR-034).** Each successfully opened Serial run now owns reader-maintained
@@ -1078,6 +1089,11 @@ The two halves have different reach (ADR-038/ADR-040):
   never hard-wrapped (§54). A configured count shall be reduced when the pane is
   too narrow to show it, and 0 fills the pane; in every case **no displayed row
   shall split a byte** or begin or end with a group separator.
+- **A line is bounded by columns, not by cells (ADR-041).** An inline `Mark`
+  occupies one cell and as many columns as its text, so a row shall end when the
+  next cell would exceed the pane width as well as when the byte budget is
+  spent. A single `Mark` wider than the whole pane may still overrun; that cuts
+  Mark text, never a byte.
 
 ## 46. Character Rendering
 
@@ -1350,9 +1366,11 @@ Timestamp recording is optional and is the only metadata a recorder writes.
 Rationale: the recorded bytes are self-sufficient; original timing is the one
 fact that cannot be regenerated from them.
 
-- **Raw Recording:** timestamps are `ChunkTime` values (wall clock + monotonic)
-  written to a **sidecar index** (`.raw.idx`) keyed by byte offset; the `.raw` byte
-  stream stays pure and byte-exact. The sidecar is written when
+- **Raw Recording:** each received block's arrival wall-clock time is written to a
+  **sidecar index** (`.raw.idx`) keyed by byte offset; the `.raw` byte stream stays
+  pure and byte-exact. The block's monotonic reading is used for ordering and
+  liveness while running and is deliberately **not** recorded — it is meaningless
+  once the process it was measured in has exited. The sidecar is written when
   `RawRecordingConfig.timestamp_enabled` is set, from the Raw recording editor or a
   profile. An offset is a **position in the `.raw` beside it**, not a count for the
   current run: appending to an existing recording continues from that file's end, and

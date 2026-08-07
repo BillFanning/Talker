@@ -1471,6 +1471,59 @@ confirmed to fail against the previous behaviour, reporting `" 03 04 0"`.
 a character *is* the unit. The comment at the call site now says which stage owns
 which, instead of claiming the stronger boundary for both.
 
+## ADR-041 — A Hex line is bounded by columns, not by cells
+
+**Status:** Accepted 2026-08-06. Amends ADR-040; from external review.
+
+**Context:** ADR-040 resolved fit-to-width to a byte count so the renderer,
+which knows cell boundaries, would do the wrapping. It held for bytes and broke
+for Marks.
+
+The renderer wrapped when its *cell* count reached the line's byte budget, and
+an inline `Mark` (§50.2) counts as one cell while occupying as many columns as
+its text. A line correct by cell count could therefore be far wider than the
+pane, and the oversized line went to `split_stream_rows` — which is exactly the
+re-engagement ADR-040 set out to prevent. At eight columns with one byte per
+group, a `[T]` before the second byte rendered `41 [T] 42` and came back as
+`41 [T] 4` and `2`.
+
+The test that was supposed to cover this passed no annotations, so
+`no_pane_width_or_grouping_ever_splits_a_hex_byte` proved the invariant only in
+the case that was never at risk. Its name claimed the general result.
+
+**Decision:** The renderer tracks the columns it has written, not only the cells,
+and ends a line when the next cell would not fit the pane **or** the byte budget
+is spent — whichever comes first. A byte is two columns; an annotation is as
+wide as its text; a separator counts where one is emitted.
+
+The pane width is attached to the view by `rebuild_rows`, which already receives
+`wrap_cols`, rather than by the GUI call site. The two settings cannot then be
+supplied apart: a view carrying a Hex line length but no column bound is the
+exact configuration that produced this defect, and it is now unconstructible on
+the path that matters. The column bound is tied to the line-length request, so
+the recorder's view — which asks for no line length — still emits the exact
+rendered stream at any width (§54).
+
+An annotation wider than the whole pane still overruns, because there is
+nowhere for it to go. That cuts Mark text, never a byte, and is stated rather
+than silently absorbed.
+
+**Consequences:** `a_mark_in_the_line_never_pushes_a_hex_byte_across_the_wrap`
+crosses grouping, pane width, annotation width and placement, and was confirmed
+to fail against the previous behaviour.
+
+The one-shot reference `batch_rows` now configures its renderer exactly as
+`rebuild_rows` does. It previously modelled a *different* renderer, so the
+incremental-equals-batch invariant could be satisfied by both sides being
+wrong — and for Hex at a narrow pane, both sides were. A reference
+implementation that drifts from the thing it references is worth more attention
+than the bug it hid.
+
+**Known structural risk.** Hex still wraps in two stages: cell-aware rendering
+followed by a generic character splitter. Two successive defects have now lived
+in the seam between them. If this path is touched again, the renderer should
+return final rows and `split_stream_rows` should not see Hex at all.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

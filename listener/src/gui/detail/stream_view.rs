@@ -178,7 +178,10 @@ impl ListenerApp {
                 let wrap_cols = (avail_w / char_w).floor().max(8.0) as usize;
                 // Resolve Hex line length against the pane now that its width is
                 // known, so the renderer wraps at a whole group and the row
-                // splitter below never has a Hex line left to cut.
+                // splitter below never has a Hex line left to cut. The column
+                // bound that goes with it — a Mark spends one cell but several
+                // columns — is attached by `rebuild_rows`, which receives
+                // `wrap_cols` anyway and cannot be given one without the other.
                 renderer.hex_bytes_per_line = hex_line_bytes(hex_grouping, wrap_cols);
                 self.refresh_stream_rows(id, &renderer, wrap_cols);
                 let rows: &[String] = self
@@ -668,7 +671,14 @@ fn rebuild_rows(p: &StreamRefresh, window_start: u64) -> super::super::StreamRen
             })
         })
         .collect();
-    let mut renderer = StreamRenderer::new(p.view.clone());
+    // The pane width belongs to the renderer, and it is attached here rather
+    // than by the caller so the two cannot come apart: a view configured with a
+    // Hex line length but no column bound wraps correctly on bytes and then
+    // overruns on Mark text, which is precisely the shape the earlier defect
+    // took. `wrap_cols` arrives with the view, so there is nothing to forget.
+    let mut view = p.view.clone();
+    view.wrap_width = Some(p.wrap_cols);
+    let mut renderer = StreamRenderer::new(view);
     let text = renderer.render_chunk(p.window, &annotations);
     let rows = split_stream_rows(&text, p.wrap_cols);
     let row_count = rows.len();
@@ -917,9 +927,16 @@ mod tests {
 
     /// Reference: the same input rendered in one shot through a fresh
     /// renderer (identical carry semantics), then split.
+    ///
+    /// Configured exactly as `rebuild_rows` configures its renderer, pane width
+    /// included. A reference that models a *different* renderer would make this
+    /// comparison agree by both sides being wrong — which is how a one-shot
+    /// render that cut bytes in half once served as the expected value.
     fn batch_rows(data: &[u8], marks: &[StreamMark], v: &DisplayView, cols: usize) -> Vec<String> {
         let annotations = delta_annotations(marks, 0, data.len());
-        let mut r = StreamRenderer::new(v.clone());
+        let mut view = v.clone();
+        view.wrap_width = Some(cols);
+        let mut r = StreamRenderer::new(view);
         split_stream_rows(&r.render_chunk(data, &annotations), cols)
     }
 
@@ -1023,6 +1040,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The same invariant with Marks in the line — the case the version above
+    /// does *not* cover, because it supplies no annotations.
+    ///
+    /// A Mark spends one renderer cell but as many columns as its text, so a
+    /// line correct by cell count could still overrun the pane and be cut by
+    /// the character splitter: at eight columns, one byte per group, a `[T]`
+    /// before the second byte produced `41 [T] 42`, which came back as
+    /// `41 [T] 4` and `2`. Widths, placements and grouping are crossed here
+    /// because the defect only appears where two of them interact.
+    #[test]
+    fn a_mark_in_the_line_never_pushes_a_hex_byte_across_the_wrap() {
+        let data: Vec<u8> = (0x41u8..=0x7A).collect();
+        let expected: String = data.iter().map(|b| format!("{b:02X}")).collect();
+
+        for bytes_per_group in [1u8, 2, 4] {
+            for groups_per_line in [0u8, 1, 4] {
+                let grouping = HexGrouping {
+                    bytes_per_group,
+                    groups_per_line,
+                };
+                for cols in [8usize, 9, 13, 20, 47] {
+                    for text in ["[T]", "‹12:00:00.000›", "[AB]"] {
+                        for before in [true, false] {
+                            // Marks early, mid-group and on a group boundary.
+                            let marks: Vec<StreamMark> = [1u64, 4, 8, 17]
+                                .iter()
+                                .map(|&o| mark(o, before, text))
+                                .collect();
+                            let mut v = view(DisplayMode::Hex);
+                            v.hex_bytes_per_group = usize::from(bytes_per_group);
+                            v.hex_bytes_per_line = hex_line_bytes(grouping, cols);
+                            let rows = incremental_rows(&data, 5, &marks, &v, cols);
+                            let context = format!(
+                                "B={bytes_per_group} G={groups_per_line} cols={cols} \
+                                 text={text:?} before={before}"
+                            );
+
+                            let mut seen = String::new();
+                            for row in &rows {
+                                assert!(
+                                    row.chars().count() <= cols,
+                                    "row overruns the pane ({context}): {row:?}"
+                                );
+                                for token in row.split(' ') {
+                                    // Annotation cells are text and are left
+                                    // alone; every hex token must still be
+                                    // whole bytes.
+                                    if token.is_empty() || !is_hex_token(token) {
+                                        continue;
+                                    }
+                                    assert!(
+                                        token.len() % 2 == 0,
+                                        "a Mark split a byte ({context}): {row:?}"
+                                    );
+                                    seen.push_str(token);
+                                }
+                            }
+                            // Nothing was lost or reordered around the Marks.
+                            assert_eq!(seen, expected, "bytes disturbed by a Mark ({context})");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A token is byte data rather than Mark text. Marks here are bracketed or
+    /// guillemet-wrapped, so anything all-hex is data — and a Mark that *were*
+    /// all hex digits would only make the assertion above stricter.
+    fn is_hex_token(token: &str) -> bool {
+        token.chars().all(|c| c.is_ascii_hexdigit())
     }
 
     #[test]
