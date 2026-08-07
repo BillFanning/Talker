@@ -88,78 +88,51 @@ Cross off items as they are completed. Add new ones inline as they come up.
   shared chrome colors (status, severity, destructive) come from
   `wiredata-ui`; content-semantic highlights stay application-owned.
 
+## External review round 4 (2026-08-06)
+
+Fixed, with the reasoning in the ADRs named — not restated here:
+
+- Miss attribution kept one send window, so a skip behind an earlier write went
+  uncharged and the callout reported the shortfall as an idle thread. Ring of
+  retained windows, partitioned charge, honest wording (ADR-051 correction).
+- The routing line stated the largest culprit and the remainder but not the
+  charged total, so with 5 + 4 + 3 it accounted for 8 of 12.
+- A Hex line was bounded by cells, and a Mark spends one cell but several
+  columns, so an annotated line overran the pane and was cut mid-byte
+  (listener ADR-041).
+- `Evidence` was defined in `wiredata-ui` and adopted nowhere; removed.
+- Two palette tests asserted less than their names (ADR-050 correction), and
+  broadening the glyph-size test found `○` shipping without an optical
+  correction, so a low control line rendered smaller than the high one beside it.
+- Doc drift: listener §57 claimed the sidecar carried a monotonic reading it
+  never wrote; the glyph module said "three symbols" with four defined.
+
+Still open:
+
+- [ ] **Split `talker/src/gui/diagnostics.rs`** (~1,800 lines). Formatting, view
+  models, thresholds, causal routing and prose in one file. Natural seams:
+  `cadence`, `capacity`, `per_message`, `missed_routing`. Pure movement, so it
+  wants its own commit rather than riding on a fix.
+- [ ] **Only the interface write counts as holding the channel.** See the
+  entry under the ADR-045 review disposition below.
+
 ## Colour accessibility (2026-08-06)
 
-Found by testing the palette against a red-green colour deficiency: `fault` was
-not visible as distinct from `warning`, which meant the most important signal in
-either app was the one that did not arrive. `fault` is now blue (ADR-049).
+Closed. The pass ran from a red-green deficiency making `fault` unreadable
+against `warning` through to a full audit of colour-only states, and the whole
+account — what changed, what was cleared and why — is in **ADR-049 / ADR-050**
+and the commits they name. It is not repeated here: this file tracks work
+outstanding, and an investigation narrative kept alongside it is the same
+duplication the review that prompted the pass complained about.
 
-The general rule these items serve: **anywhere a state is carried by colour
-alone is the bug.** Colour may reinforce a distinction; it may not be the only
-thing making it. The diagnostics cards already do this correctly with word
-badges (`ISSUE` / `ATTENTION` / `MONITORING`) — that is the pattern to copy.
+One item survives as work:
 
-- [x] **Serial control lines were colour-only** — fixed 2026-08-06. `●` filled
-  for high, `○` hollow for low (`glyphs::LINE_HIGH`/`LINE_LOW`), so shape
-  carries the level and colour reinforces it. That rule was already stated in
-  `status.rs` for the channel glyphs and already followed there; the control
-  lines were the one readout that missed it, which is why the fix was small.
-  Pinned by `control_line_levels_differ_without_colour`.
-- [x] **`running` vs `warning` collide — confirmed 2026-08-06.** Checked against
-  the same red-green deficiency: the green and the amber read as similar. Unlike
-  the control lines this is **not** a functional failure, and the difference is
-  worth understanding rather than filing as another bug: everywhere the two
-  appear, a distinct glyph and a word are already carrying the state (`●` vs
-  `⚠`, "running" vs the warning's own text), so nothing is unreadable. The
-  diagnostics card is safe by construction too — `SignalTone::Healthy` resolves
-  to the theme's body text, not to green, so a healthy row is never a green
-  smudge next to an amber one.
-  What the finding actually says is that these two accents are **not earning
-  their keep**: they cost a distinguishable-pair budget and buy reinforcement a
-  reader with this deficiency does not receive. That is an argument for the
-  reduction item below, not for a third colour — resolve it there.
-- [x] **Palette reduced to four accents** — done 2026-08-06, ADR-050. Ten fields
-  became `fault` / `warning` / `running` / `idle`, which is the same four states
-  `SignalTone` already names. The five greys were *emphasis*, not meaning, so
-  they became `Visuals::weak_text_color`/`text_color` — the theme owns emphasis
-  and no palette should re-decide it. `reconnecting` folded into `warning`,
-  `line_high` into `running`, `line_low` into `idle`, because each pair meant
-  the same thing in two places. Pinned by
-  `the_palette_stays_four_distinct_accents` and `fault_stays_on_the_blue_axis`.
-- [x] **Running and Reconnecting shared a glyph** — found during the reduction
-  and fixed with it. `status_glyph` mapped both to `●`, so on the channel list —
-  which shows the glyph and the channel *name*, not the status word — they
-  differed by green against amber alone, the pair confirmed above as
-  indistinguishable. Reconnecting now has `◐`. The detail pane was never
-  affected: it prints `status_label` beside the glyph.
-- [x] **Audited every colour-only state across both apps** — 2026-08-06. Method:
-  every use of a palette accent, checked against one question — *is the state
-  still legible with the colour removed?* Two failed.
-  - **`signal_row` carried tone by colour alone** (shared chrome, so both apps'
-    decision rows). A warning row and a calm one were the same string in two
-    hues. Warning and Fault now prefix `⚠`; they share it deliberately, because
-    what has to survive without colour is the binary *does this want
-    attention*, and which of the two it is stays in the row's text and the
-    card's badge. Pinned by `only_the_tones_that_want_attention_are_marked`.
-  - **Listener's Raw record queue line** stated "at or above half capacity" in
-    amber only. The numbers were always there, but the *judgement the app had
-    drawn from them* was not; it now says ", at half capacity".
-
-  What the audit **cleared**, and why, since that is the reusable part:
-  status glyphs and recording indicators carry a glyph plus a word; log lines
-  are formatted `[time] [LEVEL] message`; severity counts read "3 warn";
-  diagnostics lists prefix `INFO `/`WARN `/`ERROR`; the per-message table shows
-  `—` where a non-blocking message has nothing to report, so the *presence* of a
-  value is the signal; the timer line says "request failed" in words; "duplicate
-  name" and the interface-error line only exist when they apply; `red_bordered`
-  adds an outline, and presence-of-outline is not a hue. Every one of those was
-  already obeying the rule before anyone wrote it down — which is why they
-  survived and the two above did not.
-- [x] **Looked at the reduced palette in both apps** — 2026-08-06, confirmed
-  good. This was the open risk in the reduction: four greys became two theme
-  emphases, and nothing but eyes could say whether the log panel and diagnostics
-  list still read hierarchically. They do. The theme's own `weak_text_color` was
-  enough, which is the argument for not having had four greys.
+- [ ] **`running` and `warning` do not earn their pair budget.** Confirmed
+  indistinguishable under the same deficiency. Not a functional failure —
+  everywhere the two appear a glyph and a word already carry the state — so the
+  question is whether two accents are worth keeping for reinforcement one reader
+  does not receive. Revisit if a third state ever wants a colour; see ADR-050 for
+  the pair argument.
 
 ## Robustness (external review round 2, 2026-07-12)
 

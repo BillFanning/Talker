@@ -95,6 +95,30 @@ pub struct Palette {
     pub idle: Color32,
 }
 
+#[cfg(test)]
+impl Palette {
+    /// The accents, as a set.
+    ///
+    /// Destructured deliberately: a struct pattern must name every field, so
+    /// adding a fifth accent makes this fail to **compile** rather than quietly
+    /// leave the new colour out of whatever iterates it. Listing `self.fault`
+    /// and friends instead would have moved the omission from the test to here,
+    /// which is no better for being tidier.
+    ///
+    /// Test-only. It exists so a property can be checked over the whole set,
+    /// and nothing in either application wants the accents as a list — a
+    /// production API added for a test loop is API nobody asked for.
+    fn accents(&self) -> [Color32; 4] {
+        let Palette {
+            fault,
+            warning,
+            running,
+            idle,
+        } = *self;
+        [fault, warning, running, idle]
+    }
+}
+
 /// The light-theme palette.
 pub const LIGHT: Palette = Palette {
     // Deep enough to carry white text on the Remove button's fill.
@@ -118,45 +142,22 @@ pub const DARK: Palette = Palette {
 mod tests {
     use super::*;
 
-    /// Four accents, all distinct, in both themes.
+    /// Every accent differs from every other, in both themes.
     ///
-    /// The count is the point, not just the distinctness: every colour has to
-    /// stay tellable from every other, so the maintenance burden is pairs. Four
-    /// is six pairs; the ten this replaced was forty-five, and two of the three
-    /// pairs ever checked against a red-green deficiency failed. If a fifth
-    /// field is ever added, this test should be read as the question "can a
-    /// glyph or a word do it instead?" rather than a number to bump.
+    /// Distinctness is what a test can hold. That the *set* stays small is an
+    /// argument, not an assertion, and it lives in the type's documentation
+    /// where someone adding a field will read it. `accents` is destructured, so
+    /// a fifth field breaks the build here rather than slipping past this loop.
     #[test]
-    fn the_palette_stays_four_distinct_accents() {
+    fn no_two_accents_share_a_value() {
         for palette in [&LIGHT, &DARK] {
-            let accents = [
-                palette.fault,
-                palette.warning,
-                palette.running,
-                palette.idle,
-            ];
-            assert_eq!(accents.len(), 4, "a fifth accent needs the pair argument");
+            let accents = palette.accents();
             for (index, color) in accents.iter().enumerate() {
                 assert!(
                     !accents[..index].contains(color),
                     "two accents share a value: {color:?}"
                 );
             }
-        }
-    }
-
-    /// The fault accent is blue and must stay that way — red was measurably
-    /// invisible against `warning` (talker ADR-049). Pinned by its blue channel
-    /// dominating, so a future edit toward red or amber trips here rather than
-    /// silently undoing an accessibility fix.
-    #[test]
-    fn fault_stays_on_the_blue_axis() {
-        for palette in [&LIGHT, &DARK] {
-            let fault = palette.fault;
-            assert!(
-                fault.b() > fault.r() && fault.b() > fault.g(),
-                "fault is no longer blue: {fault:?}"
-            );
         }
     }
 }

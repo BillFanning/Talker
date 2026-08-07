@@ -1906,11 +1906,21 @@ diagnostics list, and the channel-list counts, where four greys became two theme
 emphases. That flattens some hierarchy; it is the one part of this that tests
 cannot judge, and it is filed to be looked at.
 
-`the_palette_stays_four_distinct_accents` pins the count in both themes, with the
-pair argument written into it — a fifth field should be read as the question
-"could a glyph or a word do this?" rather than a number to bump.
-`fault_stays_on_the_blue_axis` pins ADR-049's fix against a future edit that
-quietly walks it back toward red.
+**Correction (2026-08-06, from external review).** The two tests this entry
+first named proved less than it claimed. `the_palette_stays_four_distinct_accents`
+asserted that an array built from the four named fields had four elements —
+true by construction, and a fifth field would simply not have appeared in it.
+`fault_stays_on_the_blue_axis` proved only that blue was the largest channel,
+which any blue satisfies, including one sitting on top of `warning`.
+
+What is checked now: `no_two_accents_share_a_value`, and
+`no_accent_pair_gets_closer_under_a_red_green_deficiency` — a ratchet over a
+linear protanope/deuteranope simulation. That second one is a regression floor
+and is documented as one, because it does **not** reproduce the original defect:
+red `fault` against amber `warning` scores well under the model, since the two
+differ in lightness even where their hue collapses. The set size stays an
+argument in the type's own documentation, where someone adding a field will
+read it, rather than a number a test pretends to guard.
 
 ---
 

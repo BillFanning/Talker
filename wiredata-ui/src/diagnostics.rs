@@ -44,14 +44,12 @@
 //! # How certain a reading is
 //!
 //! Both applications report things they measured directly, things they can only
-//! point at, and things they cannot see at all. That difference is carried by
-//! [`Evidence`] — three words, defined here once — rather than by a paragraph of
-//! qualifiers under each result. A caveat repeated everywhere stops being read;
-//! a label that is always one of three things gets learned.
-//!
-//! Reach for prose only where a *specific* boundary is not implied by the label
-//! — that a counter excludes loss upstream of this socket, say. "This is
-//! indirect" is the label's job.
+//! point at, and things they cannot see at all. Each readout says which in its
+//! own words — "worst", "check", "unavailable", "not charged to any send" — and
+//! the wording is reviewed per readout. There is deliberately no shared
+//! certainty vocabulary: one was defined here and adopted nowhere, and a term
+//! set with no speakers governs nothing. Introduce it with its first two call
+//! sites if it is ever wanted.
 //!
 //! The rule lives in both applications rather than here: it reads a
 //! `wiredata-telemetry` histogram, and this crate depends on `egui` alone. See
@@ -73,42 +71,6 @@ use crate::{
     fonts::bold,
     palette::{active, tint},
 };
-
-/// How directly a reading is supported by what was actually measured.
-///
-/// Orthogonal to [`SignalTone`], which says how much a reading matters.
-/// A [`Evidence::Measured`] fault and a [`Evidence::Check`] hint can both be
-/// urgent; they differ in what the application is entitled to claim.
-///
-/// The three are exhaustive by design. A reading is taken from the thing it
-/// describes, taken from something correlated with it, or not taken at all —
-/// and the last is never rendered as a zero.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Evidence {
-    /// Sampled at the boundary being described. The figure means what it says.
-    #[default]
-    Measured,
-    /// Real, but sampled somewhere adjacent — a different population, a run
-    /// total behind a current question, a correlated signal. Enough to say
-    /// where to look, never enough to name a cause.
-    Check,
-    /// No measurement exists: the platform has no such counter, or the request
-    /// for one failed. Distinct from a measured zero, and the distinction is
-    /// load-bearing — "unavailable" means unknown.
-    Unavailable,
-}
-
-impl Evidence {
-    /// The word this evidence is presented under. One vocabulary, so a reader
-    /// learns three terms instead of parsing three paragraphs.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Measured => "Measured",
-            Self::Check => "Check",
-            Self::Unavailable => "Unavailable",
-        }
-    }
-}
 
 /// Visual emphasis for a diagnostic signal. Semantics and thresholds remain local
 /// to the application that owns the measurement.
@@ -330,23 +292,6 @@ mod tests {
                 "attention uses the shared ⚠, not a private symbol"
             );
         }
-    }
-
-    /// The three terms are fixed and distinct — the point of defining them once
-    /// is that neither app invents a fourth word for the same idea.
-    #[test]
-    fn evidence_has_exactly_three_distinct_words() {
-        let all = [Evidence::Measured, Evidence::Check, Evidence::Unavailable];
-        let labels: Vec<&str> = all.iter().map(|e| e.label()).collect();
-        assert_eq!(labels, vec!["Measured", "Check", "Unavailable"]);
-        for (index, label) in labels.iter().enumerate() {
-            assert!(!labels[..index].contains(label));
-        }
-        assert_eq!(
-            Evidence::default(),
-            Evidence::Measured,
-            "a reading is direct unless it says otherwise"
-        );
     }
 
     #[test]
