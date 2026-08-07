@@ -1,6 +1,6 @@
 # Listener Specification v2.3.1
 
-Status: Draft (v2.0 — stream-only architecture; the Message infrastructure is removed)
+Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
@@ -112,27 +112,27 @@ The received data is a single verbatim **byte stream** — the bytes as the tran
 
 ### 4.4 Message Extraction
 
-_Removed in v2.0. There is no extraction (§20)._
+_Removed. There is no extraction (§20)._
 
 ### 4.5 Decoder
 
-_Removed in v2.0. There is no decoder (§29)._
+_Removed. There is no decoder (§29)._
 
 ### 4.6 Metadata
 
-_Removed in v2.0. The only reception facts kept are the running byte count (§25) and the per-chunk arrival time (§26); there is no per-Message metadata._
+_Removed. The only reception facts kept are the running byte count (§25) and the per-chunk arrival time (§26); there is no per-Message metadata._
 
 ### 4.7 Payload Metadata
 
-_Removed in v2.0 (see §4.6)._
+_Removed (see §4.6)._
 
 ### 4.8 Protocol Metadata
 
-_Removed in v2.0 (see §4.5)._
+_Removed (see §4.5)._
 
 ### 4.9 Integrity Metadata
 
-_Removed in v2.0 (see §4.5)._
+_Removed (see §4.5)._
 
 ### 4.10 Display View
 
@@ -599,9 +599,9 @@ Each TCP Connection Channel shall have:
 
 Data from different TCP clients shall not be merged into a common Byte Stream.
 
-_Scope (v2.1, ADR-024; parked by user decision 2026-07-11):_ these independence
+_Scope (ADR-024; parked by user decision 2026-07-11):_ these independence
 requirements are architectural — each accepted connection runs its own full
-pipeline today. Their **user-facing surfacing is deferred** (Appendix A): v2.1
+pipeline today. Their **user-facing surfacing is deferred** (Appendix A): the spec
 exposes connection channels through connect/disconnect lifecycle events only,
 with no per-connection snapshot, stream view, recording, or match rules, and
 `recv_buffer_bytes` (§76) is not yet applied to accepted sockets.
@@ -637,7 +637,7 @@ Each connection is displayed and processed separately.
 
 ## 17. Input Processing Model
 
-A Channel processes received data as a single **verbatim byte stream**. There is no per-Channel mode switch — the stream is the only model. (The former Message Mode and its per-Channel Stream/Message toggle are removed in v2.0.)
+A Channel processes received data as a single **verbatim byte stream**. There is no per-Channel mode switch — the stream is the only model, and there is no Message Mode (ADR-010).
 
 ## 18. Stream Processing
 
@@ -651,23 +651,23 @@ In stream processing:
 
 ## 19. Message Mode
 
-_Removed in v2.0. `Listener` has no Message Mode; all input is a verbatim stream (§17–18)._
+_Removed. `Listener` has no Message Mode; all input is a verbatim stream (§17–18)._
 
 ## 20. Extraction Methods
 
-_Removed in v2.0. There is no Message Extraction. The former `ExtractionConfig` (`Stream` / `Delimiter` / `FixedLength` / `Protocol`) and the `MessageExtractor` trait (§139) are gone; received bytes are a verbatim stream (§17–18)._
+_Removed. There is no Message Extraction. The former `ExtractionConfig` (`Stream` / `Delimiter` / `FixedLength` / `Protocol`) and the `MessageExtractor` trait (§139) are gone; received bytes are a verbatim stream (§17–18)._
 
 ## 21. Delimiter-Based Extraction
 
-_Removed in v2.0 (see §20)._
+_Removed (see §20)._
 
 ## 22. Fixed-Length Extraction
 
-_Removed in v2.0 (see §20)._
+_Removed (see §20)._
 
 ## 23. Protocol-Based Extraction
 
-_Removed in v2.0 (see §20)._
+_Removed (see §20)._
 
 ---
 
@@ -675,7 +675,7 @@ _Removed in v2.0 (see §20)._
 
 ## 24. Message Number
 
-_Removed in v2.0. There are no Messages, so there is no Message Numbering. Liveness is byte-based (§25, §166)._
+_Removed. There are no Messages, so there is no Message Numbering. Liveness is byte-based (§25, §166)._
 
 ## 25. Total Byte Count
 
@@ -708,66 +708,66 @@ enabled, the recording timestamp sidecar (§57).
 
 ## 27. Reception Duration
 
-_Removed in v2.0 (a per-Message concept)._
+_Removed (a per-Message concept)._
 
 ## 28. Integrity Metadata
 
-_Removed in v2.0. Integrity checking belonged to decoders, which are removed (§29); the `IntegrityScope` / `IntegrityStatus` / `IntegrityMetadata` types are gone._
+_Removed. Integrity checking belonged to decoders, which are removed (§29); the `IntegrityScope` / `IntegrityStatus` / `IntegrityMetadata` types are gone._
 
 ---
 
-# Part VIII — Decoder Architecture (removed in v2.0)
+# Part VIII — Decoder Architecture (not present)
 
 ## 29. Decoder Responsibilities
 
-_Removed in v2.0. `Listener` decodes nothing — it is a verbatim stream tool. The `Decoder` trait (§140) and all decoder selection/output/isolation rules are gone._
+_Removed. `Listener` decodes nothing — it is a verbatim stream tool. The `Decoder` trait (§140) and all decoder selection/output/isolation rules are gone._
 
 ## 30. Decoder Selection
 
-_Removed in v2.0 (see §29)._
+_Removed (see §29)._
 
 ## 31. Decoder Output
 
-_Removed in v2.0 (see §29)._
+_Removed (see §29)._
 
 ## 32. Decoder Failure Isolation
 
-_Removed in v2.0 (see §29)._
+_Removed (see §29)._
 
 ---
 
-# Part IX — NMEA0183 Decoder (removed in v2.0)
+# Part IX — NMEA0183 Decoder (removed)
 
 ## 33. NMEA0183 Scope
 
-_Removed in v2.0. `Listener` no longer decodes NMEA0183. NMEA data is carried,
-displayed, searched, and recorded as ordinary stream bytes. v2.2 reacquires the
+_Removed. `Listener` no longer decodes NMEA0183. NMEA data is carried,
+displayed, searched, and recorded as ordinary stream bytes. The spec reacquires the
 `nmea0183` crate only to construct presentation-only ZDA Mark text (§50.2, ADR-025);
 no received bytes are parsed through it._
 
 ## 34. NMEA Message Boundary Requirement
 
-_Removed in v2.0 (see §33)._
+_Removed (see §33)._
 
 ## 35. NMEA Metadata
 
-_Removed in v2.0 (see §33)._
+_Removed (see §33)._
 
 ## 36. NMEA Checksum Validation
 
-_Removed in v2.0 (see §33)._
+_Removed (see §33)._
 
 ## 37. NMEA Validation Modes
 
-_Removed in v2.0 (see §33)._
+_Removed (see §33)._
 
 ## 38. NMEA Proprietary Sentences
 
-_Removed in v2.0 (see §33)._
+_Removed (see §33)._
 
 ## 39. NMEA Multi-Sentence Groups
 
-_Removed in v2.0 (see §33)._
+_Removed (see §33)._
 
 ---
 
@@ -784,7 +784,7 @@ Display functions shall not modify:
 
 ## 41. Display Source
 
-A Display View operates on the received **byte stream** — the verbatim sequence of bytes as received (§17–18). There is a single source; the former per-view Stream/Messages source selector is removed in v2.0. The Channel's one view renders that stream in its selected mode, switchable at any time (§42, §48).
+A Display View operates on the received **byte stream** — the verbatim sequence of bytes as received (§17–18). There is a single source; the former per-view Stream/Messages source selector is removed. The Channel's one view renders that stream in its selected mode, switchable at any time (§42, §48).
 
 ## 42. Display Modes
 
@@ -882,7 +882,7 @@ Display View configuration may include:
 
 ## 48. Display View
 
-_Amended in v2.1 (ADR-023): one logical Display View per Channel._
+_Amended by ADR-023: one logical Display View per Channel._
 
 Each Channel has exactly **one** Display View. Raw, Rendered, and Hex are that
 view's switchable **modes** (§42), not separate simultaneous views; the per-view
@@ -890,13 +890,13 @@ settings of §46–§47 and the pause of §50 apply to this single view, so "the
 is paused" and "the Channel's display is paused" mean the same thing.
 
 The profile schema's `views` list (§78) is retained for forward compatibility;
-v2.1 reads exactly one entry and ignores the rest. Multiple simultaneous views
+The runtime reads exactly one entry and ignores the rest. Multiple simultaneous views
 (e.g. Raw + Hex side by side, each independently paused) are deferred —
 Appendix A.
 
 ## 49. Metadata Display
 
-_Removed in v2.0. There are no Messages and no per-Message metadata to display; a view shows the stream bytes only._
+_Removed. There are no Messages and no per-Message metadata to display; a view shows the stream bytes only._
 
 ## 50. Display Pause
 
@@ -908,7 +908,7 @@ When Display is Paused:
 
 ## 50.1 Sink Subsampling
 
-_Removed in v2.0. Subsampling was a Message-oriented filter (`.dat` → `.ssdat`); with no Messages it does not apply. Raw recording is byte-exact and full-fidelity-or-off (§53); Display recording captures the rendered stream (§54)._
+_Removed. Subsampling was a Message-oriented filter (`.dat` → `.ssdat`); with no Messages it does not apply. Raw recording is byte-exact and full-fidelity-or-off (§53); Display recording captures the rendered stream (§54)._
 
 ## 50.2 Find and Triggers
 
@@ -1363,7 +1363,7 @@ struct ChannelConfig {
 }
 ```
 
-The `extraction` and `decoder` fields are removed in v2.0 (there is no Message
+The `extraction` and `decoder` fields are removed (there is no Message
 Extraction or decoding); `schema_version` bumps for this breaking change (§72.1).
 
 ### 72.1 Schema Version Compatibility
@@ -1462,7 +1462,7 @@ status/snapshot for troubleshooting.
 
 ## 77. Decoder Configuration
 
-_Removed in v2.0. There is no decoder (§29); `DecoderConfig` is gone._
+_Removed. There is no decoder (§29); `DecoderConfig` is gone._
 
 ## 78. Display Configuration
 
@@ -1484,7 +1484,7 @@ struct DisplayViewConfig {
 ```
 
 The `source`, `timestamp`, `annotations`, and `subsample` fields are removed in
-v2.0: there is one source (the stream, §41), no per-Message annotations or
+There is one source (the stream, §41), no per-Message annotations or
 timestamps (§49), and no subsampling (§50.1).
 
 ## 79. Recording Configuration
@@ -1515,7 +1515,7 @@ struct DisplayRecordingConfig {        // §54 — the rendered view output (.di
                                        //   timestamp is the per-match Mark (§50.2)
 ```
 
-The single `RecordingConfig`/`RecordingMode` (Disabled/Raw/Display/Both) of v2.0 is
+The former single `RecordingConfig`/`RecordingMode` (Disabled/Raw/Display/Both) is
 removed: the four modes are now two `enabled` bools, and "Both" is simply both enabled
 to their own destinations. The `subsample` field is removed (§50.1); raw recording is
 byte-exact-or-off. Splitting the config bumps `schema_version` to 3 (a clean break —
@@ -1643,7 +1643,7 @@ Display: Raw + Hex
 
 ## 83. NMEA Serial Template
 
-_Removed in v2.0. There is no NMEA-specific template — NMEA arrives as ordinary stream bytes on a Serial channel (§33). Use the Serial template (§82); a common NMEA serial port is 4800 8N1._
+_Removed. There is no NMEA-specific template — NMEA arrives as ordinary stream bytes on a Serial channel (§33). Use the Serial template (§82); a common NMEA serial port is 4800 8N1._
 
 ## 84. UDP Template
 
@@ -2103,7 +2103,7 @@ held across transport I/O, retry sleep, or queue waiting.
 
 ## 105. Extractor Ownership
 
-_Removed in v2.0. There is no extractor (§20)._
+_Removed. There is no extractor (§20)._
 
 ## 106. Liveness Ownership
 
@@ -2111,7 +2111,7 @@ The activity/liveness stage owns the per-Channel byte counter and last-data time
 
 ## 107. Decoder Ownership
 
-_Removed in v2.0. There is no decoder (§29)._
+_Removed. There is no decoder (§29)._
 
 ## 108. Fan-Out Ownership
 
@@ -2329,7 +2329,7 @@ consumer or a compile-time concern justifies it) without disturbing the module A
 
 This also corrects the original sketch, which nested `nmea0183/` inside `listener`.
 In this workspace `nmea0183` is a **top-level sibling crate**, shared with `talker`.
-ADR-010 removed Listener's decoder and its original dependency. v2.2 adds a narrowly
+ADR-010 removed Listener's decoder and its original dependency. ADR-025 adds a narrowly
 scoped construction-only dependency for ZDA Mark presentation text (ADR-025); it does
 not restore decoding (§29).
 
@@ -2408,11 +2408,11 @@ Does not know about:
 - Display
 - Recording format
 
-### listener-extract — removed in v2.0
+### listener-extract — removed
 
 There is no extraction module; received bytes are a verbatim stream (§20).
 
-### listener-decode — removed in v2.0
+### listener-decode — removed
 
 There is no decoder module. The `nmea0183` dependency is construction-only for ZDA
 Mark presentation text and never receives stream bytes (§29, ADR-025).
@@ -2538,11 +2538,11 @@ pub enum RecordingState {
 
 ## 131. Message
 
-_Removed in v2.0. There are no Messages; received data is a verbatim stream (§17–18)._
+_Removed. There are no Messages; received data is a verbatim stream (§17–18)._
 
 ## 132. Message Metadata
 
-_Removed in v2.0 (see §131)._
+_Removed (see §131)._
 
 ## 133. Timestamp
 
@@ -2570,18 +2570,18 @@ capture into the receive path but remain datagram-granular and are not hardware 
 
 ## 134. Protocol Metadata
 
-_Removed in v2.0. There is no decoder to produce protocol metadata (§29)._
+_Removed. There is no decoder to produce protocol metadata (§29)._
 
 ## 135. Integrity Metadata
 
-_Removed in v2.0 (see §28, §134)._
+_Removed (see §28, §134)._
 
 ## 136. Runtime Commands
 
 Commands flow UI → runtime as direct `Listener` async method calls — there is no
 `RuntimeCommand` enum (listener ADR-012). The orchestrator exposes one method per
 operation: `start` / `stop` / `apply_pending` (§13), `enable_recording` /
-`disable_recording`, `pause_display` / `resume_display` (§11), and the v1.2 live
+`disable_recording`, `pause_display` / `resume_display` (§11), and the live
 controls `set_rts` / `set_dtr` (§14.3). Network live-adjustment (§76.1 — multicast
 join/leave, receive-buffer) and match-rule commands (`SetMatchRuleEnabled`, `MarkNow`,
 §50.2) land as further methods plus an internal command channel into the per-Channel
@@ -2605,7 +2605,7 @@ pub enum RuntimeEvent {
     WarningRaised(ChannelId),
     TcpClientConnected(ChannelId),
     TcpClientDisconnected(ChannelId),
-    // v1.2 additions
+    // Live-adjustment additions
     ReceptionStalled(ChannelId, Duration),    // §101/ADR-007: dedicated, replaces the WarningRaised overload
     ControlLinesChanged(ChannelId),           // §14.3: input CTS/DSR/DCD/RI changed — poll snapshot for detail
     MatchTriggered(ChannelId, MatchRuleId),   // §50.2: a rule fired (Notify/Mark observable here)
@@ -2703,11 +2703,11 @@ pub struct NewConnection {
 
 ## 139. Message Extractor Trait
 
-_Removed in v2.0. There is no extractor (§20)._
+_Removed. There is no extractor (§20)._
 
 ## 140. Decoder Trait
 
-_Removed in v2.0. There is no decoder (§29)._
+_Removed. There is no decoder (§29)._
 
 ## 141. Renderer Trait
 
@@ -2798,7 +2798,7 @@ Recommended `.vscode/settings.json`:
 
 ## 147. Development Order
 
-Recommended implementation order (v2.0; for the v1→v2 strip, follow ADR-010's build order):
+Recommended implementation order (for the strip to stream-only, follow ADR-010's build order):
 
 1. `listener-core` (`ChunkTime`, channel IDs/states)
 2. transport contracts + `ReceivedData` + queue/backpressure tests (the single
@@ -2856,7 +2856,7 @@ Required tests:
 
 ## 151. NMEA Tests
 
-_Removed in v2.0. There is no NMEA decoder to test (§29); NMEA data is exercised as ordinary stream bytes by the stream display/recording tests._
+_Removed. There is no NMEA decoder to test (§29); NMEA data is exercised as ordinary stream bytes by the stream display/recording tests._
 
 ## 152. Backpressure Tests
 
@@ -2909,7 +2909,7 @@ A user shall be able to:
 - Define a `BytePattern` find rule and observe its matches fire: the rule's firings
   appear in the recent-matches log (snapshot `matches`, §165) and a `Mark` action
   splices its marker/timestamp inline at the matched offset (§50.2). (On-screen
-  byte-range highlighting was removed in v2.0 — ADR-015.)
+  byte-range highlighting was removed — ADR-015.)
 - Define an `Idle` rule and have it fire after the configured quiet time.
 - Attach `Record` / `Notify` / `Mark` actions to a rule and observe them fire.
 
@@ -2971,13 +2971,13 @@ Profile loading shall not:
 
 ## 160. NMEA0183
 
-_Removed in v2.0. There is no NMEA decoder (§29); NMEA arrives as ordinary stream bytes._
+_Removed. There is no NMEA decoder (§29); NMEA arrives as ordinary stream bytes._
 
 ---
 
-# Part XXIX.1 — Acceptance Criteria (v1.2 addendum)
+# Part XXIX.1 — Acceptance Criteria — troubleshooting and long-run logging
 
-The v1.2 feature set (revision note at the top of this document) is **required**,
+The troubleshooting and long-run logging feature set is **required**,
 not optional spec detail, and carries its own acceptance bar. Each criterion below
 is unverified end-to-end until proven.
 
@@ -3003,7 +3003,7 @@ filesystem-unsafe channel name at config time (§59, §71).
 
 ## 164. Subsampling
 
-_Removed in v2.0 (§50.1). Raw recording is byte-exact-or-off; there is no message-framed `.ssdat`._
+_Removed (§50.1). Raw recording is byte-exact-or-off; there is no message-framed `.ssdat`._
 
 ## 165. Find and Triggers
 
@@ -3034,7 +3034,7 @@ space, and rotation countdown (§56.2).
 
 # Appendix A — Deferred Features
 
-Deferred in v2.1:
+Deferred (ADR-023/ADR-024):
 
 - Multiple simultaneous Display Views per Channel (§48 — one view with switchable
   modes ships; per-view render state would be required for independent pause)
@@ -3117,7 +3117,7 @@ this specification**, not agent advice, and remain in their authoritative locati
 - *Deferred features* (no automatic protocol detection, no protocol field extraction,
   no CSV/JSON export, no TCP client mode) — Appendix A.
 - *Immutable received chunks, GUI out of core* — §103 and listener [`ADR.md`](ADR.md)
-  ADR-010 (decoders and Messages are removed in v2.0).
+  ADR-010 (decoders and Messages are removed).
 - *Display formatting must not affect Raw Recording* — §5.6 / §53–§54.
 - *Runtime TCP Connection Channels are not persisted* — the TCP transport sections.
 

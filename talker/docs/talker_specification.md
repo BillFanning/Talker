@@ -902,7 +902,7 @@ version = 2
 name = "GPS sim"
 
 [[channels]]
-name = "GPS feed"   # optional display name (v2.1); omitted when unnamed
+name = "GPS feed"   # optional display name; omitted when unnamed
 timing_mode = "precise" # optional; omitted when Standard
 cadence_alignment = "utc_phase" # optional; omitted when Immediate
 type = "serial"
