@@ -708,14 +708,16 @@ far this evidence reaches.";
 pub(super) const MISSED_ROUTING_LIMITS: &str =
     "Where missed sends point, and how far: a miss charged to a message is counted as the \
 cadence point is skipped, so that share is measured rather than inferred, and unlike delay it \
-does not thin out as overload gets worse. Its own limits are narrower. A point is charged to \
-whichever message was inside its interface write as the point passed, so a message that holds \
-the channel some other way is not charged; and a message is never charged for its own skipped \
-points, which show up instead as a send call longer than its interval. Misses left uncharged \
-were skipped with the thread free — a late deadline wake, or the machine suspended — and no \
-message caused them. The rest of the line is weaker evidence: the counts weighed are run \
-totals, so a fault that has since recovered still appears, and the capacity finding is a \
-projection rather than a measurement.";
+does not thin out as overload gets worse. A skipped run is split across every write it spans, \
+so a stall containing several sends charges each with its own part. Its limits are narrower. A \
+point is charged to whichever message was inside its interface write as the point passed, so a \
+message that holds the channel some other way is not charged; and a message is never charged \
+for its own skipped points, which show up instead as a send call longer than its interval. \
+Only the last few dozen sends are retained, so a point skipped behind an older one goes \
+uncharged: an uncharged miss means this record cannot place it, not that the channel was idle, \
+which is why the line says \"not charged\" and never \"nothing was running\". The rest of the \
+line is weaker evidence: the counts weighed are run totals, so a fault that has since recovered \
+still appears, and the capacity finding is a projection rather than a measurement.";
 
 /// Evidence available when scheduled sends are being skipped.
 ///
@@ -793,41 +795,61 @@ pub(super) fn missed_send_routing(
     } else if serial_oversubscribed {
         "Missed sends: the serial line cannot carry this schedule — see Capacity.".to_owned()
     } else if let Some((index, message)) = convicted {
-        // The one branch entitled to say "caused". Every point counted here was
-        // charged while the named message's send held the thread, so this is an
-        // amount, not a lead to follow.
-        let hold = if message.longest_block.is_zero() {
-            String::new()
-        } else {
-            format!(
-                ", the longest for {}",
-                compact_duration(message.longest_block)
-            )
-        };
+        // The one branch entitled to state an amount rather than a lead: every
+        // point counted here was charged while some message's send held the
+        // thread.
+        //
+        // All three quantities appear. Naming only the largest culprit and the
+        // shortfall drops every other charged message out of a sentence whose
+        // numbers are supposed to add up — with 5 to #2, 4 to #3 and 3
+        // uncharged, the old wording said 5 and 3 of 12.
         let attributed: u64 = per_message
             .iter()
             .map(|message| message.missed_others)
             .sum();
-        // The rest were skipped with the thread free. Naming that share stops
-        // the reader from generalizing one message's blame to the whole count.
-        let idle = missed.saturating_sub(attributed);
-        let remainder = if idle == 0 {
+        let headline = if attributed >= missed {
+            format!(
+                "all {} are charged to sends that held the channel",
+                thousands(missed)
+            )
+        } else {
+            format!(
+                "{} of {} are charged to sends that held the channel",
+                thousands(attributed),
+                thousands(missed)
+            )
+        };
+        let largest = if message.missed_others == attributed {
+            format!(", all to message #{}", index + 1)
+        } else {
+            format!(
+                ", most to message #{} with {}",
+                index + 1,
+                thousands(message.missed_others)
+            )
+        };
+        let hold = if message.longest_block.is_zero() {
             String::new()
         } else {
             format!(
-                " The other {} passed with the channel thread free, so no send caused them — \
-                 suspect late deadline wakes instead.",
-                thousands(idle)
+                " Its longest send held the channel {}.",
+                compact_duration(message.longest_block)
             )
         };
-        format!(
-            "Missed sends: message #{} caused {} of them — its sends held the channel as those \
-             cadence points passed{}.{} See Per-message timing.",
-            index + 1,
-            thousands(message.missed_others),
-            hold,
-            remainder,
-        )
+        // Uncharged is not idle, and nothing here can tell the two apart: a
+        // point goes uncharged both when the thread was genuinely free and
+        // when the send that held it has aged out of the retained window.
+        // Stating it as idle time was a claim the measurement never supported.
+        let remainder = if attributed >= missed {
+            String::new()
+        } else {
+            format!(
+                " The other {} are not charged to any send — either a late deadline wake, or a \
+                 hold too far back to still be retained.",
+                thousands(missed - attributed)
+            )
+        };
+        format!("Missed sends: {headline}{largest}.{hold}{remainder} See Per-message timing.")
     } else if let Some((index, message)) = blocker {
         // Two different quantities, and only one of them is an elapsed hold:
         // the longest blocking send is what the channel actually spent, while
@@ -1481,14 +1503,12 @@ mod tests {
         assert!(unexplained.text.contains("no message delayed another"));
     }
 
-    /// The one branch entitled to convict rather than route, and the boundary
-    /// that keeps it honest. Misses charged at the skip are evidence about the
-    /// misses themselves, so this outranks the delay-based lead above — but
-    /// only for the share actually charged. The remainder passed with the
-    /// thread free, and absorbing it into the named message would convert a
-    /// measurement back into the inference this replaced.
+    /// The one branch entitled to state an amount rather than a lead, and the
+    /// two things that keep it honest: every charged miss is accounted for,
+    /// and the uncharged remainder is described as uncharged rather than as
+    /// idle time the measurement never observed.
     #[test]
-    fn measured_misses_convict_and_still_name_the_share_nobody_caused() {
+    fn measured_misses_state_an_amount_without_overclaiming_the_remainder() {
         let culprit = MessageTiming {
             blocked_others: Duration::from_millis(430),
             blocking_sends: 4,
@@ -1510,18 +1530,67 @@ mod tests {
         let all = missed_send_routing(&evidence(9), &per_message).unwrap();
         assert_eq!(
             all.text,
-            "Missed sends: message #2 caused 9 of them — its sends held the channel as those \
-             cadence points passed, the longest for 120 ms. See Per-message timing."
+            "Missed sends: all 9 are charged to sends that held the channel, all to message #2. \
+             Its longest send held the channel 120 ms. See Per-message timing."
         );
 
-        // Three more than any send can account for.
+        // Three the record cannot place. Uncharged is not idle — a send that
+        // has aged out of the retained window leaves the same gap as a free
+        // thread, and this line must not pick one of those.
         let partial = missed_send_routing(&evidence(12), &per_message).unwrap();
         assert!(
             partial
                 .text
-                .contains("The other 3 passed with the channel thread free"),
-            "an unattributable remainder must not be worn by the named message: {partial:?}"
+                .contains("The other 3 are not charged to any send"),
+            "the shortfall must be stated as uncharged: {partial:?}"
         );
+        assert!(
+            !partial.text.contains("thread free"),
+            "the measurement cannot see an idle thread, so it may not claim one: {partial:?}"
+        );
+    }
+
+    /// Every charged message has to survive into the sentence. Naming only the
+    /// largest culprit and the shortfall silently dropped the rest: with five
+    /// misses on #2, four on #3 and three uncharged, the line accounted for
+    /// eight of twelve and read as though it had covered all of them.
+    #[test]
+    fn the_routing_line_accounts_for_every_charged_miss() {
+        let hold = Duration::from_millis(120);
+        let per_message = [
+            MessageTiming::default(),
+            MessageTiming {
+                missed_others: 5,
+                longest_block: hold,
+                ..MessageTiming::default()
+            },
+            MessageTiming {
+                missed_others: 4,
+                longest_block: hold,
+                ..MessageTiming::default()
+            },
+        ];
+        let routing = missed_send_routing(
+            &MissedSendEvidence {
+                missed: 12,
+                interface_erroring: false,
+                failed: 0,
+                serial_oversubscribed: false,
+                service: None,
+            },
+            &per_message,
+        )
+        .unwrap();
+
+        // The charged total, the run total, the largest single share, and the
+        // part that could not be placed — all four, or the arithmetic does not
+        // close for the reader.
+        assert!(routing.text.contains("9 of 12 are charged"), "{routing:?}");
+        assert!(
+            routing.text.contains("most to message #2 with 5"),
+            "{routing:?}"
+        );
+        assert!(routing.text.contains("The other 3"), "{routing:?}");
     }
 
     #[test]

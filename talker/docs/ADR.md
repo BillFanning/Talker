@@ -11,11 +11,13 @@ Revision note (misses are measured where they happen):
   10 ms cadence destroys a thousand cadence points and yields one lateness
   sample — the evidence thinned out as the fault grew. `Schedule::poll` now
   reports the points it skips, and each is charged to whichever send held the
-  thread as it passed, by ADR-045's own rule. The missed-send callout gains one
-  branch entitled to convict, and must state the share it cannot account for.
-  ADR-045's refusal of a *victim-side* miss count still stands and is unchanged.
+  thread as it passed — searched over a retained send history sized from the
+  schedule, so a channel cannot outgrow its own attribution. The missed-send
+  callout gains one branch entitled to convict, and must state the share it
+  cannot account for. ADR-045's refusal of a *victim-side* miss count still
+  stands and is unchanged.
 
-Revision note for 1.13 (four accents, and one rule):
+Revision note (2026-08-06) — four accents, and one rule:
 
 - **ADR-050** reduces the palette from ten colours to four — `fault`, `warning`,
   `running`, `idle`, the same states `SignalTone` already names. Five greys were
@@ -28,7 +30,7 @@ Revision note for 1.13 (four accents, and one rule):
   Running and Reconnecting shared the `●` glyph and differed only by the two
   colours already confirmed indistinguishable.
 
-Revision note for 1.12 (the fault colour becomes visible):
+Revision note (2026-08-06) — the fault colour becomes visible:
 
 - **ADR-049** makes the fault colour blue. Red was not distinguishable from the
   amber warning under a red-green colour deficiency, so the applications' most
@@ -38,7 +40,7 @@ Revision note for 1.12 (the fault colour becomes visible):
   colour-only defects are recorded in the TODO rather than fixed here, along
   with the larger question of whether ten colours are needed at all.
 
-Revision note for 1.11 (semantic color has one source):
+Revision note (2026-08-05) — semantic color has one source:
 
 - **ADR-048** routes Talker's remaining hardcoded status, severity and
   destructive colors through `wiredata_ui::palette`, so a fault in the log panel
@@ -53,7 +55,7 @@ Revision note for 1.11 (semantic color has one source):
   remains in use for the card's two strokes. What changed is three call sites
   that blended it into the panel fill.
 
-Revision note for 1.10 (the warm-up gate retires):
+Revision note (2026-07-31) — the warm-up gate retires:
 
 - **ADR-046** removes the twenty-sample warm-up gate from Talker's readouts. It
   never guarded a bad computation: the percentile rank is
@@ -67,7 +69,7 @@ Revision note for 1.10 (the warm-up gate retires):
   `MIN_SERVICE_SAMPLES` is a different gate — it guards the headroom projection —
   and stays. Listener's migration is pending and recorded as deliberate.
 
-Revision note for 1.9 (measured blame for deadline delay):
+Revision note (2026-07-31) — measured blame for deadline delay:
 
 - **ADR-045** adds per-message timing and, with it, the missing half of every
   cadence readout Talker had. Deadline lateness names only the *victim* — and
@@ -80,7 +82,7 @@ Revision note for 1.9 (measured blame for deadline delay):
   The clipboard report gains per-message timing keys; no profile schema, wire
   output, or cadence behavior changes.
 
-Revision note for 1.8 (one vocabulary, each counted fact rendered once):
+Revision note (2026-07-28) — one vocabulary, each counted fact rendered once:
 
 - **ADR-044** settles *interface* as the term for a configured serial/UDP/TCP
   endpoint, reserving *connection* for Listener's accepted TCP peer sessions, and
@@ -94,7 +96,7 @@ Revision note for 1.8 (one vocabulary, each counted fact rendered once):
   as its value. No profile schema, clipboard-report keys, wire output, or cadence
   behavior changes.
 
-Revision note for 1.7 (telemetry ownership across the two applications):
+Revision note (2026-07-27) — telemetry ownership across the two applications:
 
 - **ADR-043** records why only Talker's timing telemetry carries a capture instant.
   Talker pushes collapsed snapshots from its send path, so they age between
@@ -106,7 +108,7 @@ Revision note for 1.7 (telemetry ownership across the two applications):
   runner. The two panels stay consistent in vocabulary rather than mechanism. See
   listener ADR-035 for the same decision from Listener's side.
 
-Revision note for 1.6 (truthful pushed-snapshot freshness), which introduced
+Revision note (2026-07-27) — truthful pushed-snapshot freshness, which introduced
 ADR-039 through ADR-042:
 
 - **ADR-039** moves the bounded duration-histogram buckets and the ten-segment
@@ -1944,12 +1946,35 @@ channel-wide `missed_sends` total. The skipped points lie at
 one of them on the timeline.
 
 `MessageTiming::missed_others` counts, for each message, the cadence points
-**other** messages lost while its own sends held the channel. The charging rule
-is ADR-045's, unchanged and now shared as one function (`blocker_for`): a point
-is charged to whichever send spanned the moment it passed; a backlog stays with
-the send that opened it; a point that passed with the thread free is charged to
-nobody; and a message is never charged for its own points, which are already
-visible as a send call longer than its interval.
+**other** messages lost while its own sends held the channel. A point is charged
+to whichever send spanned the moment it passed, and a message is never charged
+for its own points, which are already visible as a send call longer than its
+interval.
+
+A skipped run is **partitioned** across every retained send window it overlaps.
+A stall long enough to skip points is usually long enough to contain several
+writes — most commonly at startup, where every message is due at once and the
+runner drains them one at a time — so assigning the run to a single send would
+credit one message with damage the others did. Partitioning also makes the
+backlog rule unnecessary on this path: a quick catch-up send owns only the
+points inside its own brief window, which is almost never any, so it cannot
+inherit a burst it is clearing.
+
+**Correction (2026-08-06, before release).** This entry first specified the
+charge against a single retained send window and described the shortfall as
+points that "passed with the thread free". Both were wrong. The recorder kept
+one completed window, so a deadline or a skip behind an *earlier* write in the
+same busy stretch matched nothing — the startup case above went entirely
+uncharged — and ADR-045's `blocked_others` had carried the same hole silently
+since it shipped. Calling the shortfall idle time then converted a gap in the
+record into an affirmative claim about the machine. The record now retains
+`RETAINED_SENDS` windows and both paths search them, which closes the delay
+hole as well; and an uncharged point is reported as **unattributed**, never as
+idle, because reaching the end of the retained history produces exactly the same
+silence as a genuinely free thread and nothing here can tell them apart. (The
+history was first capped at a constant, which the same review then pointed out
+was a number with no matching limit anywhere in the scheduler; it is now derived
+as above.)
 
 Two details the arithmetic forced:
 
@@ -1971,13 +1996,26 @@ for it. Its own limits are narrower than the old ones but real: a point is
 charged to whichever message was inside its *interface write* when the point
 passed, so a message that holds the channel some other way is not charged
 (render is 1–3 µs and below the histogram's first bucket, which is why the send
-call is the only window measured). Misses left uncharged were skipped with the
-thread free — a late deadline wake, or the machine suspended — and the callout
-states that remainder rather than letting the named message wear it. Absorbing
-it would convert the measurement straight back into the inference this replaces.
+call is the only window measured).
 
-**Consequences:** `MessageTiming` gains one `u64`; the recorder gains one
-saturating add per tick that skipped anything, and no allocation. The
+The retained history is sized from the message count rather than capped at a
+constant, and the size is a consequence rather than a budget: between two
+deadlines of the same message, every *other* message can send at most once,
+because a message is only serviced ahead of an overdue one if its own deadline
+is earlier, and firing advances it past that deadline under the stall policy.
+One window per message is therefore always enough to answer, and a schedule
+that grows widens its own reach.
+
+The callout must therefore state three quantities: the charged total, the
+largest single share, and the remainder — and must describe the remainder as
+**not charged to any send**, not as idle time. Naming only the largest culprit
+and the shortfall drops every other charged message out of a sentence whose
+numbers are supposed to add up.
+
+**Consequences:** `MessageTiming` gains one `u64`; the recorder gains a ring of
+send windows one deep per message (tens of bytes each, alongside the ~0.5 kB of
+histograms that message already carries) and one saturating add per overlapping
+window on a tick that skipped anything, with no allocation on the send path. The
 clipboard report gains a `per_message_missed_others` lane which sums to at most
 `missed_sends`, so the unattributed share is a subtraction the reader can do
 from two adjacent lines. The per-message table's **Delay caused** column becomes

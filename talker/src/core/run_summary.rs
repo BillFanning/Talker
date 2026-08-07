@@ -182,8 +182,8 @@ impl RunSummary {
             |m| m.longest_block.as_micros().to_string(),
         );
         // Sends lost rather than delayed. This lane sums to at most
-        // `missed_sends`; the shortfall is what was skipped with the thread
-        // idle, which no message is answerable for.
+        // `missed_sends`; the shortfall is what could not be charged to a
+        // retained send, which is weaker than saying the thread was idle.
         write_per_message(&mut out, "missed_others", &self.per_message_timing, |m| {
             m.missed_others.to_string()
         });
@@ -417,7 +417,7 @@ mod tests {
         assert!(report.contains("per_message_blocked_others_us=0,430000\n"));
         assert!(report.contains("per_message_blocking_sends=0,4\n"));
         // The miss lane sums to at most the run's `missed_sends`; the gap is
-        // what was skipped with the thread idle, and a reader can take that
+        // what no retained send accounts for, and a reader can take that
         // difference straight off these two lines.
         assert!(report.contains("per_message_missed_others=0,2\n"));
         assert!(report.contains("missed_sends=3\n"));

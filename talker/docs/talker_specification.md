@@ -1,9 +1,19 @@
 # Talker — Program Specification
-**Version:** 2.4.8
+**Version:** 2.4.9
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (a missed send names its cause):
+Revision note (2026-08-06) — a missed send names its cause, honestly:
+
+- **§3.2 missed-send routing (ADR-051, corrected)** — the amount-stating branch
+  must close its own arithmetic: charged total, largest single share, and
+  remainder. Naming only the largest culprit dropped every other charged message
+  out of the sentence. The remainder is stated as **not charged to any send** and
+  never as an idle channel — a miss goes uncharged both when the thread was free
+  and when the send that held it has aged out of the retained record, and nothing
+  measured can tell those apart.
+
+Revision note (2026-08-06) — a missed send names its cause:
 
 - **§3.2 missed-send routing (ADR-051)** — one branch of the callout may now
   convict rather than route: misses charged at the moment they were skipped are
@@ -17,7 +27,7 @@ Revision note (a missed send names its cause):
   shown is the culprit's, and unlike the delay figures beside it, it does not
   thin out under heavy overload.
 
-Revision note for 2.4.7 (no warm-up state; skipped sends name a cause):
+Revision note (2026-07-31) — no warm-up state; skipped sends name a cause:
 
 - **§3.2 Cadence (ADR-046)** — the twenty-sample warm-up state is removed. Below
   a hundred samples the p99 bucket *is* the maximum's bucket, so the gate only
@@ -515,10 +525,13 @@ The **detail pane** (right) shows the selected channel:
     fault that has since recovered is described in the past tense; a capacity
     finding is a projection; and delay-based blocking evidence is qualified
     because it comes from deadlines the channel reached rather than the ones it
-    skipped. The convicting branch must also state the share it **cannot**
-    account for: misses skipped with the channel thread free belong to no
-    message, and folding them into the named one would turn the measurement back
-    into an inference.
+    skipped. The amount-stating branch must close its own arithmetic: the
+    charged total, the largest single share, and the remainder, so that a reader
+    is never left to infer where the rest went. That remainder is described as
+    **not charged to any send** and never as an idle channel — a miss goes
+    uncharged both when the thread was genuinely free and when the send that
+    held it has aged out of the retained record, and nothing measured can tell
+    those apart.
   - *Per-message timing (ADR-045, amended by ADR-051):* a collapsed table, one
     row per message numbered as in the Messages editor, with seven columns —
     **Msg**, **Interval**, **Sends**, **Late**, **Send call**, **Longest
@@ -531,7 +544,10 @@ The **detail pane** (right) shows the selected channel:
     be presented as a duration the channel was held — and the cadence points
     others lost outright while it was sending. Neither converts into the other.
     All three come from charging each deadline, and each skipped point, to
-    whichever send was holding the channel when it passed. Because a channel
+    whichever send in the retained history was holding the channel when it
+    passed. That history is sized from the schedule — a deadline is separated
+    from its handling by at most one send per other message — so a longer
+    message list widens the reach rather than exhausting it. Because a channel
     handles its messages one at a time, the message
     recording the lateness and the message causing it are routinely different
     rows; the table exists so that comparison is a single read across a row. An
