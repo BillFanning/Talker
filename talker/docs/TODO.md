@@ -109,10 +109,12 @@ Fixed, with the reasoning in the ADRs named — not restated here:
 
 Still open:
 
-- [ ] **Split `talker/src/gui/diagnostics.rs`** (~1,800 lines). Formatting, view
-  models, thresholds, causal routing and prose in one file. Natural seams:
-  `cadence`, `capacity`, `per_message`, `missed_routing`. Pure movement, so it
-  wants its own commit rather than riding on a fix.
+- [x] **Split `talker/src/gui/diagnostics.rs`** — done 2026-08-07. One submodule
+  per readout family (`outcomes`, `capacity`, `cadence`, `per_message`,
+  `missed_routing`, `timing`), each owning its wording, thresholds and tests;
+  `mod.rs` keeps only what more than one row needs and re-exports flat, so no
+  call site changed. Movement only — every function name and all 28 tests are
+  the same, verified line by line against the original.
 - [ ] **Only the interface write counts as holding the channel.** See the
   entry under the ADR-045 review disposition below.
 
