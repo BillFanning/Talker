@@ -25,11 +25,11 @@ do not guess and proceed.
 
 Each crate owns a `docs/` folder:
 
-| Crate | Spec | Decisions | Tasks |
-|-------|------|-----------|-------|
-| `talker` | [talker/docs/talker_specification.md](talker/docs/talker_specification.md) | [talker/docs/ADR.md](talker/docs/ADR.md) | [talker/docs/TODO.md](talker/docs/TODO.md) |
-| `nmea0183` | [nmea0183/docs/nmea0183_specification.md](nmea0183/docs/nmea0183_specification.md) | [nmea0183/docs/ADR.md](nmea0183/docs/ADR.md) | [nmea0183/docs/TODO.md](nmea0183/docs/TODO.md) |
-| `listener` | [listener/docs/listener_specification.md](listener/docs/listener_specification.md) | [listener/docs/ADR.md](listener/docs/ADR.md) | [listener/docs/TODO.md](listener/docs/TODO.md) |
+| Crate | Spec | Decisions | Tasks | Superseded revision notes |
+|-------|------|-----------|-------|---------------------------|
+| `talker` | [talker/docs/talker_specification.md](talker/docs/talker_specification.md) | [talker/docs/ADR.md](talker/docs/ADR.md) | [talker/docs/TODO.md](talker/docs/TODO.md) | [talker/docs/REVISIONS.md](talker/docs/REVISIONS.md) |
+| `nmea0183` | [nmea0183/docs/nmea0183_specification.md](nmea0183/docs/nmea0183_specification.md) | [nmea0183/docs/ADR.md](nmea0183/docs/ADR.md) | [nmea0183/docs/TODO.md](nmea0183/docs/TODO.md) | — |
+| `listener` | [listener/docs/listener_specification.md](listener/docs/listener_specification.md) | [listener/docs/ADR.md](listener/docs/ADR.md) | [listener/docs/TODO.md](listener/docs/TODO.md) | [listener/docs/REVISIONS.md](listener/docs/REVISIONS.md) |
 
 - `wiredata-ui` (the shared GUI-chrome crate) has **no** `docs/` folder: it is internal
   and small by design. Its decisions live in the app ADR series — talker ADR-016 and
@@ -59,7 +59,27 @@ TODOs, and any other versioned file):
 - **Never change a version number without checking with the user first.** Get explicit
   approval before any bump.
 - **Every version change ships with a revision note** at the top of the document,
-  summarizing what changed.
+  summarizing what changed. Label it with a **date**, never a version — the version
+  is already in the header, and a body that repeats it breaks the rule above.
+- **Keep only the current revision note** in the document. When a bump supersedes the
+  previous note, move that note to the crate's `REVISIONS.md` (newest first). The
+  history is worth keeping and is not worth making every reader cross to reach §1.
+
+### What goes where
+
+A fact belongs in exactly one of these. When a reviewer says the same fix is
+explained in seven places, this is the rule that was not applied:
+
+| Document | States |
+|----------|--------|
+| Spec | **Current behaviour.** Not how it got there. |
+| ADR | The **durable decision** and the boundary it does *not* cross — including a correction, when a decision is later found wrong. |
+| TODO | Work **outstanding**. A completed investigation belongs in the ADR it produced. |
+| Test | The **case**, and what the assertion does and does not prove. |
+| Commit message | The **debugging story**: what the old behaviour was, what failed, which review raised it. |
+
+Rustdoc describes what exists. It is not a memorial for deleted code — that is
+what the commit and, where a decision was involved, the ADR are for.
 
 ## 3. Scope & workflow discipline
 

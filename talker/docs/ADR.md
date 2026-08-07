@@ -4,7 +4,7 @@
 **Date:** 2026-08-06
 **Status:** Accepted
 
-Revision note (misses are measured where they happen):
+Revision note (2026-08-06) — misses are measured where they happen:
 
 - **ADR-051** amends the scope limit ADR-045 set for itself. Delay blame is
   collected per deadline the channel *reaches*, so a ten-second block against a
@@ -17,112 +17,7 @@ Revision note (misses are measured where they happen):
   cannot account for. ADR-045's refusal of a *victim-side* miss count still
   stands and is unchanged.
 
-Revision note (2026-08-06) — four accents, and one rule:
-
-- **ADR-050** reduces the palette from ten colours to four — `fault`, `warning`,
-  `running`, `idle`, the same states `SignalTone` already names. Five greys were
-  emphasis rather than meaning and became the theme's own `weak_text_color`;
-  three more fields meant one thing in two places. The burden a palette carries
-  is *pairs*, not colours: ten is forty-five to keep distinguishable, four is
-  six, and two of the three ever checked had failed. It also states the rule the
-  whole accessibility pass produced — colour reinforces a state, it never
-  carries one alone — and fixes a live case found while applying it, where
-  Running and Reconnecting shared the `●` glyph and differed only by the two
-  colours already confirmed indistinguishable.
-
-Revision note (2026-08-06) — the fault colour becomes visible:
-
-- **ADR-049** makes the fault colour blue. Red was not distinguishable from the
-  amber warning under a red-green colour deficiency, so the applications' most
-  important signal was the one that did not arrive. Palette fields now name the
-  role and not the hue — `fault`, not `fault_red` — because a palette exists so
-  a colour can change, and this rename is that argument's own proof. Two further
-  colour-only defects are recorded in the TODO rather than fixed here, along
-  with the larger question of whether ten colours are needed at all.
-
-Revision note (2026-08-05) — semantic color has one source:
-
-- **ADR-048** routes Talker's remaining hardcoded status, severity and
-  destructive colors through `wiredata_ui::palette`, so a fault in the log panel
-  is the same red as a fault anywhere else in either application. The palette
-  gains `tint`, which derives a surface fill from an accent and the theme's own
-  panel color — replacing hand-named light/dark background pairs, which were the
-  same decision made twice and drifted the moment an accent changed. Content
-  annotation colors stay Talker-owned and are named as such.
-- **Correction (2026-08-05):** as first written, ADR-048 said the diagnostics
-  card's private `translucent` helper "is the same function" as `tint`. It is
-  not, and it still exists: `translucent` returns an alpha-adjusted color and
-  remains in use for the card's two strokes. What changed is three call sites
-  that blended it into the panel fill.
-
-Revision note (2026-07-31) — the warm-up gate retires:
-
-- **ADR-046** removes the twenty-sample warm-up gate from Talker's readouts. It
-  never guarded a bad computation: the percentile rank is
-  `ceil(samples × 99 / 100)`, which equals `samples` for any count up to 99, so
-  below a hundred samples the p99 bucket *is* the maximum's bucket and the gate
-  only relabelled the same number — at 20, while the two statistics separate at
-  100. Readouts now state the maximum with its sample count and add a percentile
-  only when `p99 < max`, a data-derived test needing no constant. The count is
-  stated once per line rather than beside every figure on it. Long runs gain a
-  figure they lacked, since a percentile alone hid one-off stalls.
-  `MIN_SERVICE_SAMPLES` is a different gate — it guards the headroom projection —
-  and stays. Listener's migration is pending and recorded as deliberate.
-
-Revision note (2026-07-31) — measured blame for deadline delay:
-
-- **ADR-045** adds per-message timing and, with it, the missing half of every
-  cadence readout Talker had. Deadline lateness names only the *victim* — and
-  because the scheduler skips `late / interval + 1` grid points, the victim is
-  almost always the message with the tightest interval rather than the one
-  responsible. The runner now charges a message with another's delay for the
-  portion that elapsed while its own send held the channel thread, keeps a
-  backlog charged to the send that opened it, and charges nothing when no send
-  spanned the deadline. Per-message miss counts are deliberately not offered.
-  The clipboard report gains per-message timing keys; no profile schema, wire
-  output, or cadence behavior changes.
-
-Revision note (2026-07-28) — one vocabulary, each counted fact rendered once:
-
-- **ADR-044** settles *interface* as the term for a configured serial/UDP/TCP
-  endpoint, reserving *connection* for Listener's accepted TCP peer sessions, and
-  renames the send readout to **Send outcomes** because it counts scheduled sends
-  rather than the interface. The counted outcomes now render in exactly one place
-  above the diagnostics card, which keeps only the readouts that need
-  interpretation, and the outcome line is stated as visible arithmetic
-  (`scheduled - failed - suppressed - missed = sent`) so the successful
-  remainder is defined by the equation rather than by a noun claiming more than
-  the application can observe. The shared row chrome tooltips its label as well
-  as its value. No profile schema, clipboard-report keys, wire output, or cadence
-  behavior changes.
-
-Revision note (2026-07-27) — telemetry ownership across the two applications:
-
-- **ADR-043** records why only Talker's timing telemetry carries a capture instant.
-  Talker pushes collapsed snapshots from its send path, so they age between
-  emissions; Listener collapses each recent window when a snapshot request is
-  served, so a capture instant there would always read "now". The rule is that
-  whichever application retains a collapsed snapshot across time owns proving its
-  age, and neither mechanism is ported to the other — a Listener capture instant
-  would be dead weight, and compute-on-demand on Talker would have to wake a dormant
-  runner. The two panels stay consistent in vocabulary rather than mechanism. See
-  listener ADR-035 for the same decision from Listener's side.
-
-Revision note (2026-07-27) — truthful pushed-snapshot freshness, which introduced
-ADR-039 through ADR-042:
-
-- **ADR-039** moves the bounded duration-histogram buckets and the ten-segment
-  recent window into `wiredata-telemetry`, so the two applications cannot drift
-  apart on the numbers they present.
-- **ADR-040** makes the timer-resolution guard lifecycle explicit and keeps Precise
-  deadline windows bounded.
-- **ADR-041** lets the diagnostics surface lead with decisions without hiding the
-  telemetry behind them.
-- **ADR-042** records the runner-supplied capture instant and explicit final
-  provenance that distinguish current, expired, and final timing evidence without
-  adding a dormant telemetry heartbeat. Capacity, Cadence, and detailed Timing now
-  consume one freshness classification, and expired recent timing cannot silently
-  drive measured headroom.
+Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
 ---
 
