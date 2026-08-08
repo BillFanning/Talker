@@ -31,11 +31,13 @@ so a stall containing several sends charges each with its own part. Its limits a
 point is charged to whichever message was inside its interface write as the point passed, so a \
 message that holds the channel some other way is not charged; and a message is never charged \
 for its own skipped points, which show up instead as a send call longer than its interval. \
-Only the last few dozen sends are retained, so a point skipped behind an older one goes \
-uncharged: an uncharged miss means this record cannot place it, not that the channel was idle, \
-which is why the line says \"not charged\" and never \"nothing was running\". The rest of the \
-line is weaker evidence: the counts weighed are run totals, so a fault that has since recovered \
-still appears, and the capacity finding is a projection rather than a measurement.";
+The retained write history is sized from the schedule — one window per message, which is as many \
+writes as can ever separate a deadline from its handling — so a miss left uncharged means no \
+retained interface write spanned that point. That is not the same as the channel having been \
+idle: a hold that was not an interface write leaves exactly the same gap, which is why the line \
+says \"not charged\" and never \"nothing was running\". The rest of the line is weaker evidence: \
+the counts weighed are run totals, so a fault that has since recovered still appears, and the \
+capacity finding is a projection rather than a measurement.";
 
 /// Evidence available when scheduled sends are being skipped.
 ///

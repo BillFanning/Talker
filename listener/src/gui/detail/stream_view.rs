@@ -125,10 +125,12 @@ impl ListenerApp {
             .unwrap_or(false);
         // The stream viewer (§41): there is one source — the verbatim byte stream.
         // Hex line length is filled in below, once the pane's width is known, so
-        // that every Hex wrap happens in the renderer — the only place a cell
-        // boundary is known. `split_stream_rows` is still character-based, and
-        // still wraps the text modes; Hex simply never reaches it with a line
-        // left to cut (see `hex_line_bytes`).
+        // that every Hex byte wrap happens in the renderer — the only place a
+        // cell boundary is known. `split_stream_rows` is still character-based
+        // and still wraps the text modes; a Hex *byte* row never reaches it with
+        // anything left to cut (see `hex_line_bytes`). A Hex *Mark* row can, and
+        // that is deliberate: a Mark wider than the pane is cut as text, which
+        // is the one overrun ADR-042 accepts.
         let hex_grouping = prefs.hex_grouping;
         let mut renderer = DisplayView {
             mode: msg_mode,
@@ -672,10 +674,12 @@ fn rebuild_rows(p: &StreamRefresh, window_start: u64) -> super::super::StreamRen
         })
         .collect();
     // The pane width belongs to the renderer, and it is attached here rather
-    // than by the caller so the two cannot come apart: a view configured with a
-    // Hex line length but no column bound wraps correctly on bytes and then
-    // overruns on Mark text, which is precisely the shape the earlier defect
-    // took. `wrap_cols` arrives with the view, so there is nothing to forget.
+    // than by the caller so the two cannot come apart. Since ADR-042 put Marks
+    // on their own rows the column bound is a byte-row safety invariant — the
+    // renderer's own guarantee that it never returns a row wider than the pane —
+    // rather than the thing standing between a Mark and a split byte. It is
+    // still attached here because `wrap_cols` arrives with the view, so there is
+    // nothing for a caller to forget.
     let mut view = p.view.clone();
     view.wrap_width = Some(p.wrap_cols);
     let mut renderer = StreamRenderer::new(view);
