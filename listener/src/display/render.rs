@@ -235,8 +235,9 @@ pub struct HexCursor {
 ///
 /// `width` is the cell's monospace width. A line ends when it has taken all the
 /// cells it was asked for **or** when the next cell would not fit within
-/// `max_columns` — the second condition is what an annotation trips, since it
-/// spends one cell but several columns.
+/// `max_columns`. Only bytes reach here — annotations take their own row — so
+/// the two bounds normally agree; the column one is the renderer holding the
+/// pane limit itself rather than inheriting the caller's arithmetic.
 fn start_hex_cell(
     out: &mut String,
     cursor: &mut HexCursor,
@@ -268,30 +269,35 @@ fn start_hex_cell(
     cursor.columns_on_line += width;
 }
 
-fn push_hex_annotation(
-    out: &mut String,
-    cursor: &mut HexCursor,
-    per_line: Option<usize>,
-    max_columns: Option<usize>,
-    separator: &str,
-    text: &str,
-) {
-    // An annotation always stands apart, even mid-group: running a Mark into
-    // the bytes on either side (`4142‹T›4344`) would hide both.
-    cursor.bytes_in_group = 0;
-    // Measured whole for the fit decision even when it carries a line control:
-    // erring toward an early wrap costs a short line, while erring the other
-    // way costs a byte cut in half.
-    let width = text.chars().count();
-    start_hex_cell(out, cursor, per_line, max_columns, separator, false, width);
-    out.push_str(text);
-    if let Some(tail) = tail_after_line_control(text) {
-        cursor.cells_on_line = usize::from(!tail.is_empty());
-        cursor.columns_on_line = tail.chars().count();
+/// Emit an annotation as a line of its own, breaking the byte run at the byte
+/// it marks (§45, ADR-042).
+///
+/// Hex is a fixed-width grid, and that grid is the whole reason to read it:
+/// byte *N* sits at a predictable column, so a reader can follow one field down
+/// a column across many rows. A Mark spliced into a byte row destroys that for
+/// everything after it — its text is as wide as it is, so the bytes following
+/// land at unpredictable columns and the row's length stops matching its
+/// neighbours'. Giving it its own line costs a short row and keeps the grid.
+///
+/// The break is at the marked byte, not at the next row boundary. A Mark says
+/// *this byte*, so a rendering that only placed it near the right row would be
+/// answering a coarser question than the one asked. The ragged row that results
+/// explains itself: the reason is sitting on the line below it.
+fn push_hex_annotation(out: &mut String, cursor: &mut HexCursor, text: &str) {
+    if cursor.cells_on_line > 0 {
+        out.push('\n');
     }
-    // The bytes after an annotation start a fresh group, so a Mark never shifts
-    // the grouping of everything that follows it.
+    out.push_str(text);
+    // Mark text that already ends a line does not need another break; anything
+    // after it on that line is the caller's own continuation.
+    if !text.ends_with(['\r', '\n']) {
+        out.push('\n');
+    }
+    // A fresh row, and a fresh group: a Mark never shifts the grouping of what
+    // follows it.
+    cursor.cells_on_line = 0;
     cursor.bytes_in_group = 0;
+    cursor.columns_on_line = 0;
 }
 
 /// Render bytes as Hex (§45): each byte as two uppercase hex digits. Every
@@ -299,16 +305,16 @@ fn push_hex_annotation(
 /// `separator`. A `bytes_per_group` of 1 is the conventional hexdump, one byte
 /// per group, and is what a zero also means — no group can be empty.
 ///
-/// When `bytes_per_line` is `Some`, wrap to that many cells per line
-/// (annotation cells count). `max_columns` bounds the same line by width, and
-/// is the one that holds when annotations are present: a Mark spends one cell
-/// but several columns, so a line correct by cell count can still overrun the
-/// pane and be cut mid-byte by the viewer's character splitter.
+/// When `bytes_per_line` is `Some`, wrap to that many byte cells per line;
+/// `max_columns` bounds the same line by width. Both are kept, and they are not
+/// redundant: the byte count honours the reader's requested groups-per-line,
+/// while the column bound is the renderer enforcing "never wider than the pane"
+/// for itself rather than trusting a caller's arithmetic to agree with it.
 ///
-/// A single annotation wider than `max_columns` still overruns — there is
-/// nowhere for it to go — but that cuts annotation text, never a byte.
-///
-/// `annotations` are spliced as extra cells before/after their target byte.
+/// `annotations` take a line of their own (see [`push_hex_annotation`]) and so
+/// never share a row with bytes. One wider than the pane still overruns, since
+/// there is nowhere else for it to go — but that cuts annotation text, never a
+/// byte.
 /// Emits directly into one pre-sized `String` — no per-byte allocation.
 /// `cursor` carries streaming continuation state across chunks: an annotation
 /// ending in CR/LF resets the line, and a group survives a chunk boundary so a
@@ -330,7 +336,7 @@ fn render_hex(
     for (i, b) in bytes.iter().enumerate() {
         let (before, after) = split_run(walker.run_at(i));
         for s in before {
-            push_hex_annotation(&mut out, cursor, per_line, max_columns, separator, s);
+            push_hex_annotation(&mut out, cursor, s);
         }
         let continues_group = cursor.bytes_in_group > 0;
         start_hex_cell(
@@ -346,14 +352,14 @@ fn render_hex(
         out.push(HEX_DIGITS[(b & 0xF) as usize] as char);
         cursor.bytes_in_group = (cursor.bytes_in_group + 1) % per_group;
         for s in after {
-            push_hex_annotation(&mut out, cursor, per_line, max_columns, separator, s);
+            push_hex_annotation(&mut out, cursor, s);
         }
     }
     // Annotations targeting the one-past-the-end offset (an `After` on the final byte
     // is handled above; a `Before` at len is a trailing mark) attach at the end.
     let (end_before, _) = split_run(walker.run_at(bytes.len()));
     for s in end_before {
-        push_hex_annotation(&mut out, cursor, per_line, max_columns, separator, s);
+        push_hex_annotation(&mut out, cursor, s);
     }
     out
 }
@@ -888,21 +894,25 @@ mod tests {
         assert_eq!(v.render_text_annotated(b"ABCDE", &anns), "AB\n[TS]\nCDE");
     }
 
+    /// Hex is a column grid, so a Mark takes a row of its own and the byte run
+    /// breaks at the byte it marks — not at the next row boundary, because a
+    /// Mark says *this byte* (ADR-042).
     #[test]
-    fn hex_splices_annotation_as_its_own_cell() {
+    fn hex_gives_an_annotation_its_own_row() {
         let v = view(DisplayMode::Hex, CharacterRendering::Native);
         let anns = [ann(1, AnnotationPlacement::Before, "[T]")];
-        assert_eq!(v.render_text_annotated(b"ABC", &anns), "41 [T] 42 43");
+        assert_eq!(v.render_text_annotated(b"ABC", &anns), "41\n[T]\n42 43");
     }
 
+    /// An annotation no longer spends a byte-line slot, because it is not on
+    /// the byte line: two bytes per line still means two bytes per line.
     #[test]
-    fn hex_wrap_counts_annotation_as_a_cell() {
+    fn an_annotation_row_does_not_consume_the_byte_line_budget() {
         let mut v = view(DisplayMode::Hex, CharacterRendering::Native);
         v.wrapping = WrappingMode::Wrap;
         v.hex_bytes_per_line = 2;
         let anns = [ann(1, AnnotationPlacement::Before, "[T]")];
-        // Cells: 41, [T], 42, 43 → 2 per line.
-        assert_eq!(v.render_text_annotated(b"ABC", &anns), "41 [T]\n42 43");
+        assert_eq!(v.render_text_annotated(b"ABC", &anns), "41\n[T]\n42 43");
     }
 
     #[test]
@@ -1008,7 +1018,8 @@ mod tests {
         let anns = [ann(0, AnnotationPlacement::After, "<T>\r\n")];
         let mut out = r.render_chunk(b"A", &anns);
         out.push_str(&r.render_chunk(b"B", &[]));
-        assert_eq!(out, "41 <T>\r\n42");
+        // Mark text that already ends a line gets no second break.
+        assert_eq!(out, "41\n<T>\r\n42");
     }
 
     #[test]
@@ -1051,7 +1062,10 @@ mod tests {
                     ann(0, AnnotationPlacement::Before, "[0]"),
                 ]
             ),
-            "[0] 61 62 [2] 63"
+            "[0]
+61 62
+[2]
+63"
         );
     }
 

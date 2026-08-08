@@ -10,6 +10,17 @@ the specification, the specification is right and this is history.
 
 ---
 
+Revision note (2026-08-06) — a Hex line is bounded by columns:
+
+- **§45 Hex line width (ADR-041).** A row ends when the next cell would exceed
+  the pane, not only when the byte budget is spent. An inline `Mark` occupies one
+  cell and as many columns as its text, so the cell-count bound alone let a line
+  overrun and be cut mid-byte by the viewer's character splitter. A `Mark` wider
+  than the whole pane may still overrun; that cuts Mark text, never a byte.
+- **§57 sidecar record.** The prose said `ChunkTime` — wall clock *and*
+  monotonic — reached the sidecar, six lines above the record format that carries
+  only the wall-clock value. The description now matches the format.
+
 Revision note (2026-08-06) — Hex grouping and the timestamp sidecar become specified behaviour:
 
 - **§45 Hex grouping (ADR-038/ADR-040).** `HexGrouping` was specified and

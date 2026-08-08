@@ -178,10 +178,10 @@ impl ListenerApp {
                 let wrap_cols = (avail_w / char_w).floor().max(8.0) as usize;
                 // Resolve Hex line length against the pane now that its width is
                 // known, so the renderer wraps at a whole group and the row
-                // splitter below never has a Hex line left to cut. The column
-                // bound that goes with it — a Mark spends one cell but several
-                // columns — is attached by `rebuild_rows`, which receives
-                // `wrap_cols` anyway and cannot be given one without the other.
+                // splitter below never has a Hex byte line left to cut. The
+                // column bound that goes with it is attached by `rebuild_rows`,
+                // which receives `wrap_cols` anyway and so cannot be given one
+                // setting without the other.
                 renderer.hex_bytes_per_line = hex_line_bytes(hex_grouping, wrap_cols);
                 self.refresh_stream_rows(id, &renderer, wrap_cols);
                 let rows: &[String] = self
@@ -1081,20 +1081,28 @@ mod tests {
 
                             let mut seen = String::new();
                             for row in &rows {
+                                // A Mark row, or a fragment of one too wide for
+                                // the pane — that overrun cuts text, which is
+                                // the one this design accepts. Byte rows are
+                                // hex digits and single spaces and nothing else,
+                                // so anything carrying another character is not
+                                // one.
+                                if !is_byte_row(row) {
+                                    continue;
+                                }
                                 assert!(
                                     row.chars().count() <= cols,
-                                    "row overruns the pane ({context}): {row:?}"
+                                    "byte row overruns the pane ({context}): {row:?}"
                                 );
                                 for token in row.split(' ') {
-                                    // Annotation cells are text and are left
-                                    // alone; every hex token must still be
-                                    // whole bytes.
-                                    if token.is_empty() || !is_hex_token(token) {
-                                        continue;
-                                    }
+                                    // Since Marks take a row of their own, a
+                                    // byte row is *only* bytes — a stronger
+                                    // claim than "its hex tokens are whole".
                                     assert!(
-                                        token.len() % 2 == 0,
-                                        "a Mark split a byte ({context}): {row:?}"
+                                        !token.is_empty()
+                                            && token.len() % 2 == 0
+                                            && is_hex_token(token),
+                                        "a byte row is not whole bytes ({context}): {row:?}"
                                     );
                                     seen.push_str(token);
                                 }
@@ -1113,6 +1121,11 @@ mod tests {
     /// all hex digits would only make the assertion above stricter.
     fn is_hex_token(token: &str) -> bool {
         token.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    /// A row of bytes rather than a Mark row: hex digits and separators only.
+    fn is_byte_row(row: &str) -> bool {
+        !row.is_empty() && row.chars().all(|c| c.is_ascii_hexdigit() || c == ' ')
     }
 
     #[test]
@@ -1169,17 +1182,26 @@ mod tests {
         }
     }
 
-    /// A Mark stands apart from the bytes on both sides, and the bytes after it
-    /// start a fresh group — otherwise one annotation shifts every column below.
+    /// A Mark takes a row of its own, and the bytes after it start a fresh
+    /// group — otherwise one annotation shifts every column below it.
     #[test]
-    fn hex_annotations_break_out_of_their_group() {
+    fn hex_annotations_take_a_row_of_their_own() {
         let mut v = view(DisplayMode::Hex);
         v.hex_bytes_per_group = 4;
         let marks = vec![mark(2, true, "[T]")];
         let got = incremental_rows(b"ABCDEF", 2, &[], &v, 80);
         assert_eq!(got, vec!["41424344 4546".to_string()], "no mark, no break");
+        // The byte run breaks at the marked byte, so the row above is short and
+        // the mark below explains why.
         let got = incremental_rows(b"ABCDEF", 3, &marks, &v, 80);
-        assert_eq!(got, vec!["4142 [T] 43444546".to_string()]);
+        assert_eq!(
+            got,
+            vec![
+                "4142".to_string(),
+                "[T]".to_string(),
+                "43444546".to_string()
+            ]
+        );
     }
 
     /// A Mark whose byte lands exactly on a delta boundary is spliced once.

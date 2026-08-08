@@ -1,20 +1,25 @@
-# Listener Specification v2.3.1
+# Listener Specification v2.3.2
 
 Status: Draft (stream-only architecture; the Message infrastructure is removed)
 Audience: human reviewers, Rust implementers, and code-generation agents
 Primary implementation language: Rust
 Primary editor workflow: VS Code + rust-analyzer
 
-Revision note (2026-08-06) — a Hex line is bounded by columns:
+Revision note (2026-08-08) — a Mark takes a row of its own in Hex:
 
-- **§45 Hex line width (ADR-041).** A row ends when the next cell would exceed
-  the pane, not only when the byte budget is spent. An inline `Mark` occupies one
-  cell and as many columns as its text, so the cell-count bound alone let a line
-  overrun and be cut mid-byte by the viewer's character splitter. A `Mark` wider
-  than the whole pane may still overrun; that cuts Mark text, never a byte.
-- **§57 sidecar record.** The prose said `ChunkTime` — wall clock *and*
-  monotonic — reached the sidecar, six lines above the record format that carries
-  only the wall-clock value. The description now matches the format.
+- **§45 Hex Mark placement (ADR-042).** A `Mark` is a row, not a cell in a byte
+  row. Hex is a fixed-width grid and reading a field down a column is what the
+  mode is for; a `Mark` spliced into a byte row is as wide as its text, so
+  everything after it landed at an unpredictable column. The byte run now breaks
+  **at the byte the `Mark` targets**, because a `Mark` identifies a byte and a
+  coarser placement would answer a different question. The short row that
+  results is explained by the `Mark` on the line below it.
+- **§45 the column bound is retained** and restated for what it now does: with
+  `Mark`s off the byte rows it is the renderer holding the pane limit for
+  itself, not the thing standing between a `Mark` and a split byte.
+- A Hex `.disp` recording now carries `Mark`s on their own lines, following the
+  display as it always has. Byte-exact timestamping remains `.raw` plus its
+  `.raw.idx` sidecar (ADR-039), which perturbs nothing.
 
 Earlier revisions are in [REVISIONS.md](REVISIONS.md). They live there rather
 than here for two reasons: a document's version number belongs only in its own
@@ -838,18 +843,26 @@ The two halves have different reach (ADR-038/ADR-040):
 
 - **Bytes per group is rendering.** Those bytes run together and only groups are
   separated, so the grouping appears in a Display Recording (`.disp`) exactly as
-  on screen. A group is never broken by a read-chunk boundary, and an inline
-  `Mark` (§50.2) stands apart from the bytes on both sides and starts a fresh
-  group after it.
+  on screen. A group is never broken by a read-chunk boundary, and the bytes
+  after a `Mark` (§50.2) start a fresh group.
 - **Groups per line is view layout.** It shall not reach a recording, which is
   never hard-wrapped (§54). A configured count shall be reduced when the pane is
   too narrow to show it, and 0 fills the pane; in every case **no displayed row
   shall split a byte** or begin or end with a group separator.
-- **A line is bounded by columns, not by cells (ADR-041).** An inline `Mark`
-  occupies one cell and as many columns as its text, so a row shall end when the
-  next cell would exceed the pane width as well as when the byte budget is
-  spent. A single `Mark` wider than the whole pane may still overrun; that cuts
-  Mark text, never a byte.
+- **A `Mark` takes a row of its own (ADR-042).** Hex is a fixed-width grid, and
+  reading a field down a column across rows is what the mode is for; a `Mark`
+  spliced into a byte row is as wide as its text, so everything after it lands
+  at an unpredictable column. The byte run shall therefore break **at the byte
+  the `Mark` targets** — not at the next row boundary, since a `Mark` identifies
+  a byte and a coarser placement would answer a different question. The short
+  row that results is explained by the `Mark` sitting on the line below it.
+  A `Mark` wider than the pane may still overrun; that cuts `Mark` text, never a
+  byte.
+- **A byte row is bounded by columns as well as by count (ADR-041).** A row
+  shall end when the next byte would exceed the pane width as well as when the
+  byte budget is spent. With `Mark`s on their own rows the two bounds normally
+  agree; the column bound is the renderer holding the pane limit itself rather
+  than inheriting the resolved byte count.
 
 ## 46. Character Rendering
 

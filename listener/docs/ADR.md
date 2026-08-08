@@ -1525,6 +1525,61 @@ followed by a generic character splitter. Two successive defects have now lived
 in the seam between them. If this path is touched again, the renderer should
 return final rows and `split_stream_rows` should not see Hex at all.
 
+## ADR-042 — In Hex, a Mark takes a row of its own
+
+**Status:** Accepted 2026-08-08.
+
+**Context:** ADR-041 made an annotated Hex line fit the pane, which fixed the
+byte being cut in half. It did not address why the annotation was hard to place
+to begin with.
+
+Hex is a fixed-width grid, and the grid is the reason to read it: byte *N* sits
+at a predictable column, so a reader can follow one field down a column across
+many rows. A `Mark` is text of arbitrary width. Splicing it into a byte row
+pushes everything after it to an unpredictable column and forces an early wrap,
+so row lengths stop matching. The result was correct — no byte was split — and
+still destroyed the affordance the mode exists for.
+
+The `NmeaZda` style makes it concrete: `$GPZDA,120000.00,08,08,2026,00,00*4F`
+is about 37 columns. At 80 columns with one byte per group a row holds roughly
+26 bytes, so one `Mark` costs more than an entire row of data.
+
+Removing `Mark`s from Hex was considered and rejected. Hex is the mode used for
+binary protocols, which is exactly where "when did this pattern occur" is asked;
+and rule behaviour that silently changes with the display mode is a matrix the
+user has to carry.
+
+**Decision:** In Hex, an annotation is a row, not a cell. The byte run ends, the
+`Mark` text occupies its own line, and bytes resume on a fresh row and a fresh
+group.
+
+The break is **at the marked byte**, not at the next row boundary. A `Mark`
+identifies a byte; placing it only near the right row would answer a coarser
+question than the one asked. This costs a short row, which is acceptable because
+the row is self-explaining — the reason for it is on the line immediately below.
+
+`Mark` text that already ends in CR/LF gets no second break, so a multi-line
+annotation still renders as written.
+
+**Consequences:** the column-width interaction that produced ADR-041's defect
+cannot recur for byte rows, because no annotation shares one. The invariant a
+byte row can now assert is stronger than "its hex tokens are whole bytes": a
+byte row is *only* bytes and separators, and the property test asserts that
+across grouping, pane width, `Mark` width and placement.
+
+ADR-041's column bound is kept. It is no longer the thing standing between a
+`Mark` and a split byte, but it remains the renderer enforcing "never wider than
+the pane" for itself rather than trusting the resolved byte count to agree.
+
+A `Mark` wider than the pane still overruns and is cut by the character
+splitter. That cuts annotation text, never a byte, and is the one overrun this
+design accepts.
+
+The `.disp` recording follows the display, as it always has: a Hex recording now
+carries `Mark`s on their own lines. It was never byte-exact — that is `.raw`,
+whose sidecar (`.raw.idx`, ADR-039) remains the precise, non-perturbing way to
+timestamp bytes.
+
 ## Open questions
 
 _None open. (OQ-L1 resolved by ADR-004 above.)_

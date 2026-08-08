@@ -147,11 +147,11 @@ Message-model removal). Everything below this block is verified done:
       it sets the viewer's line length and `build_display_view` passes 0 — no hard
       wraps in a recording (ADR-018). `0` groups stays "fit to the display width"
       (§45). A `HexCursor` carries group position across chunks so read sizes are not
-      visible in the spacing, and an annotation stands apart and resets the group so
-      one Mark cannot shift every column below it. GUI control under Configure
-      display, in the schema's own units. Pinned by `hex_groups_bytes_between_
-      separators`, `hex_grouping_is_chunking_invariant`, `hex_lines_wrap_between_
-      groups_not_inside_them`, and `hex_annotations_break_out_of_their_group`.
+      visible in the spacing, and a Mark takes a row of its own so it cannot shift
+      every column below it (ADR-042). GUI control under Configure display, in the
+      schema's own units. Pinned by `hex_groups_bytes_between_separators`,
+      `hex_grouping_is_chunking_invariant`, and
+      `hex_lines_wrap_between_groups_not_inside_them`.
 - [x] **Marks spliced twice on a delta boundary** — found while testing the above.
       `rebuild_rows` admitted a mark at one *past* the window end (a `Before` whose
       byte had not arrived), so it rendered ahead of its byte and again when that
