@@ -115,8 +115,9 @@ Still open:
   `mod.rs` keeps only what more than one row needs and re-exports flat, so no
   call site changed. Movement only — every function name and all 28 tests are
   the same, verified line by line against the original.
-- [ ] **Only the interface write counts as holding the channel.** See the
-  entry under the ADR-045 review disposition below.
+  (Also open here: **only the interface write counts as holding the channel** —
+  one item, tracked under the ADR-045 review disposition below. A second
+  checkbox for it would count one piece of work twice.)
 
 ## Colour accessibility (2026-08-06)
 
@@ -343,8 +344,9 @@ preceded it. The first two are cross-crate consistency debts, not local cleanups
 - [x] **The shared readout vocabulary no longer describes Talker's Cadence row.**
   `wiredata-ui/src/diagnostics.rs` documents the state names both apps must share
   (`warm-up (N) · max X`, `p99 ≤ X`, `no recent <noun>s · run max X`,
-  `awaiting first <noun>`). `cadence_decision` in `talker/src/gui/diagnostics.rs`
-  now renders them in plain language instead — `worst send started X late of N
+  `awaiting first <noun>`). `cadence_decision` (now in
+  `talker/src/gui/diagnostics/cadence.rs`, after the 2026-08-07 split)
+  renders them in plain language instead — `worst send started X late of N
   sends`, `nothing sent in <window> · worst this run X`, `awaiting the first
   scheduled send`; the warm-up form is gone entirely (ADR-046). Talker's own split
   closed first (`timing_metric` and the Cadence row share one rule), and

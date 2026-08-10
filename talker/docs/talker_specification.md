@@ -1,39 +1,27 @@
 # Talker — Program Specification
-**Version:** 2.4.10
+**Version:** 2.4.11
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-08-09) — a warning may be acknowledged, and is raised where
-it lands:
+Revision note (2026-08-09) — three readouts stop claiming more than they measure:
 
-- **§3.2 dismissible warnings (ADR-052)** — the missed-send routing callout and
-  the Output pane's dropped-update warning each carry a **Dismiss** button.
-  Dismissal records the run counter behind the warning, which returns when that
-  counter is exceeded, so the reader is told once per occurrence and a spreading
-  fault is never silent. A counter below the record means a new run and discards
-  it. Dismissing the routing hides advice, never the counts: the misses stay on
-  the send-outcomes line and keep the card's badge raised.
-- **§3.2 / §5.7 completeness notices (ADR-052)** — the dropped-update warning
-  moves out of the diagnostics card into the **Output** pane, above the sampling
-  note, because what those drops cost is that pane's completeness rather than
-  anything about the wire. The card's badge no longer rises for them; the queue
-  gauge stays under Timing & runtime details. The sampling note keeps its calm
-  treatment but is set in a stronger weight, since it qualifies every line
-  beneath it.
-- **§9.2 edge-triggered channel conditions (ADR-053)** — a channel falling off
-  its send schedule is now logged: WARN on the first skipped send, INFO once
-  five seconds pass with none skipped, carrying the episode's total, and the
-  run's own total if it stops mid-episode. Missed sends previously appeared only
-  as a live counter, so the log recorded connection loss but never cadence loss,
-  and CLI mode had no account of them at all. The dropped-update warning was
-  reworded in the same pass to state what it costs the reader rather than the
-  queue behind it.
-- **§9.2 who the log is written for (ADR-054)** — a log line states what
-  happened to the reader's channel, in the vocabulary the screen uses. The
-  structured `channel` field is a claim that the event is about that channel's
-  operation, and it is what raises the channel row's warning badge; talker's own
-  bookkeeping faults therefore no longer carry it, name themselves as internal,
-  say what they cost, and are rate limited on a decade cadence.
+- **§3.2 uncharged misses (ADR-051, corrected)** — the remainder no longer offers
+  "the send that held it has aged out of the retained record" as an explanation.
+  The retained history is sized from the schedule, so a write that could have
+  spanned a point has not been forgotten. What the record supports is one
+  negative fact — no measured interface write spanned those points — which a late
+  deadline wake, work outside the send call, and a genuinely free thread all
+  produce alike.
+- **§5.7 completeness notices (ADR-052)** — while the dropped-update warning is
+  unacknowledged, the **Output** section header reads `Output ⚠ <n> dropped`.
+  The pane is collapsed by default and the warning no longer raises the
+  diagnostics card's badge, so without the marked header the condition could be
+  on screen and unseeable.
+- **§9.2 edge-triggered channel conditions (ADR-053)** — the five-second settle
+  is a **minimum, not a deadline**: it is judged on a cadence point the channel
+  reaches, so a slow schedule reports at its next send. The table no longer
+  claims all three conditions close — discarded updates are a run total with no
+  recovery edge to report, which is now stated rather than left as a dash.
 
 Earlier revisions are in [REVISIONS.md](REVISIONS.md). They live there rather
 than here for two reasons: a document's version number belongs only in its own
@@ -606,6 +594,13 @@ the wire, and so is stated here rather than in the diagnostics card (ADR-052):
    no ⚠ — but it qualifies every line beneath it, so it is set in a strong
    weight rather than a small, weak one. It is not dismissible: it describes a
    condition that stays true.
+
+While the dropped-update warning is unacknowledged, the **Output** section
+header itself reads `Output ⚠ <n> dropped` in the warning accent. The pane is
+collapsed by default and this warning no longer raises the diagnostics card's
+badge, so without the marked header a reader could sit in front of the condition
+and never see it. The marker and the count carry it; the accent only reinforces
+them.
 
 #### Control Character Rendering
 

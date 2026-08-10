@@ -33,6 +33,10 @@ fn workspace_root() -> PathBuf {
 }
 
 /// Every `.md` under a `docs/` folder, plus the working agreement itself.
+///
+/// Recursive, so "every" stays true the first time a `docs/` folder grows a
+/// subdirectory. A guard whose coverage silently depends on the shape of the
+/// tree is one that reports success for documents it never opened.
 fn documents(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let agreement = root.join("AGENTS.md");
@@ -40,19 +44,23 @@ fn documents(root: &Path) -> Vec<PathBuf> {
         found.push(agreement);
     }
     for entry in fs::read_dir(root).into_iter().flatten().flatten() {
-        for file in fs::read_dir(entry.path().join("docs"))
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let path = file.path();
-            if path.extension().is_some_and(|e| e == "md") {
-                found.push(path);
-            }
-        }
+        collect_markdown(&entry.path().join("docs"), &mut found);
     }
     found.sort();
     found
+}
+
+/// Append every `.md` at or beneath `dir`. A missing directory is not an error:
+/// most workspace members have no `docs/` folder at all.
+fn collect_markdown(dir: &Path, found: &mut Vec<PathBuf>) {
+    for file in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = file.path();
+        if path.is_dir() {
+            collect_markdown(&path, found);
+        } else if path.extension().is_some_and(|e| e == "md") {
+            found.push(path);
+        }
+    }
 }
 
 /// Every identifier-shaped token in the workspace's Rust source.

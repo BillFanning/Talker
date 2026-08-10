@@ -1357,7 +1357,7 @@ mod tests {
         fail: bool,
         policy: ObserverPolicy,
     ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle, ChannelId) {
-        spawn_runner_full(messages, fail, policy, None)
+        spawn_runner_full(messages, fail, policy, None, None)
     }
 
     fn spawn_runner_full(
@@ -1365,6 +1365,7 @@ mod tests {
         fail: bool,
         policy: ObserverPolicy,
         slow: Option<(u8, Duration)>,
+        log_tx: Option<crossbeam_channel::Sender<crate::core::logging::LogEvent>>,
     ) -> (Arc<Mutex<Vec<Vec<u8>>>>, TalkerHandle, ChannelId) {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let interface = Box::new(MockInterface {
@@ -1383,14 +1384,29 @@ mod tests {
         };
         let id = who.id;
         let thread = std::thread::spawn(move || {
-            run(
-                who,
-                interface,
-                None,
-                schedule,
-                cmd_rx,
-                RunnerObserver::new(status_tx, policy).with_control(control_tx),
-            )
+            let go = move || {
+                run(
+                    who,
+                    interface,
+                    None,
+                    schedule,
+                    cmd_rx,
+                    RunnerObserver::new(status_tx, policy).with_control(control_tx),
+                )
+            };
+            // A subscriber installed inside the runner's own thread. Tracing's
+            // default is thread-local, so this captures exactly this run's
+            // lines: no global to install, nothing shared with another test,
+            // and no window between spawning and subscribing.
+            match log_tx {
+                Some(tx) => {
+                    use tracing_subscriber::layer::SubscriberExt as _;
+                    let subscriber = tracing_subscriber::registry()
+                        .with(crate::core::logging::GuiLogLayer::new(tx));
+                    tracing::subscriber::with_default(subscriber, go)
+                }
+                None => go(),
+            }
         });
         (
             sent,
@@ -1418,6 +1434,120 @@ mod tests {
         MessageConfig::new(PayloadConfig::raw_hex(hex), interval_ms)
     }
 
+    /// A runner under test: the payloads it wrote, its handle, and its log.
+    type LoggingRunner = (
+        Arc<Mutex<Vec<Vec<u8>>>>,
+        TalkerHandle,
+        crossbeam_channel::Receiver<crate::core::logging::LogEvent>,
+    );
+
+    /// A runner whose log lines are delivered to the returned receiver.
+    fn spawn_logging_runner(
+        messages: &[MessageConfig],
+        fail: bool,
+        slow: Option<(u8, Duration)>,
+    ) -> LoggingRunner {
+        let (log_tx, log_rx) = crossbeam_channel::unbounded();
+        let (sent, handle, _id) = spawn_runner_full(
+            messages,
+            fail,
+            ObserverPolicy::every_send(),
+            slow,
+            Some(log_tx),
+        );
+        (sent, handle, log_rx)
+    }
+
+    /// Wait (bounded) for a line containing `want`, accumulating into `seen`.
+    ///
+    /// A test asserting that something is *absent* must first wait for
+    /// something present, or it proves only that it looked too early.
+    fn wait_for_line(
+        log_rx: &crossbeam_channel::Receiver<crate::core::logging::LogEvent>,
+        seen: &mut Vec<String>,
+        want: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            seen.extend(log_rx.try_iter().map(|event| event.message));
+            if seen.iter().any(|line| line.contains(want)) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no line containing {want:?} within 5 s; saw {seen:#?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The edge-triggering, through the real send path rather than the
+    /// transition table: overload that skips hundreds of cadence points must
+    /// still produce one line, and a run stopped mid-episode must not leave the
+    /// warning unanswered.
+    ///
+    /// 120 ms writes against a 10 ms cadence skip at least a dozen points per
+    /// send, on any machine — the assertion is on the count of *lines*, which
+    /// the edge-trigger fixes at one however many points are lost.
+    #[test]
+    fn a_stalled_channel_logs_one_warning_and_answers_it_at_stop() {
+        let (sent, handle, log_rx) = spawn_logging_runner(
+            &[msg("AB", 10)],
+            false,
+            Some((0xAB, Duration::from_millis(120))),
+        );
+        let mut lines = Vec::new();
+
+        // Two completed slow writes guarantee skipped points between them.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sent.lock().unwrap().len() < 2 {
+            assert!(Instant::now() < deadline, "the slow interface never sent");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        wait_for_line(&log_rx, &mut lines, "missed");
+
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        join_within(handle, Duration::from_secs(5));
+        wait_for_line(&log_rx, &mut lines, "stopped while off schedule");
+
+        let fell_behind = lines
+            .iter()
+            .filter(|line| line.contains("missed") && line.contains("below its configured rate"))
+            .count();
+        assert_eq!(
+            fell_behind, 1,
+            "the episode opens once, however many points are skipped: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("no further")),
+            "five seconds never elapsed without a skip, so nothing recovered: {lines:#?}"
+        );
+    }
+
+    /// Cadence and delivery are independent, and the log must not blur them.
+    /// Every write fails here while every deadline is reached, so the failure
+    /// path speaks and the cadence path stays silent — the seam that makes
+    /// "back on schedule" a claim about cadence alone.
+    #[test]
+    fn failing_sends_do_not_make_a_channel_look_off_cadence() {
+        // 200 ms apart and failing instantly: reaching each deadline needs an
+        // OS delay of a fifth of a second to miss, which is not a hiccup.
+        let (_sent, handle, log_rx) = spawn_logging_runner(&[msg("AB", 200)], true, None);
+        let mut lines = Vec::new();
+
+        wait_for_line(&log_rx, &mut lines, "mock send failure");
+        std::thread::sleep(Duration::from_millis(450));
+
+        handle.cmd_tx.send(TalkerCommand::Stop).unwrap();
+        join_within(handle, Duration::from_secs(5));
+
+        lines.extend(log_rx.try_iter().map(|event| event.message));
+        assert!(
+            !lines.iter().any(|line| line.contains("missed")),
+            "failing sends are not missed sends: {lines:#?}"
+        );
+    }
+
     /// End to end through the real send path: the message whose write holds the
     /// thread is charged, and the fast message it delays is not — even though
     /// the fast message is the one recording all the lateness.
@@ -1429,6 +1559,7 @@ mod tests {
             false,
             ObserverPolicy::every_send(),
             Some((0xBB, Duration::from_millis(120))),
+            None,
         );
 
         std::thread::sleep(Duration::from_millis(700));

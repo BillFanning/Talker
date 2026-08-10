@@ -13,6 +13,38 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-08-09) — a warning may be acknowledged, and is raised where
+it lands:
+
+- **§3.2 dismissible warnings (ADR-052)** — the missed-send routing callout and
+  the Output pane's dropped-update warning each carry a **Dismiss** button.
+  Dismissal records the run counter behind the warning, which returns when that
+  counter is exceeded, so the reader is told once per occurrence and a spreading
+  fault is never silent. A counter below the record means a new run and discards
+  it. Dismissing the routing hides advice, never the counts: the misses stay on
+  the send-outcomes line and keep the card's badge raised.
+- **§3.2 / §5.7 completeness notices (ADR-052)** — the dropped-update warning
+  moves out of the diagnostics card into the **Output** pane, above the sampling
+  note, because what those drops cost is that pane's completeness rather than
+  anything about the wire. The card's badge no longer rises for them; the queue
+  gauge stays under Timing & runtime details. The sampling note keeps its calm
+  treatment but is set in a stronger weight, since it qualifies every line
+  beneath it.
+- **§9.2 edge-triggered channel conditions (ADR-053)** — a channel falling off
+  its send schedule is now logged: WARN on the first skipped send, INFO once
+  five seconds pass with none skipped, carrying the episode's total, and the
+  run's own total if it stops mid-episode. Missed sends previously appeared only
+  as a live counter, so the log recorded connection loss but never cadence loss,
+  and CLI mode had no account of them at all. The dropped-update warning was
+  reworded in the same pass to state what it costs the reader rather than the
+  queue behind it.
+- **§9.2 who the log is written for (ADR-054)** — a log line states what
+  happened to the reader's channel, in the vocabulary the screen uses. The
+  structured `channel` field is a claim that the event is about that channel's
+  operation, and it is what raises the channel row's warning badge; talker's own
+  bookkeeping faults therefore no longer carry it, name themselves as internal,
+  say what they cost, and are rate limited on a decade cadence.
+
 Revision note (2026-08-06) — a missed send names its cause, honestly:
 
 - **§3.2 missed-send routing (ADR-051, corrected)** — the amount-stating branch
@@ -265,6 +297,38 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-08-09) — a warning may be acknowledged, and is raised where
+it lands:
+
+- **ADR-052** makes two callouts dismissible, and moves one of them. Both stand
+  on a run counter that only grows, so dismissal records the count and the
+  warning returns when it is exceeded — acknowledgement, not deletion, and a
+  counter below the record can only mean a new run. The dropped-update warning
+  leaves the diagnostics card for the **Output** pane whose completeness it
+  actually describes, and stops raising the card's badge, which had been
+  reading ATTENTION over a card containing no reason for it. The boundary: only
+  a warning standing on a growing counter is dismissible — a live interface
+  fault, an impossible serial schedule, and a failed timer request each describe
+  a condition still true while it is on screen.
+- **ADR-053** puts losing cadence into the log, which had recorded failed sends
+  since the runner shipped and missed ones nowhere. WARN on the first skipped
+  send, INFO once five seconds pass without another, carrying the episode's
+  total — the edges only, because skips concentrate on the shortest interval and
+  a line each would flood the log with the fault's own symptom. It closes a CLI
+  blind spot where a channel could skip half its cadence points with nothing on
+  stdout, and makes the log answer *when* a channel fell behind rather than only
+  what the totals are now. The drop warning of ADR-052 was reworded in the same
+  pass to state its consequence rather than the queue behind it.
+- **ADR-054** states who the log is written for, after a sweep found a dozen
+  strings naming internals the reader has no access to — including the three
+  that fire when Start is pressed with something unfilled. It also settles what
+  `channel = …` means: it claims the event is about that channel's operation,
+  and it is what raises the channel row's warning badge. Six internal
+  bookkeeping faults carried it and should not have, so a bug in our own command
+  tracking was summoning the reader to their serial link. They now name the
+  channel in their text, say they are internal, say what it cost, and report on
+  a decade cadence so a wedged state machine cannot flood the log.
 
 Revision note (2026-08-06) — misses are measured where they happen:
 

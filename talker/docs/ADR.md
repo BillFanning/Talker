@@ -1,40 +1,30 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.15
+**Version:** 1.16
 **Date:** 2026-08-09
 **Status:** Accepted
 
-Revision note (2026-08-09) — a warning may be acknowledged, and is raised where
-it lands:
+Revision note (2026-08-09) — three decisions state their boundaries, and stop
+telling their own story:
 
-- **ADR-052** makes two callouts dismissible, and moves one of them. Both stand
-  on a run counter that only grows, so dismissal records the count and the
-  warning returns when it is exceeded — acknowledgement, not deletion, and a
-  counter below the record can only mean a new run. The dropped-update warning
-  leaves the diagnostics card for the **Output** pane whose completeness it
-  actually describes, and stops raising the card's badge, which had been
-  reading ATTENTION over a card containing no reason for it. The boundary: only
-  a warning standing on a growing counter is dismissible — a live interface
-  fault, an impossible serial schedule, and a failed timer request each describe
-  a condition still true while it is on screen.
-- **ADR-053** puts losing cadence into the log, which had recorded failed sends
-  since the runner shipped and missed ones nowhere. WARN on the first skipped
-  send, INFO once five seconds pass without another, carrying the episode's
-  total — the edges only, because skips concentrate on the shortest interval and
-  a line each would flood the log with the fault's own symptom. It closes a CLI
-  blind spot where a channel could skip half its cadence points with nothing on
-  stdout, and makes the log answer *when* a channel fell behind rather than only
-  what the totals are now. The drop warning of ADR-052 was reworded in the same
-  pass to state its consequence rather than the queue behind it.
-- **ADR-054** states who the log is written for, after a sweep found a dozen
-  strings naming internals the reader has no access to — including the three
-  that fire when Start is pressed with something unfilled. It also settles what
-  `channel = …` means: it claims the event is about that channel's operation,
-  and it is what raises the channel row's warning badge. Six internal
-  bookkeeping faults carried it and should not have, so a bug in our own command
-  tracking was summoning the reader to their serial link. They now name the
-  channel in their text, say they are internal, say what it cost, and report on
-  a decade cadence so a wedged state machine cannot flood the log.
+- **ADR-052 (boundary added)** — placement by consequence has to reach the
+  reader. Moving the dropped-update warning into the Output pane while removing
+  the card badge put it inside a section that is collapsed by default, so the
+  warning could be on screen and unseeable. A warning inside a collapsed section
+  now marks that section's header.
+- **ADR-053 (boundary added)** — the settle window is a **minimum, not a
+  deadline**: recovery is judged where the skip count arrives, on a cadence
+  point the channel reaches, so a slow schedule reports at its next send rather
+  than at five seconds, and nothing is woken to announce its own recovery. The
+  line is scoped to cadence alone — sends can be failing while every point is
+  reached.
+- **ADR-054 (corrected)** — the decade rate limit was applied by convention to
+  five of the six internal faults, and the sixth, on the send path, was the one
+  best placed to flood. The tally and the sentence shape now live in one module
+  every caller reaches for.
+- **All three, compressed.** They carried the debugging story, superseded
+  wording, and test mechanics. AGENTS.md gives those to the commit message; an
+  ADR states the decision, the boundary it does not cross, and what follows.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -1959,65 +1949,49 @@ stall policy is untouched — this measures the skips it was already making.
 
 **Status:** Accepted 2026-08-09.
 
-**Context:** Two of the diagnostics card's callouts behave unlike the others.
-Both stand on a run-total counter, so once the condition has occurred the
-callout stays on screen for the rest of the run even though the pressure that
-caused it has passed. A reader watching a long soak cannot clear either one, and
-a warning that cannot be cleared is one the reader learns to look past —
-including on the occasion it means something.
+**Context:** A warning standing on a run-total counter stays on screen for the
+rest of the run, long after the pressure that raised it has passed. A warning
+that cannot be cleared is one the reader learns to look past — including on the
+occasion it means something.
 
-The dropped-update callout had a second problem: it was in the wrong panel. The
-diagnostics card is about the wire — what was scheduled, what went out, what the
-line can carry. Discarded diagnostic updates cost none of that; what they cost
-is the completeness of the **Output** pane, which has its own standing note
-about completeness a few centimetres away. Two statements qualifying the same
-lines sat in different panels, and only one of them was next to the lines.
+**Decision:** Three rules.
 
-**Decision:** Three parts.
+*A warning is placed where its consequence lands.* Discarded diagnostic updates
+cost the **Output** pane's completeness, not anything about the wire, so the
+warning about them belongs there rather than in the diagnostics card, above the
+sampling note that qualifies the same lines. `diagnostic_card_tone` therefore
+does not read drops: a badge reading ATTENTION over rows that are all calm sends
+the reader hunting inside the card for a cause that was never in it. The queue
+gauge stays under Timing & runtime details, where depth and occupancy belong. A
+warning inside a collapsed section also marks that section's header, or placement
+by consequence would put it somewhere the reader can sit in front of and not see.
 
-*Placement follows consequence.* The dropped-update warning moves into the
-Output pane, directly beneath its header and above the sampling note, ordered by
-how much each qualifies the pane — dropped updates can cost any kind of update,
-sampling only costs payload lines. The queue gauge stays under Timing & runtime
-details, where a reader who wants depth and occupancy will look. Because the
-card no longer holds anything about drops, `diagnostic_card_tone` no longer
-takes them: a badge reading ATTENTION over rows that are all calm sends the
-reader hunting inside the card for a cause that was never in it.
-
-*Dismissal is acknowledgement, not deletion.* Both counters only grow within a
-run, so dismissal records the count and the warning returns when that count is
-**exceeded**. The reader is told once per occurrence; a fault still spreading is
-never silent. The two rejected alternatives are the two ends of the same axis: a
-dismissal lasting the rest of the run silences a real escalation, and one
-persisted across restarts hides a regression weeks later with no way back.
-
-A counter *below* the record can only mean the counter was reset, so
-`DismissedNotice` discards the record rather than trusting it. Without that, a
-fresh run's first drop would be measured against a number the reader last saw in
-a different run and would stay silent until it grew past it. The lifecycle path
-also clears the whole set on start; the self-correction is what makes the
-guarantee hold regardless.
+*Dismissal is acknowledgement, not deletion.* Dismissal records the counter, and
+the warning returns when that counter is **exceeded** — told once per occurrence,
+never silent while a fault spreads. The two rejected alternatives are the ends of
+one axis: a dismissal lasting the run silences a real escalation, and one
+persisted across restarts hides a regression weeks later with no way back. A
+counter *below* the record can only mean a new run, so the record is discarded
+rather than trusted; without that, a fresh run's first drop would be measured
+against a number from a previous one.
 
 *Dismissal never removes a counted fact.* The missed-send routing callout is
-advice about where to look. The misses themselves stay on the send-outcomes line
-above the card and keep the card's badge raised, so a dismissed routing line
-cannot make a channel with skipped sends look clean. This is pinned by test
-rather than left to reading.
+advice about where to look; the misses stay on the send-outcomes line and keep
+the card's badge raised, so a dismissed routing line cannot make a channel with
+skipped sends look clean.
 
-**Boundary.** Only these two are dismissible. A live interface fault, a serial
-line that cannot carry the schedule, and a failed Windows timer request each
-describe a condition that is still true while it is on screen; there is nothing
-to acknowledge and nothing that would bring them back. The sampling note is not
-dismissible either, for the same reason — but it was reset to a strong weight,
-because at small-and-weak a note qualifying every line beneath it read as a
-footnote to skip. Weight, not colour, carries that (ADR-050).
+**Boundary.** Only a warning standing on a growing counter is dismissible. A
+live interface fault, a serial line that cannot carry the schedule, and a failed
+Windows timer request each describe a condition still true while it is on
+screen: there is nothing to acknowledge and nothing that would bring them back.
+The sampling note is not dismissible for the same reason, but it is set in a
+strong weight — it qualifies every line beneath it, and weight rather than
+colour carries that (ADR-050).
 
 **Consequences:** Dismissal is process-local view state, per channel, never
 written to a profile, and changes nothing counted, logged, or sent. The shared
-chrome gains `dismissible_attention_callout` beside the plain one — the same
-frame with a trailing button, added before the text under a right-to-left layout
-so a long routing sentence wraps into the width the button leaves rather than
-pushing it outside the frame, which is pinned by a headless layout test.
+chrome gains `dismissible_attention_callout` beside the plain one, sharing its
+frame so this is not a second visual language for the same kind of statement.
 
 ---
 
@@ -2025,58 +1999,52 @@ pushing it outside the frame, which is pinned by a headless layout test.
 
 **Status:** Accepted 2026-08-09.
 
-**Context:** A failed send has been logged since the runner shipped: WARN on the
-first failure of an episode, INFO on recovery with the episode's counts. A
-*missed* send — a scheduled point the channel fell more than an interval behind
-and never reached — was logged nowhere. It existed only as `missed_sends` folded
-into the `Counters` status, which the GUI renders on the send-outcomes line.
+**Context:** Failed sends have been logged since the runner shipped. A *missed*
+send — a scheduled point the channel fell more than an interval behind and never
+reached — was logged nowhere; it existed only as a live counter. The CLI has no
+diagnostics card and prints no run summary, so a channel could skip half its
+cadence points with nothing on stdout at all, and in the GUI the log recorded
+connection loss but never cadence loss.
 
-Two things follow from that, and neither was ever decided; the gap simply went
-unnoticed. The CLI has no diagnostics card and prints no run summary, so a
-channel could skip half its cadence points with **nothing on stdout at all**. And
-in the GUI the fact was live-only: the send-outcomes line says what the run
-totals are *now*, while the log is the record of *when* things changed. A
-technician reconstructing a night's behaviour from the log found failures and
-recoveries in it and no trace of the channel having fallen off cadence.
-
-The information was already available at the right moment — ADR-051 made
-`Schedule::poll` report the points it skips on `Tick::Due`, so the runner learns
-of each skip as it happens.
-
-**Decision:** Report the edges of an off-cadence episode, and nothing between
-them.
-
-WARN on the first skipped send, INFO once the channel has gone
+**Decision:** Report the edges of an off-cadence episode and nothing between
+them. WARN on the first skipped send, INFO once the channel has gone
 `MISS_RECOVERY_SETTLE` without another, carrying the episode's total. A run that
 stops mid-episode logs the run's missed total, so the log never ends on an
 unanswered warning. A later lapse is a new episode counted from zero.
 
-*Why not a line per miss.* Skips accrue as `late / interval + 1` and concentrate
-on the shortest interval, so heavy overload produces thousands a second. In the
-GUI the log pane is fed by a bounded queue, so that flood would discard the very
-updates the reader needs — the fault's symptom degrading its own diagnosis
-(ADR-052 concerns the same queue).
+*Not a line per miss.* Skips accrue as `late / interval + 1` and concentrate on
+the shortest interval, so heavy overload produces thousands a second — into a log
+pane the GUI feeds through a bounded queue, which would discard the very updates
+the reader needs. The fault's symptom would degrade its own diagnosis.
 
-*Why recovery is a settle window and not the first clean send.* A marginal
-channel skips intermittently. Closing the episode on the first clean poll would
-log a start and an end for every pair of polls, which is the same flood at two
-lines instead of one. The window has to outlast the coarsest ordinary cause of a
-skip, which is an OS scheduling quantum — tens of milliseconds — so seconds is
-the right order of magnitude and five is a settle time rather than a threshold
-anyone should tune.
+*Not the first clean send.* A marginal channel skips intermittently, so closing
+on the first clean poll reproduces that flood at two lines instead of one. The
+window only has to outlast the skip's cause, and the coarsest ordinary one is an
+OS scheduling quantum, so seconds is the right order of magnitude; five is a
+settle time chosen within it, not a threshold anyone should tune.
 
-*Why the first skip and not a threshold.* This matches the failure path exactly:
-the first event is the one the reader could have acted on, and every later one
-says only "still". A threshold would also have to be justified per schedule — one
-skipped send on a 15 s cadence is a fifteen-second hole in the data, and one on a
-10 ms cadence is nothing anyone would notice.
+*Not a threshold on the opening edge either.* The first event is the one the
+reader could have acted on, and every later one says only "still" — the same rule
+the failure path follows. A threshold would need justifying per schedule, since
+one skipped send on a 15 s cadence is a fifteen-second hole in the data and one
+on a 10 ms cadence is nothing anyone would notice.
 
-**Consequences:** The transition table is a pure function (`observe_skips`)
-tested directly, because what must hold — sustained overload logs twice, not once
-per skipped send — is a property of the table rather than of any timed run. This
-closes the CLI blind spot and puts cadence loss into the same record as
-connection loss, at the same two levels. Nothing measured, counted, scheduled, or
-sent changes; this is reporting only.
+**Boundary.** The settle window is a **minimum, not a deadline**, and the line
+says so. The check runs where the skip count arrives, on a cadence point the
+channel reaches, so nothing is woken to announce its own recovery and a slow
+schedule reports at its next send. Adding a timer to the send loop's wait
+calculation — on the hot path, to make a notice punctual — was rejected. The line
+is scoped to cadence alone: sends can still be failing or withheld by backoff
+while every point is reached, so it states what it measured rather than "back to
+normal".
+
+**Consequences:** Cadence loss joins connection loss in the same record at the
+same two levels, and the CLI blind spot closes. The transition table is a pure
+function tested directly, because "sustained overload logs twice, not once per
+skipped send" is a property of the table rather than of any timed run; two
+timed tests cover the seam to the send loop, including the stop-mid-episode
+path and the independence from send failure. Nothing measured, counted,
+scheduled, or sent changes; this is reporting only.
 
 ---
 
@@ -2084,61 +2052,52 @@ sent changes; this is reporting only.
 
 **Status:** Accepted 2026-08-09.
 
-**Context:** A reader asked what "status receiver is falling behind" meant. It
-named an internal queue, in the vocabulary of the code that owns it, and its
-leading clause read as a fault on the send path — the one thing it can never be.
-A sweep of every log string then found a dozen more of the same kind, including
-three that fire on the most ordinary failure in the application: pressing Start
-with something unfilled produced "start preflight failed: missing draft", where
-neither *preflight* nor *draft* appears anywhere on the screen the reader was
-looking at.
-
-A second class was worse than badly worded. Six messages report talker's own
-state machine disagreeing with itself — a result arriving for an untracked
-request, an interface confirming with no start waiting. Each carried a structured
-`channel` field, and the GUI log layer tallies any event carrying that field onto
-that channel's row in the channel list. So an internal bookkeeping bug raised a
-warning badge on the reader's serial link: a summons to a channel about a fault
-that was not the channel's, which they could neither act on nor clear.
+**Context:** Log strings had been written in the vocabulary of the code that
+emitted them rather than of the reader in front of the screen. Worse, six of
+them report talker's own state machine disagreeing with itself and each carried
+a structured `channel` field — which the GUI log layer turns into a warning badge
+on that channel's row. An internal bookkeeping bug summoned the reader to their
+serial link over a fault that was not the channel's and that they could neither
+act on nor clear.
 
 **Decision:** Three rules.
 
 *A log line states its consequence, in the reader's vocabulary.* The reader is a
 technician with a device on the other end of a wire, not the author of the module
 that emitted the line. Name what happened to their channel, not the mechanism
-that carried it. "The live output display may lag with no disruption of output
-count or cadence" says what the reader must decide; "the status receiver is
-falling behind" says where in our code the author was standing.
+that carried it.
 
 *`channel = …` is a claim, not decoration.* It asserts *this event is about that
 channel's operation*, and it is what raises the row badge. A failed send, a clock
 step, a skipped cadence point all qualify. An internal bookkeeping fault does
 not — so those carry no `channel` field and name the channel in their text
 instead, which keeps the identity in the record without making a false claim in
-the UI. The rule is stated here because the field is trivially easy to re-add out
-of a wish to be helpful, and nothing in the type system says otherwise.
+the UI. The rule is written down because the field is trivially easy to re-add
+out of a wish to be helpful, and nothing in the type system says otherwise.
 
-*An internal fault says it is one, and what it cost.* Each of the six now
-follows one shape: `internal fault on channel <label> (<n>x): <what our state
-did>. <what it costs the reader>. Please report this.` They stay at WARN/ERROR
-rather than being demoted to DEBUG — a fault that is only recorded when someone
-had already raised the log level is a fault nobody ever hears about, and these
-are rare by construction, so their *frequency* is itself a signal worth keeping.
+*An internal fault says it is one, what it cost, and how often.* One shape:
+`internal fault on channel <label> (<n>x): <what our state did>. <what it costs
+the reader>. Please report this.` They stay at WARN/ERROR rather than dropping to
+DEBUG — a fault recorded only when someone had already raised the log level is one
+nobody hears about, and these are rare by construction, so their *frequency* is
+itself a signal.
 
-**Rate limiting.** Four of the six sit inside a per-status drain loop, so a
-wedged state machine could emit one per poll forever. `InternalFaultTally`
-reports the 1st, 10th, 100th … occurrence and states the running count. That
-serves both shapes these ever take — a single edge case we got wrong is never
-missed, and a billion occurrences cost ten lines — while the count distinguishes
-them, which a first-only guard would not.
+**Rate limiting.** Every one of these sits in a loop that repeats, so a wedged
+state machine could emit one per poll forever. `InternalFaultTally` reports the
+1st, 10th, 100th … occurrence with the running count: a single edge case is never
+missed, a billion occurrences cost ten lines, and the count distinguishes those
+two shapes where a first-only guard would not. The tally and the sentence shape
+live in one module (`core::internal_fault`) that every caller reaches for —
+applying the rule was tried by convention first, and one of the six was missed.
 
 **Consequences:** No behaviour, measurement, or wire output changes; this is
-reporting only. The tally is per slot, so a wedged slot cannot be diagnosed from
-a number that pooled every channel. One test asserts the decade cadence directly,
-since "cannot flood the log" is a property of the counter rather than of any run.
-The same pass reworded nine operational strings and one diagnostics-card branch
-that had said "competing for its thread" while every sibling branch said a
-message *held the channel*.
+reporting only. The tally is per channel slot, and per run for the runner's, so a
+wedged slot cannot be diagnosed from a number that pooled every channel. Three
+tests hold the rules: the decade cadence and the sentence shape, both properties
+of the counter rather than of any run, and one that dispatches a real fault at a
+real call site through the GUI log layer and asserts the badge never rises —
+because a rule the type system cannot carry needs something other than reading to
+enforce it.
 
 ---
 
