@@ -1,5 +1,6 @@
 pub mod capacity;
 pub mod channel;
+pub(crate) mod internal_fault;
 pub mod logging;
 pub mod message;
 pub mod profile;

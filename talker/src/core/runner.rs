@@ -15,6 +15,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
 use crate::core::{
     channel::{ChannelId, Interface, InterfaceConfig},
+    internal_fault::InternalFaultTally,
     run_summary::{RunEndReason, RunId, RunSummary},
     scheduler::{Schedule, Tick},
     telemetry::{MessageTiming, MessageTimingRecorder, SendTimingRecorder, SendTimingReport},
@@ -796,6 +797,10 @@ fn run_loop(
     // while keeping perfect cadence.
     let mut miss_episode: Option<MissEpisode> = None;
 
+    // Renders that returned nothing for an index the schedule handed out. Per
+    // run rather than per slot, because a runner outlives no run but its own.
+    let mut render_faults = InternalFaultTally::default();
+
     let end_reason = 'run: loop {
         // Drain anything already queued so back-to-back sends can't starve
         // command handling.
@@ -892,15 +897,20 @@ fn run_loop(
                     let Some(payload) = schedule.render(index) else {
                         // `poll` obtains this index from the same immutable-size
                         // schedule. Stay panic-free if that invariant ever
-                        // changes — and say what it cost, without the `channel`
-                        // field, because this is talker disagreeing with itself
-                        // rather than anything about the link (ADR-054).
-                        tracing::error!(
-                            "internal fault on channel {}: message {} could not be built and this \
-                             send was skipped. The channel is still running. Please report this.",
-                            who.label,
-                            index + 1
-                        );
+                        // changes — and report it as talker disagreeing with
+                        // itself rather than anything about the link (ADR-054).
+                        //
+                        // Tallied like the supervisor's: this sits on the send
+                        // path, so a broken invariant would otherwise emit a
+                        // line at every due point, which on a 10 ms cadence is
+                        // a hundred a second for as long as the run lasts.
+                        if let Some(line) = render_faults.report(
+                            &who.label,
+                            format!("message {} could not be built", index + 1),
+                            "That send was skipped; the channel is still running",
+                        ) {
+                            tracing::error!("{line}");
+                        }
                         continue;
                     };
                     let render_finished = Instant::now();

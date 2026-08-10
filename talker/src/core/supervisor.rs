@@ -26,6 +26,7 @@ use std::time::Instant;
 use crossbeam_channel::{Receiver, TrySendError};
 
 use crate::core::channel::{ChannelId, InterfaceConfig};
+use crate::core::internal_fault::InternalFaultTally;
 use crate::core::message::MessageConfig;
 use crate::core::run_summary::{RunId, RunSummary};
 use crate::core::runner::{
@@ -246,36 +247,12 @@ struct DrainingRunner {
     status_rx: Receiver<TalkerStatus>,
 }
 
-/// Occurrences of one internal bookkeeping fault, and whether this one earns a
-/// line (ADR-054).
-///
-/// Reports the 1st, 10th, 100th … so a fault that happens once is never missed
-/// and one that repeats every poll cannot flood the log: a billion occurrences
-/// produce ten lines. The count is reported with it, because *how often* is what
-/// separates the two shapes these ever take — a single edge case we got wrong,
-/// or a state machine wedged and repeating.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct InternalFaultTally(u64);
-
-impl InternalFaultTally {
-    /// Count one occurrence; return the running count when it should be logged.
-    fn should_report(&mut self) -> Option<u64> {
-        self.0 += 1;
-        let seen = self.0;
-        std::iter::successors(Some(1_u64), |decade| decade.checked_mul(10))
-            .take_while(|decade| *decade <= seen)
-            .any(|decade| decade == seen)
-            .then_some(seen)
-    }
-}
-
 /// One channel slot's internal bookkeeping faults.
 ///
 /// Every one of these means talker's own state machine disagreed with itself.
-/// None of them is a statement about the channel's link, which is exactly why
-/// they are reported *without* the `channel` field the GUI log layer tallies on
-/// — see ADR-054. Counted per slot so a wedged slot cannot be diagnosed from a
-/// number that pooled every channel.
+/// None of them is a statement about the channel's link, which is why they are
+/// reported through [`InternalFaultTally`] — see [`crate::core::internal_fault`]
+/// for the two rules that module keeps together.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SlotFaults {
     /// The runner opened an interface that is not the one the start requested.
@@ -859,24 +836,24 @@ fn drain_control_statuses(
                 match pending_start.take() {
                     Some(run) if run.interface == config => *applied_run = Some(run),
                     Some(run) => {
-                        if let Some(seen) = faults.interface_mismatch.should_report() {
-                            tracing::warn!(
-                                "internal fault on channel {label} ({seen}x): the interface that \
-                                 opened is not the one the last start asked for. Sending is \
-                                 unaffected; the settings shown may not match what is running. \
-                                 Please report this."
-                            );
+                        if let Some(line) = faults.interface_mismatch.report(
+                            label,
+                            "the interface that opened is not the one the last start asked for",
+                            "Sending is unaffected; the settings shown may not match what is \
+                             running",
+                        ) {
+                            tracing::warn!("{line}");
                         }
                         *pending_start = Some(run);
                     }
                     None => {
-                        if let Some(seen) = faults.interface_unexpected.should_report() {
-                            tracing::warn!(
-                                "internal fault on channel {label} ({seen}x): an interface \
-                                 reported itself open with no start waiting for it. Sending is \
-                                 unaffected; the settings shown may not match what is running. \
-                                 Please report this."
-                            );
+                        if let Some(line) = faults.interface_unexpected.report(
+                            label,
+                            "an interface reported itself open with no start waiting for it",
+                            "Sending is unaffected; the settings shown may not match what is \
+                             running",
+                        ) {
+                            tracing::warn!("{line}");
                         }
                     }
                 }
@@ -891,22 +868,22 @@ fn drain_control_statuses(
                     continue;
                 }
                 let Some(pending) = pending_commands.remove(&id) else {
-                    if let Some(seen) = faults.unknown_command.should_report() {
-                        tracing::warn!(
-                            "internal fault on channel {label} ({seen}x): a result arrived for a \
-                             request that is no longer being tracked. Sending is unaffected; a \
-                             setting you changed may not be shown as applied. Please report this."
-                        );
+                    if let Some(line) = faults.unknown_command.report(
+                        label,
+                        "a result arrived for a request that is no longer being tracked",
+                        "Sending is unaffected; a setting you changed may not be shown as applied",
+                    ) {
+                        tracing::warn!("{line}");
                     }
                     continue;
                 };
                 if pending.effect.target() != target {
-                    if let Some(seen) = faults.command_target_mismatch.should_report() {
-                        tracing::warn!(
-                            "internal fault on channel {label} ({seen}x): a result arrived naming \
-                             a different setting than the one requested. Sending is unaffected; a \
-                             setting you changed may not be shown as applied. Please report this."
-                        );
+                    if let Some(line) = faults.command_target_mismatch.report(
+                        label,
+                        "a result arrived naming a different setting than the one requested",
+                        "Sending is unaffected; a setting you changed may not be shown as applied",
+                    ) {
+                        tracing::warn!("{line}");
                     }
                     continue;
                 }
@@ -993,12 +970,13 @@ fn retain_run_summary(
     misrouted: &mut InternalFaultTally,
 ) {
     if reported_channel != slot_id || summary.channel != slot_id {
-        if let Some(seen) = misrouted.should_report() {
-            tracing::warn!(
-                "internal fault on channel {slot_id} ({seen}x): a finished run reported itself \
-                 against a different channel, so its summary was discarded. Sending is \
-                 unaffected; Last completed run may be missing or stale. Please report this."
-            );
+        if let Some(line) = misrouted.report(
+            slot_id,
+            "a finished run reported itself against a different channel, so its summary was \
+             discarded",
+            "Sending is unaffected; Last completed run may be missing or stale",
+        ) {
+            tracing::warn!("{line}");
         }
         return;
     }
@@ -1266,19 +1244,71 @@ mod tests {
         assert!(samples.iter().all(|s| s.slot == 0));
     }
 
-    /// An internal fault must survive happening once and must not flood the
-    /// log happening constantly — the two shapes these ever take. The decade
-    /// cadence is what serves both, and the count is what tells them apart.
+    /// ADR-054's central claim, at a real call site rather than in prose: an
+    /// internal fault must not carry the structured `channel` field, because
+    /// the GUI log layer turns that field into a warning badge on the reader's
+    /// channel row. A bug in our own bookkeeping summoning someone to their
+    /// serial link is the failure this forbids, and nothing in the type system
+    /// prevents a future edit from re-adding the field.
     #[test]
-    fn an_internal_fault_reports_on_decades_so_a_wedged_state_cannot_flood() {
-        let mut tally = InternalFaultTally::default();
-        let reported: Vec<u64> = (0..10_000).filter_map(|_| tally.should_report()).collect();
+    fn an_internal_fault_does_not_claim_to_be_about_the_channel() {
+        use tracing_subscriber::layer::SubscriberExt as _;
 
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        let subscriber =
+            tracing_subscriber::registry().with(crate::core::logging::GuiLogLayer::new(tx));
+        let slot = ChannelId::mint();
+        let mut retained = None;
+        let mut misrouted = InternalFaultTally::default();
+
+        tracing::subscriber::with_default(subscriber, || {
+            retain_run_summary(
+                slot,
+                ChannelId::mint(),
+                Box::new(misrouted_summary()),
+                &mut retained,
+                &mut misrouted,
+            );
+        });
+
+        let event = rx.try_recv().expect("a misrouted summary is reported");
         assert_eq!(
-            reported,
-            vec![1, 10, 100, 1_000, 10_000],
-            "the first occurrence is never missed, and ten thousand cost five lines"
+            event.channel, None,
+            "an internal fault must not raise a badge on a channel row"
         );
+        assert!(
+            event.message.contains(&slot.to_string()),
+            "the channel belongs in the text instead: {}",
+            event.message
+        );
+        assert!(
+            event.message.starts_with("internal fault on channel"),
+            "and it must say it is internal: {}",
+            event.message
+        );
+    }
+
+    /// A summary that names a channel other than the slot it arrived on.
+    fn misrouted_summary() -> RunSummary {
+        RunSummary {
+            run_id: RunId::mint(),
+            channel: ChannelId::mint(),
+            label: "test".to_owned(),
+            started_at: SystemTime::UNIX_EPOCH,
+            finished_at: SystemTime::UNIX_EPOCH,
+            elapsed: Duration::ZERO,
+            end_reason: crate::core::run_summary::RunEndReason::StopCommand,
+            total_count: 0,
+            total_bytes: 0,
+            per_message_counts: Vec::new(),
+            per_message_timing: Vec::new(),
+            dropped_statuses: 0,
+            missed_sends: 0,
+            failed_sends: 0,
+            suppressed_sends: 0,
+            timing: Default::default(),
+            timer: Default::default(),
+        }
     }
 
     #[test]
