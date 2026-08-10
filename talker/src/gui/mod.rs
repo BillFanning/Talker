@@ -999,17 +999,21 @@ impl TalkerApp {
         let label = self.channel_label(i);
         let cid = self.sup.channel_id(i).map_or(0, |id| id.as_u64());
 
+        // These three fire on the most ordinary failure in the application —
+        // pressing Start with something unfilled — so they say what is missing
+        // in the words the screen uses. "Preflight" and "draft" are this
+        // module's own vocabulary and appear nowhere the reader was looking.
         let Some(conn) = self.conn_drafts.get(i) else {
             tracing::error!(
                 channel = cid,
-                "channel {label} start preflight failed: missing draft"
+                "channel {label} could not start: no interface settings"
             );
             return;
         };
         let Some(drafts) = self.sched_drafts.get(i) else {
             tracing::error!(
                 channel = cid,
-                "channel {label} start preflight failed: missing message drafts"
+                "channel {label} could not start: no messages configured"
             );
             return;
         };
@@ -1019,7 +1023,7 @@ impl TalkerApp {
         if let Err(e) = replace_channel_run(&mut self.sup, i, label.clone(), conn, drafts) {
             tracing::error!(
                 channel = cid,
-                "channel {label} start preflight failed; runtime unchanged: {e:#}"
+                "channel {label} could not start; nothing was changed: {e:#}"
             );
             return;
         }

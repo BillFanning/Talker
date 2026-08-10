@@ -28,6 +28,12 @@ it lands:
   and CLI mode had no account of them at all. The dropped-update warning was
   reworded in the same pass to state what it costs the reader rather than the
   queue behind it.
+- **§9.2 who the log is written for (ADR-054)** — a log line states what
+  happened to the reader's channel, in the vocabulary the screen uses. The
+  structured `channel` field is a claim that the event is about that channel's
+  operation, and it is what raises the channel row's warning badge; talker's own
+  bookkeeping faults therefore no longer carry it, name themselves as internal,
+  say what they cost, and are rate limited on a decade cadence.
 
 Earlier revisions are in [REVISIONS.md](REVISIONS.md). They live there rather
 than here for two reasons: a document's version number belongs only in its own
@@ -1046,6 +1052,33 @@ unanswered warning. A second lapse is a second episode, counted from zero.
 
 This is the only account of missed sends available in CLI mode, which has no
 diagnostics card.
+
+#### Who the log is written for (ADR-054)
+
+A log line states **what happened to the reader's channel**, in the vocabulary
+the screen uses — not the mechanism inside talker that carried it. The reader is
+a technician with a device on the far end of a wire.
+
+Events carry a structured `channel` field, and the GUI tallies any event carrying
+it onto that channel's row in the channel list. **That field is a claim**: this
+event is about that channel's operation. A failed send, a clock step, and a
+skipped cadence point all qualify.
+
+Talker's own bookkeeping faults do not, and carry no `channel` field — a bug in
+command tracking must not raise a warning badge on the reader's serial link,
+where it cannot be acted on or cleared. Each names the channel in its text and
+follows one shape:
+
+```
+internal fault on channel <label> (<n>x): <what talker's own state did>.
+<what it costs the reader>. Please report this.
+```
+
+They stay at WARN or ERROR rather than DEBUG: a fault recorded only when someone
+had already raised the log level is one nobody hears about. They are rate
+limited on a decade cadence — the 1st, 10th, 100th … occurrence, with the running
+count — so a single lapse is never missed and a wedged state machine cannot flood
+the log.
 
 #### CLI Logging
 

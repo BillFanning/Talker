@@ -197,13 +197,18 @@ pub(in crate::gui) fn missed_send_routing(
         .count()
         <= 1
     {
-        // With one active message there is nothing else to hold the thread, so
+        // With one active message there is nothing else to hold the channel, so
         // the blocking branch above can never fire. Saying "no single message
         // accounts for these" here would be true and useless — it describes the
         // absence of a cause that was never possible.
-        "Missed sends: this channel has one active message, so nothing else is competing for its \
-         thread — either its own render and send overrun its interval, or deadline wakes are \
-         arriving late. Compare its send-call timing against its interval."
+        //
+        // Worded in the same terms as every other branch: a message *holds the
+        // channel*. This one said "competing for its thread" and named the
+        // internals of the wait — the reader is a technician with a serial
+        // link, not someone who can act on a wake being late.
+        "Missed sends: this channel has one active message, so nothing else can be holding it up \
+         — either that message's own send takes longer than its interval, or the channel is being \
+         woken late. Compare its send-call timing against its interval."
             .to_owned()
     } else {
         "Missed sends: no message delayed another and no capacity limit was reached — compare \

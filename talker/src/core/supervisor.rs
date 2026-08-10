@@ -246,6 +246,50 @@ struct DrainingRunner {
     status_rx: Receiver<TalkerStatus>,
 }
 
+/// Occurrences of one internal bookkeeping fault, and whether this one earns a
+/// line (ADR-054).
+///
+/// Reports the 1st, 10th, 100th … so a fault that happens once is never missed
+/// and one that repeats every poll cannot flood the log: a billion occurrences
+/// produce ten lines. The count is reported with it, because *how often* is what
+/// separates the two shapes these ever take — a single edge case we got wrong,
+/// or a state machine wedged and repeating.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct InternalFaultTally(u64);
+
+impl InternalFaultTally {
+    /// Count one occurrence; return the running count when it should be logged.
+    fn should_report(&mut self) -> Option<u64> {
+        self.0 += 1;
+        let seen = self.0;
+        std::iter::successors(Some(1_u64), |decade| decade.checked_mul(10))
+            .take_while(|decade| *decade <= seen)
+            .any(|decade| decade == seen)
+            .then_some(seen)
+    }
+}
+
+/// One channel slot's internal bookkeeping faults.
+///
+/// Every one of these means talker's own state machine disagreed with itself.
+/// None of them is a statement about the channel's link, which is exactly why
+/// they are reported *without* the `channel` field the GUI log layer tallies on
+/// — see ADR-054. Counted per slot so a wedged slot cannot be diagnosed from a
+/// number that pooled every channel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SlotFaults {
+    /// The runner opened an interface that is not the one the start requested.
+    interface_mismatch: InternalFaultTally,
+    /// An interface open was confirmed with no start waiting for it.
+    interface_unexpected: InternalFaultTally,
+    /// A command result arrived for a request no longer tracked.
+    unknown_command: InternalFaultTally,
+    /// A command result arrived naming a different target than the request.
+    command_target_mismatch: InternalFaultTally,
+    /// A completed run's summary named a different channel than its slot.
+    summary_misrouted: InternalFaultTally,
+}
+
 struct Slot {
     /// Stable identity, minted when the slot is created (ADR-020). Slots
     /// shift positionally on removal; the id travels with the slot, and
@@ -269,6 +313,8 @@ struct Slot {
     pending_commands: BTreeMap<CommandId, PendingCommand>,
     /// Newest completed run for this stable channel slot.
     last_run_summary: Option<RunSummary>,
+    /// Talker's own bookkeeping faults for this slot — not the channel's.
+    faults: SlotFaults,
 }
 
 impl Slot {
@@ -284,6 +330,7 @@ impl Slot {
             pending_start: None,
             pending_commands: BTreeMap::new(),
             last_run_summary: None,
+            faults: SlotFaults::default(),
         }
     }
 
@@ -636,13 +683,17 @@ impl TalkerSupervisor {
         what: &str,
         outcome: CommandOutcome,
     ) {
+        // This reaches the reader twice — the log and the channel's own error
+        // banner — so it is written for someone who has just clicked something
+        // and seen nothing happen. "Enqueued" and "runner" describe how the
+        // request travels, which is not what they are asking.
         let why = match outcome {
             CommandOutcome::QueueFull => {
-                "the channel is not accepting commands — it may be stuck in a send that has not returned"
+                "the channel is not accepting commands — it may be stuck in a send that has not finished"
             }
-            _ => "the runner has already exited",
+            _ => "the channel has already stopped",
         };
-        let msg = format!("{what} was not enqueued: {why}");
+        let msg = format!("{what} was not carried out: {why}");
         if let Some(slot) = self.slots.get(i) {
             tracing::warn!(
                 channel = slot.id.as_u64(),
@@ -709,15 +760,18 @@ impl TalkerSupervisor {
                 let qlen = h.status_rx.len();
                 slot.telemetry.queue_len = qlen;
                 slot.telemetry.queue_peak = slot.telemetry.queue_peak.max(qlen);
+                let label = slot.display_label();
                 drain_control_statuses(
                     &h.control_rx,
                     slot.id,
+                    &label,
                     ControlDrainState {
                         applied_run: &mut slot.applied_run,
                         pending_start: &mut slot.pending_start,
                         pending_commands: &mut slot.pending_commands,
                         last_run_summary: &mut slot.last_run_summary,
                         telemetry: &mut slot.telemetry,
+                        faults: &mut slot.faults,
                     },
                     &mut command_completions,
                 );
@@ -728,7 +782,7 @@ impl TalkerSupervisor {
                         &mut slot.pending_commands,
                         &mut slot.telemetry,
                         &mut command_completions,
-                        "the runner exited before executing the command",
+                        "the channel stopped before carrying this out",
                     );
                     slot.pending_start = None;
                     slot.handle = None; // runner exited on its own (open failed / disconnect)
@@ -742,17 +796,18 @@ impl TalkerSupervisor {
             let slot_id = slot.id;
             let last_run_summary = &mut slot.last_run_summary;
             let telemetry = &mut slot.telemetry;
+            let misrouted = &mut slot.faults.summary_misrouted;
             slot.draining.retain_mut(|d| {
                 let finished = d.thread.is_finished();
                 // Results from a stopped predecessor no longer describe a live
                 // interface. Retain only its self-contained completion summary;
                 // drain the other results to keep the reliable lane unblocked.
-                drain_finished_summaries(&d.control_rx, slot_id, last_run_summary);
+                drain_finished_summaries(&d.control_rx, slot_id, last_run_summary, misrouted);
                 drain_statuses(i, &d.status_rx, telemetry, &mut samples);
                 !finished
             });
             slot.retired_control.retain_mut(|control_rx| {
-                !drain_finished_summaries(control_rx, slot_id, last_run_summary)
+                !drain_finished_summaries(control_rx, slot_id, last_run_summary, misrouted)
             });
         }
         self.orphans.retain_mut(|d| {
@@ -777,11 +832,13 @@ struct ControlDrainState<'a> {
     pending_commands: &'a mut BTreeMap<CommandId, PendingCommand>,
     last_run_summary: &'a mut Option<RunSummary>,
     telemetry: &'a mut ChannelTelemetry,
+    faults: &'a mut SlotFaults,
 }
 
 fn drain_control_statuses(
     control_rx: &Receiver<RunnerControlStatus>,
     slot_id: ChannelId,
+    label: &str,
     state: ControlDrainState<'_>,
     completions: &mut Vec<CommandCompletion>,
 ) {
@@ -791,6 +848,7 @@ fn drain_control_statuses(
         pending_commands,
         last_run_summary,
         telemetry,
+        faults,
     } = state;
     for status in control_rx.try_iter() {
         match status {
@@ -801,16 +859,26 @@ fn drain_control_statuses(
                 match pending_start.take() {
                     Some(run) if run.interface == config => *applied_run = Some(run),
                     Some(run) => {
-                        tracing::warn!(
-                            channel = channel.as_u64(),
-                            "runner opened a different interface than its pending start"
-                        );
+                        if let Some(seen) = faults.interface_mismatch.should_report() {
+                            tracing::warn!(
+                                "internal fault on channel {label} ({seen}x): the interface that \
+                                 opened is not the one the last start asked for. Sending is \
+                                 unaffected; the settings shown may not match what is running. \
+                                 Please report this."
+                            );
+                        }
                         *pending_start = Some(run);
                     }
-                    None => tracing::warn!(
-                        channel = channel.as_u64(),
-                        "runner confirmed an interface with no pending start"
-                    ),
+                    None => {
+                        if let Some(seen) = faults.interface_unexpected.should_report() {
+                            tracing::warn!(
+                                "internal fault on channel {label} ({seen}x): an interface \
+                                 reported itself open with no start waiting for it. Sending is \
+                                 unaffected; the settings shown may not match what is running. \
+                                 Please report this."
+                            );
+                        }
+                    }
                 }
             }
             RunnerControlStatus::CommandCompleted {
@@ -823,17 +891,23 @@ fn drain_control_statuses(
                     continue;
                 }
                 let Some(pending) = pending_commands.remove(&id) else {
-                    tracing::warn!(
-                        channel = channel.as_u64(),
-                        "runner completed unknown command id {id:?}"
-                    );
+                    if let Some(seen) = faults.unknown_command.should_report() {
+                        tracing::warn!(
+                            "internal fault on channel {label} ({seen}x): a result arrived for a \
+                             request that is no longer being tracked. Sending is unaffected; a \
+                             setting you changed may not be shown as applied. Please report this."
+                        );
+                    }
                     continue;
                 };
                 if pending.effect.target() != target {
-                    tracing::warn!(
-                        channel = channel.as_u64(),
-                        "runner command id {id:?} completed for the wrong target"
-                    );
+                    if let Some(seen) = faults.command_target_mismatch.should_report() {
+                        tracing::warn!(
+                            "internal fault on channel {label} ({seen}x): a result arrived naming \
+                             a different setting than the one requested. Sending is unaffected; a \
+                             setting you changed may not be shown as applied. Please report this."
+                        );
+                    }
                     continue;
                 }
                 match execution {
@@ -878,7 +952,13 @@ fn drain_control_statuses(
                 }
             }
             RunnerControlStatus::RunFinished { channel, summary } => {
-                retain_run_summary(slot_id, channel, summary, last_run_summary);
+                retain_run_summary(
+                    slot_id,
+                    channel,
+                    summary,
+                    last_run_summary,
+                    &mut faults.summary_misrouted,
+                );
             }
         }
     }
@@ -891,11 +971,12 @@ fn drain_finished_summaries(
     control_rx: &Receiver<RunnerControlStatus>,
     slot_id: ChannelId,
     last_run_summary: &mut Option<RunSummary>,
+    misrouted: &mut InternalFaultTally,
 ) -> bool {
     loop {
         match control_rx.try_recv() {
             Ok(RunnerControlStatus::RunFinished { channel, summary }) => {
-                retain_run_summary(slot_id, channel, summary, last_run_summary);
+                retain_run_summary(slot_id, channel, summary, last_run_summary, misrouted);
             }
             Ok(_) => {}
             Err(crossbeam_channel::TryRecvError::Empty) => return false,
@@ -909,12 +990,16 @@ fn retain_run_summary(
     reported_channel: ChannelId,
     summary: Box<RunSummary>,
     retained: &mut Option<RunSummary>,
+    misrouted: &mut InternalFaultTally,
 ) {
     if reported_channel != slot_id || summary.channel != slot_id {
-        tracing::warn!(
-            channel = reported_channel.as_u64(),
-            "runner completed a run summary for the wrong channel"
-        );
+        if let Some(seen) = misrouted.should_report() {
+            tracing::warn!(
+                "internal fault on channel {slot_id} ({seen}x): a finished run reported itself \
+                 against a different channel, so its summary was discarded. Sending is \
+                 unaffected; Last completed run may be missing or stale. Please report this."
+            );
+        }
         return;
     }
     if retained
@@ -1181,6 +1266,21 @@ mod tests {
         assert!(samples.iter().all(|s| s.slot == 0));
     }
 
+    /// An internal fault must survive happening once and must not flood the
+    /// log happening constantly — the two shapes these ever take. The decade
+    /// cadence is what serves both, and the count is what tells them apart.
+    #[test]
+    fn an_internal_fault_reports_on_decades_so_a_wedged_state_cannot_flood() {
+        let mut tally = InternalFaultTally::default();
+        let reported: Vec<u64> = (0..10_000).filter_map(|_| tally.should_report()).collect();
+
+        assert_eq!(
+            reported,
+            vec![1, 10, 100, 1_000, 10_000],
+            "the first occurrence is never missed, and ten thousand cost five lines"
+        );
+    }
+
     #[test]
     fn newest_run_summary_wins_regardless_of_completion_arrival_order() {
         let channel = ChannelId::mint();
@@ -1208,13 +1308,50 @@ mod tests {
             })
         };
         let mut retained = None;
+        let mut misrouted = InternalFaultTally::default();
 
-        retain_run_summary(channel, channel, make_summary(newer_id, 20), &mut retained);
-        retain_run_summary(channel, channel, make_summary(older_id, 10), &mut retained);
+        retain_run_summary(
+            channel,
+            channel,
+            make_summary(newer_id, 20),
+            &mut retained,
+            &mut misrouted,
+        );
+        retain_run_summary(
+            channel,
+            channel,
+            make_summary(older_id, 10),
+            &mut retained,
+            &mut misrouted,
+        );
+
+        assert_eq!(
+            misrouted,
+            InternalFaultTally::default(),
+            "correctly routed summaries are not an internal fault"
+        );
+
+        // A summary naming a different channel is discarded and counted, and
+        // leaves what was already retained alone.
+        retain_run_summary(
+            channel,
+            ChannelId::mint(),
+            make_summary(RunId::mint(), 99),
+            &mut retained,
+            &mut misrouted,
+        );
+        assert_ne!(
+            misrouted,
+            InternalFaultTally::default(),
+            "a misrouted summary is an internal fault and must be counted"
+        );
 
         let retained = retained.expect("newest summary retained");
         assert_eq!(retained.run_id, newer_id);
-        assert_eq!(retained.total_count, 20);
+        assert_eq!(
+            retained.total_count, 20,
+            "the misrouted summary must not displace the slot's own"
+        );
     }
 
     #[test]
@@ -1447,7 +1584,7 @@ mod tests {
                 target: CommandTarget::MessageInterval(0),
                 message,
                 ..
-            }] if *id == submission.id && message.contains("runner exited")
+            }] if *id == submission.id && message.contains("stopped")
         ));
         assert!(sup.telemetry(0).command_error.is_some());
     }
@@ -1535,7 +1672,7 @@ mod tests {
     fn samples_clear_interface_errors_but_not_command_errors() {
         let mut telemetry = ChannelTelemetry {
             last_error: Some("send failed".into()),
-            command_error: Some("the interval change was not enqueued".into()),
+            command_error: Some("the interval change was not carried out".into()),
             ..ChannelTelemetry::default()
         };
         let (tx, rx) = crossbeam_channel::bounded(4);

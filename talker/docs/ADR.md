@@ -26,6 +26,15 @@ it lands:
   stdout, and makes the log answer *when* a channel fell behind rather than only
   what the totals are now. The drop warning of ADR-052 was reworded in the same
   pass to state its consequence rather than the queue behind it.
+- **ADR-054** states who the log is written for, after a sweep found a dozen
+  strings naming internals the reader has no access to — including the three
+  that fire when Start is pressed with something unfilled. It also settles what
+  `channel = …` means: it claims the event is about that channel's operation,
+  and it is what raises the channel row's warning badge. Six internal
+  bookkeeping faults carried it and should not have, so a bug in our own command
+  tracking was summoning the reader to their serial link. They now name the
+  channel in their text, say they are internal, say what it cost, and report on
+  a decade cadence so a wedged state machine cannot flood the log.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -2068,6 +2077,68 @@ per skipped send — is a property of the table rather than of any timed run. Th
 closes the CLI blind spot and puts cadence loss into the same record as
 connection loss, at the same two levels. Nothing measured, counted, scheduled, or
 sent changes; this is reporting only.
+
+---
+
+## ADR-054 — The log is written for the reader, and `channel` is a claim
+
+**Status:** Accepted 2026-08-09.
+
+**Context:** A reader asked what "status receiver is falling behind" meant. It
+named an internal queue, in the vocabulary of the code that owns it, and its
+leading clause read as a fault on the send path — the one thing it can never be.
+A sweep of every log string then found a dozen more of the same kind, including
+three that fire on the most ordinary failure in the application: pressing Start
+with something unfilled produced "start preflight failed: missing draft", where
+neither *preflight* nor *draft* appears anywhere on the screen the reader was
+looking at.
+
+A second class was worse than badly worded. Six messages report talker's own
+state machine disagreeing with itself — a result arriving for an untracked
+request, an interface confirming with no start waiting. Each carried a structured
+`channel` field, and the GUI log layer tallies any event carrying that field onto
+that channel's row in the channel list. So an internal bookkeeping bug raised a
+warning badge on the reader's serial link: a summons to a channel about a fault
+that was not the channel's, which they could neither act on nor clear.
+
+**Decision:** Three rules.
+
+*A log line states its consequence, in the reader's vocabulary.* The reader is a
+technician with a device on the other end of a wire, not the author of the module
+that emitted the line. Name what happened to their channel, not the mechanism
+that carried it. "The live output display may lag with no disruption of output
+count or cadence" says what the reader must decide; "the status receiver is
+falling behind" says where in our code the author was standing.
+
+*`channel = …` is a claim, not decoration.* It asserts *this event is about that
+channel's operation*, and it is what raises the row badge. A failed send, a clock
+step, a skipped cadence point all qualify. An internal bookkeeping fault does
+not — so those carry no `channel` field and name the channel in their text
+instead, which keeps the identity in the record without making a false claim in
+the UI. The rule is stated here because the field is trivially easy to re-add out
+of a wish to be helpful, and nothing in the type system says otherwise.
+
+*An internal fault says it is one, and what it cost.* Each of the six now
+follows one shape: `internal fault on channel <label> (<n>x): <what our state
+did>. <what it costs the reader>. Please report this.` They stay at WARN/ERROR
+rather than being demoted to DEBUG — a fault that is only recorded when someone
+had already raised the log level is a fault nobody ever hears about, and these
+are rare by construction, so their *frequency* is itself a signal worth keeping.
+
+**Rate limiting.** Four of the six sit inside a per-status drain loop, so a
+wedged state machine could emit one per poll forever. `InternalFaultTally`
+reports the 1st, 10th, 100th … occurrence and states the running count. That
+serves both shapes these ever take — a single edge case we got wrong is never
+missed, and a billion occurrences cost ten lines — while the count distinguishes
+them, which a first-only guard would not.
+
+**Consequences:** No behaviour, measurement, or wire output changes; this is
+reporting only. The tally is per slot, so a wedged slot cannot be diagnosed from
+a number that pooled every channel. One test asserts the decade cadence directly,
+since "cannot flood the log" is a property of the counter rather than of any run.
+The same pass reworded nine operational strings and one diagnostics-card branch
+that had said "competing for its thread" while every sibling branch said a
+message *held the channel*.
 
 ---
 

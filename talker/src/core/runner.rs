@@ -591,7 +591,7 @@ impl<'a> TimerReconciler<'a> {
         {
             tracing::warn!(
                 channel = self.who.id.as_u64(),
-                "channel {} could not enable Windows 1 ms timer resolution; deadline wakes may be late",
+                "channel {} could not enable Windows 1 ms timer resolution; sends may start late",
                 self.who.label
             );
         }
@@ -808,7 +808,7 @@ fn run_loop(
             tracing::info!(
                 channel = who.id.as_u64(),
                 realignments = schedule.clock_realignments(),
-                "channel {} rebased future sends after a wall-clock step",
+                "channel {} re-aligned its future sends after the system clock jumped",
                 who.label
             );
         }
@@ -878,11 +878,15 @@ fn run_loop(
                     let render_started = Instant::now();
                     let Some(payload) = schedule.render(index) else {
                         // `poll` obtains this index from the same immutable-size
-                        // schedule. Stay panic-free if that invariant ever changes.
+                        // schedule. Stay panic-free if that invariant ever
+                        // changes — and say what it cost, without the `channel`
+                        // field, because this is talker disagreeing with itself
+                        // rather than anything about the link (ADR-054).
                         tracing::error!(
-                            channel = who.id.as_u64(),
-                            "channel {} scheduler returned missing message index {index}",
-                            who.label
+                            "internal fault on channel {}: message {} could not be built and this \
+                             send was skipped. The channel is still running. Please report this.",
+                            who.label,
+                            index + 1
                         );
                         continue;
                     };
@@ -909,13 +913,17 @@ fn run_loop(
                     match send_result {
                         Ok(()) => {
                             if let Some(ep) = episode.take() {
+                                // "Suppressed" is defined on the send-outcomes
+                                // line and nowhere the log reader can see, so
+                                // this states what happened to those sends.
                                 tracing::info!(
-                            channel = who.id.as_u64(),
-                            "channel {} sending recovered after {} failed and {} suppressed sends",
-                            who.label,
-                            ep.failures,
-                            ep.suppressed
-                        );
+                                    channel = who.id.as_u64(),
+                                    "channel {} sending recovered after {} failed sends and {} \
+                                     withheld while retrying",
+                                    who.label,
+                                    ep.failures,
+                                    ep.suppressed
+                                );
                                 timer.emit(TalkerStatus::SendRecovered {
                                     channel: who.id,
                                     failures: ep.failures,
@@ -961,7 +969,8 @@ fn run_loop(
                                 None => {
                                     tracing::warn!(
                                         channel = who.id.as_u64(),
-                                        "channel {} send failed (retrying with backoff): {e:#}",
+                                        "channel {} send failed (retrying, with a growing delay \
+                                         between attempts): {e:#}",
                                         who.label
                                     );
                                     episode = Some(FailureEpisode {
