@@ -156,16 +156,20 @@ pub(in crate::gui) fn missed_send_routing(
                 compact_duration(message.longest_block)
             )
         };
-        // Uncharged is not idle, and nothing here can tell the two apart: a
-        // point goes uncharged both when the thread was genuinely free and
-        // when the send that held it has aged out of the retained window.
-        // Stating it as idle time was a claim the measurement never supported.
+        // Uncharged is not idle, and nothing here can tell the causes apart.
+        // What the record supports is one negative fact — no measured interface
+        // write spanned the point — and a late wake, work outside the send
+        // call, and a free thread all produce exactly that. Ageing out is *not*
+        // among them: the history is sized from the schedule (see
+        // `MISSED_ROUTING_LIMITS`), so a write that could have spanned the
+        // point is still there to be found.
         let remainder = if attributed >= missed {
             String::new()
         } else {
             format!(
-                " The other {} are not charged to any send — either a late deadline wake, or a \
-                 hold too far back to still be retained.",
+                " The other {} are not charged to any send: no measured interface write spanned \
+                 those points, which a late deadline wake, work outside the send itself, and an \
+                 idle thread all look alike.",
                 thousands(missed - attributed)
             )
         };
@@ -345,9 +349,9 @@ mod tests {
              Its longest send held the channel 120 ms. See Per-message timing."
         );
 
-        // Three the record cannot place. Uncharged is not idle — a send that
-        // has aged out of the retained window leaves the same gap as a free
-        // thread, and this line must not pick one of those.
+        // Three the record cannot place. Uncharged is not idle — a late wake
+        // and work outside the send call leave the same gap as a free thread,
+        // and this line must not pick one of those.
         let partial = missed_send_routing(&evidence(12), &per_message).unwrap();
         assert!(
             partial

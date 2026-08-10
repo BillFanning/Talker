@@ -316,10 +316,12 @@ The **detail pane** (right) shows the selected channel:
     skipped. The amount-stating branch must close its own arithmetic: the
     charged total, the largest single share, and the remainder, so that a reader
     is never left to infer where the rest went. That remainder is described as
-    **not charged to any send** and never as an idle channel — a miss goes
-    uncharged both when the thread was genuinely free and when the send that
-    held it has aged out of the retained record, and nothing measured can tell
-    those apart. The callout carries a **Dismiss** button, on the rule in §3.2
+    **not charged to any send** and never as an idle channel. The record
+    supports one negative fact — no measured interface write spanned those
+    points — and a late deadline wake, work outside the send call, and a
+    genuinely free thread all produce it. The retained history is sized from
+    the schedule, so a write that could have spanned a point has not been
+    forgotten; the gap is in what is measured, not in what is kept. The callout carries a **Dismiss** button, on the rule in §3.2
     *Dismissible warnings* below. It is advice rather than a count: the misses
     stay on the send-outcomes line and keep the card's badge raised, so
     dismissing hides where to look and never what happened.
@@ -1033,22 +1035,30 @@ Logging uses the `tracing` facade with `tracing-subscriber` for dispatch. Log le
 #### Edge-triggered channel conditions
 
 Three conditions can persist for the whole of a long run, and each is logged
-**once when it starts and once when it ends**, never per occurrence. A line per
-event would emit thousands a second under exactly the fault it describes — and
-in the GUI the log pane is itself fed by a queue, so the flood would degrade the
-display it is competing with.
+**at its edges** rather than per occurrence. A line per event would emit
+thousands a second under exactly the fault it describes — and in the GUI the log
+pane is itself fed by a queue, so the flood would degrade the display it is
+competing with.
 
 | Condition | Opens with | Closes with |
 |-----------|-----------|-------------|
 | Sends failing | the first failed write, at WARN | the first success, at INFO, carrying the episode's failed and withheld counts |
-| Off schedule (ADR-053) | the first skipped send, at WARN | five seconds with none skipped, at INFO, carrying the episode's total |
-| Display updates discarded | the first discarded update, at WARN | — (a run total; the count is on the Output pane) |
+| Off schedule (ADR-053) | the first skipped send, at WARN | the first cadence point reached at least five seconds after the last skip, at INFO, carrying the episode's total |
+| Display updates discarded | the first discarded update, at WARN | nothing — see below |
+
+Two of the three close; the third cannot. Discarded updates are a run total
+that never returns to zero, so there is no recovery edge to report. The standing
+count is on the Output pane (§5.7), which is where it can be acted on.
 
 Off-schedule recovery is a **settle window**, not the first clean send: a
 marginal channel skips intermittently, so closing on the first clean send would
-log a start and an end per pair and reproduce the flood. A run that stops while
-off schedule logs the run's own missed total, so the log never ends on an
-unanswered warning. A second lapse is a second episode, counted from zero.
+log a start and an end per pair and reproduce the flood. Five seconds is a
+**minimum, not a deadline** — the check runs where the skip count arrives, on a
+cadence point the channel reaches, so no channel is woken to announce its own
+recovery and a slow schedule reports at its next send rather than at five
+seconds. A run that stops while off schedule logs the run's own missed total, so
+the log never ends on an unanswered warning. A second lapse is a second episode,
+counted from zero.
 
 This is the only account of missed sends available in CLI mode, which has no
 diagnostics card.

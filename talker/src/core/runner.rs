@@ -256,16 +256,23 @@ struct FailureEpisode {
     next_attempt: Instant,
 }
 
-/// How long a channel must go without skipping a scheduled send before it is
-/// reported as back on schedule.
+/// How long a channel must go without skipping a scheduled send before its
+/// off-cadence episode is closed.
 ///
 /// Recovery cannot be "the first poll that skipped nothing". A marginal channel
 /// skips intermittently, so closing on the first clean tick would log a start
 /// and an end for every pair of ticks — at a 10 ms cadence, a hundred pairs a
 /// second, which is the flood the edge-triggering exists to prevent. The window
-/// has to outlast whatever caused the skip; the coarsest ordinary cause is an OS
-/// scheduling quantum, measured in tens of milliseconds, so seconds is the right
-/// order and five is a settle time rather than a threshold to tune.
+/// only has to outlast the skip's cause, and the coarsest ordinary one is an OS
+/// scheduling quantum, measured in tens of milliseconds. Seconds is therefore
+/// the right order of magnitude, and five is a settle time chosen within it
+/// rather than a threshold proven by anything.
+///
+/// **It is a minimum, not a deadline.** The test runs only where the skip count
+/// arrives, on a reached cadence point, so a channel is not woken to announce
+/// its own recovery: a 15 s schedule reports at its next send, not at 5 s. A run
+/// that stops first never reports one at all, which is why the end of the run
+/// states the missed total instead.
 const MISS_RECOVERY_SETTLE: Duration = Duration::from_secs(5);
 
 /// One episode of a channel failing to keep its cadence: from the first skipped
@@ -855,10 +862,16 @@ fn run_loop(
                          below its configured rate",
                         who.label
                     ),
+                    // Not "back to normal": this is a statement about cadence
+                    // points only. Sends can still be failing or withheld by
+                    // retry backoff while every point is reached, and that
+                    // episode reports itself separately.
                     MissReport::BackOnSchedule(total) => tracing::info!(
                         channel = who.id.as_u64(),
-                        "channel {} back on schedule after missing {total} scheduled sends",
-                        who.label
+                        "channel {} has missed no further scheduled sends for {} seconds \
+                         ({total} missed in that episode)",
+                        who.label,
+                        MISS_RECOVERY_SETTLE.as_secs()
                     ),
                     MissReport::Silent => {}
                 }

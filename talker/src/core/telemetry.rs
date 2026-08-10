@@ -351,9 +351,12 @@ impl MessageTimingRecorder {
     /// a quick catch-up send owns only the points inside its own brief window,
     /// which is almost never any, so it cannot inherit a burst it is clearing.
     ///
-    /// Points matching no retained window are left uncharged. With the ring
-    /// sized to the schedule that means the thread really was free, but the
-    /// record cannot *prove* which, so no readout may call it idle time.
+    /// Points matching no retained window are left uncharged. The ring is sized
+    /// from the schedule, so that does not mean the write has been forgotten —
+    /// it means no *interface write* spanned the point. A late wake, time spent
+    /// rendering or handling commands, and a genuinely free thread all leave
+    /// that same gap, and nothing measured here separates them, so no readout
+    /// may call it idle time.
     pub(crate) fn record_skips(
         &mut self,
         index: usize,
