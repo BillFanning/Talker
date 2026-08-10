@@ -17,6 +17,15 @@ it lands:
   a warning standing on a growing counter is dismissible — a live interface
   fault, an impossible serial schedule, and a failed timer request each describe
   a condition still true while it is on screen.
+- **ADR-053** puts losing cadence into the log, which had recorded failed sends
+  since the runner shipped and missed ones nowhere. WARN on the first skipped
+  send, INFO once five seconds pass without another, carrying the episode's
+  total — the edges only, because skips concentrate on the shortest interval and
+  a line each would flood the log with the fault's own symptom. It closes a CLI
+  blind spot where a channel could skip half its cadence points with nothing on
+  stdout, and makes the log answer *when* a channel fell behind rather than only
+  what the totals are now. The drop warning of ADR-052 was reworded in the same
+  pass to state its consequence rather than the queue behind it.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -2000,6 +2009,65 @@ chrome gains `dismissible_attention_callout` beside the plain one — the same
 frame with a trailing button, added before the text under a right-to-left layout
 so a long routing sentence wraps into the width the button leaves rather than
 pushing it outside the frame, which is pinned by a headless layout test.
+
+---
+
+## ADR-053 — Losing cadence is a logged event, not only a counter
+
+**Status:** Accepted 2026-08-09.
+
+**Context:** A failed send has been logged since the runner shipped: WARN on the
+first failure of an episode, INFO on recovery with the episode's counts. A
+*missed* send — a scheduled point the channel fell more than an interval behind
+and never reached — was logged nowhere. It existed only as `missed_sends` folded
+into the `Counters` status, which the GUI renders on the send-outcomes line.
+
+Two things follow from that, and neither was ever decided; the gap simply went
+unnoticed. The CLI has no diagnostics card and prints no run summary, so a
+channel could skip half its cadence points with **nothing on stdout at all**. And
+in the GUI the fact was live-only: the send-outcomes line says what the run
+totals are *now*, while the log is the record of *when* things changed. A
+technician reconstructing a night's behaviour from the log found failures and
+recoveries in it and no trace of the channel having fallen off cadence.
+
+The information was already available at the right moment — ADR-051 made
+`Schedule::poll` report the points it skips on `Tick::Due`, so the runner learns
+of each skip as it happens.
+
+**Decision:** Report the edges of an off-cadence episode, and nothing between
+them.
+
+WARN on the first skipped send, INFO once the channel has gone
+`MISS_RECOVERY_SETTLE` without another, carrying the episode's total. A run that
+stops mid-episode logs the run's missed total, so the log never ends on an
+unanswered warning. A later lapse is a new episode counted from zero.
+
+*Why not a line per miss.* Skips accrue as `late / interval + 1` and concentrate
+on the shortest interval, so heavy overload produces thousands a second. In the
+GUI the log pane is fed by a bounded queue, so that flood would discard the very
+updates the reader needs — the fault's symptom degrading its own diagnosis
+(ADR-052 concerns the same queue).
+
+*Why recovery is a settle window and not the first clean send.* A marginal
+channel skips intermittently. Closing the episode on the first clean poll would
+log a start and an end for every pair of polls, which is the same flood at two
+lines instead of one. The window has to outlast the coarsest ordinary cause of a
+skip, which is an OS scheduling quantum — tens of milliseconds — so seconds is
+the right order of magnitude and five is a settle time rather than a threshold
+anyone should tune.
+
+*Why the first skip and not a threshold.* This matches the failure path exactly:
+the first event is the one the reader could have acted on, and every later one
+says only "still". A threshold would also have to be justified per schedule — one
+skipped send on a 15 s cadence is a fifteen-second hole in the data, and one on a
+10 ms cadence is nothing anyone would notice.
+
+**Consequences:** The transition table is a pure function (`observe_skips`)
+tested directly, because what must hold — sustained overload logs twice, not once
+per skipped send — is a property of the table rather than of any timed run. This
+closes the CLI blind spot and puts cadence loss into the same record as
+connection loss, at the same two levels. Nothing measured, counted, scheduled, or
+sent changes; this is reporting only.
 
 ---
 

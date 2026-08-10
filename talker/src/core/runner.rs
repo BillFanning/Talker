@@ -256,6 +256,80 @@ struct FailureEpisode {
     next_attempt: Instant,
 }
 
+/// How long a channel must go without skipping a scheduled send before it is
+/// reported as back on schedule.
+///
+/// Recovery cannot be "the first poll that skipped nothing". A marginal channel
+/// skips intermittently, so closing on the first clean tick would log a start
+/// and an end for every pair of ticks — at a 10 ms cadence, a hundred pairs a
+/// second, which is the flood the edge-triggering exists to prevent. The window
+/// has to outlast whatever caused the skip; the coarsest ordinary cause is an OS
+/// scheduling quantum, measured in tens of milliseconds, so seconds is the right
+/// order and five is a settle time rather than a threshold to tune.
+const MISS_RECOVERY_SETTLE: Duration = Duration::from_secs(5);
+
+/// One episode of a channel failing to keep its cadence: from the first skipped
+/// send (reported) to [`MISS_RECOVERY_SETTLE`] without another (reported with
+/// these counts).
+///
+/// Edge-triggered for the reason the failure path is, only more so. Skips are
+/// counted at every poll, and they concentrate on the shortest interval, so a
+/// line per skipped send would emit thousands a second under exactly the
+/// overload it is describing — into a log pane that is itself a queue consumer.
+/// The first skip and the return to schedule are the two facts worth a line;
+/// the count in between belongs on the line that closes the episode.
+struct MissEpisode {
+    /// Scheduled sends skipped since the episode opened, ≥ 1.
+    skipped: u64,
+    /// When the most recent skip was observed, for the settle test.
+    last_skip: Instant,
+}
+
+/// What one poll's skip count is worth reporting, if anything.
+#[derive(Debug, PartialEq, Eq)]
+enum MissReport {
+    /// Either nothing was skipped and nothing was open, or the episode is
+    /// still running and this poll only added to it.
+    Silent,
+    /// The channel has just fallen off cadence. Carries this poll's own count,
+    /// which is what is known at the moment it is reported.
+    FellBehind(u64),
+    /// The channel has held its cadence for [`MISS_RECOVERY_SETTLE`]. Carries
+    /// the episode's total.
+    BackOnSchedule(u64),
+}
+
+/// Fold one poll's skip count into the off-cadence episode.
+///
+/// Separated from the send loop so the edge behaviour can be exercised
+/// directly: what has to hold is that a sustained overload logs twice and not
+/// once per skipped send, and that is a statement about this transition table
+/// rather than about any particular run.
+fn observe_skips(episode: &mut Option<MissEpisode>, skipped: u64, now: Instant) -> MissReport {
+    match (skipped > 0, episode.as_mut()) {
+        (true, Some(open)) => {
+            open.skipped = open.skipped.saturating_add(skipped);
+            open.last_skip = now;
+            MissReport::Silent
+        }
+        (true, None) => {
+            *episode = Some(MissEpisode {
+                skipped,
+                last_skip: now,
+            });
+            MissReport::FellBehind(skipped)
+        }
+        (false, Some(open))
+            if now.saturating_duration_since(open.last_skip) >= MISS_RECOVERY_SETTLE =>
+        {
+            let total = open.skipped;
+            *episode = None;
+            MissReport::BackOnSchedule(total)
+        }
+        _ => MissReport::Silent,
+    }
+}
+
 /// The owning side's handle for a running talker thread.
 pub struct TalkerHandle {
     pub cmd_tx: Sender<TalkerCommand>,
@@ -709,6 +783,12 @@ fn run_loop(
     // see [`RETRY_BACKOFF_INITIAL`]). `None` while sends are succeeding.
     let mut episode: Option<FailureEpisode> = None;
 
+    // The current off-cadence episode, if any. `None` while every scheduled
+    // send is being reached. Independent of `episode` above: a channel can miss
+    // its cadence with a perfectly healthy interface, and can fail every write
+    // while keeping perfect cadence.
+    let mut miss_episode: Option<MissEpisode> = None;
+
     let end_reason = 'run: loop {
         // Drain anything already queued so back-to-back sends can't starve
         // command handling.
@@ -764,6 +844,24 @@ fn run_loop(
                 // backlog belongs to, and the skipped points belong to the
                 // same one.
                 per_message_timing.record_skips(index, scheduled_for, interval, skipped);
+                // Report falling off cadence and returning to it, and nothing
+                // in between. The first skip is reported for the same reason
+                // the first failed send is: it is the moment the reader could
+                // have acted, and every later one says only "still".
+                match observe_skips(&mut miss_episode, skipped, due_handled_at) {
+                    MissReport::FellBehind(now_skipped) => tracing::warn!(
+                        channel = who.id.as_u64(),
+                        "channel {} missed {now_skipped} scheduled sends — output is running \
+                         below its configured rate",
+                        who.label
+                    ),
+                    MissReport::BackOnSchedule(total) => tracing::info!(
+                        channel = who.id.as_u64(),
+                        "channel {} back on schedule after missing {total} scheduled sends",
+                        who.label
+                    ),
+                    MissReport::Silent => {}
+                }
                 let suppressed = episode
                     .as_ref()
                     .is_some_and(|ep| due_handled_at < ep.next_attempt);
@@ -976,6 +1074,18 @@ fn run_loop(
     let finished_mono = Instant::now();
     let finished_at = SystemTime::now();
     let missed_sends = schedule.missed_sends();
+    // A run that stops mid-episode never reaches a settle window, so the log
+    // would otherwise end on the warning with no total against it. The run's
+    // own figure is stated rather than the episode's: it is exact, channel-wide,
+    // and the same number the completed-run summary carries.
+    if miss_episode.is_some() {
+        tracing::warn!(
+            channel = who.id.as_u64(),
+            "channel {} stopped while off schedule — {missed_sends} scheduled sends missed \
+             during this run",
+            who.label
+        );
+    }
     let final_timing = send_timing.snapshot_at(finished_mono);
     per_message_timing.set_schedule(schedule.message_demand());
     let final_per_message = per_message_timing.snapshot();
@@ -1043,11 +1153,15 @@ fn emit_status(
         }
         Err(TrySendError::Full(_)) => {
             *dropped_statuses += 1;
+            // Stated as the consequence, not the mechanism. "Status receiver is
+            // falling behind" named an internal queue the reader cannot see and
+            // read as a fault on the send path, which is the one thing this can
+            // never be. What it costs is display freshness, and nothing else.
             if *dropped_statuses == 1 {
                 tracing::warn!(
                     channel = who.id.as_u64(),
-                    "channel {}: status receiver is falling behind — sends continue at \
-                     cadence; observer updates are being dropped and counted",
+                    "channel {}: the live output display may lag with no disruption of \
+                     output count or cadence",
                     who.label
                 );
             }
@@ -1082,6 +1196,80 @@ mod tests {
     use super::*;
     use crate::core::channel::TcpClientConfig;
     use crate::core::message::{CodePage, MessageConfig, PayloadConfig};
+
+    /// Sustained overload must log twice, not once per skipped send. This is
+    /// the whole reason the episode exists: skips concentrate on the shortest
+    /// interval, so a line each would flood the log with the fault's own
+    /// symptom at the moment the log is least able to carry it.
+    #[test]
+    fn falling_off_cadence_reports_the_edges_and_not_every_skipped_send() {
+        let start = Instant::now();
+        let mut episode = None;
+
+        // The first skip is the one the reader could have acted on.
+        assert_eq!(
+            observe_skips(&mut episode, 3, start),
+            MissReport::FellBehind(3)
+        );
+
+        // A thousand polls of continuing overload say nothing further, and the
+        // count accrues for the line that closes the episode.
+        for tick in 1..=1_000 {
+            assert_eq!(
+                observe_skips(&mut episode, 2, start + Duration::from_millis(tick)),
+                MissReport::Silent,
+                "a continuing episode must not log again at tick {tick}"
+            );
+        }
+
+        // A clean poll inside the settle window is not yet a recovery: a
+        // marginal channel alternates, and reporting each clean tick would
+        // produce the same flood with two lines instead of one.
+        assert_eq!(
+            observe_skips(&mut episode, 0, start + MISS_RECOVERY_SETTLE),
+            MissReport::Silent
+        );
+
+        // Settle is measured from the last skip, not from the episode's start.
+        let last_skip = start + Duration::from_millis(1_000);
+        assert_eq!(
+            observe_skips(&mut episode, 0, last_skip + MISS_RECOVERY_SETTLE),
+            MissReport::BackOnSchedule(3 + 2 * 1_000)
+        );
+        assert!(episode.is_none(), "recovery closes the episode");
+
+        // And a quiet channel stays quiet.
+        assert_eq!(
+            observe_skips(&mut episode, 0, last_skip + MISS_RECOVERY_SETTLE * 10),
+            MissReport::Silent
+        );
+    }
+
+    /// A channel that recovers and later falls behind again is two episodes,
+    /// each with its own count — not one running total that outlives the fault
+    /// it described.
+    #[test]
+    fn a_second_lapse_is_counted_from_zero() {
+        let start = Instant::now();
+        let mut episode = None;
+
+        observe_skips(&mut episode, 5, start);
+        assert_eq!(
+            observe_skips(&mut episode, 0, start + MISS_RECOVERY_SETTLE),
+            MissReport::BackOnSchedule(5)
+        );
+
+        let later = start + MISS_RECOVERY_SETTLE * 4;
+        assert_eq!(
+            observe_skips(&mut episode, 1, later),
+            MissReport::FellBehind(1)
+        );
+        assert_eq!(
+            observe_skips(&mut episode, 0, later + MISS_RECOVERY_SETTLE),
+            MissReport::BackOnSchedule(1),
+            "the second episode must not carry the first one's total"
+        );
+    }
 
     /// An [`Interface`] that records every payload (or fails on demand).
     struct MockInterface {

@@ -20,6 +20,14 @@ it lands:
   gauge stays under Timing & runtime details. The sampling note keeps its calm
   treatment but is set in a stronger weight, since it qualifies every line
   beneath it.
+- **§9.2 edge-triggered channel conditions (ADR-053)** — a channel falling off
+  its send schedule is now logged: WARN on the first skipped send, INFO once
+  five seconds pass with none skipped, carrying the episode's total, and the
+  run's own total if it stops mid-episode. Missed sends previously appeared only
+  as a live counter, so the log recorded connection loss but never cadence loss,
+  and CLI mode had no account of them at all. The dropped-update warning was
+  reworded in the same pass to state what it costs the reader rather than the
+  queue behind it.
 
 Earlier revisions are in [REVISIONS.md](REVISIONS.md). They live there rather
 than here for two reasons: a document's version number belongs only in its own
@@ -1013,8 +1021,31 @@ Logging uses the `tracing` facade with `tracing-subscriber` for dispatch. Log le
 | Level | Examples |
 |-------|---------|
 | ERROR | Connection failure, file not found, encoding error |
-| WARN | Parameter change caused reconnect, malformed record skipped |
-| INFO | Channel opened/closed, profile loaded, send started/stopped |
+| WARN | Parameter change caused reconnect, malformed record skipped, a channel falling off its send schedule |
+| INFO | Channel opened/closed, profile loaded, send started/stopped, a channel returning to schedule |
+
+#### Edge-triggered channel conditions
+
+Three conditions can persist for the whole of a long run, and each is logged
+**once when it starts and once when it ends**, never per occurrence. A line per
+event would emit thousands a second under exactly the fault it describes — and
+in the GUI the log pane is itself fed by a queue, so the flood would degrade the
+display it is competing with.
+
+| Condition | Opens with | Closes with |
+|-----------|-----------|-------------|
+| Sends failing | the first failed write, at WARN | the first success, at INFO, carrying the episode's failed and withheld counts |
+| Off schedule (ADR-053) | the first skipped send, at WARN | five seconds with none skipped, at INFO, carrying the episode's total |
+| Display updates discarded | the first discarded update, at WARN | — (a run total; the count is on the Output pane) |
+
+Off-schedule recovery is a **settle window**, not the first clean send: a
+marginal channel skips intermittently, so closing on the first clean send would
+log a start and an end per pair and reproduce the flood. A run that stops while
+off schedule logs the run's own missed total, so the log never ends on an
+unanswered warning. A second lapse is a second episode, counted from zero.
+
+This is the only account of missed sends available in CLI mode, which has no
+diagnostics card.
 
 #### CLI Logging
 
