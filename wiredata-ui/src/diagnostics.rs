@@ -235,6 +235,24 @@ fn tone_marker(tone: SignalTone) -> &'static str {
     }
 }
 
+/// The tinted, accented surround both callout forms are drawn in.
+fn callout_frame(ui: &Ui, tone: SignalTone) -> egui::Frame {
+    let accent = tone.accent(ui);
+    egui::Frame::new()
+        .fill(tint(ui, accent, 24))
+        .stroke(egui::Stroke::new(1.0_f32, translucent(accent, 115)))
+        .corner_radius(egui::CornerRadius::same(5))
+        .inner_margin(egui::Margin::symmetric(8, 5))
+}
+
+/// The callout's own text, marked and accented.
+fn callout_label(ui: &mut Ui, text: WidgetText, tone: SignalTone) -> Response {
+    ui.add(
+        egui::Label::new(RichText::new(format!("\u{26A0} {}", text.text())).color(tone.accent(ui)))
+            .wrap(),
+    )
+}
+
 /// Draw an exceptional condition beneath the summary rows. Healthy information
 /// belongs in the grid; this callout is deliberately reserved for warning/fault
 /// conditions so it remains noticeable.
@@ -246,27 +264,53 @@ pub fn attention_callout(
     tooltip: impl Into<WidgetText>,
 ) -> Response {
     debug_assert!(matches!(tone, SignalTone::Warning | SignalTone::Fault));
-    let accent = tone.accent(ui);
-    let fill = tint(ui, accent, 24);
+    let text = text.into();
     let response = ui
         .push_id(id_source, |ui| {
-            egui::Frame::new()
-                .fill(fill)
-                .stroke(egui::Stroke::new(1.0_f32, translucent(accent, 115)))
-                .corner_radius(egui::CornerRadius::same(5))
-                .inner_margin(egui::Margin::symmetric(8, 5))
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(format!("\u{26A0} {}", text.into().text())).color(accent),
-                        )
-                        .wrap(),
-                    )
-                })
+            callout_frame(ui, tone)
+                .show(ui, |ui| callout_label(ui, text, tone))
                 .inner
         })
         .inner;
     response.on_hover_text(tooltip)
+}
+
+/// [`attention_callout`] with a Dismiss button on its trailing edge. Returns
+/// `true` on the frame the button is clicked; the caller owns what dismissal
+/// then means, since only it knows what would make the condition worth saying
+/// again.
+///
+/// The button is added *before* the text under a right-to-left layout, so the
+/// text wraps into the width the button leaves rather than pushing it out of
+/// the frame. A long routing sentence is the normal case here, not the edge one.
+pub fn dismissible_attention_callout(
+    ui: &mut Ui,
+    id_source: impl Hash,
+    text: impl Into<WidgetText>,
+    tone: SignalTone,
+    tooltip: impl Into<WidgetText>,
+) -> bool {
+    debug_assert!(matches!(tone, SignalTone::Warning | SignalTone::Fault));
+    let text = text.into();
+    let tooltip = tooltip.into();
+    ui.push_id(id_source, |ui| {
+        callout_frame(ui, tone)
+            .show(ui, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                    let dismissed = ui
+                        .small_button("Dismiss")
+                        .on_hover_text("Hide this until the condition gets worse.")
+                        .clicked();
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        callout_label(ui, text, tone).on_hover_text(tooltip);
+                    });
+                    dismissed
+                })
+                .inner
+            })
+            .inner
+    })
+    .inner
 }
 
 #[cfg(test)]
@@ -291,6 +335,73 @@ mod tests {
                 "attention uses the shared ⚠, not a private symbol"
             );
         }
+    }
+
+    /// The dismissible form is the plain one plus a button, not a second
+    /// visual language for the same kind of statement.
+    #[test]
+    fn both_callout_forms_share_one_frame() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for tone in [SignalTone::Warning, SignalTone::Fault] {
+                let frame = callout_frame(ui, tone);
+                assert_eq!(frame.corner_radius, egui::CornerRadius::same(5));
+                assert_eq!(frame.stroke.width, 1.0);
+                assert_ne!(
+                    frame.fill,
+                    tone.accent(ui),
+                    "the fill is a tint of the accent, never the accent itself"
+                );
+            }
+        });
+    }
+
+    /// The Dismiss button is added before the text, under a right-to-left
+    /// layout, so the text wraps into the width the button leaves. Added the
+    /// other way round a long sentence pushes the button past the frame edge,
+    /// and the control the reader is looking for is the part that vanishes.
+    #[test]
+    fn a_dismissible_callout_wraps_its_text_rather_than_displacing_the_button() {
+        const LONG: &str = "Missed sends: check message #2 first — its longest send held the \
+                            channel 120 ms, causing 430 ms of combined waiting across other \
+                            messages in 4 sends. See Per-message timing.";
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.set_max_width(320.0);
+            let available = ui.available_width();
+
+            let short = ui
+                .scope(|ui| {
+                    dismissible_attention_callout(
+                        ui,
+                        "short",
+                        "Missed sends.",
+                        SignalTone::Warning,
+                        "",
+                    );
+                })
+                .response
+                .rect;
+            let long = ui
+                .scope(|ui| {
+                    dismissible_attention_callout(ui, "long", LONG, SignalTone::Warning, "");
+                })
+                .response
+                .rect;
+
+            assert!(
+                long.width() <= available + 0.5,
+                "the callout grew past its width ({} > {available}), so the button is outside it",
+                long.width()
+            );
+            assert!(
+                long.height() > short.height(),
+                "the long text did not wrap: {} vs {}",
+                long.height(),
+                short.height()
+            );
+        });
     }
 
     #[test]

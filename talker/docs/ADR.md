@@ -1,21 +1,22 @@
 # Architecture Decision Record — Talker
 **Project:** talker  
-**Version:** 1.14
-**Date:** 2026-08-06
+**Version:** 1.15
+**Date:** 2026-08-09
 **Status:** Accepted
 
-Revision note (2026-08-06) — misses are measured where they happen:
+Revision note (2026-08-09) — a warning may be acknowledged, and is raised where
+it lands:
 
-- **ADR-051** amends the scope limit ADR-045 set for itself. Delay blame is
-  collected per deadline the channel *reaches*, so a ten-second block against a
-  10 ms cadence destroys a thousand cadence points and yields one lateness
-  sample — the evidence thinned out as the fault grew. `Schedule::poll` now
-  reports the points it skips, and each is charged to whichever send held the
-  thread as it passed — searched over a retained send history sized from the
-  schedule, so a channel cannot outgrow its own attribution. The missed-send
-  callout gains one branch entitled to convict, and must state the share it
-  cannot account for. ADR-045's refusal of a *victim-side* miss count still
-  stands and is unchanged.
+- **ADR-052** makes two callouts dismissible, and moves one of them. Both stand
+  on a run counter that only grows, so dismissal records the count and the
+  warning returns when it is exceeded — acknowledgement, not deletion, and a
+  counter below the record can only mean a new run. The dropped-update warning
+  leaves the diagnostics card for the **Output** pane whose completeness it
+  actually describes, and stops raising the card's badge, which had been
+  reading ATTENTION over a card containing no reason for it. The boundary: only
+  a warning standing on a growing counter is dismissible — a live interface
+  fault, an impossible serial schedule, and a failed timer request each describe
+  a condition still true while it is on screen.
 
 Earlier revision notes are in [REVISIONS.md](REVISIONS.md).
 
@@ -1933,6 +1934,72 @@ the other is sends that never happened.
 
 No wire output, cadence, scheduling behaviour, or profile schema changes. The
 stall policy is untouched — this measures the skips it was already making.
+
+---
+
+## ADR-052 — A warning may be acknowledged, and it is raised where it lands
+
+**Status:** Accepted 2026-08-09.
+
+**Context:** Two of the diagnostics card's callouts behave unlike the others.
+Both stand on a run-total counter, so once the condition has occurred the
+callout stays on screen for the rest of the run even though the pressure that
+caused it has passed. A reader watching a long soak cannot clear either one, and
+a warning that cannot be cleared is one the reader learns to look past —
+including on the occasion it means something.
+
+The dropped-update callout had a second problem: it was in the wrong panel. The
+diagnostics card is about the wire — what was scheduled, what went out, what the
+line can carry. Discarded diagnostic updates cost none of that; what they cost
+is the completeness of the **Output** pane, which has its own standing note
+about completeness a few centimetres away. Two statements qualifying the same
+lines sat in different panels, and only one of them was next to the lines.
+
+**Decision:** Three parts.
+
+*Placement follows consequence.* The dropped-update warning moves into the
+Output pane, directly beneath its header and above the sampling note, ordered by
+how much each qualifies the pane — dropped updates can cost any kind of update,
+sampling only costs payload lines. The queue gauge stays under Timing & runtime
+details, where a reader who wants depth and occupancy will look. Because the
+card no longer holds anything about drops, `diagnostic_card_tone` no longer
+takes them: a badge reading ATTENTION over rows that are all calm sends the
+reader hunting inside the card for a cause that was never in it.
+
+*Dismissal is acknowledgement, not deletion.* Both counters only grow within a
+run, so dismissal records the count and the warning returns when that count is
+**exceeded**. The reader is told once per occurrence; a fault still spreading is
+never silent. The two rejected alternatives are the two ends of the same axis: a
+dismissal lasting the rest of the run silences a real escalation, and one
+persisted across restarts hides a regression weeks later with no way back.
+
+A counter *below* the record can only mean the counter was reset, so
+`DismissedNotice` discards the record rather than trusting it. Without that, a
+fresh run's first drop would be measured against a number the reader last saw in
+a different run and would stay silent until it grew past it. The lifecycle path
+also clears the whole set on start; the self-correction is what makes the
+guarantee hold regardless.
+
+*Dismissal never removes a counted fact.* The missed-send routing callout is
+advice about where to look. The misses themselves stay on the send-outcomes line
+above the card and keep the card's badge raised, so a dismissed routing line
+cannot make a channel with skipped sends look clean. This is pinned by test
+rather than left to reading.
+
+**Boundary.** Only these two are dismissible. A live interface fault, a serial
+line that cannot carry the schedule, and a failed Windows timer request each
+describe a condition that is still true while it is on screen; there is nothing
+to acknowledge and nothing that would bring them back. The sampling note is not
+dismissible either, for the same reason — but it was reset to a strong weight,
+because at small-and-weak a note qualifying every line beneath it read as a
+footnote to skip. Weight, not colour, carries that (ADR-050).
+
+**Consequences:** Dismissal is process-local view state, per channel, never
+written to a profile, and changes nothing counted, logged, or sent. The shared
+chrome gains `dismissible_attention_callout` beside the plain one — the same
+frame with a trailing button, added before the text under a right-to-left layout
+so a long routing sentence wraps into the width the button leaves rather than
+pushing it outside the frame, which is pinned by a headless layout test.
 
 ---
 

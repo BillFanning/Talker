@@ -149,11 +149,17 @@ pub(in crate::gui) struct DecisionSignal {
     pub(in crate::gui) tone: SignalTone,
 }
 
+/// The badge on the diagnostics card.
+///
+/// Every input is something the card itself shows or is shown immediately above
+/// it. Discarded diagnostic updates used to raise this badge too, and no longer
+/// do: that warning now belongs to the Output pane, and a badge reading
+/// ATTENTION over rows that are all calm sends the reader hunting inside a card
+/// for a cause that was never in it.
 pub(in crate::gui) fn diagnostic_card_tone(
     delivery: SignalTone,
     capacity: SignalTone,
     timer_request_failed: bool,
-    dropped_updates: u64,
     running: bool,
 ) -> SignalTone {
     if delivery == SignalTone::Fault || capacity == SignalTone::Fault {
@@ -161,7 +167,6 @@ pub(in crate::gui) fn diagnostic_card_tone(
     } else if delivery == SignalTone::Warning
         || capacity == SignalTone::Warning
         || timer_request_failed
-        || dropped_updates > 0
     {
         SignalTone::Warning
     } else if running {
@@ -186,23 +191,34 @@ mod tests {
     /// The send-outcome counts moved out of the card and above it, but their
     /// tone still has to reach the badge — otherwise a failing interface reads
     /// as a calm card. This pins the coupling that survived that move.
+    ///
+    /// It also pins the half that must *not* survive: a run whose only
+    /// complaint is skipped sends still raises the badge from the outcome
+    /// counts, so dismissing the routing callout inside the card cannot make
+    /// the card look clean.
     #[test]
     fn send_outcome_tone_still_escalates_the_card_badge() {
         let failing = send_outcomes(98, 1, 0, 1);
         assert_eq!(
-            diagnostic_card_tone(failing.tone, SignalTone::Neutral, false, 0, true),
+            diagnostic_card_tone(failing.tone, SignalTone::Neutral, false, true),
             SignalTone::Fault
         );
 
         let shortfall = send_outcomes(98, 0, 1, 1);
         assert_eq!(
-            diagnostic_card_tone(shortfall.tone, SignalTone::Neutral, false, 0, true),
+            diagnostic_card_tone(shortfall.tone, SignalTone::Neutral, false, true),
+            SignalTone::Warning
+        );
+
+        let missed_only = send_outcomes(98, 0, 0, 2);
+        assert_eq!(
+            diagnostic_card_tone(missed_only.tone, SignalTone::Neutral, false, true),
             SignalTone::Warning
         );
 
         let clean = send_outcomes(100, 0, 0, 0);
         assert_eq!(
-            diagnostic_card_tone(clean.tone, SignalTone::Neutral, false, 0, true),
+            diagnostic_card_tone(clean.tone, SignalTone::Neutral, false, true),
             SignalTone::Healthy
         );
     }
@@ -210,19 +226,19 @@ mod tests {
     #[test]
     fn card_tone_surfaces_faults_warnings_and_clean_live_state() {
         assert_eq!(
-            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Fault, false, 0, true),
+            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Fault, false, true),
             SignalTone::Fault
         );
         assert_eq!(
-            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Neutral, true, 0, true),
+            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Neutral, true, true),
             SignalTone::Warning
         );
         assert_eq!(
-            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Neutral, false, 0, true),
+            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Neutral, false, true),
             SignalTone::Healthy
         );
         assert_eq!(
-            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Neutral, false, 0, false),
+            diagnostic_card_tone(SignalTone::Healthy, SignalTone::Neutral, false, false),
             SignalTone::Neutral
         );
     }

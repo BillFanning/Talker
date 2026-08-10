@@ -13,6 +13,16 @@ the specification, the specification is right and this is history.
 
 ## Specification
 
+Revision note (2026-08-06) — a missed send names its cause, honestly:
+
+- **§3.2 missed-send routing (ADR-051, corrected)** — the amount-stating branch
+  must close its own arithmetic: charged total, largest single share, and
+  remainder. Naming only the largest culprit dropped every other charged message
+  out of the sentence. The remainder is stated as **not charged to any send** and
+  never as an idle channel — a miss goes uncharged both when the thread was free
+  and when the send that held it has aged out of the retained record, and nothing
+  measured can tell those apart.
+
 Revision note (2026-08-06) — a missed send names its cause:
 
 - **§3.2 missed-send routing (ADR-051)** — one branch of the callout may now
@@ -255,6 +265,19 @@ keys are additive `#[serde(default)]` fields — older profiles load unchanged).
 ---
 
 ## Architecture Decision Record
+
+Revision note (2026-08-06) — misses are measured where they happen:
+
+- **ADR-051** amends the scope limit ADR-045 set for itself. Delay blame is
+  collected per deadline the channel *reaches*, so a ten-second block against a
+  10 ms cadence destroys a thousand cadence points and yields one lateness
+  sample — the evidence thinned out as the fault grew. `Schedule::poll` now
+  reports the points it skips, and each is charged to whichever send held the
+  thread as it passed — searched over a retained send history sized from the
+  schedule, so a channel cannot outgrow its own attribution. The missed-send
+  callout gains one branch entitled to convict, and must state the share it
+  cannot account for. ADR-045's refusal of a *victim-side* miss count still
+  stands and is unchanged.
 
 Revision note (2026-08-06) — four accents, and one rule:
 

@@ -3,6 +3,7 @@ mod detail;
 mod diagnostics;
 mod display;
 mod draft;
+mod notice;
 mod widgets;
 
 use std::collections::HashMap;
@@ -25,6 +26,7 @@ use crate::core::{
 
 use display::ChannelDisplay;
 use draft::{ConnDraft, ConnKind, ScheduleDraft, UdpModeDraft};
+use notice::ChannelNotices;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -440,6 +442,10 @@ struct TalkerApp {
     log_level: LogLevel,
     log_level_handle: LogLevelHandle,
     displays: Vec<ChannelDisplay>,
+    /// Per-channel dismissed warnings, shape-matched to `displays`. Which
+    /// warnings this reader has already acknowledged is view-state and belongs
+    /// to neither the display buffer nor the runner's telemetry.
+    notices: Vec<ChannelNotices>,
     last_title: String,
     serial_ports: Vec<String>,
     /// `true` = dark theme, `false` = light. Persisted; toggled from
@@ -653,6 +659,7 @@ impl TalkerApp {
             log_level: LogLevel::default(),
             log_level_handle,
             displays: Vec::new(),
+            notices: Vec::new(),
             last_title: String::new(),
             serial_ports: Vec::new(),
             dark_mode,
@@ -840,6 +847,7 @@ impl TalkerApp {
                 self.sup.resize_slots(0); // orphan any old runners, then size fresh
                 self.sup.resize_slots(n);
                 self.displays = (0..n).map(|_| ChannelDisplay::default()).collect();
+                self.notices = vec![ChannelNotices::default(); n];
                 self.rates = vec![RateTracker::new(); n];
                 // Fresh slots minted fresh ids, so old entries are unreachable
                 // — clear rather than leak them.
@@ -1027,6 +1035,13 @@ impl TalkerApp {
         }
         if let Some(display) = self.displays.get_mut(i) {
             display.reset_run_state();
+        }
+        // A fresh run has nothing yet acknowledged. `DismissedNotice` re-arms
+        // itself when a counter falls beneath its record, so this is belt and
+        // braces — but it keeps the intent readable at the lifecycle boundary
+        // where every other per-run reset already lives.
+        if let Some(notices) = self.notices.get_mut(i) {
+            *notices = ChannelNotices::default();
         }
     }
 
@@ -1528,6 +1543,7 @@ impl TalkerApp {
             self.sched_drafts.remove(i);
             self.message_analysis.remove(i);
             self.displays.remove(i);
+            self.notices.remove(i);
             if i < self.rates.len() {
                 self.rates.remove(i);
             }
@@ -1556,6 +1572,7 @@ impl TalkerApp {
             self.message_analysis.push(Vec::new());
             self.sup.push_slot();
             self.displays.push(ChannelDisplay::default());
+            self.notices.push(ChannelNotices::default());
             self.rates.push(RateTracker::new());
             // log_counts: entries appear on demand, keyed by the new slot's id.
             // Jump straight to the new channel for editing.

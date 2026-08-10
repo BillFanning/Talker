@@ -18,7 +18,10 @@ use crate::core::{
 };
 
 use wiredata_ui::{
-    diagnostics::{attention_callout, decision_card, signal_grid, signal_row, SignalTone},
+    diagnostics::{
+        attention_callout, decision_card, dismissible_attention_callout, signal_grid, signal_row,
+        SignalTone,
+    },
     fonts::bold,
     format::{
         compact_duration, human_byte_rate, human_bytes, percent, serial_port_hint, thousands,
@@ -187,12 +190,20 @@ impl TalkerApp {
                 ui.separator();
                 // The sent total proves whether Output payload updates
                 // were omitted; retained Output history is a separate concern.
-                let sent_total = self
+                // Dropped updates are the pane's other completeness limit and
+                // are read from the same snapshot.
+                let (sent_total, dropped_updates) = self
                     .sup
                     .telemetry_ref(i)
-                    .map(|telemetry| telemetry.total_count)
+                    .map(|telemetry| (telemetry.total_count, telemetry.dropped_statuses))
                     .unwrap_or_default();
-                show_display_pane(ui, &mut self.displays[i], sent_total);
+                show_display_pane(
+                    ui,
+                    &mut self.displays[i],
+                    &mut self.notices[i].dropped_updates,
+                    sent_total,
+                    dropped_updates,
+                );
             });
         });
     }
@@ -475,8 +486,12 @@ impl TalkerApp {
         // The send-outcome tone still escalates the card badge even though the
         // counts themselves now live above the card: a failing interface must
         // read as ISSUE there, and the adjacent line carries the reason.
-        let card_tone =
-            diagnostic_card_tone(outcomes.tone, capacity.tone, timer_hot, drops, running);
+        let card_tone = diagnostic_card_tone(outcomes.tone, capacity.tone, timer_hot, running);
+        // Read before the card so the closure below can stay free of `self`.
+        // `showing` mutates — it re-arms a record left over from a previous run
+        // — so this is the one call per frame, and dismissal is applied after.
+        let missed_notice_showing = self.notices[i].missed_sends.showing(missed);
+        let mut missed_acknowledged = false;
         let card_status = match card_tone {
             SignalTone::Fault => "ISSUE",
             SignalTone::Warning => "ATTENTION",
@@ -552,28 +567,36 @@ impl TalkerApp {
             // Skipped cadence points name a cause rather than a count: the
             // count is already on the send-outcomes line above, and the message
             // showing the misses is rarely the one causing them (ADR-045).
+            //
+            // Dismissible because it is advice, not a count: the misses
+            // themselves stay on the send-outcomes line above and keep this
+            // card's badge raised, so acknowledging the routing hides where to
+            // look, never what happened.
             let mut missed_routing_shown = false;
-            if let Some(routing) = missed_send_routing(
-                &MissedSendEvidence {
-                    missed,
-                    // The banner error is the only *current* interface signal
-                    // here; `failed` is a run total that may have recovered.
-                    interface_erroring: error.is_some(),
-                    failed,
-                    serial_oversubscribed: serial.is_some_and(|line| line.is_oversubscribed()),
-                    service: service_estimate,
-                },
-                &telemetry.per_message_timing,
-            ) {
-                ui.add_space(4.0);
-                attention_callout(
-                    ui,
-                    "missed_send_routing",
-                    routing.text,
-                    routing.tone,
-                    MISSED_ROUTING_TOOLTIP,
-                );
-                missed_routing_shown = true;
+            if missed_notice_showing {
+                if let Some(routing) = missed_send_routing(
+                    &MissedSendEvidence {
+                        missed,
+                        // The banner error is the only *current* interface
+                        // signal here; `failed` is a run total that may have
+                        // recovered.
+                        interface_erroring: error.is_some(),
+                        failed,
+                        serial_oversubscribed: serial.is_some_and(|line| line.is_oversubscribed()),
+                        service: service_estimate,
+                    },
+                    &telemetry.per_message_timing,
+                ) {
+                    ui.add_space(4.0);
+                    missed_acknowledged = dismissible_attention_callout(
+                        ui,
+                        "missed_send_routing",
+                        routing.text,
+                        routing.tone,
+                        MISSED_ROUTING_TOOLTIP,
+                    );
+                    missed_routing_shown = true;
+                }
             }
 
             // No unsent callout: the send-outcomes line above the card already
@@ -605,16 +628,10 @@ impl TalkerApp {
                         "The channel continues with ordinary deadline waits. The failed request does not prove that any send was late; inspect measured deadline lateness and Missed cadence points for the observed effect.",
                     );
             }
-            if drops > 0 {
-                ui.add_space(4.0);
-                attention_callout(
-                    ui,
-                    "display_drop_attention",
-                    format!("{drops} diagnostic updates dropped; live readouts may lag"),
-                    SignalTone::Warning,
-                    DISPLAY_QUEUE_TOOLTIP,
-                );
-            }
+            // No dropped-update callout: what those drops cost is the Output
+            // pane's completeness, so the warning is raised there, beside the
+            // sampling note that qualifies the same lines. Only the queue gauge
+            // stays here, under Timing & runtime details.
 
             ui.add_space(5.0);
             egui::CollapsingHeader::new("Timing & runtime details")
@@ -788,6 +805,10 @@ impl TalkerApp {
                     .on_hover_text(PER_MESSAGE_TOOLTIP);
             }
         });
+
+        if missed_acknowledged {
+            self.notices[i].missed_sends.dismiss(missed);
+        }
 
         if let Some(summary) = self.sup.last_run_summary(i) {
             ui.add_space(4.0);

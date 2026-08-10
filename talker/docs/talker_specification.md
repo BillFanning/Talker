@@ -1,17 +1,25 @@
 # Talker — Program Specification
-**Version:** 2.4.9
+**Version:** 2.4.10
 **Language:** Rust
 **Target Platforms:** Windows, macOS, Linux
 
-Revision note (2026-08-06) — a missed send names its cause, honestly:
+Revision note (2026-08-09) — a warning may be acknowledged, and is raised where
+it lands:
 
-- **§3.2 missed-send routing (ADR-051, corrected)** — the amount-stating branch
-  must close its own arithmetic: charged total, largest single share, and
-  remainder. Naming only the largest culprit dropped every other charged message
-  out of the sentence. The remainder is stated as **not charged to any send** and
-  never as an idle channel — a miss goes uncharged both when the thread was free
-  and when the send that held it has aged out of the retained record, and nothing
-  measured can tell those apart.
+- **§3.2 dismissible warnings (ADR-052)** — the missed-send routing callout and
+  the Output pane's dropped-update warning each carry a **Dismiss** button.
+  Dismissal records the run counter behind the warning, which returns when that
+  counter is exceeded, so the reader is told once per occurrence and a spreading
+  fault is never silent. A counter below the record means a new run and discards
+  it. Dismissing the routing hides advice, never the counts: the misses stay on
+  the send-outcomes line and keep the card's badge raised.
+- **§3.2 / §5.7 completeness notices (ADR-052)** — the dropped-update warning
+  moves out of the diagnostics card into the **Output** pane, above the sampling
+  note, because what those drops cost is that pane's completeness rather than
+  anything about the wire. The card's badge no longer rises for them; the queue
+  gauge stays under Timing & runtime details. The sampling note keeps its calm
+  treatment but is set in a stronger weight, since it qualifies every line
+  beneath it.
 
 Earlier revisions are in [REVISIONS.md](REVISIONS.md). They live there rather
 than here for two reasons: a document's version number belongs only in its own
@@ -297,7 +305,10 @@ The **detail pane** (right) shows the selected channel:
     **not charged to any send** and never as an idle channel — a miss goes
     uncharged both when the thread was genuinely free and when the send that
     held it has aged out of the retained record, and nothing measured can tell
-    those apart.
+    those apart. The callout carries a **Dismiss** button, on the rule in §3.2
+    *Dismissible warnings* below. It is advice rather than a count: the misses
+    stay on the send-outcomes line and keep the card's badge raised, so
+    dismissing hides where to look and never what happened.
   - *Per-message timing (ADR-045, amended by ADR-051):* a collapsed table, one
     row per message numbered as in the Messages editor, with seven columns —
     **Msg**, **Interval**, **Sends**, **Late**, **Send call**, **Longest
@@ -352,7 +363,21 @@ The **detail pane** (right) shows the selected channel:
   - *Observer health:* `Display backlog: <len>/<cap> (peak <p>, <d> dropped)` —
     the runner→UI status-queue gauge (ADR-018/ADR-019); amber when the peak
     nears the cap or anything was dropped. Pressure here never delays a send;
-    counters are cumulative, so tallies stay exact across drops.
+    counters are cumulative, so tallies stay exact across drops. The gauge is
+    the card's only account of dropped updates: what those drops cost is the
+    **Output** pane's completeness, so the warning about them is raised there
+    (§5.7) and the card's badge does not rise for them (ADR-052).
+- **Dismissible warnings** (ADR-052) — the missed-send routing callout and the
+  Output pane's dropped-update warning each carry a **Dismiss** button. Both
+  stand on a per-run counter that only grows, so dismissal records that counter
+  and the warning returns when it is **exceeded**: the reader is told once per
+  occurrence, and a fault still spreading is never silent. A counter below the
+  recorded value can only mean a new run, which discards the record rather than
+  reading a fresh fault against a number from a previous run. Dismissal is
+  presentation state — process-local, per channel, never saved to a profile, and
+  it changes nothing that is counted or logged. No other callout is dismissible:
+  a live interface fault, an impossible serial schedule, and a failed timer
+  request each describe a condition that is still true while it is on screen.
 - **Lifecycle buttons** — the labeled pair (shared with listener):
   [Start Channel / Apply & Restart / Retry Channel] + [Stop Channel]; the Start
   side's label and enabled state derive from run state, drift, and draft
@@ -368,7 +393,8 @@ The **detail pane** (right) shows the selected channel:
   column *N* of every line describes the same message and one fact can be diffed
   across runs without re-assembling a block per message.
 - **Configure interface** / **Configure messages** sections (the editors), and
-  the **Output** display pane (sampled at high rates, with a sub-sampling badge).
+  the **Output** display pane, headed by the two notices that qualify how
+  complete its lines are — dropped diagnostic updates and sampling (§5.7).
 
 The deadline-wait policy is derived from the shortest active interval —
 continuous below 32 ms, a bounded window at or above it — and is **not
@@ -544,6 +570,26 @@ Each channel includes a real-time display pane showing outgoing data as it is se
 - **Decoded text** — valid UTF-8 sequences rendered as Unicode characters; invalid bytes shown as `U+FFFD`
 
 The display mode is a GUI-only setting and is not saved in the profile.
+
+#### Completeness notices
+
+Two notices head the pane, above the view controls, because both qualify how
+complete the lines below them are — which is a fact about this pane, not about
+the wire, and so is stated here rather than in the diagnostics card (ADR-052):
+
+1. **Dropped diagnostic updates** — `<n> diagnostic updates dropped; live
+   readouts may lag`, an attention callout shown when the runner has discarded
+   any update because the UI queue was full. It can cost a payload line, a
+   counter snapshot, a timer change, or an interface error notice; sends are
+   never delayed by it, counters remain self-correcting, and the final run
+   snapshot stays exact. Dismissible, per §3.2.
+2. **Sampled output** — `sampled output · not every sent payload is shown ·
+   limit ~<n>/s`, shown once the cumulative accepted total proves an omitted
+   payload update, and then for the rest of the run. A standing statement about
+   how the pane works rather than a state to act on, so it takes no accent and
+   no ⚠ — but it qualifies every line beneath it, so it is set in a strong
+   weight rather than a small, weak one. It is not dismissible: it describes a
+   condition that stays true.
 
 #### Control Character Rendering
 

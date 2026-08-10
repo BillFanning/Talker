@@ -10,14 +10,17 @@ use std::{
 };
 
 use egui::{Align, Layout};
+use wiredata_ui::diagnostics::{dismissible_attention_callout, SignalTone};
 
 use crate::core::message::{
     code_page_encodes, decode_codepage_byte, repair_after_edit, segments, ChecksumAlgorithm,
     CodePage, Segment,
 };
 
+use super::diagnostics::DISPLAY_QUEUE_TOOLTIP;
 use super::display::{ChannelDisplay, ControlStyle, DisplayMode};
 use super::draft::{ConnDraft, ConnKind, PayloadKind, PortHold, ScheduleDraft, UdpModeDraft};
+use super::notice::DismissedNotice;
 use super::{MessageAnalysisCache, MessageDraftAnalysis};
 
 /// Foreground/background pair for a lossy code-page substitution. The shared
@@ -1863,12 +1866,36 @@ fn output_layout_job(
 }
 
 /// Render a channel's real-time outbound display pane (spec §5.7).
+///
+/// Both notices at the top of the pane qualify the same thing — how complete
+/// what follows is — so they are stated where that matters rather than in the
+/// diagnostics card, which holds readouts about the wire. The dropped-update
+/// warning is dismissible because it is a run total that keeps its last value
+/// long after the pressure that caused it passed; `dismissed` carries the count
+/// the reader has already acknowledged (see `super::notice`).
 pub(super) fn show_display_pane(
     ui: &mut egui::Ui,
     display: &mut ChannelDisplay,
+    dismissed: &mut DismissedNotice,
     accepted_total: u64,
+    dropped_updates: u64,
 ) {
     ui.collapsing("Output", |ui| {
+        // Ordered by how much each notice qualifies the pane: dropped updates
+        // can cost any kind of update, sampling only costs payload lines.
+        if dropped_updates > 0 && dismissed.showing(dropped_updates) {
+            let acknowledged = dismissible_attention_callout(
+                ui,
+                "display_drop_attention",
+                format!("{dropped_updates} diagnostic updates dropped; live readouts may lag"),
+                SignalTone::Warning,
+                DISPLAY_QUEUE_TOOLTIP,
+            );
+            if acknowledged {
+                dismissed.dismiss(dropped_updates);
+            }
+            ui.add_space(4.0);
+        }
         // The payload observer is rate-limited independently of cumulative
         // counters. Drive the badge from proven accepted-vs-sampled omission
         // so a throughput estimate can neither conceal nor invent sampling.
@@ -1877,16 +1904,16 @@ pub(super) fn show_display_pane(
                 .sample_interval
                 .as_secs_f32();
         if display.payload_samples_omitted(accepted_total) {
-            // A standing note about how the pane works, not a state to act on,
-            // so it recedes with the theme rather than taking an accent.
-            let note = ui.visuals().weak_text_color();
-            ui.label(
-                egui::RichText::new(format!(
-                    "sampled output · not every sent payload is shown · limit ~{sample_hz:.0}/s"
-                ))
-                .small()
-                .color(note),
-            )
+            // Weighted, not accented: this is still a standing note about how
+            // the pane works rather than a state to act on, so it takes no
+            // accent and no ⚠ and does not compete with the callout above. But
+            // it qualifies every line beneath it, and at small-and-weak it read
+            // as a footnote to skip. The bundled bold face carries that as
+            // stroke — `RichText::strong` only shifts the colour, which is the
+            // one channel a state may never depend on (ADR-050).
+            ui.label(wiredata_ui::fonts::bold(format!(
+                "sampled output · not every sent payload is shown · limit ~{sample_hz:.0}/s"
+            )))
             .on_hover_text(format!(
                 "Above ~{sample_hz:.0} messages/s the Output pane shows a \
                  rate-limited live sample, not every message, so its \
