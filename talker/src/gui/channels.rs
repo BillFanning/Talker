@@ -131,7 +131,7 @@ impl TalkerApp {
                     running: self.is_connection_running(i),
                     error: telemetry.and_then(|t| t.banner_error()).map(str::to_owned),
                     sent: telemetry.map(|t| t.total_count).unwrap_or_default(),
-                    per_sec: self.rates.get(i).map(|r| r.per_sec).unwrap_or(0.0),
+                    per_sec: self.views.get(i).map(|v| v.rate.per_sec).unwrap_or(0.0),
                     info: counts.info,
                     warnings: counts.warn,
                     errors: counts.error,

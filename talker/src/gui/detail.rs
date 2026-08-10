@@ -197,10 +197,11 @@ impl TalkerApp {
                     .telemetry_ref(i)
                     .map(|telemetry| (telemetry.total_count, telemetry.dropped_statuses))
                     .unwrap_or_default();
+                let view = &mut self.views[i];
                 show_display_pane(
                     ui,
-                    &mut self.displays[i],
-                    &mut self.notices[i].dropped_updates,
+                    &mut view.display,
+                    &mut view.notices.dropped_updates,
                     sent_total,
                     dropped_updates,
                 );
@@ -293,9 +294,9 @@ impl TalkerApp {
         let msgs = telemetry.total_count;
         let bytes = telemetry.total_bytes;
         let (mps, bps) = self
-            .rates
+            .views
             .get(i)
-            .map(|r| (r.per_sec, r.bytes_per_sec))
+            .map(|v| (v.rate.per_sec, v.rate.bytes_per_sec))
             .unwrap_or((0.0, 0.0));
         let missed = telemetry.missed_sends;
         let failed = telemetry.failed_sends;
@@ -490,7 +491,7 @@ impl TalkerApp {
         // Read before the card so the closure below can stay free of `self`.
         // `showing` mutates — it re-arms a record left over from a previous run
         // — so this is the one call per frame, and dismissal is applied after.
-        let missed_notice_showing = self.notices[i].missed_sends.showing(missed);
+        let missed_notice_showing = self.views[i].notices.missed_sends.showing(missed);
         let mut missed_acknowledged = false;
         let card_status = match card_tone {
             SignalTone::Fault => "ISSUE",
@@ -807,7 +808,7 @@ impl TalkerApp {
         });
 
         if missed_acknowledged {
-            self.notices[i].missed_sends.dismiss(missed);
+            self.views[i].notices.missed_sends.dismiss(missed);
         }
 
         if let Some(summary) = self.sup.last_run_summary(i) {

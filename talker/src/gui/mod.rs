@@ -4,6 +4,7 @@ mod diagnostics;
 mod display;
 mod draft;
 mod notice;
+mod view;
 mod widgets;
 
 use std::collections::HashMap;
@@ -24,9 +25,8 @@ use crate::core::{
     supervisor::TalkerSupervisor,
 };
 
-use display::ChannelDisplay;
 use draft::{ConnDraft, ConnKind, ScheduleDraft, UdpModeDraft};
-use notice::ChannelNotices;
+use view::ChannelView;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -441,11 +441,11 @@ struct TalkerApp {
     log_lines: Vec<(String, tracing::Level)>,
     log_level: LogLevel,
     log_level_handle: LogLevelHandle,
-    displays: Vec<ChannelDisplay>,
-    /// Per-channel dismissed warnings, shape-matched to `displays`. Which
-    /// warnings this reader has already acknowledged is view-state and belongs
-    /// to neither the display buffer nor the runner's telemetry.
-    notices: Vec<ChannelNotices>,
+    /// Per-channel GUI view state — Output buffer, acknowledged warnings, and
+    /// rate estimator — indexed by slot position. One vector rather than one
+    /// per field, so no lifecycle path can update some and forget the rest;
+    /// see [`view`] for the bug that argued for it.
+    views: Vec<ChannelView>,
     last_title: String,
     serial_ports: Vec<String>,
     /// `true` = dark theme, `false` = light. Persisted; toggled from
@@ -456,8 +456,6 @@ struct TalkerApp {
     selected: Option<usize>,
     /// Whether the channel list is collapsed to the thin status strip.
     channels_collapsed: bool,
-    /// Per-channel msgs/s estimators for the channel-list rows.
-    rates: Vec<RateTracker>,
     /// Per-channel log-event tallies for the channel-list rows, keyed by the
     /// slot's stable [`ChannelId`] (ADR-020) — a positional Vec misrouted a
     /// running runner's events after a channel above it was removed.
@@ -658,14 +656,12 @@ impl TalkerApp {
             log_lines: Vec::new(),
             log_level: LogLevel::default(),
             log_level_handle,
-            displays: Vec::new(),
-            notices: Vec::new(),
+            views: Vec::new(),
             last_title: String::new(),
             serial_ports: Vec::new(),
             dark_mode,
             selected: None,
             channels_collapsed: false,
-            rates: Vec::new(),
             log_counts: HashMap::new(),
             show_info: true,
             show_warn: true,
@@ -846,9 +842,7 @@ impl TalkerApp {
                 self.refresh_message_analysis();
                 self.sup.resize_slots(0); // orphan any old runners, then size fresh
                 self.sup.resize_slots(n);
-                self.displays = (0..n).map(|_| ChannelDisplay::default()).collect();
-                self.notices = vec![ChannelNotices::default(); n];
-                self.rates = vec![RateTracker::new(); n];
+                self.views = (0..n).map(|_| ChannelView::default()).collect();
                 // Fresh slots minted fresh ids, so old entries are unreachable
                 // — clear rather than leak them.
                 self.log_counts.clear();
@@ -873,6 +867,30 @@ impl TalkerApp {
                 == rfd::MessageDialogResult::Ok
     }
 
+    /// Every per-channel collection is indexed by the same channel position, so
+    /// they must all be the length the supervisor reports.
+    ///
+    /// The three profile-owned vectors are maintained by five lifecycle paths
+    /// (new, load, add, remove, start) that each have to touch all of them, and
+    /// one that falls out of step hands out another channel's drafts rather
+    /// than panicking. Checked once a frame in debug builds, so a mismatch is
+    /// loud where it happens rather than silent wherever it is read.
+    #[cfg(debug_assertions)]
+    fn debug_assert_channel_state_aligned(&self) {
+        let n = self.sup.len();
+        for (what, len) in [
+            ("conn_drafts", self.conn_drafts.len()),
+            ("sched_drafts", self.sched_drafts.len()),
+            ("message_analysis", self.message_analysis.len()),
+            ("views", self.views.len()),
+        ] {
+            debug_assert_eq!(len, n, "{what} is out of step with the supervisor's slots");
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn debug_assert_channel_state_aligned(&self) {}
+
     fn new_profile(&mut self) {
         if !self.confirm_discard() {
             return;
@@ -885,8 +903,7 @@ impl TalkerApp {
         self.sched_drafts.clear();
         self.message_analysis.clear();
         self.sup.resize_slots(0);
-        self.displays.clear();
-        self.rates.clear();
+        self.views.clear();
         self.log_counts.clear();
         self.selected = None;
         tracing::info!("new profile");
@@ -1034,18 +1051,8 @@ impl TalkerApp {
         if let Some(id) = self.sup.channel_id(i) {
             self.log_counts.remove(&id);
         }
-        if let Some(rate) = self.rates.get_mut(i) {
-            *rate = RateTracker::new();
-        }
-        if let Some(display) = self.displays.get_mut(i) {
-            display.reset_run_state();
-        }
-        // A fresh run has nothing yet acknowledged. `DismissedNotice` re-arms
-        // itself when a counter falls beneath its record, so this is belt and
-        // braces — but it keeps the intent readable at the lifecycle boundary
-        // where every other per-run reset already lives.
-        if let Some(notices) = self.notices.get_mut(i) {
-            *notices = ChannelNotices::default();
+        if let Some(view) = self.views.get_mut(i) {
+            view.start_run();
         }
     }
 
@@ -1179,8 +1186,9 @@ impl TalkerApp {
         // the GUI gets back only the display samples) and route the sampled
         // payloads into the Output panes.
         for sample in self.sup.poll() {
-            if let Some(d) = self.displays.get_mut(sample.slot) {
-                d.push(sample.payload, sample.replacement_wire_offsets);
+            if let Some(view) = self.views.get_mut(sample.slot) {
+                view.display
+                    .push(sample.payload, sample.replacement_wire_offsets);
             }
         }
         // The supervisor has already reconciled applied runtime state and
@@ -1190,13 +1198,15 @@ impl TalkerApp {
 
         // Refresh the per-channel rolling five-second acceptance rates.
         let now = Instant::now();
-        for i in 0..self.rates.len() {
+        for i in 0..self.views.len() {
             let (count, bytes) = self
                 .sup
                 .telemetry_ref(i)
                 .map(|t| (t.total_count, t.total_bytes))
                 .unwrap_or_default();
-            self.rates[i].sample(now, count, bytes, self.sup.is_running(i));
+            self.views[i]
+                .rate
+                .sample(now, count, bytes, self.sup.is_running(i));
         }
 
         if self.sup.any_running() || self.sup.any_draining() {
@@ -1224,6 +1234,7 @@ impl eframe::App for TalkerApp {
         // arriving mid-drain either lands in this frame's batch or triggers a
         // fresh wake — never lost.
         self.repaint.frame_started();
+        self.debug_assert_channel_state_aligned();
         self.poll_channels(ui.ctx());
         self.refresh_message_analysis();
         self.handle_tab_keys(ui.ctx());
@@ -1546,11 +1557,7 @@ impl TalkerApp {
             self.conn_drafts.remove(i);
             self.sched_drafts.remove(i);
             self.message_analysis.remove(i);
-            self.displays.remove(i);
-            self.notices.remove(i);
-            if i < self.rates.len() {
-                self.rates.remove(i);
-            }
+            self.views.remove(i);
             if i < self.profile.channels.len() {
                 self.profile.channels.remove(i);
             }
@@ -1575,9 +1582,7 @@ impl TalkerApp {
             self.sched_drafts.push(Vec::new());
             self.message_analysis.push(Vec::new());
             self.sup.push_slot();
-            self.displays.push(ChannelDisplay::default());
-            self.notices.push(ChannelNotices::default());
-            self.rates.push(RateTracker::new());
+            self.views.push(ChannelView::default());
             // log_counts: entries appear on demand, keyed by the new slot's id.
             // Jump straight to the new channel for editing.
             self.selected = Some(self.conn_drafts.len() - 1);
